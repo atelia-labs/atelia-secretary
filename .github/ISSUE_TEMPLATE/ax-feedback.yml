@@ -1,0 +1,25 @@
+name: AX Feedback
+description: Report friction experienced by an AI agent or Secretary.
+title: "[AX] "
+labels: ["ax-feedback"]
+body:
+  - type: textarea
+    id: friction
+    attributes:
+      label: Friction
+      description: What was difficult, confusing, noisy, blocked, or missing?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: false
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Logs, task links, screenshots, transcripts, or reproduction notes.
+    validations:
+      required: false
