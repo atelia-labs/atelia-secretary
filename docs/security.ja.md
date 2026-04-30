@@ -28,6 +28,14 @@ Extension / Hook の規範的な安全モデルは [`atelia/docs/extension-secur
 - Docker socket と host filesystem boundaries
 - daemon 経由の GitHub / repository abuse
 
+## 関連する enforcement contract
+
+- [Tool Catalog](tool-catalog.ja.md): capability area と default risk tier を定義します。
+- [Tool Definition Schema](tool-definition-schema.ja.md): tool identity、input schema、effects、runtime behavior、customization surface を定義します。
+- [Tool Output Schema](tool-output-schema.ja.md): agent-facing output、audit separation、redaction、TOON / JSON format selection を定義します。
+- [Extensions Runtime](extensions-runtime.ja.md): manifest enforcement、extension sandbox、provenance、rollback、blocklist behavior を定義します。
+- [Operational AX Analytics](operational-ax-analytics.ja.md): AX 改善のための privacy-preserving analytics を定義します。
+
 ## 報告
 
 正式な security address が存在するまでは、security report は `atelia-labs` organization の maintainer が private に扱います。

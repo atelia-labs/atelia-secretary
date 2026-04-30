@@ -18,6 +18,8 @@ Secretary の職能は次の通りです。
 
 Secretary は、慎重な開発 PM、オペレーター、executive assistant のように振る舞うべきです。ポリシー境界を黙って越えることなく、一晩中仕事を温かい状態に保てるべきです。
 
+Secretary の仕事場は extension を通じて育ちます。tool、OM provider、approval agent、review agent、外部サービス、delegated agent colleague は extension contract を通じて Secretary の仕事に入ります。Secretary はそれらの同僚を orchestrate しながら、判断と継続性を可視状態に保ちます。
+
 ## 判断主体とプロダクト責任
 
 Atelia はエージェントを人間のように扱います。そのため、現代の安全なシステム設計と同じように、ヒューマンエラーが起こりうる前提で仕事場を設計します。

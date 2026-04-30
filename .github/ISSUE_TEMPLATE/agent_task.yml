@@ -1,0 +1,56 @@
+name: Agent task
+description: A scoped Secretary implementation or documentation task for a coding agent.
+title: "[Agent Task]: "
+labels: ["type: agent-task", "agent: ready", "needs: triage"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+    validations:
+      required: true
+  - type: textarea
+    id: required_reading
+    attributes:
+      label: Required reading before implementation
+      value: |
+        - [ ] `README.md`
+        - [ ] `docs/architecture.md`
+        - [ ] `docs/security.md`
+        - [ ] `docs/philosophy/secretary.md`
+        - [ ] Docs or code directly affected by this task
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      value: |
+        - [ ]
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: self_review
+    attributes:
+      label: Required self-review before PR
+      value: |
+        - [ ] The diff is scoped to this issue.
+        - [ ] I re-read the required documents after implementing.
+        - [ ] I considered repository, secret, hook, automation, extension, and audit-log impact.
+        - [ ] I ran or documented the relevant verification.
+        - [ ] I listed follow-up work or confirmed none is needed.
+    validations:
+      required: true
+  - type: textarea
+    id: human_decisions
+    attributes:
+      label: Human decisions or blockers
+

@@ -5,14 +5,19 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     name: Rust
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Check
-        run: cargo check --workspace
-      - name: Test
-        run: cargo test --workspace
+    uses: atelia-labs/.github/.github/workflows/reusable-rust-ci.yml@main
+
+  dependency-review:
+    name: Dependency Review
+    uses: atelia-labs/.github/.github/workflows/reusable-dependency-review.yml@main

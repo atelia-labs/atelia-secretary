@@ -6,6 +6,11 @@ repository. This document covers only the daemon implementation boundary.
 
 ## Shape
 
+Secretary exercises judgment through the protocol boundary. The daemon enforces
+policy, persistence, and execution limits; Secretary decides what the work means
+and how the workplace should evolve. When Secretary runs close to the daemon,
+the same separation still applies.
+
 ```text
 Atelia clients and agents
           |
@@ -14,9 +19,9 @@ Atelia clients and agents
    Atelia Secretary
    Rust daemon in Docker
           |
-repositories, GitHub, policy,
+repositories, extension host, policy,
 jobs, events, AX Feedback,
-audit logs, execution boundaries
+execution ledger, execution boundaries
 ```
 
 ## Backend
@@ -28,8 +33,8 @@ Initial backend crate boundaries:
 - `atelia-core`: domain model and policy primitives.
 - `ateliad`: daemon binary and service runtime.
 - `atelia-protocol`: generated or hand-authored protocol bindings.
-- `atelia-github`: GitHub integration boundary.
-- `atelia-agents`: agent provider and execution abstractions.
+- `atelia-extensions`: extension host, manifest, and capability boundaries.
+- `atelia-agents`: agent delegation substrate and provider abstractions.
 
 The daemon should be designed as a long-running process. Docker is the primary
 distribution and runtime target.
@@ -59,6 +64,10 @@ The protocol must support:
 The transport choice can evolve, but the domain contracts should remain stable
 and versioned.
 
+Protocol message definitions live in the `atelia-protocol` crate once the first
+wire contract is introduced. Until then, docs in this repository define domain
+contracts and compatibility expectations.
+
 ## Execution Boundaries
 
 Atelia Secretary implements extension and Hook execution boundaries according to
@@ -70,12 +79,30 @@ Daemon responsibilities:
 - checking extension / Hook execution permissions;
 - allowing, denying, or requesting approval according to policy;
 - recording audit logs;
-- enforcing access boundaries for GitHub, repositories, secrets, and external
-  services;
+- enforcing access boundaries for repositories, secrets, extensions, and
+  external services;
 - blocking dangerous execution paths.
+
+R0/R1 capabilities can be granted automatically by daemon policy when the
+contract permits it. R2 capabilities require audit and checkpoint behavior where
+applicable. R3/R4 capabilities require visible Secretary judgment and, when the
+policy requires it, human approval.
 
 See the project-level Atelia documents for normative extension and Hook specs.
 
-- [Custom AX Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
+- [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
+- [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md)
+- [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md)
 - [Extension Security](https://github.com/atelia-labs/atelia/blob/main/docs/extension-security.md)
+
+## Tool And Extension Implementation Notes
+
+Secretary's implementation contracts for tool categories, tool output rendering,
+extension runtime behavior, and operational AX analytics live in:
+
+- [Tool Catalog](tool-catalog.md)
+- [Tool Definition Schema](tool-definition-schema.md)
+- [Tool Output Schema](tool-output-schema.md)
+- [Extensions Runtime](extensions-runtime.md)
+- [Operational AX Analytics](operational-ax-analytics.md)

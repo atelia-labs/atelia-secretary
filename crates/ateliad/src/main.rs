@@ -5,9 +5,7 @@ use tracing::info;
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "ateliad=info".to_string()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "ateliad=info".to_string()))
         .init();
 
     let auto_merge = PolicyState::Blocked;

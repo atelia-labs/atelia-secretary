@@ -15,11 +15,11 @@ repository focuses on the daemon implementation that executes those contracts.
 - distribution and runtime through Docker
 - repository registration and project status
 - job scheduling / observation
-- agent provider integration
+- agent delegation substrate
 - policy enforcement
 - AX Feedback storage and connection to Atelia-level workflows
-- GitHub integration boundary
-- audit trails and daemon logs
+- extension host and capability boundary
+- execution ledger and daemon logs
 - implementation of extension / Hook execution boundaries
 
 ## Out of Scope
@@ -34,6 +34,11 @@ repository focuses on the daemon implementation that executes those contracts.
 
 - [Secretary Philosophy](docs/philosophy/secretary.md)
 - [Architecture](docs/architecture.md)
+- [Tool Catalog](docs/tool-catalog.md)
+- [Tool Definition Schema](docs/tool-definition-schema.md)
+- [Tool Output Schema](docs/tool-output-schema.md)
+- [Extensions Runtime](docs/extensions-runtime.md)
+- [Operational AX Analytics](docs/operational-ax-analytics.md)
 - [Security](docs/security.md)
 - [Release Policy](docs/release.md)
 - [ADR 0001](docs/adr/0001-rust-daemon-native-clients.md)
@@ -43,7 +48,9 @@ Project-level docs:
 
 - [Atelia](https://github.com/atelia-labs/atelia)
 - [AX Feedback](https://github.com/atelia-labs/atelia/blob/main/docs/ax-feedback.md)
-- [Custom AX Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
+- [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
+- [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md)
+- [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md)
 - [Client UX](https://github.com/atelia-labs/atelia/blob/main/docs/client-ux.md)
 
@@ -51,4 +58,4 @@ Project-level docs:
 
 Atelia Secretary is in its early design and minimal implementation stage. The
 first concrete work is to shape the Rust daemon, typed protocol, policy, job
-orchestration, GitHub integration, and extension / Hook execution boundaries.
+orchestration, extension runtime, and Hook execution boundaries.

@@ -33,6 +33,19 @@ Initial threat model work should cover:
 - Docker socket and host filesystem boundaries;
 - GitHub / repository abuse through the daemon.
 
+## Related Enforcement Contracts
+
+- [Tool Catalog](tool-catalog.md) defines capability areas and default risk
+  tiers.
+- [Tool Definition Schema](tool-definition-schema.md) defines tool identity,
+  input schemas, effects, runtime behavior, and customization surfaces.
+- [Tool Output Schema](tool-output-schema.md) defines agent-facing output,
+  audit separation, redaction, and TOON/JSON format selection.
+- [Extensions Runtime](extensions-runtime.md) defines manifest enforcement,
+  extension sandboxing, provenance, rollback, and blocklist behavior.
+- [Operational AX Analytics](operational-ax-analytics.md) defines
+  privacy-preserving analytics for AX improvement.
+
 ## Disclosure
 
 Until a formal security address exists, security reports should be handled
