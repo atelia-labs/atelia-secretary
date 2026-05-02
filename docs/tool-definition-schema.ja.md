@@ -161,7 +161,7 @@ Secretary built-in は意図的に小さくします。すべての built-in too
 - `agent.cancel`
 - `agent.takeover`
 
-Git helpers、GitHub、Linear、OM provider、memory、notification、review agent、approval agent は、同じ schema を使って extension 側で定義します。
+Git helpers、GitHub、Linear、memory provider、memory strategy、notification、review agent、approval agent は、同じ schema を使って extension 側で定義します。
 
 `approval.*` built-ins は decision の submission / verification のための boundary tools です。approval judgment 自体は human または Approval Agent extension が担います。
 

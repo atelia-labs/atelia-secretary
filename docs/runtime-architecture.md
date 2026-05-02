@@ -154,7 +154,7 @@ Defer:
 - Linear;
 - cloud storage;
 - browser / computer use;
-- memory providers;
+- memory providers and memory strategies;
 - notification providers;
 - approval agents;
 - delegated agent providers.
@@ -210,10 +210,12 @@ It must reserve the following concepts in domain and protocol naming:
 - output customizer;
 - approval agent;
 - delegated agent provider;
-- OM / memory provider.
+- memory provider;
+- memory strategy.
 
 The first implementation may expose only built-in providers. It should not bake
-GitHub, Linear, memory, or external agents into Secretary core.
+GitHub, Linear, long-term memory, observational memory, or external agents into
+Secretary core.
 
 ## Deferred Product Surface
 

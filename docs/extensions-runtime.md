@@ -27,7 +27,8 @@ surface.
 - `workflow`: runs bounded multi-step jobs
 - `notification`: sends or formats notifications
 - `memory_provider`: provides scoped workplace memory or preference surfaces
-- `om_provider`: provides an Observe / Memory / Memory model implementation
+- `memory_strategy`: controls how conversation and tool history is observed,
+  compressed, reflected on, and presented back into agent context
 - `approval_agent`: reviews approval requests and submits bounded approval
   decisions
 - `review`: participates in review, evidence, critique, or policy checks

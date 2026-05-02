@@ -10,8 +10,8 @@ Atelia [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/d
 Secretary core should provide a general harness: filesystem, shell, search,
 jobs, events, policy, extension hosting, hooks, output rendering, agent
 delegation substrate, and a service broker. Git, GitHub, Linear, memory
-providers, notification systems, review agents, and approval agents are
-extension-provided surfaces.
+providers, memory strategies, notification systems, review agents, and approval
+agents are extension-provided surfaces.
 
 ## Risk Scale
 
@@ -49,7 +49,8 @@ extensions:
 - Linear integration
 - build/test/package-manager profiles
 - network API clients
-- OM / memory providers
+- memory providers
+- memory strategies, including observational memory
 - preference managers
 - notification and digest systems
 - client extension views / actions / settings

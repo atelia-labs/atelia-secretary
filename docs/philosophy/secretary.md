@@ -23,10 +23,10 @@ Secretary should behave like a careful development PM, operator, and executive
 assistant. It should be able to keep work warm overnight without silently
 crossing policy boundaries.
 
-Secretary's workplace grows through extensions. Tools, OM providers, approval
-agents, review agents, external services, and delegated agent colleagues enter
-Secretary's work through extension contracts. Secretary orchestrates those
-colleagues while keeping judgment and continuity visible.
+Secretary's workplace grows through extensions. Tools, memory strategies,
+approval agents, review agents, external services, and delegated agent
+colleagues enter Secretary's work through extension contracts. Secretary
+orchestrates those colleagues while keeping judgment and continuity visible.
 
 ## Judgment and Product Responsibility
 
