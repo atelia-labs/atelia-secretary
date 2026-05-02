@@ -175,12 +175,17 @@ Storage migrations must be:
 
 Before migration, the daemon must acquire a single migration lock stored as a
 well-known `migration_lock` record inside the `schema_migrations` collection.
-The record contains leader id, started timestamp, safe flag, and timeout. All
-daemons create, update, or read that record to acquire or release the lock.
-Running jobs are drained until the configured timeout; if they cannot drain, the
-daemon enters `degraded` or `read_only` and records the failure. Non-leader
-daemons report `storage_status: migrating` and do not accept new mutating work
-until the migration lock is released or expires.
+The record contains leader id, started timestamp, safe flag, and timeout.
+Acquisition uses a unique key plus compare-and-set or transactional insert; it
+fails if an unexpired `migration_lock` row already exists. All daemons create,
+update, or read that record to acquire or release the lock. While
+`storage_status: migrating`, the leader must stop accepting new mutating work
+unless `safe_flag: true`; that flag permits only idempotent or explicitly
+marked-safe operations. Running jobs are drained until the configured timeout.
+If they cannot drain, retriable jobs are enqueued for retry with backoff, while
+non-retriable work is marked `failed` with cleanup steps recorded in the ledger.
+Non-leader daemons report `storage_status: migrating` and do not accept new
+mutating work until the migration lock is released or expires.
 
 If a migration fails, the daemon should start in `degraded` or `read_only`
 state rather than silently accepting new work.
@@ -205,6 +210,16 @@ PII deletion requests should prefer redaction over physical deletion when audit
 continuity matters. Redaction records preserve id, timestamp, reason, actor, and
 legal basis; only designated vault-backed processes may reverse reversible
 redaction.
+
+When audit continuity is not needed, physical deletion or crypto-shredding is
+mandatory within the configured deletion window. Reversible redaction is not
+allowed for data that a policy classifies as non-continuity PII, user-requested
+hard deletion, revoked consent, or secret material. After physical deletion, a
+minimal deletion record can persist for the configured deletion-proof retention
+window, or a policy-versioned override, and should contain only id, timestamp,
+actor, legal basis, and non-sensitive proof of deletion. Only a designated
+vault-backed process may reverse reversible redaction, and that path is
+unavailable for physical deletion or crypto-shredded data.
 
 ## AX Check
 

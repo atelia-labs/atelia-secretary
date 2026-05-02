@@ -151,7 +151,7 @@ storage migration は次を満たします。
 - `storage_status: migrating` を report できる
 - 明示的に safe でない限り、job 実行中に migration しない
 
-daemon は migration 前に、leader id、started timestamp、safe flag、timeout を持つ single migration lock を `schema_migrations` に記録します。running job は configured timeout まで drain します。drain できない場合、daemon は `degraded` または `read_only` に入り failure を記録します。non-leader daemon は `storage_status: migrating` を report し、migration lock が release されるまで新しい mutating work を受け付けません。
+daemon は migration 前に、leader id、started timestamp、safe flag、timeout を持つ single migration lock を `schema_migrations` に記録します。acquisition は unique key と compare-and-set または transactional insert を使い、unexpired `migration_lock` row がすでに存在する場合は失敗します。`storage_status: migrating` の間、leader は新しい mutating work を受け付けません。ただし `safe_flag: true` の場合に限り、idempotent または明示的に marked-safe な operation だけを許可できます。running job は configured timeout まで drain します。drain できない場合、retriable job は backoff 付き retry に enqueue し、non-retriable work は cleanup steps を ledger に記録したうえで `failed` に mark します。non-leader daemon は `storage_status: migrating` を report し、migration lock が release または expire されるまで新しい mutating work を受け付けません。
 
 migration が失敗した場合、daemon は新しい work を黙って受けず、`degraded` または `read_only` state で起動します。
 
@@ -167,6 +167,8 @@ migration が失敗した場合、daemon は新しい work を黙って受けず
 - retention は data class ごとに configurable とし、override は policy version 付きで記録する
 
 PII deletion request は、audit continuity が必要な場合、physical deletion より redaction を優先します。redaction record は id、timestamp、reason、actor、legal basis を保持します。reversible redaction を戻せるのは、指定された vault-backed process のみです。
+
+audit continuity が不要な場合、physical deletion または crypto-shredding は configured deletion window 内に必ず実行します。policy が non-continuity PII、user-requested hard deletion、revoked consent、secret material と分類した data には reversible redaction を許可しません。physical deletion 後は、configured deletion-proof retention window または policy-versioned override の間だけ minimal deletion record を保持できます。その record は id、timestamp、actor、legal basis、non-sensitive proof of deletion だけを含めます。reversible redaction を戻せるのは指定された vault-backed process のみであり、physical deletion または crypto-shredded data にはその経路はありません。
 
 ## AX Check
 
