@@ -1,10 +1,12 @@
 # MDP Runtime Contract
 
 This document defines the first concrete runtime contract for Atelia Secretary.
-MDP means Minimum Delightful Product: a small first product that is already
-trustworthy, inspectable, and pleasant enough to invite continued use. The goal
-is to give maintainers and agents a stable implementation target for the first
-usable daemon loop without reducing the work to a bare technical minimum.
+MDP means Minimum Desirable / Delightful Product: a small first product that is
+already worth wanting, trustworthy, inspectable, and pleasant enough to invite
+continued use. Desirable asks whether the product should exist in someone's
+life. Delightful asks whether using it feels careful, legible, and alive. The
+goal is to give maintainers and agents a stable implementation target for the
+first usable daemon loop without reducing the work to a bare technical minimum.
 
 ## Goal
 
@@ -18,6 +20,8 @@ proves the Atelia boundary while carrying enough polish and care to be worth
 living with:
 
 - clients do not execute privileged work directly;
+- the first loop solves a real, recognizable user need instead of only proving
+  infrastructure;
 - Secretary-visible policy is checked before work runs;
 - work creates structured records that can be inspected later;
 - tool output has a canonical result independent of TOON / JSON rendering;

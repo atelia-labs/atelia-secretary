@@ -1,6 +1,6 @@
 # MDP Runtime Contract
 
-この文書は、Atelia Secretary の最初の具体的な runtime contract を定義します。MDP は Minimum Delightful Product、つまり「小さいが、信頼でき、見通せて、また使いたくなる最初の product」です。単なる技術的最小限ではなく、最初の usable daemon loop に Atelia らしい手触りを持たせるための実装目標を置きます。
+この文書は、Atelia Secretary の最初の具体的な runtime contract を定義します。MDP は Minimum Desirable / Delightful Product、つまり「小さいが、欲しいと思える理由があり、信頼でき、見通せて、また使いたくなる最初の product」です。Desirable は「その product がその人の生活や仕事に存在する理由があるか」を問い、Delightful は「使うときに丁寧さ、読みやすさ、生きた手触りがあるか」を問います。単なる技術的最小限ではなく、最初の usable daemon loop に Atelia らしい手触りを持たせるための実装目標を置きます。
 
 ## 目的
 
@@ -11,6 +11,7 @@ typed state を expose し、bounded work request を受け、policy を enforce
 MDP はまだ general automation platform ではありません。Atelia の境界を証明しつつ、日常的に触っても雑に感じない最初の runtime です。
 
 - client は privileged work を直接実行しない
+- infrastructure の証明だけでなく、最初の loop が実在する user need を解く
 - work 実行前に Secretary から見える policy を確認する
 - work はあとから inspect できる structured record を作る
 - tool output は TOON / JSON rendering から独立した canonical result を持つ
