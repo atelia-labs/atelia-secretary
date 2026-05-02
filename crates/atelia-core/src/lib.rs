@@ -3,11 +3,13 @@ use uuid::Uuid;
 
 pub mod domain;
 pub mod policy;
+pub mod runtime;
 pub mod store;
 pub mod tool_output;
 
 pub use domain::*;
 pub use policy::*;
+pub use runtime::*;
 pub use store::*;
 pub use tool_output::*;
 
