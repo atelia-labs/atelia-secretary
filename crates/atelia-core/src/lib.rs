@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod domain;
+pub mod policy;
 pub mod store;
 
 pub use domain::*;
+pub use policy::*;
 pub use store::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
