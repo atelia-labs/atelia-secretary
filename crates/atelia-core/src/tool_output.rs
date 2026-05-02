@@ -94,33 +94,38 @@ pub fn render_tool_result(
         OutputFormat::Toon => Ok(RenderedToolOutput {
             format: OutputFormat::Toon,
             schema_version,
-            body: render_toon(result, None),
+            body: render_toon(result, options, None),
             fallback_reason: None,
         }),
         OutputFormat::Text => Ok(RenderedToolOutput {
             format: OutputFormat::Text,
             schema_version,
-            body: render_text(result),
+            body: render_text(result, options),
             fallback_reason: None,
         }),
         OutputFormat::Json => Ok(RenderedToolOutput {
             format: OutputFormat::Json,
             schema_version,
-            body: serde_json::to_string_pretty(result).map_err(|error| {
-                ToolOutputRenderError::JsonSerialize {
+            body: serde_json::to_string_pretty(&renderable_result(result, options)).map_err(
+                |error| ToolOutputRenderError::JsonSerialize {
                     reason: error.to_string(),
-                }
-            })?,
+                },
+            )?,
             fallback_reason: None,
         }),
     }
 }
 
-fn render_toon(result: &ToolResult, fallback_reason: Option<&str>) -> String {
+fn render_toon(
+    result: &ToolResult,
+    options: &RenderOptions,
+    fallback_reason: Option<&str>,
+) -> String {
     let mut lines = Vec::new();
+    let result = renderable_result(result, options);
 
     lines.push(format!("status {}", status_name(result.status)));
-    lines.push(format!("schema_version {}", schema_version(result)));
+    lines.push(format!("schema_version {}", schema_version(&result)));
     lines.push(format!("format {}", OutputFormat::Toon.as_str()));
 
     if let Some(reason) = fallback_reason {
@@ -142,7 +147,7 @@ fn render_toon(result: &ToolResult, fallback_reason: Option<&str>) -> String {
         lines.push(format!("schema_ref {}", render_toon_value(schema_ref)));
     }
 
-    append_fields(&mut lines, result);
+    append_fields(&mut lines, &result);
     append_artifact_refs(&mut lines, "evidence_refs", &result.evidence_refs);
     append_output_refs(&mut lines, &result.output_refs);
 
@@ -155,8 +160,9 @@ fn render_toon(result: &ToolResult, fallback_reason: Option<&str>) -> String {
     lines.join("\n")
 }
 
-fn render_text(result: &ToolResult) -> String {
-    let summary = summary_field(result).unwrap_or("no summary");
+fn render_text(result: &ToolResult, options: &RenderOptions) -> String {
+    let result = renderable_result(result, options);
+    let summary = summary_field(&result).unwrap_or("no summary");
     let mut parts = vec![format!(
         "{} {}: {}",
         result.tool_id,
@@ -176,15 +182,87 @@ fn render_text(result: &ToolResult) -> String {
         parts.push(format!("{} output ref(s)", result.output_refs.len()));
     }
 
-    if result.truncation.is_some() {
-        parts.push("truncated".to_string());
+    if let Some(truncation) = &result.truncation {
+        parts.push(format!(
+            "truncated {}/{} bytes: {}",
+            truncation.retained_bytes, truncation.original_bytes, truncation.reason
+        ));
     }
 
     if !result.redactions.is_empty() {
-        parts.push(format!("{} redaction(s)", result.redactions.len()));
+        let markers = result
+            .redactions
+            .iter()
+            .map(|redaction| {
+                format!(
+                    "{} ({}, redacted_at_ms {})",
+                    redaction.field_path, redaction.reason, redaction.redacted_at.unix_millis
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        parts.push(format!(
+            "{} redaction(s): {}",
+            result.redactions.len(),
+            markers
+        ));
     }
 
     parts.join("; ")
+}
+
+fn renderable_result(result: &ToolResult, options: &RenderOptions) -> ToolResult {
+    let mut result = result.clone();
+    result
+        .fields
+        .retain(|field| should_render_field(&field.key, options));
+    result
+}
+
+fn should_render_field(key: &str, options: &RenderOptions) -> bool {
+    match optional_field_channel(key) {
+        Some(OptionalFieldChannel::Policy) => options.include_policy,
+        Some(OptionalFieldChannel::Diagnostics) => options.include_diagnostics,
+        Some(OptionalFieldChannel::Cost) => options.include_cost,
+        None => true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionalFieldChannel {
+    Policy,
+    Diagnostics,
+    Cost,
+}
+
+fn optional_field_channel(key: &str) -> Option<OptionalFieldChannel> {
+    let normalized = key
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '.', ' '], "_");
+
+    if normalized == "policy"
+        || normalized.starts_with("policy_")
+        || matches!(normalized.as_str(), "needs_approval" | "blocked_reason")
+    {
+        Some(OptionalFieldChannel::Policy)
+    } else if normalized == "diagnostic"
+        || normalized == "diagnostics"
+        || normalized.starts_with("diagnostic_")
+        || normalized.starts_with("diagnostics_")
+        || matches!(normalized.as_str(), "retry_hint" | "parser_failure")
+    {
+        Some(OptionalFieldChannel::Diagnostics)
+    } else if normalized == "cost"
+        || normalized.starts_with("cost_")
+        || normalized.ends_with("_tokens")
+        || matches!(normalized.as_str(), "duration_ms" | "elapsed_ms")
+    {
+        Some(OptionalFieldChannel::Cost)
+    } else {
+        None
+    }
 }
 
 fn append_fields(lines: &mut Vec<String>, result: &ToolResult) {
@@ -327,11 +405,17 @@ fn render_optional_string(value: Option<&str>) -> String {
 }
 
 fn render_toon_value(value: &str) -> String {
-    if value.is_empty() || value.chars().any(needs_quotes) {
+    if value.is_empty() || is_toon_literal(value) || value.chars().any(needs_quotes) {
         quote_string(value)
     } else {
         value.to_string()
     }
+}
+
+fn is_toon_literal(value: &str) -> bool {
+    matches!(value, "null" | "true" | "false")
+        || value.parse::<i64>().is_ok()
+        || value.parse::<f64>().is_ok()
 }
 
 fn needs_quotes(character: char) -> bool {
@@ -418,6 +502,29 @@ mod tests {
         }
     }
 
+    fn result_with_optional_channels() -> ToolResult {
+        let mut result = sample_result();
+        result.fields = vec![
+            ToolResultField {
+                key: "summary".to_string(),
+                value: StructuredValue::String("optional channel sample".to_string()),
+            },
+            ToolResultField {
+                key: "policy.state".to_string(),
+                value: StructuredValue::String("allowed_with_audit".to_string()),
+            },
+            ToolResultField {
+                key: "diagnostics.parser_failure".to_string(),
+                value: StructuredValue::String("none".to_string()),
+            },
+            ToolResultField {
+                key: "cost.output_tokens".to_string(),
+                value: StructuredValue::Integer(128),
+            },
+        ];
+        result
+    }
+
     #[test]
     fn toon_rendering_keeps_contract_order_and_content() {
         let result = sample_result();
@@ -476,6 +583,86 @@ mod tests {
     }
 
     #[test]
+    fn render_options_filter_optional_channels_in_toon() {
+        let result = result_with_optional_channels();
+        let rendered = render_tool_result(&result, &RenderOptions::default()).unwrap();
+
+        assert!(rendered.body.contains("fields[1]{key,value}"));
+        assert!(rendered
+            .body
+            .contains("  summary,\"optional channel sample\""));
+        assert!(!rendered.body.contains("policy.state"));
+        assert!(!rendered.body.contains("diagnostics.parser_failure"));
+        assert!(!rendered.body.contains("cost.output_tokens"));
+
+        let options = RenderOptions {
+            include_policy: true,
+            include_diagnostics: true,
+            include_cost: true,
+            ..RenderOptions::default()
+        };
+        let rendered = render_tool_result(&result, &options).unwrap();
+
+        assert!(rendered.body.contains("fields[4]{key,value}"));
+        assert!(rendered.body.contains("  policy.state,allowed_with_audit"));
+        assert!(rendered.body.contains("  diagnostics.parser_failure,none"));
+        assert!(rendered.body.contains("  cost.output_tokens,128"));
+    }
+
+    #[test]
+    fn render_options_filter_optional_channels_in_text() {
+        let result = result_with_optional_channels();
+        let rendered =
+            render_tool_result(&result, &RenderOptions::new(OutputFormat::Text)).unwrap();
+
+        assert_eq!(
+            rendered.body,
+            "git_status succeeded: optional channel sample; 1 field(s); 1 evidence ref(s); 1 output ref(s)"
+        );
+
+        let options = RenderOptions {
+            format: OutputFormat::Text,
+            include_policy: true,
+            include_diagnostics: true,
+            include_cost: true,
+        };
+        let rendered = render_tool_result(&result, &options).unwrap();
+
+        assert_eq!(
+            rendered.body,
+            "git_status succeeded: optional channel sample; 4 field(s); 1 evidence ref(s); 1 output ref(s)"
+        );
+    }
+
+    #[test]
+    fn render_options_filter_optional_channels_in_json() {
+        let result = result_with_optional_channels();
+        let rendered =
+            render_tool_result(&result, &RenderOptions::new(OutputFormat::Json)).unwrap();
+
+        assert!(rendered.body.contains("\"key\": \"summary\""));
+        assert!(!rendered.body.contains("\"key\": \"policy.state\""));
+        assert!(!rendered
+            .body
+            .contains("\"key\": \"diagnostics.parser_failure\""));
+        assert!(!rendered.body.contains("\"key\": \"cost.output_tokens\""));
+
+        let options = RenderOptions {
+            format: OutputFormat::Json,
+            include_policy: true,
+            include_diagnostics: true,
+            include_cost: true,
+        };
+        let rendered = render_tool_result(&result, &options).unwrap();
+
+        assert!(rendered.body.contains("\"key\": \"policy.state\""));
+        assert!(rendered
+            .body
+            .contains("\"key\": \"diagnostics.parser_failure\""));
+        assert!(rendered.body.contains("\"key\": \"cost.output_tokens\""));
+    }
+
+    #[test]
     fn canceled_status_uses_domain_spelling() {
         let mut result = sample_result();
         result.status = ToolResultStatus::Canceled;
@@ -484,6 +671,62 @@ mod tests {
 
         assert!(rendered.body.contains("status canceled"));
         assert!(!rendered.body.contains("status cancelled"));
+    }
+
+    #[test]
+    fn toon_string_literals_are_quoted_to_preserve_types() {
+        let mut result = sample_result();
+        result.fields = vec![
+            ToolResultField {
+                key: "literal_null".to_string(),
+                value: StructuredValue::String("null".to_string()),
+            },
+            ToolResultField {
+                key: "literal_true".to_string(),
+                value: StructuredValue::String("true".to_string()),
+            },
+            ToolResultField {
+                key: "integer_like".to_string(),
+                value: StructuredValue::String("42".to_string()),
+            },
+            ToolResultField {
+                key: "float_like".to_string(),
+                value: StructuredValue::String("-3.14".to_string()),
+            },
+            ToolResultField {
+                key: "actual_null".to_string(),
+                value: StructuredValue::Null,
+            },
+            ToolResultField {
+                key: "actual_bool".to_string(),
+                value: StructuredValue::Bool(true),
+            },
+            ToolResultField {
+                key: "actual_integer".to_string(),
+                value: StructuredValue::Integer(42),
+            },
+            ToolResultField {
+                key: "literal_list".to_string(),
+                value: StructuredValue::StringList(vec![
+                    "false".to_string(),
+                    "7".to_string(),
+                    "plain".to_string(),
+                ]),
+            },
+        ];
+
+        let rendered = render_tool_result(&result, &RenderOptions::default()).unwrap();
+
+        assert!(rendered.body.contains("  literal_null,\"null\""));
+        assert!(rendered.body.contains("  literal_true,\"true\""));
+        assert!(rendered.body.contains("  integer_like,\"42\""));
+        assert!(rendered.body.contains("  float_like,\"-3.14\""));
+        assert!(rendered.body.contains("  actual_null,null"));
+        assert!(rendered.body.contains("  actual_bool,true"));
+        assert!(rendered.body.contains("  actual_integer,42"));
+        assert!(rendered
+            .body
+            .contains("  literal_list,[\"false\",\"7\",plain]"));
     }
 
     #[test]
@@ -520,5 +763,30 @@ mod tests {
         assert!(rendered
             .body
             .contains("  \"secret note\",\"line one\\nline two\""));
+    }
+
+    #[test]
+    fn text_rendering_preserves_redaction_and_truncation_markers() {
+        let mut result = sample_result();
+        result.truncation = Some(TruncationMetadata {
+            original_bytes: 4096,
+            retained_bytes: 512,
+            reason: "artifact threshold".to_string(),
+        });
+        result.redactions = vec![RedactionMarker {
+            field_path: "fields.secret note".to_string(),
+            reason: "policy secret".to_string(),
+            redacted_at: LedgerTimestamp::from_unix_millis(1_700_000_000_123),
+        }];
+
+        let rendered =
+            render_tool_result(&result, &RenderOptions::new(OutputFormat::Text)).unwrap();
+
+        assert!(rendered
+            .body
+            .contains("truncated 512/4096 bytes: artifact threshold"));
+        assert!(rendered.body.contains(
+            "1 redaction(s): fields.secret note (policy secret, redacted_at_ms 1700000000123)"
+        ));
     }
 }
