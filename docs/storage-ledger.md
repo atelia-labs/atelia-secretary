@@ -41,6 +41,21 @@ Every record includes:
 
 Append-only records use superseding events instead of in-place mutation.
 
+## Atomicity And Ordering
+
+Backends must provide one of these minimal storage primitives:
+
+- a single multi-row transaction; or
+- an atomic append / write-ahead-log commit with fsync-equivalent durability.
+
+The first lifecycle boundary persists `job: queued` and the initial `job_event`
+in one atomic commit. A `policy_decision` must be durably committed before any
+`tool_invocation`, `tool_result`, or audit effect record can be created. On
+restart, the daemon uses these durable boundaries to recover deterministically:
+if `policy_decision` is missing, re-run policy evaluation; if a
+`tool_invocation` exists without a `tool_result`, mark it for retry or cleanup
+before accepting new work for that job.
+
 ## Repository Records
 
 Repository records include:
@@ -134,11 +149,17 @@ TOON, JSON, or text renderings are derived views.
 - locked path or repository scope
 - `locked_at`
 - `expires_at`
+- `reclaimed_at`, when reclaimed
 - status: `held`, `released`, `expired`, `reclaimed`
 
-The daemon writes the lock decision before the protected effect. On restart it
-reclaims expired locks by appending a reclaim event and then re-evaluates policy
-before continuing the job.
+The daemon writes the lock decision before the protected effect. Active locks
+are unique by `(repository_id, policy_decision_id, locked_scope)`. Reclaim is
+safe-repeatable for the same lock decision and owner: duplicate reclaim attempts
+return no-op success after the first persisted reclaim record. On restart, the
+daemon reclaims expired locks by appending a reclaim event with
+`lock_decision.id`, owner id, and `reclaimed_at`; only after that durable record
+exists may it treat the lock as reclaimed. It then re-evaluates the policy rule
+referenced by `policy_decision_id` before continuing the job.
 
 ## Migration Policy
 

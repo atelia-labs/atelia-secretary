@@ -38,6 +38,15 @@ Atelia Secretary には、複雑な database より先に local ledger が必要
 
 append-only record は in-place mutation ではなく superseding event を使います。
 
+## Atomicity And Ordering
+
+backend は、少なくとも次のどちらかの storage primitive を提供します。
+
+- single multi-row transaction
+- fsync-equivalent durability を持つ atomic append / write-ahead-log commit
+
+最初の lifecycle boundary では、`job: queued` と initial `job_event` を1つの atomic commit で永続化します。`policy_decision` は、どの `tool_invocation`、`tool_result`、audit effect record より先に durable commit される必要があります。restart 時、daemon はこの durable boundary を使って deterministic に recovery します。`policy_decision` がなければ policy evaluation を再実行し、`tool_invocation` があり `tool_result` がない場合は、その job の新しい work を受ける前に retry または cleanup 対象として mark します。
+
 ## Repository Records
 
 repository record は次を含みます。
@@ -127,9 +136,10 @@ TOON、JSON、text rendering は derived view です。
 - locked path または repository scope
 - `locked_at`
 - `expires_at`
+- reclaimed の場合は `reclaimed_at`
 - status: `held`, `released`, `expired`, `reclaimed`
 
-daemon は protected effect より前に lock decision を書き込みます。restart 時は expired lock を reclaim event として append し、job を継続する前に policy を再評価します。
+daemon は protected effect より前に lock decision を書き込みます。active lock は `(repository_id, policy_decision_id, locked_scope)` で unique です。reclaim は同じ lock decision と owner に対して safe-repeatable です。duplicate reclaim attempt は、最初の persisted reclaim record 以後 no-op success を返します。restart 時、daemon は expired lock について `lock_decision.id`、owner id、`reclaimed_at` を持つ reclaim event を append します。その durable record が存在して初めて lock を reclaimed と扱えます。その後、`policy_decision_id` が参照する policy rule を再評価してから job を継続します。
 
 ## Migration Policy
 
