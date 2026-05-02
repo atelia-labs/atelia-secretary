@@ -1,9 +1,10 @@
 //! Storage abstractions for Secretary runtime records.
 
 use crate::domain::{
-    AuditRecord, AuditRecordId, EventSubjectType, JobEvent, JobEventId, JobId, JobRecord,
-    LockDecision, LockDecisionId, LockOwner, PolicyDecision, PolicyDecisionId, RepositoryId,
-    RepositoryRecord, ToolInvocation, ToolInvocationId, ToolResult, ToolResultId,
+    Actor, AuditRecord, AuditRecordId, EventSeverity, EventSubjectType, JobEvent, JobEventId,
+    JobId, JobRecord, JobStatus, LockDecision, LockDecisionId, LockOwner, PolicyDecision,
+    PolicyDecisionId, RepositoryId, RepositoryRecord, ToolInvocation, ToolInvocationId, ToolResult,
+    ToolResultId,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -23,6 +24,50 @@ pub enum EventCursor {
     AfterSequence(u64),
     /// Replay events after the event with this id.
     AfterEventId(JobEventId),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobQuery {
+    pub repository_id: Option<RepositoryId>,
+    pub status: Option<JobStatus>,
+    pub requester: Option<Actor>,
+    pub page_size: Option<usize>,
+    pub page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobPage {
+    pub jobs: Vec<JobRecord>,
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventQuery {
+    pub repository_id: Option<RepositoryId>,
+    pub cursor: EventCursor,
+    pub subject_ids: Vec<String>,
+    pub min_severity: Option<EventSeverity>,
+    pub page_size: Option<usize>,
+    pub page_token: Option<String>,
+}
+
+impl Default for EventQuery {
+    fn default() -> Self {
+        Self {
+            repository_id: None,
+            cursor: EventCursor::Beginning,
+            subject_ids: Vec::new(),
+            min_severity: None,
+            page_size: None,
+            page_token: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventPage {
+    pub events: Vec<JobEvent>,
+    pub next_page_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +141,7 @@ pub trait SecretaryStore: Send + Sync + 'static {
         initial_event: JobEvent,
     ) -> StoreResult<JobEvent>;
     fn list_jobs(&self) -> StoreResult<Vec<JobRecord>>;
+    fn query_jobs(&self, query: JobQuery) -> StoreResult<JobPage>;
     fn get_job(&self, id: &JobId) -> StoreResult<JobRecord>;
 
     /// Append a job event and assign the next store-wide sequence number.
@@ -105,6 +151,7 @@ pub trait SecretaryStore: Send + Sync + 'static {
         cursor: EventCursor,
         limit: Option<usize>,
     ) -> StoreResult<Vec<JobEvent>>;
+    fn query_job_events(&self, query: EventQuery) -> StoreResult<EventPage>;
     fn get_job_event(&self, id: &JobEventId) -> StoreResult<JobEvent>;
 
     fn create_policy_decision(&self, record: PolicyDecision) -> StoreResult<()>;
@@ -217,6 +264,45 @@ impl SecretaryStore for InMemoryStore {
         Ok(list_records(&self.lock()?.jobs))
     }
 
+    fn query_jobs(&self, query: JobQuery) -> StoreResult<JobPage> {
+        let inner = self.lock()?;
+        let start = page_start(query.page_token.as_deref(), "jobs")?;
+        let page_size = query.page_size.unwrap_or(usize::MAX);
+        let mut filtered = inner
+            .jobs
+            .values()
+            .filter(|job| {
+                query
+                    .repository_id
+                    .as_ref()
+                    .map(|repository_id| &job.repository_id == repository_id)
+                    .unwrap_or(true)
+            })
+            .filter(|job| {
+                query
+                    .status
+                    .map(|status| job.status == status)
+                    .unwrap_or(true)
+            })
+            .filter(|job| {
+                query
+                    .requester
+                    .as_ref()
+                    .map(|requester| &job.requester == requester)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        filtered.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let (jobs, next_page_token) = page_records(filtered.into_iter(), start, page_size);
+
+        Ok(JobPage {
+            jobs,
+            next_page_token,
+        })
+    }
+
     fn get_job(&self, id: &JobId) -> StoreResult<JobRecord> {
         get_record(&self.lock()?.jobs, id, "jobs")
     }
@@ -279,6 +365,37 @@ impl SecretaryStore for InMemoryStore {
             }
         }
         Ok(events)
+    }
+
+    fn query_job_events(&self, query: EventQuery) -> StoreResult<EventPage> {
+        let inner = self.lock()?;
+        let start = page_start(query.page_token.as_deref(), "job_events")?;
+        let page_size = query.page_size.unwrap_or(usize::MAX);
+        let after_sequence = event_cursor_sequence(&inner, query.cursor.clone())?;
+
+        let mut filtered = Vec::new();
+        if let Some(start_sequence) = after_sequence.checked_add(1) {
+            for (_, id) in inner.job_events_by_sequence.range(start_sequence..) {
+                let event = inner
+                    .job_events_by_id
+                    .get(id)
+                    .ok_or_else(|| StoreError::Conflict {
+                        collection: "job_events",
+                        reason: format!("sequence index references missing id {}", id_debug(id)),
+                    })?;
+
+                if event_matches_query(&inner, event, &query)? {
+                    filtered.push(event.clone());
+                }
+            }
+        }
+
+        let (events, next_page_token) = page_records(filtered.into_iter(), start, page_size);
+
+        Ok(EventPage {
+            events,
+            next_page_token,
+        })
     }
 
     fn get_job_event(&self, id: &JobEventId) -> StoreResult<JobEvent> {
@@ -477,6 +594,260 @@ where
     Record: Clone,
 {
     collection.values().cloned().collect()
+}
+
+fn page_start(page_token: Option<&str>, collection: &'static str) -> StoreResult<usize> {
+    match page_token {
+        Some(token) if !token.is_empty() => {
+            token
+                .parse::<usize>()
+                .map_err(|_| StoreError::InvalidCursor {
+                    reason: format!("{collection} page token is not a numeric offset"),
+                })
+        }
+        _ => Ok(0),
+    }
+}
+
+fn page_records<Record>(
+    records: impl Iterator<Item = Record>,
+    start: usize,
+    page_size: usize,
+) -> (Vec<Record>, Option<String>) {
+    let mut skipped = 0usize;
+    let mut retained = Vec::new();
+    let mut has_next = false;
+
+    if page_size == 0 {
+        for _ in records.take(start) {}
+
+        return (retained, None);
+    }
+
+    for record in records {
+        if skipped < start {
+            skipped += 1;
+            continue;
+        }
+
+        if retained.len() == page_size {
+            has_next = true;
+            break;
+        }
+
+        retained.push(record);
+    }
+
+    let next_page_token = if has_next {
+        Some((start + retained.len()).to_string())
+    } else {
+        None
+    };
+
+    (retained, next_page_token)
+}
+
+fn event_cursor_sequence(inner: &InMemoryInner, cursor: EventCursor) -> StoreResult<u64> {
+    match cursor {
+        EventCursor::Beginning => Ok(0),
+        EventCursor::AfterSequence(sequence) => Ok(sequence),
+        EventCursor::AfterEventId(id) => {
+            let event =
+                inner
+                    .job_events_by_id
+                    .get(&id)
+                    .ok_or_else(|| StoreError::InvalidCursor {
+                        reason: format!("event id is not retained: {}", id_debug(&id)),
+                    })?;
+            Ok(event.sequence_number)
+        }
+    }
+}
+
+fn event_matches_query(
+    inner: &InMemoryInner,
+    event: &JobEvent,
+    query: &EventQuery,
+) -> StoreResult<bool> {
+    let repository_matches = query
+        .repository_id
+        .as_ref()
+        .map(|repository_id| {
+            event_repository_id(inner, event)
+                .map(|event_repository_id| event_repository_id.as_ref() == Some(repository_id))
+        })
+        .transpose()?
+        .unwrap_or(true);
+    let subject_matches =
+        query.subject_ids.is_empty() || query.subject_ids.contains(&event.subject.subject_id);
+    let severity_matches = query
+        .min_severity
+        .map(|min_severity| severity_rank(event.severity) >= severity_rank(min_severity))
+        .unwrap_or(true);
+
+    Ok(repository_matches && subject_matches && severity_matches)
+}
+
+fn event_repository_id(
+    inner: &InMemoryInner,
+    event: &JobEvent,
+) -> StoreResult<Option<RepositoryId>> {
+    if let Some(repository_id) = &event.refs.repository_id {
+        return Ok(Some(repository_id.clone()));
+    }
+
+    let subject_repository_id = subject_repository_id(inner, event, None)?.cloned();
+    let mut event_repository_id = subject_repository_id;
+    derive_event_repository_from_refs(inner, event, &mut event_repository_id)?;
+
+    Ok(event_repository_id)
+}
+
+fn derive_event_repository_from_refs(
+    inner: &InMemoryInner,
+    event: &JobEvent,
+    event_repository_id: &mut Option<RepositoryId>,
+) -> StoreResult<()> {
+    if let Some(job_id) = &event.refs.job_id {
+        let job = inner.jobs.get(job_id).ok_or_else(|| StoreError::NotFound {
+            collection: "jobs",
+            id: format!("{} (job_event.refs.job_id)", id_debug(job_id)),
+        })?;
+        ensure_owned_event_repository_consistency(
+            event_repository_id,
+            &job.repository_id,
+            "job_event.refs.job_id",
+        )?;
+    }
+
+    if let Some(policy_decision_id) = &event.refs.policy_decision_id {
+        let policy_decision = inner
+            .policy_decisions
+            .get(policy_decision_id)
+            .ok_or_else(|| StoreError::NotFound {
+                collection: "policy_decisions",
+                id: format!(
+                    "{} (job_event.refs.policy_decision_id)",
+                    id_debug(policy_decision_id)
+                ),
+            })?;
+        ensure_owned_event_repository_consistency(
+            event_repository_id,
+            &policy_decision.repository_id,
+            "job_event.refs.policy_decision_id",
+        )?;
+    }
+
+    if let Some(lock_decision_id) = &event.refs.lock_decision_id {
+        let lock_decision =
+            inner
+                .lock_decisions
+                .get(lock_decision_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "lock_decisions",
+                    id: format!(
+                        "{} (job_event.refs.lock_decision_id)",
+                        id_debug(lock_decision_id)
+                    ),
+                })?;
+        ensure_owned_event_repository_consistency(
+            event_repository_id,
+            &lock_decision.repository_id,
+            "job_event.refs.lock_decision_id",
+        )?;
+    }
+
+    if let Some(tool_invocation_id) = &event.refs.tool_invocation_id {
+        let tool_invocation = inner
+            .tool_invocations
+            .get(tool_invocation_id)
+            .ok_or_else(|| StoreError::NotFound {
+                collection: "tool_invocations",
+                id: format!(
+                    "{} (job_event.refs.tool_invocation_id)",
+                    id_debug(tool_invocation_id)
+                ),
+            })?;
+        ensure_owned_event_repository_consistency(
+            event_repository_id,
+            &tool_invocation.repository_id,
+            "job_event.refs.tool_invocation_id",
+        )?;
+    }
+
+    if let Some(tool_result_id) = &event.refs.tool_result_id {
+        let tool_result =
+            inner
+                .tool_results
+                .get(tool_result_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "tool_results",
+                    id: format!(
+                        "{} (job_event.refs.tool_result_id)",
+                        id_debug(tool_result_id)
+                    ),
+                })?;
+        let tool_invocation = inner
+            .tool_invocations
+            .get(&tool_result.invocation_id)
+            .ok_or_else(|| StoreError::Conflict {
+                collection: "tool_results",
+                reason: format!(
+                    "tool_result {} references missing invocation {}",
+                    id_debug(tool_result_id),
+                    id_debug(&tool_result.invocation_id)
+                ),
+            })?;
+        ensure_owned_event_repository_consistency(
+            event_repository_id,
+            &tool_invocation.repository_id,
+            "job_event.refs.tool_result_id",
+        )?;
+    }
+
+    if let Some(audit_record_id) = &event.refs.audit_record_id {
+        let audit_record =
+            inner
+                .audit_records
+                .get(audit_record_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "audit_records",
+                    id: format!(
+                        "{} (job_event.refs.audit_record_id)",
+                        id_debug(audit_record_id)
+                    ),
+                })?;
+        ensure_owned_event_repository_consistency(
+            event_repository_id,
+            &audit_record.repository_id,
+            "job_event.refs.audit_record_id",
+        )?;
+    }
+
+    Ok(())
+}
+
+fn ensure_owned_event_repository_consistency(
+    expected: &mut Option<RepositoryId>,
+    actual: &RepositoryId,
+    context: &str,
+) -> StoreResult<()> {
+    if let Some(expected) = expected {
+        ensure_same_repository("job_events", context, expected, actual)?;
+    } else {
+        *expected = Some(actual.clone());
+    }
+
+    Ok(())
+}
+
+const fn severity_rank(severity: EventSeverity) -> u8 {
+    match severity {
+        EventSeverity::Debug => 0,
+        EventSeverity::Info => 1,
+        EventSeverity::Warning => 2,
+        EventSeverity::Error => 3,
+    }
 }
 
 fn id_debug<Id: fmt::Debug>(id: &Id) -> String {
@@ -1337,6 +1708,146 @@ mod tests {
                 .unwrap(),
             Vec::<JobEvent>::new()
         );
+    }
+
+    #[test]
+    fn query_jobs_filters_and_paginates_without_full_scan_contract() {
+        let store = InMemoryStore::new();
+        let first_repository = repository_record();
+        let second_repository = repository_record();
+        let first_job = job_record(first_repository.id.clone());
+        let second_job = job_record(second_repository.id.clone());
+
+        store.create_repository(first_repository.clone()).unwrap();
+        store.create_repository(second_repository).unwrap();
+        let first_job = persist_job(&store, first_job);
+        persist_job(&store, second_job);
+
+        let page = store
+            .query_jobs(JobQuery {
+                repository_id: Some(first_repository.id),
+                status: Some(JobStatus::Queued),
+                page_size: Some(1),
+                page_token: None,
+                requester: None,
+            })
+            .unwrap();
+
+        assert_eq!(page.jobs, vec![first_job]);
+        assert_eq!(page.next_page_token, None);
+    }
+
+    #[test]
+    fn query_jobs_uses_stable_order_and_zero_size_does_not_loop() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let first_job = job_record(repository.id.clone());
+        let second_job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let second_job = persist_job(&store, second_job);
+        let first_job = persist_job(&store, first_job);
+
+        let page = store
+            .query_jobs(JobQuery {
+                repository_id: Some(repository.id.clone()),
+                page_size: Some(10),
+                ..JobQuery::default()
+            })
+            .unwrap();
+        let mut expected = vec![first_job, second_job];
+        expected.sort_by(|left, right| left.id.cmp(&right.id));
+
+        assert_eq!(page.jobs, expected);
+
+        let empty_page = store
+            .query_jobs(JobQuery {
+                repository_id: Some(repository.id),
+                page_size: Some(0),
+                ..JobQuery::default()
+            })
+            .unwrap();
+
+        assert!(empty_page.jobs.is_empty());
+        assert_eq!(empty_page.next_page_token, None);
+    }
+
+    #[test]
+    fn query_job_events_filters_by_repository_subject_and_severity() {
+        let store = InMemoryStore::new();
+        let first_repository = repository_record();
+        let second_repository = repository_record();
+        let mut first_event = job_event(first_repository.id.clone());
+        let second_event = job_event(second_repository.id.clone());
+        first_event.severity = EventSeverity::Warning;
+
+        store.create_repository(first_repository.clone()).unwrap();
+        store.create_repository(second_repository).unwrap();
+        let first_event = store.append_job_event(first_event).unwrap();
+        store.append_job_event(second_event).unwrap();
+
+        let page = store
+            .query_job_events(EventQuery {
+                repository_id: Some(first_repository.id),
+                cursor: EventCursor::Beginning,
+                subject_ids: vec![first_event.subject.subject_id.clone()],
+                min_severity: Some(EventSeverity::Warning),
+                page_size: Some(1),
+                page_token: None,
+            })
+            .unwrap();
+
+        assert_eq!(page.events, vec![first_event]);
+        assert_eq!(page.next_page_token, None);
+    }
+
+    #[test]
+    fn query_job_events_infers_repository_from_subject_when_ref_is_omitted() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+
+        let mut event = job_event(repository.id.clone());
+        event.subject = EventSubject::job(&job.id);
+        event.refs.repository_id = None;
+        event.refs.job_id = None;
+        let event = store.append_job_event(event).unwrap();
+
+        let page = store
+            .query_job_events(EventQuery {
+                repository_id: Some(repository.id),
+                cursor: EventCursor::Beginning,
+                page_size: Some(10),
+                ..EventQuery::default()
+            })
+            .unwrap();
+
+        assert!(page.events.contains(&event));
+    }
+
+    #[test]
+    fn query_job_events_zero_size_does_not_loop() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+
+        store.create_repository(repository.clone()).unwrap();
+        store
+            .append_job_event(job_event(repository.id.clone()))
+            .unwrap();
+
+        let page = store
+            .query_job_events(EventQuery {
+                repository_id: Some(repository.id),
+                page_size: Some(0),
+                ..EventQuery::default()
+            })
+            .unwrap();
+
+        assert!(page.events.is_empty());
+        assert_eq!(page.next_page_token, None);
     }
 
     #[test]
