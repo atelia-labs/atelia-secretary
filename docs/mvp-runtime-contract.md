@@ -173,7 +173,7 @@ The MVP explicitly does not include:
 - third-party extension registry;
 - extension bundles;
 - service-to-service extension calls;
-- human approval UI beyond returning approval-needed state;
+- human approval UI beyond returning `needs_approval` state;
 - long-term memory or preference storage;
 - autonomous delegated agent scheduling;
 - hosted synchronization;
