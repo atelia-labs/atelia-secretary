@@ -32,15 +32,25 @@ repository focuses on the daemon implementation that executes those contracts.
 
 ## Docs
 
+- [Docs index](docs/README.md)
+
+Core design:
+
 - [Secretary Philosophy](docs/philosophy/secretary.md)
 - [Architecture](docs/architecture.md)
-- [MDP Runtime Contract](docs/mdp-runtime-contract.md)
+- [Secretary Runtime Architecture](docs/runtime-architecture.md)
+- [Security](docs/security.md)
+
+Implementation contracts:
+
 - [Tool Catalog](docs/tool-catalog.md)
 - [Tool Definition Schema](docs/tool-definition-schema.md)
 - [Tool Output Schema](docs/tool-output-schema.md)
 - [Extensions Runtime](docs/extensions-runtime.md)
 - [Operational AX Analytics](docs/operational-ax-analytics.md)
-- [Security](docs/security.md)
+
+Release and research:
+
 - [Release Policy](docs/release.md)
 - [ADR 0001](docs/adr/0001-rust-daemon-native-clients.md)
 - [AI Agent Harness Research](docs/research/agent-harness-survey.md)
@@ -58,6 +68,6 @@ Project-level docs:
 ## Current Status
 
 Atelia Secretary is in its early design and first-product implementation stage.
-The first concrete work is to shape the Rust daemon, typed protocol, policy, job
-orchestration, extension runtime, and Hook execution boundaries into a small but
-trustworthy MDP.
+The current work is to make the Rust daemon architecture concrete enough for
+implementation: typed protocol, domain records, policy, job orchestration,
+execution ledger, tool execution, and extension boundaries.
