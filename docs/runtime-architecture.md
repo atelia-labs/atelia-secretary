@@ -1,27 +1,41 @@
-# MDP Runtime Contract
+# Secretary Runtime Architecture
 
-This document defines the first concrete runtime contract for Atelia Secretary.
-MDP means Minimum Desirable / Delightful Product: a small first product that is
-already worth wanting, trustworthy, inspectable, and pleasant enough to invite
-continued use. Desirable asks whether the product should exist in someone's
-life. Delightful asks whether using it feels careful, legible, and alive. The
-goal is to give maintainers and agents a stable implementation target for the
-first usable daemon loop without reducing the work to a bare technical minimum.
+This document defines the runtime architecture for Atelia Secretary. It is the
+implementation anchor for the daemon: protocol surface, domain records, policy
+boundary, audit model, tool execution, and extension seams.
 
-## Goal
+The architecture is shaped by Atelia's MDP quality bar: Minimum Desirable /
+Delightful Product. Desirable asks whether the product should exist in
+someone's life and work. Delightful asks whether using it feels careful,
+legible, and alive. The runtime should be small enough to build with discipline,
+but complete enough to be trustworthy as the foundation of the product.
 
-The MDP daemon must be able to sit between an Atelia client and a local project
-workspace, expose typed state, accept bounded work requests, enforce policy,
-record what happened, and make those boundaries feel legible to the person using
-it.
+This is not a throwaway first-loop sketch. Later implementation slices may add
+capabilities, storage engines, transports, extension hosts, and hosted sync, but
+they should preserve the domain boundaries defined here.
 
-The MDP is not a general automation platform yet. It is the first runtime that
-proves the Atelia boundary while carrying enough polish and care to be worth
-living with:
+## Design Commitments
+
+The runtime architecture commits to:
+
+- explicit domain records over implicit process state;
+- append-friendly event and audit history;
+- policy decisions before execution effects;
+- canonical tool results before rendered output;
+- typed protocol contracts before client-specific view state;
+- provider boundaries before built-in service integrations;
+- recoverable failure states before generic errors.
+
+## Product Contract
+
+The daemon sits between Atelia clients, agents, and local project workspaces. It
+exposes typed state, accepts bounded work requests, enforces policy, records
+what happened, and makes those boundaries legible to the person using it.
+
+The runtime is not a generic automation platform. It is the product boundary
+that makes Atelia possible:
 
 - clients do not execute privileged work directly;
-- the first loop solves a real, recognizable user need instead of only proving
-  infrastructure;
 - Secretary-visible policy is checked before work runs;
 - work creates structured records that can be inspected later;
 - tool output has a canonical result independent of TOON / JSON rendering;
@@ -31,7 +45,7 @@ living with:
 
 ## Runtime Shape
 
-The MDP daemon is a long-running Rust process.
+The daemon is a long-running Rust process.
 
 It owns:
 
@@ -54,10 +68,11 @@ It does not own:
 
 Those surfaces are left to clients or extensions.
 
-## First Protocol Surface
+## Protocol Surface
 
-The first protocol should grow from the current health endpoint into a small,
-versioned service surface.
+The protocol grows from the current health endpoint into a versioned service
+surface. These groups define the durable contract that clients and agents build
+against.
 
 Required RPC groups:
 
@@ -78,9 +93,11 @@ Required RPC groups:
 The initial transport may be gRPC or another typed RPC transport, but these
 domain contracts should remain versioned and stable.
 
-## Core Domain Records
+## Domain Records
 
-The daemon should persist these records first.
+The daemon persists explicit domain records. Storage can begin as a simple local
+database or file-backed store, but record shape and append-friendly semantics are
+part of the architecture.
 
 | Record | Purpose | Notes |
 | --- | --- | --- |
@@ -92,12 +109,35 @@ The daemon should persist these records first.
 | tool_result | canonical structured result | independent of rendered format |
 | audit_record | durable execution and policy record | append-only; redacted where needed |
 
-The MDP can use a simple local database or file-backed store. The storage
-choice is less important than keeping these records explicit and append-friendly.
+## State Machines
+
+The runtime should model state transitions explicitly rather than encoding them
+as ad hoc strings in handlers.
+
+Initial job states:
+
+- `queued`: accepted but not started;
+- `running`: execution has started;
+- `cancel_requested`: cancellation has been requested;
+- `succeeded`: completed without blocking errors;
+- `failed`: completed with an execution or validation failure;
+- `blocked`: policy or missing approval prevents execution;
+- `canceled`: cancellation completed.
+
+Initial policy outcomes:
+
+- `allowed`: may run without extra audit beyond normal records;
+- `audited`: may run and must produce audit evidence;
+- `needs_approval`: must not run until an approval path is available;
+- `blocked`: must not run.
+
+Client-facing names should be stable, calm, and suitable for display. Internal
+error detail can be richer, but every failure exposed to a client needs a
+specific reason and a recoverable next state where recovery is possible.
 
 ## Built-In Tool Boundary
 
-The MDP built-ins should stay small and dependable.
+Built-ins stay small and dependable.
 
 Include:
 
@@ -126,7 +166,7 @@ Git surface can become an official extension later.
 
 Every job and tool invocation receives a policy decision before execution.
 
-The MDP policy engine must support:
+The policy engine must support:
 
 - R0 informational actions;
 - R1 bounded read actions;
@@ -143,7 +183,7 @@ Policy decisions must be inspectable by clients and recorded in audit records.
 
 The daemon stores canonical tool results and renders them separately.
 
-The MDP renderer must support:
+The renderer must support:
 
 - default TOON for agent-facing output;
 - JSON for integration and debugging;
@@ -155,9 +195,10 @@ The daemon should not compare output formats as "raw log vs structured record."
 Each tool contract should define fields, ordering, omissions, references, and
 redundancy intentionally.
 
-## Extension Boundary Reserved For MDP
+## Extension Boundary
 
-The MDP does not need full extension installation.
+The runtime architecture reserves extension concepts even before full extension
+installation exists.
 
 It must reserve the following concepts in domain and protocol naming:
 
@@ -174,9 +215,9 @@ It must reserve the following concepts in domain and protocol naming:
 The first implementation may expose only built-in providers. It should not bake
 GitHub, Linear, memory, or external agents into Secretary core.
 
-## Out Of Scope
+## Deferred Product Surface
 
-The MDP explicitly does not include:
+The runtime architecture explicitly defers:
 
 - full Rust / WASM extension runtime;
 - third-party extension registry;
@@ -189,12 +230,27 @@ The MDP explicitly does not include:
 - multi-user organization policy;
 - production secret vaulting.
 
-These are important, but they should build on the MDP records and policy
+These are important, but they should build on the runtime records and policy
 boundary instead of preceding them.
+
+## Implementation Slices
+
+The implementation should land in slices that preserve the architecture:
+
+1. Daemon lifecycle and health with protocol/storage versions.
+2. Repository registration and listing.
+3. Job submission, listing, inspection, cancellation, and state transitions.
+4. Event and audit persistence with replay.
+5. Policy decision records before execution.
+6. Bounded filesystem read/list/search/stat/diff.
+7. Policy-gated filesystem write/patch.
+8. Explicit argv process execution with cwd, timeout, and env allowlist.
+9. Canonical tool results with TOON and JSON rendering.
+10. Reserved provider identifiers for future extension boundaries.
 
 ## Acceptance Criteria
 
-The first MDP implementation is complete when:
+The runtime architecture is implemented when:
 
 - the daemon starts and reports health with protocol/storage versions;
 - a client can register a repository;
