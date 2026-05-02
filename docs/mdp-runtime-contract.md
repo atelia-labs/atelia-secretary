@@ -1,28 +1,33 @@
-# MVP Runtime Contract
+# MDP Runtime Contract
 
 This document defines the first concrete runtime contract for Atelia Secretary.
-It is intentionally smaller than the full Atelia architecture. The goal is to
-give maintainers and agents a stable implementation target for the first usable
-daemon loop.
+MDP means Minimum Delightful Product: a small first product that is already
+trustworthy, inspectable, and pleasant enough to invite continued use. The goal
+is to give maintainers and agents a stable implementation target for the first
+usable daemon loop without reducing the work to a bare technical minimum.
 
 ## Goal
 
-The MVP daemon must be able to sit between an Atelia client and a local project
-workspace, expose typed state, accept bounded work requests, enforce policy, and
-record what happened.
+The MDP daemon must be able to sit between an Atelia client and a local project
+workspace, expose typed state, accept bounded work requests, enforce policy,
+record what happened, and make those boundaries feel legible to the person using
+it.
 
-The MVP is not a general automation platform yet. It is the smallest runtime
-that proves the Atelia boundary:
+The MDP is not a general automation platform yet. It is the first runtime that
+proves the Atelia boundary while carrying enough polish and care to be worth
+living with:
 
 - clients do not execute privileged work directly;
 - Secretary-visible policy is checked before work runs;
 - work creates structured records that can be inspected later;
 - tool output has a canonical result independent of TOON / JSON rendering;
+- status, errors, and approval states are understandable instead of merely
+  technically correct;
 - extension points are reserved without committing to the full extension host.
 
 ## Runtime Shape
 
-The MVP daemon is a long-running Rust process.
+The MDP daemon is a long-running Rust process.
 
 It owns:
 
@@ -83,12 +88,12 @@ The daemon should persist these records first.
 | tool_result | canonical structured result | independent of rendered format |
 | audit_record | durable execution and policy record | append-only; redacted where needed |
 
-The MVP can use a simple local database or file-backed store. The storage
+The MDP can use a simple local database or file-backed store. The storage
 choice is less important than keeping these records explicit and append-friendly.
 
 ## Built-In Tool Boundary
 
-The MVP built-ins should stay small.
+The MDP built-ins should stay small and dependable.
 
 Include:
 
@@ -113,11 +118,11 @@ Defer:
 Git can start as shell/process usage through the bounded process tool. A richer
 Git surface can become an official extension later.
 
-## Policy Minimum
+## Policy Foundation
 
 Every job and tool invocation receives a policy decision before execution.
 
-The MVP policy engine must support:
+The MDP policy engine must support:
 
 - R0 informational actions;
 - R1 bounded read actions;
@@ -130,11 +135,11 @@ yet, R3 should return `needs_approval` rather than running.
 
 Policy decisions must be inspectable by clients and recorded in audit records.
 
-## Tool Output Minimum
+## Tool Output Foundation
 
 The daemon stores canonical tool results and renders them separately.
 
-The MVP renderer must support:
+The MDP renderer must support:
 
 - default TOON for agent-facing output;
 - JSON for integration and debugging;
@@ -146,9 +151,9 @@ The daemon should not compare output formats as "raw log vs structured record."
 Each tool contract should define fields, ordering, omissions, references, and
 redundancy intentionally.
 
-## Extension Boundary Reserved For MVP
+## Extension Boundary Reserved For MDP
 
-The MVP does not need full extension installation.
+The MDP does not need full extension installation.
 
 It must reserve the following concepts in domain and protocol naming:
 
@@ -167,7 +172,7 @@ GitHub, Linear, memory, or external agents into Secretary core.
 
 ## Out Of Scope
 
-The MVP explicitly does not include:
+The MDP explicitly does not include:
 
 - full Rust / WASM extension runtime;
 - third-party extension registry;
@@ -180,12 +185,12 @@ The MVP explicitly does not include:
 - multi-user organization policy;
 - production secret vaulting.
 
-These are important, but they should build on the MVP records and policy
+These are important, but they should build on the MDP records and policy
 boundary instead of preceding them.
 
 ## Acceptance Criteria
 
-The first MVP implementation is complete when:
+The first MDP implementation is complete when:
 
 - the daemon starts and reports health with protocol/storage versions;
 - a client can register a repository;
@@ -196,4 +201,8 @@ The first MVP implementation is complete when:
 - tool results are stored canonically and rendered as TOON or JSON;
 - audit records show requester, policy decision, tool effect, and output refs;
 - R3/R4 actions do not silently execute;
+- common failure states return specific, user-facing reasons and recoverable
+  next states;
+- event and job status names are calm, consistent, and suitable for native
+  clients to display directly;
 - docs and protocol definitions agree on names and status values.

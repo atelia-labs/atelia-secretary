@@ -34,7 +34,7 @@ repository focuses on the daemon implementation that executes those contracts.
 
 - [Secretary Philosophy](docs/philosophy/secretary.md)
 - [Architecture](docs/architecture.md)
-- [MVP Runtime Contract](docs/mvp-runtime-contract.md)
+- [MDP Runtime Contract](docs/mdp-runtime-contract.md)
 - [Tool Catalog](docs/tool-catalog.md)
 - [Tool Definition Schema](docs/tool-definition-schema.md)
 - [Tool Output Schema](docs/tool-output-schema.md)
@@ -57,6 +57,7 @@ Project-level docs:
 
 ## Current Status
 
-Atelia Secretary is in its early design and minimal implementation stage. The
-first concrete work is to shape the Rust daemon, typed protocol, policy, job
-orchestration, extension runtime, and Hook execution boundaries.
+Atelia Secretary is in its early design and first-product implementation stage.
+The first concrete work is to shape the Rust daemon, typed protocol, policy, job
+orchestration, extension runtime, and Hook execution boundaries into a small but
+trustworthy MDP.
