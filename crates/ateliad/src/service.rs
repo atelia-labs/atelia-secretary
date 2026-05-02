@@ -9,7 +9,7 @@ use atelia_core::{
     RepositoryTrustState, SecretaryRuntime, SecretaryStore,
 };
 
-const DAEMON_VERSION: &str = "0.1.0";
+const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "v1";
 const STORAGE_VERSION: &str = "in-memory-v1";
 
@@ -127,16 +127,17 @@ impl SecretaryService {
 
     /// Return the current daemon health snapshot.
     pub fn health(&self) -> DaemonHealth {
-        let repository_count = self
-            .runtime
-            .store()
-            .list_repositories()
-            .map(|repos| repos.len())
-            .unwrap_or(0);
+        let (repository_count, storage_status) = match self.runtime.store().list_repositories() {
+            Ok(repos) => (repos.len(), StorageStatus::Ready),
+            Err(err) => {
+                tracing::warn!("storage health check failed: {err}");
+                (0, StorageStatus::Unavailable)
+            }
+        };
 
         DaemonHealth {
             daemon_status: self.daemon_status,
-            storage_status: StorageStatus::Ready,
+            storage_status,
             daemon_version: DAEMON_VERSION.to_string(),
             protocol_version: PROTOCOL_VERSION.to_string(),
             storage_version: STORAGE_VERSION.to_string(),
@@ -156,12 +157,12 @@ impl SecretaryService {
         &self,
         request: RegisterRepositoryRequest,
     ) -> ServiceResult<RepositoryRecord> {
-        if request.display_name.is_empty() {
+        if request.display_name.trim().is_empty() {
             return Err(ServiceError::InvalidArgument {
                 reason: "display_name must not be empty".to_string(),
             });
         }
-        if request.root_path.is_empty() {
+        if request.root_path.trim().is_empty() {
             return Err(ServiceError::InvalidArgument {
                 reason: "root_path must not be empty".to_string(),
             });
@@ -380,5 +381,40 @@ mod tests {
         let missing_id = RepositoryId::new();
         let err = svc.get_repository(&missing_id).unwrap_err();
         assert!(matches!(err, ServiceError::Store(_)));
+    }
+
+    // -- whitespace-only validation tests ------------------------------------
+
+    #[test]
+    fn register_rejects_whitespace_only_display_name() {
+        let svc = ready_service();
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "   ".to_string(),
+                root_path: "/tmp/test".to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn register_rejects_whitespace_only_root_path() {
+        let svc = ready_service();
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "test-repo".to_string(),
+                root_path: "  \t ".to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    // -- DAEMON_VERSION derived from Cargo.toml -----------------------------
+
+    #[test]
+    fn daemon_version_matches_cargo_pkg_version() {
+        assert_eq!(DAEMON_VERSION, env!("CARGO_PKG_VERSION"));
     }
 }
