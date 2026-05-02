@@ -1,9 +1,9 @@
 //! Storage abstractions for Secretary runtime records.
 
 use crate::domain::{
-    AuditRecord, AuditRecordId, JobEvent, JobEventId, JobId, JobRecord, LockDecision,
-    LockDecisionId, PolicyDecision, PolicyDecisionId, RepositoryId, RepositoryRecord,
-    ToolInvocation, ToolInvocationId, ToolResult, ToolResultId,
+    AuditRecord, AuditRecordId, EventSubjectType, JobEvent, JobEventId, JobId, JobRecord,
+    LockDecision, LockDecisionId, LockOwner, PolicyDecision, PolicyDecisionId, RepositoryId,
+    RepositoryRecord, ToolInvocation, ToolInvocationId, ToolResult, ToolResultId,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -47,6 +47,10 @@ pub enum StoreError {
         reason: String,
     },
     SequenceOverflow,
+    InvalidRecord {
+        collection: &'static str,
+        reason: String,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -66,6 +70,9 @@ impl fmt::Display for StoreError {
             }
             StoreError::InvalidCursor { reason } => write!(f, "invalid event cursor: {reason}"),
             StoreError::SequenceOverflow => write!(f, "job event sequence overflowed"),
+            StoreError::InvalidRecord { collection, reason } => {
+                write!(f, "{collection} invalid record: {reason}")
+            }
         }
     }
 }
@@ -78,12 +85,16 @@ impl Error for StoreError {}
 /// append ordered events, and replay events from stable cursors. Mutation-heavy
 /// lifecycle behavior should be represented by appending records/events rather
 /// than by broad in-place updates.
-pub trait SecretaryStore: Clone + Send + Sync + 'static {
+pub trait SecretaryStore: Send + Sync + 'static {
     fn create_repository(&self, record: RepositoryRecord) -> StoreResult<()>;
     fn list_repositories(&self) -> StoreResult<Vec<RepositoryRecord>>;
     fn get_repository(&self, id: &RepositoryId) -> StoreResult<RepositoryRecord>;
 
-    fn create_job(&self, record: JobRecord) -> StoreResult<()>;
+    fn create_job_with_initial_event(
+        &self,
+        record: JobRecord,
+        initial_event: JobEvent,
+    ) -> StoreResult<JobEvent>;
     fn list_jobs(&self) -> StoreResult<Vec<JobRecord>>;
     fn get_job(&self, id: &JobId) -> StoreResult<JobRecord>;
 
@@ -168,15 +179,38 @@ impl SecretaryStore for InMemoryStore {
         get_record(&self.lock()?.repositories, id, "repositories")
     }
 
-    fn create_job(&self, record: JobRecord) -> StoreResult<()> {
+    fn create_job_with_initial_event(
+        &self,
+        mut record: JobRecord,
+        mut initial_event: JobEvent,
+    ) -> StoreResult<JobEvent> {
         let mut inner = self.lock()?;
-        if !inner.repositories.contains_key(&record.repository_id) {
-            return Err(StoreError::NotFound {
-                collection: "repositories",
-                id: id_debug(&record.repository_id),
+        validate_job_refs(&inner, &record)?;
+        if inner.jobs.contains_key(&record.id) {
+            return Err(StoreError::DuplicateId {
+                collection: "jobs",
+                id: id_debug(&record.id),
             });
         }
-        insert_record(&mut inner.jobs, record.id.clone(), record, "jobs")
+        validate_initial_event_for_job(&record, &initial_event)?;
+        validate_new_job_event(&inner, &initial_event, Some(&record))?;
+
+        let next_sequence = inner
+            .next_event_sequence
+            .checked_add(1)
+            .ok_or(StoreError::SequenceOverflow)?;
+        inner.next_event_sequence = next_sequence;
+        initial_event.sequence_number = next_sequence;
+        record.latest_event_id = Some(initial_event.id.clone());
+
+        inner.jobs.insert(record.id.clone(), record);
+        inner
+            .job_events_by_sequence
+            .insert(initial_event.sequence_number, initial_event.id.clone());
+        inner
+            .job_events_by_id
+            .insert(initial_event.id.clone(), initial_event.clone());
+        Ok(initial_event)
     }
 
     fn list_jobs(&self) -> StoreResult<Vec<JobRecord>> {
@@ -189,12 +223,7 @@ impl SecretaryStore for InMemoryStore {
 
     fn append_job_event(&self, mut event: JobEvent) -> StoreResult<JobEvent> {
         let mut inner = self.lock()?;
-        if inner.job_events_by_id.contains_key(&event.id) {
-            return Err(StoreError::DuplicateId {
-                collection: "job_events",
-                id: id_debug(&event.id),
-            });
-        }
+        validate_new_job_event(&inner, &event, None)?;
 
         let next_sequence = inner
             .next_event_sequence
@@ -258,6 +287,12 @@ impl SecretaryStore for InMemoryStore {
 
     fn create_policy_decision(&self, record: PolicyDecision) -> StoreResult<()> {
         let mut inner = self.lock()?;
+        ensure_ref_exists(
+            inner.repositories.contains_key(&record.repository_id),
+            "repositories",
+            &record.repository_id,
+            "policy_decision.repository_id",
+        )?;
         insert_record(
             &mut inner.policy_decisions,
             record.id.clone(),
@@ -282,6 +317,7 @@ impl SecretaryStore for InMemoryStore {
                 id: id_debug(&record.id),
             });
         }
+        validate_lock_decision_timing(&record)?;
         if !inner.repositories.contains_key(&record.repository_id) {
             return Err(StoreError::NotFound {
                 collection: "repositories",
@@ -301,6 +337,18 @@ impl SecretaryStore for InMemoryStore {
             &record.repository_id,
             &policy_decision.repository_id,
         )?;
+        if let LockOwner::Job(job_id) = &record.owner {
+            let job = inner.jobs.get(job_id).ok_or_else(|| StoreError::NotFound {
+                collection: "jobs",
+                id: format!("{} (lock_decision.owner)", id_debug(job_id)),
+            })?;
+            ensure_same_repository(
+                "lock_decisions",
+                "lock_decision.owner",
+                &record.repository_id,
+                &job.repository_id,
+            )?;
+        }
         if is_active_lock_status(&record.status) {
             let conflicting_lock = inner.lock_decisions.values().find(|existing| {
                 is_active_lock_status(&existing.status)
@@ -442,6 +490,400 @@ fn is_active_lock_status<Status: fmt::Debug>(status: &Status) -> bool {
     )
 }
 
+fn validate_job_refs(inner: &InMemoryInner, record: &JobRecord) -> StoreResult<()> {
+    ensure_ref_exists(
+        inner.repositories.contains_key(&record.repository_id),
+        "repositories",
+        &record.repository_id,
+        "job.repository_id",
+    )
+}
+
+fn validate_new_job_event(
+    inner: &InMemoryInner,
+    event: &JobEvent,
+    pending_job: Option<&JobRecord>,
+) -> StoreResult<()> {
+    if inner.job_events_by_id.contains_key(&event.id) {
+        return Err(StoreError::DuplicateId {
+            collection: "job_events",
+            id: id_debug(&event.id),
+        });
+    }
+    if !event.subject.has_valid_subject_id() {
+        return Err(StoreError::InvalidReference {
+            collection: "job_events",
+            reason: format!(
+                "event.subject_id {} does not match subject_type {:?}",
+                event.subject.subject_id, event.subject.subject_type
+            ),
+        });
+    }
+
+    let subject_repository_id = validate_event_subject(inner, event, pending_job)?;
+    validate_event_refs(inner, event, pending_job, subject_repository_id)
+}
+
+fn validate_initial_event_for_job(record: &JobRecord, event: &JobEvent) -> StoreResult<()> {
+    if event.subject.subject_type != EventSubjectType::Job
+        || event.subject.subject_id != record.id.as_str()
+    {
+        return Err(StoreError::InvalidReference {
+            collection: "job_events",
+            reason: format!(
+                "initial event subject must identify job {}",
+                id_debug(&record.id)
+            ),
+        });
+    }
+    if event.refs.job_id.as_ref() != Some(&record.id) {
+        return Err(StoreError::InvalidReference {
+            collection: "job_events",
+            reason: format!(
+                "initial event refs.job_id must identify job {}",
+                id_debug(&record.id)
+            ),
+        });
+    }
+    if event.refs.repository_id.as_ref() != Some(&record.repository_id) {
+        return Err(StoreError::InvalidReference {
+            collection: "job_events",
+            reason: format!(
+                "initial event refs.repository_id must identify repository {}",
+                id_debug(&record.repository_id)
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_event_subject<'a>(
+    inner: &'a InMemoryInner,
+    event: &JobEvent,
+    pending_job: Option<&'a JobRecord>,
+) -> StoreResult<Option<&'a RepositoryId>> {
+    let subject_repository_id = subject_repository_id(inner, event, pending_job)?;
+    if let (Some(subject_repository_id), Some(ref_repository_id)) =
+        (subject_repository_id, event.refs.repository_id.as_ref())
+    {
+        ensure_same_repository(
+            "job_events",
+            "job_event.subject_id",
+            ref_repository_id,
+            subject_repository_id,
+        )?;
+    }
+
+    Ok(subject_repository_id)
+}
+
+fn subject_repository_id<'a>(
+    inner: &'a InMemoryInner,
+    event: &JobEvent,
+    pending_job: Option<&'a JobRecord>,
+) -> StoreResult<Option<&'a RepositoryId>> {
+    match event.subject.subject_type {
+        EventSubjectType::Repository => {
+            let repository = inner
+                .repositories
+                .keys()
+                .find(|id| id.as_str() == event.subject.subject_id)
+                .ok_or_else(|| subject_not_found("repositories", event))?;
+            Ok(Some(repository))
+        }
+        EventSubjectType::Job => {
+            let job = inner
+                .jobs
+                .values()
+                .find(|job| job.id.as_str() == event.subject.subject_id)
+                .or_else(|| pending_job.filter(|job| job.id.as_str() == event.subject.subject_id))
+                .ok_or_else(|| subject_not_found("jobs", event))?;
+            Ok(Some(&job.repository_id))
+        }
+        EventSubjectType::PolicyDecision => {
+            let policy_decision = inner
+                .policy_decisions
+                .values()
+                .find(|policy_decision| policy_decision.id.as_str() == event.subject.subject_id)
+                .ok_or_else(|| subject_not_found("policy_decisions", event))?;
+            Ok(Some(&policy_decision.repository_id))
+        }
+        EventSubjectType::LockDecision => {
+            let lock_decision = inner
+                .lock_decisions
+                .values()
+                .find(|lock_decision| lock_decision.id.as_str() == event.subject.subject_id)
+                .ok_or_else(|| subject_not_found("lock_decisions", event))?;
+            Ok(Some(&lock_decision.repository_id))
+        }
+        EventSubjectType::ToolInvocation => {
+            let tool_invocation = inner
+                .tool_invocations
+                .values()
+                .find(|tool_invocation| tool_invocation.id.as_str() == event.subject.subject_id)
+                .ok_or_else(|| subject_not_found("tool_invocations", event))?;
+            Ok(Some(&tool_invocation.repository_id))
+        }
+        EventSubjectType::ToolResult => {
+            let tool_result = inner
+                .tool_results
+                .values()
+                .find(|tool_result| tool_result.id.as_str() == event.subject.subject_id)
+                .ok_or_else(|| subject_not_found("tool_results", event))?;
+            let tool_invocation = inner
+                .tool_invocations
+                .get(&tool_result.invocation_id)
+                .ok_or_else(|| StoreError::Conflict {
+                    collection: "tool_results",
+                    reason: format!(
+                        "tool_result {} references missing invocation {}",
+                        event.subject.subject_id,
+                        id_debug(&tool_result.invocation_id)
+                    ),
+                })?;
+            Ok(Some(&tool_invocation.repository_id))
+        }
+        EventSubjectType::AuditRecord => {
+            let audit_record = inner
+                .audit_records
+                .values()
+                .find(|audit_record| audit_record.id.as_str() == event.subject.subject_id)
+                .ok_or_else(|| subject_not_found("audit_records", event))?;
+            Ok(Some(&audit_record.repository_id))
+        }
+    }
+}
+
+fn subject_not_found(collection: &'static str, event: &JobEvent) -> StoreError {
+    StoreError::NotFound {
+        collection,
+        id: format!("{} (job_event.subject_id)", event.subject.subject_id),
+    }
+}
+
+fn validate_event_refs(
+    inner: &InMemoryInner,
+    event: &JobEvent,
+    pending_job: Option<&JobRecord>,
+    subject_repository_id: Option<&RepositoryId>,
+) -> StoreResult<()> {
+    let mut event_repository_id = event.refs.repository_id.as_ref().or(subject_repository_id);
+
+    if let Some(repository_id) = &event.refs.repository_id {
+        ensure_ref_exists(
+            inner.repositories.contains_key(repository_id),
+            "repositories",
+            repository_id,
+            "job_event.refs.repository_id",
+        )?;
+    }
+
+    if let Some(job_id) = &event.refs.job_id {
+        let job = inner
+            .jobs
+            .get(job_id)
+            .or_else(|| pending_job.filter(|job| &job.id == job_id))
+            .ok_or_else(|| StoreError::NotFound {
+                collection: "jobs",
+                id: format!("{} (job_event.refs.job_id)", id_debug(job_id)),
+            })?;
+        ensure_event_repository_consistency(
+            &mut event_repository_id,
+            &job.repository_id,
+            "job_event.refs.job_id",
+        )?;
+    }
+
+    if let Some(policy_decision_id) = &event.refs.policy_decision_id {
+        let policy_decision = inner
+            .policy_decisions
+            .get(policy_decision_id)
+            .ok_or_else(|| StoreError::NotFound {
+                collection: "policy_decisions",
+                id: format!(
+                    "{} (job_event.refs.policy_decision_id)",
+                    id_debug(policy_decision_id)
+                ),
+            })?;
+        ensure_event_repository_consistency(
+            &mut event_repository_id,
+            &policy_decision.repository_id,
+            "job_event.refs.policy_decision_id",
+        )?;
+    }
+
+    if let Some(lock_decision_id) = &event.refs.lock_decision_id {
+        let lock_decision =
+            inner
+                .lock_decisions
+                .get(lock_decision_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "lock_decisions",
+                    id: format!(
+                        "{} (job_event.refs.lock_decision_id)",
+                        id_debug(lock_decision_id)
+                    ),
+                })?;
+        ensure_event_repository_consistency(
+            &mut event_repository_id,
+            &lock_decision.repository_id,
+            "job_event.refs.lock_decision_id",
+        )?;
+    }
+
+    if let Some(tool_invocation_id) = &event.refs.tool_invocation_id {
+        let tool_invocation = inner
+            .tool_invocations
+            .get(tool_invocation_id)
+            .ok_or_else(|| StoreError::NotFound {
+                collection: "tool_invocations",
+                id: format!(
+                    "{} (job_event.refs.tool_invocation_id)",
+                    id_debug(tool_invocation_id)
+                ),
+            })?;
+        ensure_event_repository_consistency(
+            &mut event_repository_id,
+            &tool_invocation.repository_id,
+            "job_event.refs.tool_invocation_id",
+        )?;
+    }
+
+    if let Some(tool_result_id) = &event.refs.tool_result_id {
+        let tool_result =
+            inner
+                .tool_results
+                .get(tool_result_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "tool_results",
+                    id: format!(
+                        "{} (job_event.refs.tool_result_id)",
+                        id_debug(tool_result_id)
+                    ),
+                })?;
+        let tool_invocation = inner
+            .tool_invocations
+            .get(&tool_result.invocation_id)
+            .ok_or_else(|| StoreError::Conflict {
+                collection: "tool_results",
+                reason: format!(
+                    "tool_result {} references missing invocation {}",
+                    id_debug(tool_result_id),
+                    id_debug(&tool_result.invocation_id)
+                ),
+            })?;
+        ensure_event_repository_consistency(
+            &mut event_repository_id,
+            &tool_invocation.repository_id,
+            "job_event.refs.tool_result_id",
+        )?;
+    }
+
+    if let Some(audit_record_id) = &event.refs.audit_record_id {
+        let audit_record =
+            inner
+                .audit_records
+                .get(audit_record_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "audit_records",
+                    id: format!(
+                        "{} (job_event.refs.audit_record_id)",
+                        id_debug(audit_record_id)
+                    ),
+                })?;
+        ensure_event_repository_consistency(
+            &mut event_repository_id,
+            &audit_record.repository_id,
+            "job_event.refs.audit_record_id",
+        )?;
+    }
+
+    Ok(())
+}
+
+fn ensure_event_repository_consistency<'a>(
+    expected: &mut Option<&'a RepositoryId>,
+    actual: &'a RepositoryId,
+    context: &str,
+) -> StoreResult<()> {
+    if let Some(expected) = expected {
+        ensure_same_repository("job_events", context, expected, actual)?;
+    } else {
+        *expected = Some(actual);
+    }
+
+    Ok(())
+}
+
+fn validate_lock_decision_timing(record: &LockDecision) -> StoreResult<()> {
+    if record.expires_at <= record.locked_at {
+        return Err(StoreError::InvalidRecord {
+            collection: "lock_decisions",
+            reason: "expires_at must be later than locked_at".to_string(),
+        });
+    }
+    if record.created_at != record.locked_at {
+        return Err(StoreError::InvalidRecord {
+            collection: "lock_decisions",
+            reason: "created_at must equal locked_at".to_string(),
+        });
+    }
+    if record.updated_at < record.locked_at {
+        return Err(StoreError::InvalidRecord {
+            collection: "lock_decisions",
+            reason: "updated_at must not be earlier than locked_at".to_string(),
+        });
+    }
+    if record.released_at.is_some() && record.reclaimed_at.is_some() {
+        return Err(StoreError::InvalidRecord {
+            collection: "lock_decisions",
+            reason: "released_at and reclaimed_at are mutually exclusive".to_string(),
+        });
+    }
+    match record.status {
+        crate::domain::LockStatus::Held | crate::domain::LockStatus::Expired => {
+            if record.released_at.is_some() || record.reclaimed_at.is_some() {
+                return Err(StoreError::InvalidRecord {
+                    collection: "lock_decisions",
+                    reason: "active or expired locks must not have terminal timestamps".to_string(),
+                });
+            }
+        }
+        crate::domain::LockStatus::Released => {
+            let released_at = record
+                .released_at
+                .ok_or_else(|| StoreError::InvalidRecord {
+                    collection: "lock_decisions",
+                    reason: "released locks require released_at".to_string(),
+                })?;
+            if released_at < record.locked_at || record.updated_at < released_at {
+                return Err(StoreError::InvalidRecord {
+                    collection: "lock_decisions",
+                    reason: "released_at must be monotonic with lock timestamps".to_string(),
+                });
+            }
+        }
+        crate::domain::LockStatus::Reclaimed => {
+            let reclaimed_at = record
+                .reclaimed_at
+                .ok_or_else(|| StoreError::InvalidRecord {
+                    collection: "lock_decisions",
+                    reason: "reclaimed locks require reclaimed_at".to_string(),
+                })?;
+            if reclaimed_at < record.expires_at || record.updated_at < reclaimed_at {
+                return Err(StoreError::InvalidRecord {
+                    collection: "lock_decisions",
+                    reason: "reclaimed_at must be at or after expires_at and updated_at"
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_tool_invocation_refs(
     inner: &InMemoryInner,
     record: &ToolInvocation,
@@ -485,12 +927,40 @@ fn validate_tool_invocation_refs(
 }
 
 fn validate_tool_result_refs(inner: &InMemoryInner, record: &ToolResult) -> StoreResult<()> {
-    ensure_ref_exists(
-        inner.tool_invocations.contains_key(&record.invocation_id),
-        "tool_invocations",
-        &record.invocation_id,
-        "tool_result.invocation_id",
-    )
+    let invocation = inner
+        .tool_invocations
+        .get(&record.invocation_id)
+        .ok_or_else(|| StoreError::NotFound {
+            collection: "tool_invocations",
+            id: format!(
+                "{} (tool_result.invocation_id)",
+                id_debug(&record.invocation_id)
+            ),
+        })?;
+    if invocation.tool_id != record.tool_id {
+        return Err(StoreError::InvalidReference {
+            collection: "tool_results",
+            reason: format!(
+                "tool_result.tool_id {} does not match invocation tool_id {}",
+                record.tool_id, invocation.tool_id
+            ),
+        });
+    }
+    if inner
+        .tool_results
+        .values()
+        .any(|existing| existing.invocation_id == record.invocation_id)
+    {
+        return Err(StoreError::Conflict {
+            collection: "tool_results",
+            reason: format!(
+                "tool_result already exists for invocation {}",
+                id_debug(&record.invocation_id)
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_audit_record_refs(inner: &InMemoryInner, record: &AuditRecord) -> StoreResult<()> {
@@ -624,22 +1094,41 @@ mod tests {
         )
     }
 
-    fn job_event() -> JobEvent {
+    fn job_event(repository_id: RepositoryId) -> JobEvent {
         JobEvent {
             id: JobEventId::new(),
             schema_version: 1,
             sequence_number: 0,
             created_at: timestamp(3),
-            subject: EventSubject {
-                subject_type: EventSubjectType::Job,
-                subject_id: "job_test".to_string(),
-            },
+            subject: EventSubject::repository(&repository_id),
             kind: JobEventKind::Message,
             severity: EventSeverity::Info,
             public_message: "store test event".to_string(),
-            refs: EventRefs::default(),
+            refs: EventRefs {
+                repository_id: Some(repository_id),
+                ..EventRefs::default()
+            },
             redactions: Vec::new(),
         }
+    }
+
+    fn initial_job_event(repository_id: RepositoryId, job_id: &JobId) -> JobEvent {
+        let mut event = job_event(repository_id);
+        event.subject = EventSubject::job(job_id);
+        event.refs.job_id = Some(job_id.clone());
+        event.kind = JobEventKind::JobSubmitted;
+        event
+    }
+
+    fn persist_job(store: &InMemoryStore, job: JobRecord) -> JobRecord {
+        let event = initial_job_event(job.repository_id.clone(), &job.id);
+        store
+            .create_job_with_initial_event(job.clone(), event.clone())
+            .unwrap();
+
+        let mut stored_job = job;
+        stored_job.latest_event_id = Some(event.id);
+        stored_job
     }
 
     fn policy_decision(repository_id: RepositoryId) -> PolicyDecision {
@@ -684,6 +1173,7 @@ mod tests {
             timestamp(5),
             timestamp(6),
         )
+        .unwrap()
     }
 
     fn tool_invocation(
@@ -766,7 +1256,7 @@ mod tests {
         let job = job_record(repository.id.clone());
 
         store.create_repository(repository).unwrap();
-        store.create_job(job.clone()).unwrap();
+        let job = persist_job(&store, job);
 
         assert_eq!(store.get_job(&job.id).unwrap(), job);
         assert_eq!(store.list_jobs().unwrap().len(), 1);
@@ -775,9 +1265,14 @@ mod tests {
     #[test]
     fn append_events_assigns_monotonic_sequences() {
         let store = InMemoryStore::new();
+        let repository = repository_record();
 
-        let first = store.append_job_event(job_event()).unwrap();
-        let second = store.append_job_event(job_event()).unwrap();
+        store.create_repository(repository.clone()).unwrap();
+
+        let first = store
+            .append_job_event(job_event(repository.id.clone()))
+            .unwrap();
+        let second = store.append_job_event(job_event(repository.id)).unwrap();
 
         assert_eq!(first.sequence_number, 1);
         assert_eq!(second.sequence_number, 2);
@@ -787,21 +1282,31 @@ mod tests {
     #[test]
     fn append_event_reports_sequence_overflow() {
         let store = InMemoryStore::new();
+        let repository = repository_record();
+
+        store.create_repository(repository.clone()).unwrap();
         store.lock().unwrap().next_event_sequence = u64::MAX;
 
         assert_eq!(
             Err(StoreError::SequenceOverflow),
-            store.append_job_event(job_event())
+            store.append_job_event(job_event(repository.id))
         );
     }
 
     #[test]
     fn replay_from_cursor_returns_events_after_cursor() {
         let store = InMemoryStore::new();
+        let repository = repository_record();
 
-        let first = store.append_job_event(job_event()).unwrap();
-        let second = store.append_job_event(job_event()).unwrap();
-        let third = store.append_job_event(job_event()).unwrap();
+        store.create_repository(repository.clone()).unwrap();
+
+        let first = store
+            .append_job_event(job_event(repository.id.clone()))
+            .unwrap();
+        let second = store
+            .append_job_event(job_event(repository.id.clone()))
+            .unwrap();
+        let third = store.append_job_event(job_event(repository.id)).unwrap();
 
         assert_eq!(
             store
@@ -820,8 +1325,11 @@ mod tests {
     #[test]
     fn replay_after_max_sequence_returns_empty_events() {
         let store = InMemoryStore::new();
+        let repository = repository_record();
 
-        store.append_job_event(job_event()).unwrap();
+        store.create_repository(repository.clone()).unwrap();
+
+        store.append_job_event(job_event(repository.id)).unwrap();
 
         assert_eq!(
             store
@@ -850,13 +1358,135 @@ mod tests {
     #[test]
     fn duplicate_event_ids_are_rejected() {
         let store = InMemoryStore::new();
-        let event = job_event();
+        let repository = repository_record();
+        let event = job_event(repository.id.clone());
+
+        store.create_repository(repository).unwrap();
 
         store.append_job_event(event.clone()).unwrap();
 
         assert!(matches!(
             store.append_job_event(event),
             Err(StoreError::DuplicateId {
+                collection: "job_events",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn create_job_with_initial_event_persists_atomically() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+        let mut event = job_event(repository.id.clone());
+        event.subject = EventSubject::job(&job.id);
+        event.refs.job_id = Some(job.id.clone());
+
+        assert!(matches!(
+            store.create_job_with_initial_event(job.clone(), event.clone()),
+            Err(StoreError::NotFound {
+                collection: "repositories",
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.get_job(&job.id),
+            Err(StoreError::NotFound { .. })
+        ));
+
+        store.create_repository(repository).unwrap();
+        let stored_event = store
+            .create_job_with_initial_event(job.clone(), event.clone())
+            .unwrap();
+        let mut stored_job = job;
+        stored_job.latest_event_id = Some(event.id.clone());
+
+        assert_eq!(store.get_job(&stored_job.id).unwrap(), stored_job);
+        assert_eq!(stored_event.sequence_number, 1);
+        assert_eq!(store.get_job_event(&event.id).unwrap(), stored_event);
+    }
+
+    #[test]
+    fn create_job_with_initial_event_rejects_events_for_other_subjects() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+        let event = job_event(repository.id.clone());
+
+        store.create_repository(repository).unwrap();
+
+        assert!(matches!(
+            store.create_job_with_initial_event(job.clone(), event),
+            Err(StoreError::InvalidReference {
+                collection: "job_events",
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.get_job(&job.id),
+            Err(StoreError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn job_events_reject_invalid_subjects_and_missing_refs() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let mut event = job_event(repository.id.clone());
+        event.subject = EventSubject {
+            subject_type: EventSubjectType::Job,
+            subject_id: repository.id.as_str().to_string(),
+        };
+
+        store.create_repository(repository.clone()).unwrap();
+
+        assert!(matches!(
+            store.append_job_event(event),
+            Err(StoreError::InvalidReference {
+                collection: "job_events",
+                ..
+            })
+        ));
+
+        let mut event = job_event(repository.id);
+        event.refs.policy_decision_id = Some(PolicyDecisionId::new());
+
+        assert!(matches!(
+            store.append_job_event(event),
+            Err(StoreError::NotFound {
+                collection: "policy_decisions",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn job_events_reject_cross_repository_refs() {
+        let store = InMemoryStore::new();
+        let first_repository = repository_record();
+        let second_repository = repository_record();
+        let second_job = job_record(second_repository.id.clone());
+        let mut event = job_event(first_repository.id.clone());
+        event.refs.job_id = Some(second_job.id.clone());
+        let mut event_without_repository_ref = event.clone();
+        event_without_repository_ref.id = JobEventId::new();
+        event_without_repository_ref.refs.repository_id = None;
+
+        store.create_repository(first_repository).unwrap();
+        store.create_repository(second_repository).unwrap();
+        persist_job(&store, second_job);
+
+        assert!(matches!(
+            store.append_job_event(event),
+            Err(StoreError::InvalidReference {
+                collection: "job_events",
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.append_job_event(event_without_repository_ref),
+            Err(StoreError::InvalidReference {
                 collection: "job_events",
                 ..
             })
@@ -929,6 +1559,81 @@ mod tests {
     }
 
     #[test]
+    fn policy_decisions_require_existing_repository() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let policy = policy_decision(repository.id.clone());
+
+        assert!(matches!(
+            store.create_policy_decision(policy.clone()),
+            Err(StoreError::NotFound {
+                collection: "repositories",
+                ..
+            })
+        ));
+
+        store.create_repository(repository).unwrap();
+        store.create_policy_decision(policy).unwrap();
+    }
+
+    #[test]
+    fn lock_decisions_reject_missing_or_cross_repository_job_owner() {
+        let store = InMemoryStore::new();
+        let first_repository = repository_record();
+        let second_repository = repository_record();
+        let first_policy = policy_decision(first_repository.id.clone());
+        let second_job = job_record(second_repository.id.clone());
+        let mut missing_owner_lock =
+            lock_decision(first_repository.id.clone(), first_policy.id.clone());
+        missing_owner_lock.owner = LockOwner::Job(JobId::new());
+        let mut cross_owner_lock =
+            lock_decision(first_repository.id.clone(), first_policy.id.clone());
+        cross_owner_lock.owner = LockOwner::Job(second_job.id.clone());
+
+        store.create_repository(first_repository).unwrap();
+        store.create_repository(second_repository).unwrap();
+        store.create_policy_decision(first_policy).unwrap();
+
+        assert!(matches!(
+            store.create_lock_decision(missing_owner_lock),
+            Err(StoreError::NotFound {
+                collection: "jobs",
+                ..
+            })
+        ));
+
+        persist_job(&store, second_job);
+
+        assert!(matches!(
+            store.create_lock_decision(cross_owner_lock),
+            Err(StoreError::InvalidReference {
+                collection: "lock_decisions",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lock_decisions_reject_invalid_timing_even_from_struct_literal() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let policy = policy_decision(repository.id.clone());
+        let mut lock = lock_decision(repository.id.clone(), policy.id.clone());
+        lock.expires_at = lock.locked_at;
+
+        store.create_repository(repository).unwrap();
+        store.create_policy_decision(policy).unwrap();
+
+        assert!(matches!(
+            store.create_lock_decision(lock),
+            Err(StoreError::InvalidRecord {
+                collection: "lock_decisions",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn tool_records_require_existing_parents() {
         let store = InMemoryStore::new();
         let repository = repository_record();
@@ -951,7 +1656,7 @@ mod tests {
         ));
 
         store.create_repository(repository).unwrap();
-        store.create_job(job).unwrap();
+        persist_job(&store, job);
 
         assert!(matches!(
             store.create_tool_invocation(invocation.clone()),
@@ -982,8 +1687,8 @@ mod tests {
 
         store.create_repository(first_repository.clone()).unwrap();
         store.create_repository(second_repository.clone()).unwrap();
-        store.create_job(first_job.clone()).unwrap();
-        store.create_job(second_job.clone()).unwrap();
+        persist_job(&store, first_job.clone());
+        persist_job(&store, second_job.clone());
         store.create_policy_decision(first_policy.clone()).unwrap();
         store.create_policy_decision(second_policy.clone()).unwrap();
 
@@ -1038,6 +1743,42 @@ mod tests {
     }
 
     #[test]
+    fn tool_results_reject_mismatched_tool_id_and_duplicate_invocation() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+        let policy = policy_decision(repository.id.clone());
+        let invocation = tool_invocation(repository.id.clone(), job.id.clone(), policy.id.clone());
+        let mut mismatched_result = tool_result(invocation.id.clone());
+        mismatched_result.tool_id = "fs.write".to_string();
+
+        store.create_repository(repository).unwrap();
+        persist_job(&store, job);
+        store.create_policy_decision(policy).unwrap();
+        store.create_tool_invocation(invocation.clone()).unwrap();
+
+        assert!(matches!(
+            store.create_tool_result(mismatched_result),
+            Err(StoreError::InvalidReference {
+                collection: "tool_results",
+                ..
+            })
+        ));
+
+        store
+            .create_tool_result(tool_result(invocation.id.clone()))
+            .unwrap();
+
+        assert!(matches!(
+            store.create_tool_result(tool_result(invocation.id)),
+            Err(StoreError::Conflict {
+                collection: "tool_results",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn audit_records_reject_cross_repository_policy_and_invocation() {
         let store = InMemoryStore::new();
         let first_repository = repository_record();
@@ -1054,8 +1795,8 @@ mod tests {
 
         store.create_repository(first_repository.clone()).unwrap();
         store.create_repository(second_repository.clone()).unwrap();
-        store.create_job(first_job).unwrap();
-        store.create_job(second_job).unwrap();
+        persist_job(&store, first_job);
+        persist_job(&store, second_job);
         store.create_policy_decision(first_policy.clone()).unwrap();
         store.create_policy_decision(second_policy.clone()).unwrap();
         store

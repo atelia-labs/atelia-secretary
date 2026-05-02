@@ -122,6 +122,7 @@ impl LedgerTimestamp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Actor {
     User {
         id: String,
@@ -187,6 +188,7 @@ impl PathScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum RepositoryTrustState {
     Trusted,
     ReadOnly,
@@ -242,6 +244,7 @@ impl RepositoryRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum JobKind {
     Read,
     Mutate,
@@ -251,6 +254,7 @@ pub enum JobKind {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
     Running,
@@ -288,6 +292,7 @@ impl JobStatus {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum CancellationState {
     NotRequested,
     Requested,
@@ -397,6 +402,7 @@ impl JobRecord {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum JobStatusTransitionError {
     InvalidTransition {
         from: JobStatus,
@@ -409,6 +415,7 @@ pub enum JobStatusTransitionError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum EventSubjectType {
     Repository,
     Job,
@@ -425,7 +432,65 @@ pub struct EventSubject {
     pub subject_id: String,
 }
 
+impl EventSubject {
+    pub fn repository(id: &RepositoryId) -> Self {
+        Self::new(EventSubjectType::Repository, id.as_str())
+    }
+
+    pub fn job(id: &JobId) -> Self {
+        Self::new(EventSubjectType::Job, id.as_str())
+    }
+
+    pub fn policy_decision(id: &PolicyDecisionId) -> Self {
+        Self::new(EventSubjectType::PolicyDecision, id.as_str())
+    }
+
+    pub fn lock_decision(id: &LockDecisionId) -> Self {
+        Self::new(EventSubjectType::LockDecision, id.as_str())
+    }
+
+    pub fn tool_invocation(id: &ToolInvocationId) -> Self {
+        Self::new(EventSubjectType::ToolInvocation, id.as_str())
+    }
+
+    pub fn tool_result(id: &ToolResultId) -> Self {
+        Self::new(EventSubjectType::ToolResult, id.as_str())
+    }
+
+    pub fn audit_record(id: &AuditRecordId) -> Self {
+        Self::new(EventSubjectType::AuditRecord, id.as_str())
+    }
+
+    fn new(subject_type: EventSubjectType, subject_id: &str) -> Self {
+        Self {
+            subject_type,
+            subject_id: subject_id.to_string(),
+        }
+    }
+
+    pub fn has_valid_subject_id(&self) -> bool {
+        match self.subject_type {
+            EventSubjectType::Repository => RepositoryId::try_from_string(&self.subject_id).is_ok(),
+            EventSubjectType::Job => JobId::try_from_string(&self.subject_id).is_ok(),
+            EventSubjectType::PolicyDecision => {
+                PolicyDecisionId::try_from_string(&self.subject_id).is_ok()
+            }
+            EventSubjectType::LockDecision => {
+                LockDecisionId::try_from_string(&self.subject_id).is_ok()
+            }
+            EventSubjectType::ToolInvocation => {
+                ToolInvocationId::try_from_string(&self.subject_id).is_ok()
+            }
+            EventSubjectType::ToolResult => ToolResultId::try_from_string(&self.subject_id).is_ok(),
+            EventSubjectType::AuditRecord => {
+                AuditRecordId::try_from_string(&self.subject_id).is_ok()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum EventSeverity {
     Debug,
     Info,
@@ -434,6 +499,7 @@ pub enum EventSeverity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum JobEventKind {
     JobSubmitted,
     JobStatusChanged { from: JobStatus, to: JobStatus },
@@ -486,6 +552,7 @@ pub enum RiskTier {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum PolicyOutcome {
     Allowed,
     Audited,
@@ -524,6 +591,7 @@ pub struct PolicyDecision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
 pub enum LockOwner {
     Job(JobId),
     Process { id: String },
@@ -531,6 +599,7 @@ pub enum LockOwner {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
 pub enum LockedScope {
     Repository,
     Path { path: String },
@@ -538,6 +607,7 @@ pub enum LockedScope {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum LockStatus {
     Held,
     Released,
@@ -571,8 +641,15 @@ impl LockDecision {
         locked_scope: LockedScope,
         locked_at: LedgerTimestamp,
         expires_at: LedgerTimestamp,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, LockDecisionCreateError> {
+        if expires_at <= locked_at {
+            return Err(LockDecisionCreateError::NonPositiveDuration {
+                locked_at,
+                expires_at,
+            });
+        }
+
+        Ok(Self {
             id: LockDecisionId::new(),
             schema_version: DOMAIN_SCHEMA_VERSION,
             created_at: locked_at,
@@ -587,7 +664,7 @@ impl LockDecision {
             reclaimed_at: None,
             status: LockStatus::Held,
             redactions: Vec::new(),
-        }
+        })
     }
 
     pub fn reclaim(
@@ -603,6 +680,12 @@ impl LockDecision {
             LockStatus::Reclaimed => Ok(false),
             LockStatus::Held | LockStatus::Expired => {
                 self.ensure_monotonic_reclaim_timestamp(reclaimed_at)?;
+                if reclaimed_at < self.expires_at {
+                    return Err(LockReclaimError::NotExpired {
+                        reclaimed_at,
+                        expires_at: self.expires_at,
+                    });
+                }
                 self.status = LockStatus::Reclaimed;
                 self.reclaimed_at = Some(reclaimed_at);
                 self.updated_at = reclaimed_at;
@@ -628,9 +711,23 @@ impl LockDecision {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LockDecisionCreateError {
+    NonPositiveDuration {
+        locked_at: LedgerTimestamp,
+        expires_at: LedgerTimestamp,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum LockReclaimError {
     OwnerMismatch,
     AlreadyReleased,
+    NotExpired {
+        reclaimed_at: LedgerTimestamp,
+        expires_at: LedgerTimestamp,
+    },
     NonMonotonicTimestamp {
         at: LedgerTimestamp,
         latest: LedgerTimestamp,
@@ -662,6 +759,7 @@ pub struct ToolInvocation {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolResultStatus {
     Succeeded,
     Failed,
@@ -670,6 +768,7 @@ pub enum ToolResultStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum StructuredValue {
     Null,
     Bool(bool),
@@ -975,6 +1074,29 @@ mod tests {
             LockStatus::Reclaimed,
             string_round_trip(&LockStatus::Reclaimed)
         );
+
+        assert_eq!(
+            "read_only",
+            RepositoryTrustState::ReadOnly
+                .serialize(StringRoundTripSerializer)
+                .unwrap()
+        );
+        assert_eq!(
+            "needs_approval",
+            PolicyOutcome::NeedsApproval
+                .serialize(StringRoundTripSerializer)
+                .unwrap()
+        );
+        assert_eq!(
+            "job_submitted",
+            JobEventKind::JobSubmitted
+                .serialize(StringRoundTripSerializer)
+                .unwrap()
+        );
+        assert_eq!(
+            "R3",
+            RiskTier::R3.serialize(StringRoundTripSerializer).unwrap()
+        );
     }
 
     #[test]
@@ -1061,6 +1183,40 @@ mod tests {
     }
 
     #[test]
+    fn event_subject_constructors_validate_expected_id_prefixes() {
+        let repository_id = RepositoryId::new();
+        let job_id = JobId::new();
+
+        assert!(EventSubject::repository(&repository_id).has_valid_subject_id());
+        assert!(EventSubject::job(&job_id).has_valid_subject_id());
+        assert!(!EventSubject {
+            subject_type: EventSubjectType::Job,
+            subject_id: repository_id.as_str().to_string(),
+        }
+        .has_valid_subject_id());
+    }
+
+    #[test]
+    fn lock_decision_rejects_non_positive_duration() {
+        let locked_at = LedgerTimestamp::from_unix_millis(1000);
+
+        assert_eq!(
+            Err(LockDecisionCreateError::NonPositiveDuration {
+                locked_at,
+                expires_at: locked_at,
+            }),
+            LockDecision::new(
+                RepositoryId::new(),
+                PolicyDecisionId::new(),
+                LockOwner::Job(JobId::new()),
+                LockedScope::Repository,
+                locked_at,
+                locked_at,
+            )
+        );
+    }
+
+    #[test]
     fn lock_reclaim_is_idempotent_for_same_owner() {
         let owner = LockOwner::Job(JobId::new());
         let mut lock = LockDecision::new(
@@ -1070,7 +1226,8 @@ mod tests {
             LockedScope::Repository,
             LedgerTimestamp::from_unix_millis(1000),
             LedgerTimestamp::from_unix_millis(2000),
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             Ok(true),
@@ -1097,7 +1254,8 @@ mod tests {
             LockedScope::Repository,
             LedgerTimestamp::from_unix_millis(1000),
             LedgerTimestamp::from_unix_millis(2000),
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             Err(LockReclaimError::NonMonotonicTimestamp {
@@ -1105,6 +1263,31 @@ mod tests {
                 latest: LedgerTimestamp::from_unix_millis(1000),
             }),
             lock.reclaim(&owner, LedgerTimestamp::from_unix_millis(500))
+        );
+        assert_eq!(LockStatus::Held, lock.status);
+        assert_eq!(LedgerTimestamp::from_unix_millis(1000), lock.updated_at);
+        assert_eq!(None, lock.reclaimed_at);
+    }
+
+    #[test]
+    fn lock_reclaim_rejects_unexpired_lock_without_mutating() {
+        let owner = LockOwner::Job(JobId::new());
+        let mut lock = LockDecision::new(
+            RepositoryId::new(),
+            PolicyDecisionId::new(),
+            owner.clone(),
+            LockedScope::Repository,
+            LedgerTimestamp::from_unix_millis(1000),
+            LedgerTimestamp::from_unix_millis(3000),
+        )
+        .unwrap();
+
+        assert_eq!(
+            Err(LockReclaimError::NotExpired {
+                reclaimed_at: LedgerTimestamp::from_unix_millis(2000),
+                expires_at: LedgerTimestamp::from_unix_millis(3000),
+            }),
+            lock.reclaim(&owner, LedgerTimestamp::from_unix_millis(2000))
         );
         assert_eq!(LockStatus::Held, lock.status);
         assert_eq!(LedgerTimestamp::from_unix_millis(1000), lock.updated_at);
