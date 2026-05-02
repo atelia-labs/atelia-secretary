@@ -179,8 +179,10 @@ Before migration, the daemon must acquire a single migration lock stored as a
 well-known `migration_lock` record inside the `schema_migrations` collection.
 The record contains leader id, started timestamp, safe flag, and timeout.
 Acquisition uses a unique key plus compare-and-set or transactional insert; it
-fails if an unexpired `migration_lock` row already exists. All daemons create,
-update, or read that record to acquire or release the lock. While
+fails if an unexpired `migration_lock` row already exists. All daemons interact
+with the `migration_lock` record in `schema_migrations` to coordinate
+create/update/read, but only one daemon may hold the lock at a time through
+compare-and-set or transactional insert. While
 `storage_status: migrating`, the leader must not accept or execute new external
 mutating requests regardless of `safe_flag`. The leader may only drain existing
 running jobs and record internal housekeeping in `schema_migrations`,
