@@ -26,6 +26,7 @@ append log. The architecture requires these logical collections:
 | `tool_invocations` | attempted built-in or extension tool calls |
 | `tool_results` | canonical structured outputs |
 | `audit_records` | durable policy and execution evidence |
+| `lock_decisions` | durable repository/path mutual-exclusion decisions |
 | `schema_migrations` | applied storage migrations |
 
 ## Record Requirements
@@ -84,6 +85,9 @@ Event records include:
 - referenced ids
 - redaction markers
 
+Sequence numbers are strictly monotonic per daemon store and give a total order
+for replay within that store.
+
 Events should be compact enough to stream but complete enough to replay.
 
 ## Audit Records
@@ -120,6 +124,22 @@ Tool results store canonical structured data:
 
 TOON, JSON, or text renderings are derived views.
 
+## Lock Decisions
+
+`lock_decisions` record write exclusion before execution:
+
+- repository id
+- policy decision id
+- owner job/process id
+- locked path or repository scope
+- locked timestamp
+- expiration timestamp
+- status: `held`, `released`, `expired`, `reclaimed`
+
+The daemon writes the lock decision before the protected effect. On restart it
+reclaims expired locks by appending a reclaim event and then re-evaluates policy
+before continuing the job.
+
 ## Migration Policy
 
 Storage migrations must be:
@@ -130,6 +150,13 @@ Storage migrations must be:
 - able to report `storage_status: migrating`;
 - blocked from running while jobs are executing unless explicitly safe.
 
+Before migration, the daemon must acquire a single migration lock recorded in
+`schema_migrations` with leader id, started timestamp, safe flag, and timeout.
+Running jobs are drained until the configured timeout; if they cannot drain, the
+daemon enters `degraded` or `read_only` and records the failure. Non-leader
+daemons report `storage_status: migrating` and do not accept new mutating work
+until the migration lock is released.
+
 If a migration fails, the daemon should start in `degraded` or `read_only`
 state rather than silently accepting new work.
 
@@ -137,10 +164,18 @@ state rather than silently accepting new work.
 
 Initial retention is conservative:
 
-- keep repository, job, policy, and audit records indefinitely;
-- allow large tool artifacts to expire only when a metadata tombstone remains;
-- keep enough event history for clients to replay recent work;
-- never remove security-relevant audit evidence without explicit policy.
+- keep repository, job, policy, lock, and audit metadata indefinitely by default;
+- keep recent event history for at least 90 days by default;
+- allow large tool artifacts to expire after 30 days only when an output ref,
+  digest, truncation metadata, and metadata tombstone remain;
+- keep security-relevant audit evidence indefinitely unless an explicit
+  compliance policy replaces sensitive fields with redaction markers;
+- make retention configurable per data class with policy-versioned overrides.
+
+PII deletion requests should prefer redaction over physical deletion when audit
+continuity matters. Redaction records preserve id, timestamp, reason, actor, and
+legal basis; only designated vault-backed processes may reverse reversible
+redaction.
 
 ## AX Check
 

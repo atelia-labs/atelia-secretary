@@ -14,6 +14,7 @@ Owns:
 - job record
 - event record
 - policy decision
+- lock decision
 - tool invocation
 - tool result
 - audit record
@@ -32,6 +33,7 @@ Owns:
 - in-memory test store
 - file-backed or embedded store decision
 - schema version reporting
+- lock decision persistence
 
 Verification:
 
@@ -120,6 +122,7 @@ Verification:
 Owns:
 
 - fs patch/write behind policy;
+- repository/path lock decisions before mutation;
 - explicit argv process execution;
 - cwd validation;
 - env allowlist;
@@ -131,6 +134,7 @@ Verification:
 - blocked out-of-scope write;
 - process success/failure;
 - timeout.
+- stale lock reclaim on restart.
 
 ## Slice 9: Tool Output Rendering
 

@@ -23,6 +23,7 @@ Atelia Secretary には、複雑な database より先に local ledger が必要
 | `tool_invocations` | attempted built-in or extension tool calls |
 | `tool_results` | canonical structured outputs |
 | `audit_records` | durable policy and execution evidence |
+| `lock_decisions` | durable repository/path mutual-exclusion decisions |
 | `schema_migrations` | applied storage migrations |
 
 ## Record Requirements
@@ -80,6 +81,8 @@ event record は次を含みます。
 - referenced ids
 - redaction markers
 
+sequence number は daemon store ごとに strictly monotonic で、その store 内の replay に total order を与えます。
+
 event は stream できる程度に compact で、replay できる程度に complete であるべきです。
 
 ## Audit Records
@@ -114,6 +117,20 @@ tool result は canonical structured data を保存します。
 
 TOON、JSON、text rendering は derived view です。
 
+## Lock Decisions
+
+`lock_decisions` は write exclusion を execution 前に記録します。
+
+- repository id
+- policy decision id
+- owner job/process id
+- locked path または repository scope
+- locked timestamp
+- expiration timestamp
+- status: `held`, `released`, `expired`, `reclaimed`
+
+daemon は protected effect より前に lock decision を書き込みます。restart 時は expired lock を reclaim event として append し、job を継続する前に policy を再評価します。
+
 ## Migration Policy
 
 storage migration は次を満たします。
@@ -124,16 +141,21 @@ storage migration は次を満たします。
 - `storage_status: migrating` を report できる
 - 明示的に safe でない限り、job 実行中に migration しない
 
+daemon は migration 前に、leader id、started timestamp、safe flag、timeout を持つ single migration lock を `schema_migrations` に記録します。running job は configured timeout まで drain します。drain できない場合、daemon は `degraded` または `read_only` に入り failure を記録します。non-leader daemon は `storage_status: migrating` を report し、migration lock が release されるまで新しい mutating work を受け付けません。
+
 migration が失敗した場合、daemon は新しい work を黙って受けず、`degraded` または `read_only` state で起動します。
 
 ## Retention
 
 初期 retention は保守的にします。
 
-- repository、job、policy、audit record は indefinite に保持する
-- large tool artifact は metadata tombstone を残す場合のみ expire できる
-- client が recent work を replay できる event history を保持する
-- security-relevant audit evidence は明示 policy なしに削除しない
+- repository、job、policy、lock、audit metadata は default で indefinite に保持する
+- recent event history は default で少なくとも90日保持する
+- large tool artifact は output ref、digest、truncation metadata、metadata tombstone を残す場合に限り、30日後に expire できる
+- security-relevant audit evidence は、明示 compliance policy が sensitive field を redaction marker に置き換える場合を除き indefinite に保持する
+- retention は data class ごとに configurable とし、override は policy version 付きで記録する
+
+PII deletion request は、audit continuity が必要な場合、physical deletion より redaction を優先します。redaction record は id、timestamp、reason、actor、legal basis を保持します。reversible redaction を戻せるのは、指定された vault-backed process のみです。
 
 ## AX Check
 

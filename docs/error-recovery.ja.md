@@ -18,21 +18,21 @@ client-visible error は次を含みます。
 
 ## Error Codes
 
-| Code | Meaning | Recovery |
+| Code | Meaning | `next_state` |
 | --- | --- | --- |
-| `INVALID_REQUEST` | request shape is invalid | fix request |
-| `UNSUPPORTED_CAPABILITY` | daemon does not support requested capability | inspect capabilities |
-| `NOT_FOUND` | id or scoped resource not found | refresh status / ids |
-| `SCOPE_DENIED` | requested path/resource is outside scope | narrow scope |
-| `POLICY_BLOCKED` | policy blocks action | stop or change request |
-| `NEEDS_APPROVAL` | approval required before execution | ask human / wait |
-| `CONFLICT` | state changed or lock unavailable | refresh and retry |
-| `TIMEOUT` | execution exceeded timeout | retry narrower or longer if allowed |
-| `CANCELED` | job or tool was canceled | inspect final events |
-| `STORE_UNAVAILABLE` | local store unavailable | retry after daemon recovery |
-| `CURSOR_EXPIRED` | event cursor can no longer resume | refresh project status |
-| `OUTPUT_TRUNCATED` | output is partial | request artifact or narrower output |
-| `INTERNAL` | unexpected daemon error | inspect audit / logs |
+| `INVALID_REQUEST` | request shape is invalid | request 修正後に `retry_same_request` |
+| `UNSUPPORTED_CAPABILITY` | daemon does not support requested capability | `refresh_status` |
+| `NOT_FOUND` | id or scoped resource not found | `refresh_status` |
+| `SCOPE_DENIED` | requested path/resource is outside scope | `retry_with_narrower_scope` |
+| `POLICY_BLOCKED` | policy blocks action | `stop` |
+| `NEEDS_APPROVAL` | approval required before execution | `request_approval` |
+| `CONFLICT` | state changed or lock unavailable | `refresh_status` |
+| `TIMEOUT` | execution exceeded timeout | `retry_with_narrower_scope` |
+| `CANCELED` | job or tool was canceled | `inspect_audit_record` |
+| `STORE_UNAVAILABLE` | local store unavailable | `wait_for_daemon` |
+| `CURSOR_EXPIRED` | event cursor can no longer resume | `refresh_status` |
+| `OUTPUT_TRUNCATED` | output is partial | `inspect_tool_result` |
+| `INTERNAL` | unexpected daemon error | `inspect_audit_record` |
 
 ## Recovery States
 

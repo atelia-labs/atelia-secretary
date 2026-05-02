@@ -96,11 +96,13 @@ Goal: run a broad mutation or external side effect.
 
 Calls:
 
-1. `CheckPolicy(capability: repository.merge or external.call)`
-2. policy returns `needs_approval`
-3. daemon records approval request and audit ref
-4. client displays approval state
-5. agent waits or asks the human with the user-facing reason
+1. `SubmitJob(kind: approval_gated, goal, repository_id)`
+2. daemon persists `job` and initial `job_event`
+3. `CheckPolicy(capability: repository.merge or external.call)`
+4. policy returns `needs_approval`
+5. daemon records approval request and audit ref
+6. client displays approval state
+7. agent waits or asks the human with the user-facing reason
 
 Good AX:
 

@@ -39,6 +39,11 @@ diagnostic metadata.
 
 ## Service Surface
 
+This table is the required service contract, not a description of the current
+protobuf implementation. The current proto may expose only
+`SecretaryService.Health`; the other RPC groups are planned contract surface and
+must be added before clients or agents depend on them.
+
 Required RPC groups:
 
 | RPC | Purpose |
@@ -155,11 +160,12 @@ Every RPC error should map to the error taxonomy:
 - stable `code`
 - user-facing `reason`
 - `recoverable` boolean
-- optional `next_state`
+- required `next_state`
 - optional `retry_after`
 - optional `audit_ref`
 
-Transport errors should be wrapped into the same shape when they reach clients.
+Transport errors should be wrapped into the same shape when they reach clients,
+including `next_state`, so recovery logic stays consistent.
 
 ## AX Check
 

@@ -21,6 +21,13 @@ Initial lifecycle:
 
 Policy evaluation happens before execution effects.
 
+Persisting `job: queued` and the initial `job_event` must be one atomic store
+commit. A `policy_decision` must be durably persisted before any
+`tool_invocation`, `tool_result`, or audit effect record exists. On restart, the
+daemon uses these boundaries to recover deterministically: missing policy means
+re-evaluate policy; a `tool_invocation` without a `tool_result` is marked for
+retry or cleanup before new work continues.
+
 ## Cancellation
 
 `CancelJob` requests cancellation; it does not guarantee immediate stop.
@@ -47,6 +54,13 @@ Every job and tool invocation has a timeout:
 Timeouts produce `failed` or `canceled` states depending on whether the daemon
 initiated cancellation.
 
+Precedence is explicit. If the daemon observes cancellation before or at the
+same logical instant as timeout, cooperative cancellation wins and the terminal
+state is `canceled`. If timeout is detected first, the terminal state is
+`failed`; a later cancellation request must not overwrite an emitted terminal
+state. A cooperative stop that began before timeout stays `canceled`; a
+`force_stop` triggered strictly by timeout is `failed`.
+
 ## Concurrency
 
 The daemon should start conservative:
@@ -56,8 +70,12 @@ The daemon should start conservative:
 - process execution limited by daemon concurrency budget;
 - extension/provider concurrency explicit later.
 
-Concurrent jobs must not interleave writes without a recorded policy and lock
-decision.
+Concurrent jobs must not interleave writes without a recorded policy and
+`lock_decision`. A `lock_decision` records `id`, `repository_id`,
+`policy_decision_id`, owner job/process id, locked path or repository scope,
+`locked_at`, `expires_at`, and status. The ledger persists the lock decision
+before execution; restart recovery treats expired locks as stale, records the
+reclaim event, and then re-evaluates policy before continuing.
 
 ## Filesystem Scope
 
@@ -81,6 +99,12 @@ Process execution requires:
 - stdout/stderr capture policy;
 - maximum output bytes;
 - exit status capture.
+
+Stdout and stderr artifacts are treated as tool results. They use
+`tool_results` truncation metadata and redaction markers, and may point to
+larger payloads through output refs / evidence refs. Exit status and captured
+output are both subject to redaction rules; rendered output must not leak data
+that the canonical result or audit policy has hidden.
 
 Shell-string execution is not the default contract. If shell execution is ever
 allowed, it is a separate capability with higher risk.
@@ -106,6 +130,15 @@ The execution model should let an agent answer:
 - What did it change?
 - Where is the canonical result?
 - Can I retry, narrow scope, ask for approval, or stop?
+
+Record mapping:
+
+- policy allowed/blocked: `policy_decisions`;
+- which tool ran and where the canonical result lives: `tool_invocations` and
+  `tool_results`;
+- what changed: `audit_records` with effect summary and output refs;
+- retry, scope reduction, approval, or stop: `policy_decisions` plus runtime
+  failure taxonomy.
 
 If an agent cannot answer those from records, the runtime is not inspectable
 enough.
