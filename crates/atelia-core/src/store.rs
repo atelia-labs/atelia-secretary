@@ -39,6 +39,10 @@ pub enum StoreError {
         collection: &'static str,
         reason: String,
     },
+    InvalidReference {
+        collection: &'static str,
+        reason: String,
+    },
     InvalidCursor {
         reason: String,
     },
@@ -56,6 +60,9 @@ impl fmt::Display for StoreError {
             }
             StoreError::Conflict { collection, reason } => {
                 write!(f, "{collection} conflict: {reason}")
+            }
+            StoreError::InvalidReference { collection, reason } => {
+                write!(f, "{collection} invalid reference: {reason}")
             }
             StoreError::InvalidCursor { reason } => write!(f, "invalid event cursor: {reason}"),
             StoreError::SequenceOverflow => write!(f, "job event sequence overflowed"),
@@ -281,15 +288,19 @@ impl SecretaryStore for InMemoryStore {
                 id: id_debug(&record.repository_id),
             });
         }
-        if !inner
+        let policy_decision = inner
             .policy_decisions
-            .contains_key(&record.policy_decision_id)
-        {
-            return Err(StoreError::NotFound {
+            .get(&record.policy_decision_id)
+            .ok_or_else(|| StoreError::NotFound {
                 collection: "policy_decisions",
                 id: id_debug(&record.policy_decision_id),
-            });
-        }
+            })?;
+        ensure_same_repository(
+            "lock_decisions",
+            "lock_decision.policy_decision_id",
+            &record.repository_id,
+            &policy_decision.repository_id,
+        )?;
         if is_active_lock_status(&record.status) {
             let conflicting_lock = inner.lock_decisions.values().find(|existing| {
                 is_active_lock_status(&existing.status)
@@ -435,25 +446,41 @@ fn validate_tool_invocation_refs(
     inner: &InMemoryInner,
     record: &ToolInvocation,
 ) -> StoreResult<()> {
-    ensure_ref_exists(
-        inner.jobs.contains_key(&record.job_id),
-        "jobs",
-        &record.job_id,
-        "tool_invocation.job_id",
-    )?;
+    let job = inner
+        .jobs
+        .get(&record.job_id)
+        .ok_or_else(|| StoreError::NotFound {
+            collection: "jobs",
+            id: format!("{} (tool_invocation.job_id)", id_debug(&record.job_id)),
+        })?;
     ensure_ref_exists(
         inner.repositories.contains_key(&record.repository_id),
         "repositories",
         &record.repository_id,
         "tool_invocation.repository_id",
     )?;
-    ensure_ref_exists(
-        inner
-            .policy_decisions
-            .contains_key(&record.policy_decision_id),
-        "policy_decisions",
-        &record.policy_decision_id,
+    ensure_same_repository(
+        "tool_invocations",
+        "tool_invocation.job_id",
+        &record.repository_id,
+        &job.repository_id,
+    )?;
+
+    let policy_decision = inner
+        .policy_decisions
+        .get(&record.policy_decision_id)
+        .ok_or_else(|| StoreError::NotFound {
+            collection: "policy_decisions",
+            id: format!(
+                "{} (tool_invocation.policy_decision_id)",
+                id_debug(&record.policy_decision_id)
+            ),
+        })?;
+    ensure_same_repository(
+        "tool_invocations",
         "tool_invocation.policy_decision_id",
+        &record.repository_id,
+        &policy_decision.repository_id,
     )
 }
 
@@ -473,25 +500,74 @@ fn validate_audit_record_refs(inner: &InMemoryInner, record: &AuditRecord) -> St
         &record.repository_id,
         "audit_record.repository_id",
     )?;
-    ensure_ref_exists(
-        inner
-            .policy_decisions
-            .contains_key(&record.policy_decision_id),
-        "policy_decisions",
-        &record.policy_decision_id,
+    let policy_decision = inner
+        .policy_decisions
+        .get(&record.policy_decision_id)
+        .ok_or_else(|| StoreError::NotFound {
+            collection: "policy_decisions",
+            id: format!(
+                "{} (audit_record.policy_decision_id)",
+                id_debug(&record.policy_decision_id)
+            ),
+        })?;
+    ensure_same_repository(
+        "audit_records",
         "audit_record.policy_decision_id",
+        &record.repository_id,
+        &policy_decision.repository_id,
     )?;
 
     if let Some(tool_invocation_id) = &record.tool_invocation_id {
-        ensure_ref_exists(
-            inner.tool_invocations.contains_key(tool_invocation_id),
-            "tool_invocations",
-            tool_invocation_id,
+        let tool_invocation = inner
+            .tool_invocations
+            .get(tool_invocation_id)
+            .ok_or_else(|| StoreError::NotFound {
+                collection: "tool_invocations",
+                id: format!(
+                    "{} (audit_record.tool_invocation_id)",
+                    id_debug(tool_invocation_id)
+                ),
+            })?;
+        ensure_same_repository(
+            "audit_records",
             "audit_record.tool_invocation_id",
+            &record.repository_id,
+            &tool_invocation.repository_id,
         )?;
+        if tool_invocation.policy_decision_id != record.policy_decision_id {
+            return Err(StoreError::InvalidReference {
+                collection: "audit_records",
+                reason: format!(
+                    "audit_record.tool_invocation_id {} belongs to policy_decision_id {}, not {}",
+                    id_debug(tool_invocation_id),
+                    id_debug(&tool_invocation.policy_decision_id),
+                    id_debug(&record.policy_decision_id)
+                ),
+            });
+        }
     }
 
     Ok(())
+}
+
+fn ensure_same_repository(
+    collection: &'static str,
+    context: &str,
+    expected: &RepositoryId,
+    actual: &RepositoryId,
+) -> StoreResult<()> {
+    if actual == expected {
+        return Ok(());
+    }
+
+    Err(StoreError::InvalidReference {
+        collection,
+        reason: format!(
+            "{context} belongs to repository {}, not {}",
+            id_debug(actual),
+            id_debug(expected)
+        ),
+    })
 }
 
 fn ensure_ref_exists<Id: fmt::Debug>(
@@ -832,6 +908,27 @@ mod tests {
     }
 
     #[test]
+    fn lock_decisions_reject_cross_repository_policy_decisions() {
+        let store = InMemoryStore::new();
+        let first_repository = repository_record();
+        let second_repository = repository_record();
+        let policy = policy_decision(second_repository.id.clone());
+        let lock = lock_decision(first_repository.id.clone(), policy.id.clone());
+
+        store.create_repository(first_repository).unwrap();
+        store.create_repository(second_repository).unwrap();
+        store.create_policy_decision(policy).unwrap();
+
+        assert!(matches!(
+            store.create_lock_decision(lock),
+            Err(StoreError::InvalidReference {
+                collection: "lock_decisions",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn tool_records_require_existing_parents() {
         let store = InMemoryStore::new();
         let repository = repository_record();
@@ -874,6 +971,47 @@ mod tests {
     }
 
     #[test]
+    fn tool_invocations_reject_cross_repository_parents() {
+        let store = InMemoryStore::new();
+        let first_repository = repository_record();
+        let second_repository = repository_record();
+        let first_job = job_record(first_repository.id.clone());
+        let second_job = job_record(second_repository.id.clone());
+        let first_policy = policy_decision(first_repository.id.clone());
+        let second_policy = policy_decision(second_repository.id.clone());
+
+        store.create_repository(first_repository.clone()).unwrap();
+        store.create_repository(second_repository.clone()).unwrap();
+        store.create_job(first_job.clone()).unwrap();
+        store.create_job(second_job.clone()).unwrap();
+        store.create_policy_decision(first_policy.clone()).unwrap();
+        store.create_policy_decision(second_policy.clone()).unwrap();
+
+        assert!(matches!(
+            store.create_tool_invocation(tool_invocation(
+                first_repository.id.clone(),
+                second_job.id,
+                first_policy.id.clone()
+            )),
+            Err(StoreError::InvalidReference {
+                collection: "tool_invocations",
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.create_tool_invocation(tool_invocation(
+                first_repository.id,
+                first_job.id,
+                second_policy.id
+            )),
+            Err(StoreError::InvalidReference {
+                collection: "tool_invocations",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn tool_result_and_audit_reject_missing_invocation() {
         let store = InMemoryStore::new();
         let repository = repository_record();
@@ -894,6 +1032,55 @@ mod tests {
             store.create_audit_record(audit_record(repository.id, policy.id, Some(invocation.id))),
             Err(StoreError::NotFound {
                 collection: "tool_invocations",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn audit_records_reject_cross_repository_policy_and_invocation() {
+        let store = InMemoryStore::new();
+        let first_repository = repository_record();
+        let second_repository = repository_record();
+        let first_job = job_record(first_repository.id.clone());
+        let second_job = job_record(second_repository.id.clone());
+        let first_policy = policy_decision(first_repository.id.clone());
+        let second_policy = policy_decision(second_repository.id.clone());
+        let second_invocation = tool_invocation(
+            second_repository.id.clone(),
+            second_job.id.clone(),
+            second_policy.id.clone(),
+        );
+
+        store.create_repository(first_repository.clone()).unwrap();
+        store.create_repository(second_repository.clone()).unwrap();
+        store.create_job(first_job).unwrap();
+        store.create_job(second_job).unwrap();
+        store.create_policy_decision(first_policy.clone()).unwrap();
+        store.create_policy_decision(second_policy.clone()).unwrap();
+        store
+            .create_tool_invocation(second_invocation.clone())
+            .unwrap();
+
+        assert!(matches!(
+            store.create_audit_record(audit_record(
+                first_repository.id.clone(),
+                second_policy.id,
+                None
+            )),
+            Err(StoreError::InvalidReference {
+                collection: "audit_records",
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.create_audit_record(audit_record(
+                first_repository.id,
+                first_policy.id,
+                Some(second_invocation.id)
+            )),
+            Err(StoreError::InvalidReference {
+                collection: "audit_records",
                 ..
             })
         ));
