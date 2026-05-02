@@ -14,20 +14,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub type StoreResult<T> = Result<T, StoreError>;
 
 /// Cursor used by clients to replay the ordered job-event ledger.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum EventCursor {
     /// Replay from the first retained event.
+    #[default]
     Beginning,
     /// Replay events with sequence numbers greater than this value.
     AfterSequence(u64),
     /// Replay events after the event with this id.
     AfterEventId(JobEventId),
-}
-
-impl Default for EventCursor {
-    fn default() -> Self {
-        Self::Beginning
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,34 +408,84 @@ fn is_active_lock_status<Status: fmt::Debug>(status: &Status) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{
+        Actor, EventRefs, EventSeverity, EventSubject, EventSubjectType, JobEventKind, JobKind,
+        LedgerTimestamp, LockOwner, LockedScope, PolicyOutcome, RepositoryTrustState,
+        ResourceScope, RiskTier,
+    };
 
-    fn repository_record() -> RepositoryRecord {
-        RepositoryRecord {
-            id: RepositoryId::new(),
-            ..RepositoryRecord::default()
+    fn timestamp(value: i64) -> LedgerTimestamp {
+        LedgerTimestamp::from_unix_millis(value)
+    }
+
+    fn actor() -> Actor {
+        Actor::System {
+            id: "store-test".to_string(),
         }
     }
 
+    fn repository_record() -> RepositoryRecord {
+        RepositoryRecord::new(
+            "store test repository",
+            "/tmp/atelia-store-test",
+            RepositoryTrustState::Trusted,
+            timestamp(1),
+        )
+    }
+
     fn job_record(repository_id: RepositoryId) -> JobRecord {
-        JobRecord {
-            id: JobId::new(),
+        JobRecord::new(
+            actor(),
             repository_id,
-            ..JobRecord::default()
-        }
+            JobKind::Read,
+            "store test job",
+            timestamp(2),
+        )
     }
 
     fn job_event() -> JobEvent {
         JobEvent {
             id: JobEventId::new(),
+            schema_version: 1,
             sequence_number: 0,
-            ..JobEvent::default()
+            created_at: timestamp(3),
+            subject: EventSubject {
+                subject_type: EventSubjectType::Job,
+                subject_id: "job_test".to_string(),
+            },
+            kind: JobEventKind::Message,
+            severity: EventSeverity::Info,
+            public_message: "store test event".to_string(),
+            refs: EventRefs::default(),
+            redactions: Vec::new(),
         }
     }
 
-    fn policy_decision() -> PolicyDecision {
+    fn policy_decision(repository_id: RepositoryId) -> PolicyDecision {
         PolicyDecision {
             id: PolicyDecisionId::new(),
-            ..PolicyDecision::default()
+            schema_version: 1,
+            created_at: timestamp(4),
+            requester: actor(),
+            repository_id,
+            requested_capability: "filesystem.read".to_string(),
+            resource_scope: ResourceScope {
+                kind: "repository".to_string(),
+                value: "store-test".to_string(),
+            },
+            tool_id: None,
+            provider_id: None,
+            declared_effect: "read repository metadata".to_string(),
+            current_trust_state: RepositoryTrustState::Trusted,
+            approval_available: false,
+            policy_version: "test-policy-v1".to_string(),
+            outcome: PolicyOutcome::Allowed,
+            risk_tier: RiskTier::R1,
+            reason_code: "test_allowed".to_string(),
+            user_reason: "test policy decision".to_string(),
+            approval_request_ref: None,
+            audit_ref: None,
+            redactions: Vec::new(),
         }
     }
 
@@ -448,12 +493,16 @@ mod tests {
         repository_id: RepositoryId,
         policy_decision_id: PolicyDecisionId,
     ) -> LockDecision {
-        LockDecision {
-            id: LockDecisionId::new(),
+        LockDecision::new(
             repository_id,
             policy_decision_id,
-            ..LockDecision::default()
-        }
+            LockOwner::System {
+                id: "store-test".to_string(),
+            },
+            LockedScope::Repository,
+            timestamp(5),
+            timestamp(6),
+        )
     }
 
     #[test]
@@ -550,7 +599,7 @@ mod tests {
     fn lock_decisions_are_persisted() {
         let store = InMemoryStore::new();
         let repository = repository_record();
-        let policy = policy_decision();
+        let policy = policy_decision(repository.id.clone());
         let lock = lock_decision(repository.id.clone(), policy.id.clone());
 
         store.create_repository(repository).unwrap();
