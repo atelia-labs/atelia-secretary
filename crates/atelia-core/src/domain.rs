@@ -1,6 +1,8 @@
 //! Runtime domain records for the Secretary ledger.
 
 use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -17,8 +19,17 @@ macro_rules! opaque_id {
                 Self(format!("{}{}", $prefix, Uuid::new_v4()))
             }
 
-            pub fn from_string(value: impl Into<String>) -> Self {
-                Self(value.into())
+            pub fn try_from_string(value: impl Into<String>) -> Result<Self, InvalidIdError> {
+                let value = value.into();
+                let uuid_part = value.strip_prefix($prefix).ok_or_else(|| {
+                    InvalidIdError::new(stringify!($name), $prefix, value.clone())
+                })?;
+
+                if uuid_part.is_empty() || Uuid::parse_str(uuid_part).is_err() {
+                    return Err(InvalidIdError::new(stringify!($name), $prefix, value));
+                }
+
+                Ok(Self(value))
             }
 
             pub fn as_str(&self) -> &str {
@@ -37,6 +48,35 @@ macro_rules! opaque_id {
         }
     };
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvalidIdError {
+    pub type_name: &'static str,
+    pub expected_prefix: &'static str,
+    pub value: String,
+}
+
+impl InvalidIdError {
+    fn new(type_name: &'static str, expected_prefix: &'static str, value: String) -> Self {
+        Self {
+            type_name,
+            expected_prefix,
+            value,
+        }
+    }
+}
+
+impl fmt::Display for InvalidIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} must be a prefixed opaque id starting with {} followed by a UUID",
+            self.type_name, self.expected_prefix
+        )
+    }
+}
+
+impl Error for InvalidIdError {}
 
 opaque_id!(RepositoryId, "repo_");
 opaque_id!(JobId, "job_");
@@ -306,11 +346,13 @@ impl JobRecord {
         at: LedgerTimestamp,
     ) -> Result<(), JobStatusTransitionError> {
         if !self.status.can_transition_to(next) {
-            return Err(JobStatusTransitionError {
+            return Err(JobStatusTransitionError::InvalidTransition {
                 from: self.status,
                 to: next,
             });
         }
+
+        self.ensure_monotonic_transition_timestamp(at)?;
 
         self.status = next;
         self.updated_at = at;
@@ -325,12 +367,35 @@ impl JobRecord {
 
         Ok(())
     }
+
+    fn ensure_monotonic_transition_timestamp(
+        &self,
+        at: LedgerTimestamp,
+    ) -> Result<(), JobStatusTransitionError> {
+        let latest = [Some(self.updated_at), self.started_at, self.completed_at]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(self.updated_at);
+
+        if at < latest {
+            return Err(JobStatusTransitionError::NonMonotonicTimestamp { at, latest });
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct JobStatusTransitionError {
-    pub from: JobStatus,
-    pub to: JobStatus,
+pub enum JobStatusTransitionError {
+    InvalidTransition {
+        from: JobStatus,
+        to: JobStatus,
+    },
+    NonMonotonicTimestamp {
+        at: LedgerTimestamp,
+        latest: LedgerTimestamp,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -853,6 +918,12 @@ mod tests {
 
         assert_eq!(repo_id, string_round_trip(&repo_id));
         assert_eq!(job_id, string_round_trip(&job_id));
+        assert_eq!(
+            repo_id,
+            RepositoryId::try_from_string(repo_id.as_str()).unwrap()
+        );
+        assert!(RepositoryId::try_from_string(job_id.as_str()).is_err());
+        assert!(RepositoryId::try_from_string("repo_not-a-uuid").is_err());
     }
 
     #[test]
@@ -921,6 +992,39 @@ mod tests {
         assert_eq!(Some(started_at), job.started_at);
         assert_eq!(Some(completed_at), job.completed_at);
         assert_eq!(JobStatus::Succeeded, job.status);
+    }
+
+    #[test]
+    fn job_transition_rejects_non_monotonic_timestamp_without_mutating() {
+        let created_at = LedgerTimestamp::from_unix_millis(1000);
+        let started_at = LedgerTimestamp::from_unix_millis(2000);
+        let mut job = JobRecord::new(
+            Actor::User {
+                id: "user-1".to_owned(),
+                display_name: None,
+            },
+            RepositoryId::new(),
+            JobKind::Read,
+            "inspect repository",
+            created_at,
+        );
+
+        job.transition_status(JobStatus::Running, started_at)
+            .unwrap();
+
+        assert_eq!(
+            Err(JobStatusTransitionError::NonMonotonicTimestamp {
+                at: LedgerTimestamp::from_unix_millis(1500),
+                latest: started_at,
+            }),
+            job.transition_status(
+                JobStatus::Succeeded,
+                LedgerTimestamp::from_unix_millis(1500)
+            )
+        );
+        assert_eq!(JobStatus::Running, job.status);
+        assert_eq!(started_at, job.updated_at);
+        assert_eq!(None, job.completed_at);
     }
 
     #[test]

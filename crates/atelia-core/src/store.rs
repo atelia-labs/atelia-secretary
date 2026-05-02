@@ -220,19 +220,21 @@ impl SecretaryStore for InMemoryStore {
             };
 
         let mut events = Vec::new();
-        for (_, id) in inner
-            .job_events_by_sequence
-            .range((after_sequence + 1)..)
-            .take(limit.unwrap_or(usize::MAX))
-        {
-            let event = inner
-                .job_events_by_id
-                .get(id)
-                .ok_or_else(|| StoreError::Conflict {
-                    collection: "job_events",
-                    reason: format!("sequence index references missing id {}", id_debug(id)),
-                })?;
-            events.push(event.clone());
+        if let Some(start_sequence) = after_sequence.checked_add(1) {
+            for (_, id) in inner
+                .job_events_by_sequence
+                .range(start_sequence..)
+                .take(limit.unwrap_or(usize::MAX))
+            {
+                let event = inner
+                    .job_events_by_id
+                    .get(id)
+                    .ok_or_else(|| StoreError::Conflict {
+                        collection: "job_events",
+                        reason: format!("sequence index references missing id {}", id_debug(id)),
+                    })?;
+                events.push(event.clone());
+            }
         }
         Ok(events)
     }
@@ -265,6 +267,21 @@ impl SecretaryStore for InMemoryStore {
             return Err(StoreError::DuplicateId {
                 collection: "lock_decisions",
                 id: id_debug(&record.id),
+            });
+        }
+        if !inner.repositories.contains_key(&record.repository_id) {
+            return Err(StoreError::NotFound {
+                collection: "repositories",
+                id: id_debug(&record.repository_id),
+            });
+        }
+        if !inner
+            .policy_decisions
+            .contains_key(&record.policy_decision_id)
+        {
+            return Err(StoreError::NotFound {
+                collection: "policy_decisions",
+                id: id_debug(&record.policy_decision_id),
             });
         }
         if is_active_lock_status(&record.status) {
@@ -564,6 +581,20 @@ mod tests {
     }
 
     #[test]
+    fn replay_after_max_sequence_returns_empty_events() {
+        let store = InMemoryStore::new();
+
+        store.append_job_event(job_event()).unwrap();
+
+        assert_eq!(
+            store
+                .replay_job_events(EventCursor::AfterSequence(u64::MAX), None)
+                .unwrap(),
+            Vec::<JobEvent>::new()
+        );
+    }
+
+    #[test]
     fn duplicate_ids_are_rejected() {
         let store = InMemoryStore::new();
         let repository = repository_record();
@@ -608,5 +639,34 @@ mod tests {
 
         assert_eq!(store.get_lock_decision(&lock.id).unwrap(), lock);
         assert_eq!(store.list_lock_decisions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lock_decisions_require_existing_repository_and_policy_decision() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let policy = policy_decision(repository.id.clone());
+        let lock = lock_decision(repository.id.clone(), policy.id.clone());
+
+        assert!(matches!(
+            store.create_lock_decision(lock.clone()),
+            Err(StoreError::NotFound {
+                collection: "repositories",
+                ..
+            })
+        ));
+
+        store.create_repository(repository).unwrap();
+
+        assert!(matches!(
+            store.create_lock_decision(lock.clone()),
+            Err(StoreError::NotFound {
+                collection: "policy_decisions",
+                ..
+            })
+        ));
+
+        store.create_policy_decision(policy).unwrap();
+        store.create_lock_decision(lock).unwrap();
     }
 }
