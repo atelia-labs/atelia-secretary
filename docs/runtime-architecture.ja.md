@@ -131,7 +131,7 @@ built-in は小さく、信頼できる状態に保ちます。
 - Linear
 - cloud storage
 - browser / computer use
-- memory providers
+- memory providers / memory strategies
 - notification providers
 - approval agents
 - delegated agent providers
@@ -182,9 +182,10 @@ runtime architecture は、full extension installation の前から extension co
 - output customizer
 - approval agent
 - delegated agent provider
-- OM / memory provider
+- memory provider
+- memory strategy
 
-最初の実装は built-in provider だけを expose して構いません。GitHub、Linear、memory、external agent を Secretary core に焼き込まないことを優先します。
+最初の実装は built-in provider だけを expose して構いません。GitHub、Linear、long-term memory、observational memory、external agent を Secretary core に焼き込まないことを優先します。
 
 ## Deferred Product Surface
 

@@ -4,7 +4,7 @@
 
 [Tool Definition Schema](tool-definition-schema.ja.md)、[Tool Output Schema](tool-output-schema.ja.md)、[Extensions Runtime](extensions-runtime.ja.md)、Atelia の [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.ja.md) も参照します。
 
-Secretary core は general harness を提供します。filesystem、shell、search、job、event、policy、extension hosting、service broker、hook intake、output rendering、agent delegation substrate が中心です。Git、GitHub、Linear、memory provider、notification、review agent、approval agent は extension-provided surface として扱います。
+Secretary core は general harness を提供します。filesystem、shell、search、job、event、policy、extension hosting、service broker、hook intake、output rendering、agent delegation substrate が中心です。Git、GitHub、Linear、memory provider、memory strategy、notification、review agent、approval agent は extension-provided surface として扱います。
 
 ## Risk Scale
 
@@ -39,7 +39,8 @@ Secretary core は general harness を提供します。filesystem、shell、sea
 - Linear integration
 - build/test/package-manager profiles
 - network API clients
-- OM / memory providers
+- memory providers
+- observational memory を含む memory strategies
 - preference managers
 - notification and digest systems
 - client extension views / actions / settings

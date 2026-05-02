@@ -165,8 +165,9 @@ Initial built-ins:
 - `agent.cancel`
 - `agent.takeover`
 
-Git helpers, GitHub, Linear, OM providers, memory, notification, review agents,
-and approval agents are defined by extensions using the same schema.
+Git helpers, GitHub, Linear, memory providers, memory strategies, notification,
+review agents, and approval agents are defined by extensions using the same
+schema.
 
 The `approval.*` built-ins are boundary tools for submitting and verifying
 decisions. Approval judgment itself comes from humans or Approval Agent
