@@ -139,7 +139,7 @@ TOON、JSON、text rendering は derived view です。
 - reclaimed の場合は `reclaimed_at`
 - status: `held`, `released`, `expired`, `reclaimed`
 
-daemon は protected effect より前に lock decision を書き込みます。active lock は `(repository_id, policy_decision_id, locked_scope)` で unique です。reclaim は同じ lock decision と owner に対して safe-repeatable です。duplicate reclaim attempt は、最初の persisted reclaim record 以後 no-op success を返します。restart 時、daemon は expired lock について `lock_decision.id`、owner id、`reclaimed_at` を持つ reclaim event を append します。その durable record が存在して初めて lock を reclaimed と扱えます。その後、`policy_decision_id` が参照する policy rule を再評価してから job を継続します。
+daemon は protected effect より前に lock decision を書き込みます。active lock は `(repository_id, locked_scope, active status)` で unique です。`policy_decision_id` は linkage metadata として保持し、同じ scope に2つの active lock を許す理由にしてはいけません。reclaim は同じ lock decision と owner に対して safe-repeatable です。duplicate reclaim attempt は、最初の persisted reclaim record 以後 no-op success を返します。restart 時、daemon は expired lock について `lock_decision.id`、owner id、`reclaimed_at` を持つ reclaim event を append します。その durable record が存在して初めて lock を reclaimed と扱えます。その後、`policy_decision_id` が参照する policy rule を再評価してから job を継続します。
 
 ## Migration Policy
 

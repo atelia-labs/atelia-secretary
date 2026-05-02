@@ -83,8 +83,9 @@ Concurrent jobs must not interleave writes without a recorded policy and
 `lock_decision`. A `lock_decision` records `id`, `repository_id`,
 `policy_decision_id`, owner job/process id, locked path or repository scope,
 `locked_at`, `expires_at`, and status. The ledger persists the lock decision
-before execution. Active locks are unique by `(repository_id,
-policy_decision_id, locked_scope)` so only one mutating job can hold a scope.
+before execution. Active locks are unique by `(repository_id, locked_scope,
+active status)` so only one mutating job can hold a scope; `policy_decision_id`
+is linkage metadata, not part of the ownership key.
 Reclaim is idempotent: repeated reclaim attempts for the same
 `lock_decision.id` and owner job/process id return no-op success after the first
 persisted reclaim. Restart recovery treats an expired lock as reclaimed only

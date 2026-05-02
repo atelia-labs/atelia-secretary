@@ -153,13 +153,15 @@ TOON, JSON, or text renderings are derived views.
 - status: `held`, `released`, `expired`, `reclaimed`
 
 The daemon writes the lock decision before the protected effect. Active locks
-are unique by `(repository_id, policy_decision_id, locked_scope)`. Reclaim is
-safe-repeatable for the same lock decision and owner: duplicate reclaim attempts
-return no-op success after the first persisted reclaim record. On restart, the
-daemon reclaims expired locks by appending a reclaim event with
-`lock_decision.id`, owner id, and `reclaimed_at`; only after that durable record
-exists may it treat the lock as reclaimed. It then re-evaluates the policy rule
-referenced by `policy_decision_id` before continuing the job.
+are unique by `(repository_id, locked_scope, active status)`; `policy_decision_id`
+is retained as linkage metadata and must not allow two active locks on the same
+scope. Reclaim is safe-repeatable for the same lock decision and owner:
+duplicate reclaim attempts return no-op success after the first persisted
+reclaim record. On restart, the daemon reclaims expired locks by appending a
+reclaim event with `lock_decision.id`, owner id, and `reclaimed_at`; only after
+that durable record exists may it treat the lock as reclaimed. It then
+re-evaluates the policy rule referenced by `policy_decision_id` before
+continuing the job.
 
 ## Migration Policy
 
