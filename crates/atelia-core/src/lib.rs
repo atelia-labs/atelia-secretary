@@ -4,10 +4,12 @@ use uuid::Uuid;
 pub mod domain;
 pub mod policy;
 pub mod store;
+pub mod tool_output;
 
 pub use domain::*;
 pub use policy::*;
 pub use store::*;
+pub use tool_output::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectId(Uuid);
