@@ -15,7 +15,7 @@ use crate::tool_output::{
 use std::error::Error;
 use std::fmt;
 
-const RUNTIME_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeJobRequest {
