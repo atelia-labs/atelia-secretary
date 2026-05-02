@@ -30,6 +30,7 @@ Protocol ids are opaque strings with stable prefixes:
 | `job_` | job |
 | `evt_` | event |
 | `pol_` | policy decision |
+| `lock_` | lock decision |
 | `tool_` | tool invocation |
 | `res_` | tool result |
 | `aud_` | audit record |
@@ -116,7 +117,8 @@ The first observable effect is a persisted `job` and `job_event`.
 - event kind
 - severity
 - public message
-- refs to job, policy decision, tool invocation, tool result, or audit record
+- refs to job, policy decision, lock decision, tool invocation, tool result, or
+  audit record
 
 `WatchEvents` accepts a cursor and returns events after that cursor. Clients can
 replay events after reconnect without losing job history.
