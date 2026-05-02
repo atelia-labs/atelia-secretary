@@ -160,9 +160,9 @@ migration が失敗した場合、daemon は新しい work を黙って受けず
 初期 retention は保守的にします。
 
 - repository、job、policy、lock、audit metadata は default で indefinite に保持する
-- recent event history は default で少なくとも90日保持する
+- recent event history は configured full-event retention window の間保持する
 - minimal replay spine は default で indefinite に保持する。full event window が expire した後も何が起きたかを復元するために必要な key job、policy、lock、audit、output ref、digest、redaction、terminal-state event を含める
-- large tool artifact は output ref、digest、truncation metadata、metadata tombstone を残す場合に限り、30日後に expire できる
+- large tool artifact は output ref、digest、truncation metadata、metadata tombstone を残す場合に限り、configured artifact retention window 後に expire できる
 - security-relevant audit evidence は、明示 compliance policy が sensitive field を redaction marker に置き換える場合を除き indefinite に保持する
 - retention は data class ごとに configurable とし、override は policy version 付きで記録する
 
@@ -173,6 +173,6 @@ PII deletion request は、audit continuity が必要な場合、physical deleti
 ledger は agent の orientation を助けるべきです。
 
 - 1つの job id から policy、retained event spine、tool call、output、audit record に辿れる
-- full event replay により、agent は configured retention window 内で restart 後も回復できる。その window を過ぎた後も、minimal replay spine により user に「何が起きたか」を聞かずに要点を復元できる
+- full event replay により、agent は configured full-event retention window 内で restart 後も回復できる。その window を過ぎた後も、minimal replay spine により user に「何が起きたか」を聞かずに要点を復元できる
 - redaction marker は「data は存在したが意図的に隠された」と伝える
 - canonical tool result により、format 変更のために work を rerun しなくて済む

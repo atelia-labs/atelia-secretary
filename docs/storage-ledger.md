@@ -190,12 +190,13 @@ state rather than silently accepting new work.
 Initial retention is conservative:
 
 - keep repository, job, policy, lock, and audit metadata indefinitely by default;
-- keep recent event history for at least 90 days by default;
+- keep recent event history for the configured full-event retention window;
 - keep a minimal replay spine indefinitely by default: key job, policy, lock,
   audit, output-ref, digest, redaction, and terminal-state events needed to
   reconstruct what happened after the full event window expires;
-- allow large tool artifacts to expire after 30 days only when an output ref,
-  digest, truncation metadata, and metadata tombstone remain;
+- allow large tool artifacts to expire after the configured artifact retention
+  window only when an output ref, digest, truncation metadata, and metadata
+  tombstone remain;
 - keep security-relevant audit evidence indefinitely unless an explicit
   compliance policy replaces sensitive fields with redaction markers;
 - make retention configurable per data class with policy-versioned overrides.
@@ -211,9 +212,9 @@ The ledger should help agents orient quickly:
 
 - one job id links to policy, retained event spine, tool calls, outputs, and
   audit records;
-- full event replay lets an agent recover within the configured retention
-  window; after that window, the minimal replay spine still lets the agent
-  answer what happened without asking the user;
+- full event replay lets an agent recover within the configured full-event
+  retention window; after that window, the minimal replay spine still lets the
+  agent answer what happened without asking the user;
 - redaction markers tell the agent that data existed but was intentionally
   hidden;
 - canonical tool results let agents change output format without rerunning work.
