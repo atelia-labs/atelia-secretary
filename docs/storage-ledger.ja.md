@@ -124,7 +124,7 @@ tool result は canonical structured data を保存します。
 - truncation metadata
 - redaction metadata
 
-TOON、JSON、text rendering は derived view です。
+TOON（Token-Oriented Object Notation。canonical schema は [Tool Output Schema](tool-output-schema.ja.md)）、JSON、text rendering は derived view です。
 
 ## Lock Decisions
 
@@ -151,9 +151,9 @@ storage migration は次を満たします。
 - `storage_status: migrating` を report できる
 - 明示的に safe でない限り、job 実行中に migration しない
 
-daemon は migration 前に、leader id、started timestamp、safe flag、timeout を持つ single migration lock を `schema_migrations` に記録します。acquisition は unique key と compare-and-set または transactional insert を使い、unexpired `migration_lock` row がすでに存在する場合は失敗します。`storage_status: migrating` の間、leader は新しい mutating work を受け付けません。ただし `safe_flag: true` の場合に限り、idempotent または明示的に marked-safe な operation だけを許可できます。running job は configured timeout まで drain します。drain できない場合、retriable job は backoff 付き retry に enqueue し、non-retriable work は cleanup steps を ledger に記録したうえで `failed` に mark します。non-leader daemon は `storage_status: migrating` を report し、migration lock が release または expire されるまで新しい mutating work を受け付けません。
+daemon は migration 前に、leader id、started timestamp、safe flag、timeout を持つ single migration lock を `schema_migrations` に記録します。acquisition は unique key と compare-and-set または transactional insert を使い、unexpired `migration_lock` row がすでに存在する場合は失敗します。`storage_status: migrating` の間、leader は `safe_flag` の値に関係なく、新しい external mutating request を受け付けたり実行したりしません。leader が許可できるのは、既存 running job の drain と、`schema_migrations` / `migration_lock` / ledger に retry enqueue や cleanup を記録する internal housekeeping だけです。enqueue された retry は ledger entry として persist するだけで、migration lock が release または expire されるまでは実行しません。ただし `safe_flag: true` かつ operation が明示的に marked-safe な場合に限り、その marked-safe operation を実行できます。running job は configured timeout まで drain します。drain できない場合、retriable job は backoff 付き retry に enqueue し、non-retriable work は cleanup steps を ledger に記録したうえで `failed` に mark します。non-leader daemon は `storage_status: migrating` を report し、migration lock が release または expire されるまで新しい mutating work を受け付けません。
 
-migration が失敗した場合、daemon は新しい work を黙って受けず、`degraded` または `read_only` state で起動します。
+migration が失敗した場合、daemon は `storage_status: migrating` から `degraded` または `read_only` への transition と failure reason を `schema_migrations` と ledger に記録し、新しい work を黙って受けずに起動します。`running` job は configured timeout まで drain を継続するか、storage が安全に続行できない場合は paused として ledger に記録します。missing `tool_result` を待つ retriable work は backoff 付き retry として enqueue し、non-retriable work は cleanup steps を記録して `failed` に mark します。`queued` job は pending のまま保持し、`degraded` / `read_only` 中に新しい tool invocation や mutation work を開始しません。ただし `read_only` では bounded read/status/replay を許可でき、`degraded` では `safe_flag: true` かつ明示的に marked-safe な recovery housekeeping だけを許可できます。
 
 ## Retention
 

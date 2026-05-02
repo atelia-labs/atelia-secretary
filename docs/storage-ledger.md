@@ -137,7 +137,9 @@ Tool results store canonical structured data:
 - truncation metadata
 - redaction metadata
 
-TOON, JSON, or text renderings are derived views.
+TOON (Token-Oriented Object Notation; see
+[Tool Output Schema](tool-output-schema.md)), JSON, or text renderings are
+derived views.
 
 ## Lock Decisions
 
@@ -179,16 +181,30 @@ The record contains leader id, started timestamp, safe flag, and timeout.
 Acquisition uses a unique key plus compare-and-set or transactional insert; it
 fails if an unexpired `migration_lock` row already exists. All daemons create,
 update, or read that record to acquire or release the lock. While
-`storage_status: migrating`, the leader must stop accepting new mutating work
-unless `safe_flag: true`; that flag permits only idempotent or explicitly
-marked-safe operations. Running jobs are drained until the configured timeout.
-If they cannot drain, retriable jobs are enqueued for retry with backoff, while
-non-retriable work is marked `failed` with cleanup steps recorded in the ledger.
-Non-leader daemons report `storage_status: migrating` and do not accept new
-mutating work until the migration lock is released or expires.
+`storage_status: migrating`, the leader must not accept or execute new external
+mutating requests regardless of `safe_flag`. The leader may only drain existing
+running jobs and record internal housekeeping in `schema_migrations`,
+`migration_lock`, or the ledger, such as enqueueing retries or cleanup for
+already-running jobs. Enqueued retries are persisted only as ledger entries and
+are not executed until the migration lock is released or expires, unless
+`safe_flag: true` and the operation is explicitly marked-safe. Running jobs are
+drained until the configured timeout. If they cannot drain, retriable jobs are
+enqueued for retry with backoff, while non-retriable work is marked `failed`
+with cleanup steps recorded in the ledger. Non-leader daemons report
+`storage_status: migrating` and do not accept new mutating work until the
+migration lock is released or expires.
 
-If a migration fails, the daemon should start in `degraded` or `read_only`
-state rather than silently accepting new work.
+If a migration fails, the daemon records the transition from `storage_status:
+migrating` to `degraded` or `read_only`, plus the failure reason, in
+`schema_migrations` and the ledger before starting rather than silently
+accepting new work. `running` jobs either continue draining until the configured
+timeout or are recorded as paused when storage cannot safely continue. Retriable
+work waiting on a missing `tool_result` is enqueued for retry with backoff;
+non-retriable work records cleanup steps and is marked `failed`. `queued` jobs
+remain pending, and no new tool invocation or mutation work starts while
+`degraded` or `read_only`. `read_only` may allow bounded read, status, and
+replay; `degraded` may allow only recovery housekeeping that has `safe_flag:
+true` and is explicitly marked-safe.
 
 ## Retention
 
