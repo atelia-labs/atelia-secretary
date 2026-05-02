@@ -168,7 +168,7 @@ migration が失敗した場合、daemon は新しい work を黙って受けず
 
 PII deletion request は、audit continuity が必要な場合、physical deletion より redaction を優先します。redaction record は id、timestamp、reason、actor、legal basis を保持します。reversible redaction を戻せるのは、指定された vault-backed process のみです。
 
-audit continuity が不要な場合、physical deletion または crypto-shredding は configured deletion window 内に必ず実行します。policy が non-continuity PII、user-requested hard deletion、revoked consent、secret material と分類した data には reversible redaction を許可しません。physical deletion 後は、configured deletion-proof retention window または policy-versioned override の間だけ minimal deletion record を保持できます。その record は id、timestamp、actor、legal basis、non-sensitive proof of deletion だけを含めます。reversible redaction を戻せるのは指定された vault-backed process のみであり、physical deletion または crypto-shredded data にはその経路はありません。
+audit continuity が不要な場合、physical deletion または crypto-shredding は指定された vault-backed deletion process が PII deletion request の承認後 configured deletion window 内に必ず実行します。policy が non-continuity PII、user-requested hard deletion、revoked consent、secret material と分類した data には reversible redaction を許可しません。physical deletion 後は、configured deletion-proof retention window または policy-versioned override の間だけ minimal deletion record を保持できます。その record は id、timestamp、actor、legal basis、non-sensitive proof of deletion だけを含め、削除済み PII や reversible redaction material は含めません。reversible redaction を戻せるのは指定された vault-backed process のみであり、physical deletion または crypto-shredded data にはその経路はありません。
 
 ## AX Check
 

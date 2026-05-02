@@ -211,13 +211,15 @@ continuity matters. Redaction records preserve id, timestamp, reason, actor, and
 legal basis; only designated vault-backed processes may reverse reversible
 redaction.
 
-When audit continuity is not needed, physical deletion or crypto-shredding is
-mandatory within the configured deletion window. Reversible redaction is not
-allowed for data that a policy classifies as non-continuity PII, user-requested
-hard deletion, revoked consent, or secret material. After physical deletion, a
-minimal deletion record can persist for the configured deletion-proof retention
-window, or a policy-versioned override, and should contain only id, timestamp,
-actor, legal basis, and non-sensitive proof of deletion. Only a designated
+When audit continuity is not needed, a designated vault-backed deletion process
+must perform physical deletion or crypto-shredding within the configured
+deletion window after the PII deletion request is approved. Reversible redaction
+is not allowed for data that a policy classifies as non-continuity PII,
+user-requested hard deletion, revoked consent, or secret material. After
+physical deletion, a minimal deletion record can persist for the configured
+deletion-proof retention window, or a policy-versioned override, and should
+contain only id, timestamp, actor, legal basis, and non-sensitive proof of
+deletion, not deleted PII or reversible redaction material. Only a designated
 vault-backed process may reverse reversible redaction, and that path is
 unavailable for physical deletion or crypto-shredded data.
 
