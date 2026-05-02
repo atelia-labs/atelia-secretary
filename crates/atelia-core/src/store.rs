@@ -2,9 +2,9 @@
 
 use crate::domain::{
     Actor, AuditRecord, AuditRecordId, EventSeverity, EventSubjectType, JobEvent, JobEventId,
-    JobId, JobRecord, JobStatus, LockDecision, LockDecisionId, LockOwner, PolicyDecision,
-    PolicyDecisionId, RepositoryId, RepositoryRecord, ToolInvocation, ToolInvocationId, ToolResult,
-    ToolResultId,
+    JobEventKind, JobId, JobRecord, JobStatus, LockDecision, LockDecisionId, LockOwner,
+    PolicyDecision, PolicyDecisionId, RepositoryId, RepositoryRecord, ToolInvocation,
+    ToolInvocationId, ToolResult, ToolResultId,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -146,6 +146,11 @@ pub trait SecretaryStore: Send + Sync + 'static {
 
     /// Append a job event and assign the next store-wide sequence number.
     fn append_job_event(&self, event: JobEvent) -> StoreResult<JobEvent>;
+    fn append_job_event_and_update_job(
+        &self,
+        record: JobRecord,
+        event: JobEvent,
+    ) -> StoreResult<JobEvent>;
     fn replay_job_events(
         &self,
         cursor: EventCursor,
@@ -171,6 +176,14 @@ pub trait SecretaryStore: Send + Sync + 'static {
     fn get_tool_result(&self, id: &ToolResultId) -> StoreResult<ToolResult>;
 
     fn create_audit_record(&self, record: AuditRecord) -> StoreResult<()>;
+    fn record_tool_result_and_audit_with_events(
+        &self,
+        record: JobRecord,
+        tool_result: ToolResult,
+        tool_result_event: JobEvent,
+        audit_record: AuditRecord,
+        audit_event: JobEvent,
+    ) -> StoreResult<(JobEvent, JobEvent)>;
     fn list_audit_records(&self) -> StoreResult<Vec<AuditRecord>>;
     fn get_audit_record(&self, id: &AuditRecordId) -> StoreResult<AuditRecord>;
 }
@@ -311,19 +324,23 @@ impl SecretaryStore for InMemoryStore {
         let mut inner = self.lock()?;
         validate_new_job_event(&inner, &event, None)?;
 
-        let next_sequence = inner
-            .next_event_sequence
-            .checked_add(1)
-            .ok_or(StoreError::SequenceOverflow)?;
-        inner.next_event_sequence = next_sequence;
-        event.sequence_number = next_sequence;
+        append_event_locked(&mut inner, &mut event)?;
+        Ok(event)
+    }
 
-        inner
-            .job_events_by_sequence
-            .insert(event.sequence_number, event.id.clone());
-        inner
-            .job_events_by_id
-            .insert(event.id.clone(), event.clone());
+    fn append_job_event_and_update_job(
+        &self,
+        mut record: JobRecord,
+        mut event: JobEvent,
+    ) -> StoreResult<JobEvent> {
+        let mut inner = self.lock()?;
+        validate_job_update(&inner, &record, &event)?;
+        validate_new_job_event(&inner, &event, None)?;
+
+        append_event_locked(&mut inner, &mut event)?;
+        record.latest_event_id = Some(event.id.clone());
+        inner.jobs.insert(record.id.clone(), record);
+
         Ok(event)
     }
 
@@ -543,6 +560,74 @@ impl SecretaryStore for InMemoryStore {
         )
     }
 
+    fn record_tool_result_and_audit_with_events(
+        &self,
+        mut record: JobRecord,
+        tool_result: ToolResult,
+        mut tool_result_event: JobEvent,
+        audit_record: AuditRecord,
+        mut audit_event: JobEvent,
+    ) -> StoreResult<(JobEvent, JobEvent)> {
+        let mut inner = self.lock()?;
+
+        validate_sibling_event_ids_are_unique(&tool_result_event, &audit_event)?;
+        validate_job_update(&inner, &record, &tool_result_event)?;
+        validate_job_update(&inner, &record, &audit_event)?;
+        validate_tool_result_refs(&inner, &tool_result)?;
+        validate_audit_record_refs_with_pending_tool_result(
+            &inner,
+            &audit_record,
+            Some(&tool_result),
+        )?;
+        validate_new_job_event_with_pending_records(
+            &inner,
+            &tool_result_event,
+            None,
+            Some(&tool_result),
+            None,
+        )?;
+        validate_new_job_event_with_pending_records(
+            &inner,
+            &audit_event,
+            None,
+            Some(&tool_result),
+            Some(&audit_record),
+        )?;
+        ensure_ref_absent(
+            !inner.tool_results.contains_key(&tool_result.id),
+            "tool_results",
+            &tool_result.id,
+        )?;
+        ensure_ref_absent(
+            !inner.audit_records.contains_key(&audit_record.id),
+            "audit_records",
+            &audit_record.id,
+        )?;
+        ensure_event_sequence_capacity(&inner, 2)?;
+
+        insert_record(
+            &mut inner.tool_results,
+            tool_result.id.clone(),
+            tool_result,
+            "tool_results",
+        )?;
+        append_event_locked(&mut inner, &mut tool_result_event)?;
+        record.latest_event_id = Some(tool_result_event.id.clone());
+        inner.jobs.insert(record.id.clone(), record.clone());
+
+        insert_record(
+            &mut inner.audit_records,
+            audit_record.id.clone(),
+            audit_record,
+            "audit_records",
+        )?;
+        append_event_locked(&mut inner, &mut audit_event)?;
+        record.latest_event_id = Some(audit_event.id.clone());
+        inner.jobs.insert(record.id.clone(), record);
+
+        Ok((tool_result_event, audit_event))
+    }
+
     fn list_audit_records(&self) -> StoreResult<Vec<AuditRecord>> {
         Ok(list_records(&self.lock()?.audit_records))
     }
@@ -696,7 +781,7 @@ fn event_repository_id(
         return Ok(Some(repository_id.clone()));
     }
 
-    let subject_repository_id = subject_repository_id(inner, event, None)?.cloned();
+    let subject_repository_id = subject_repository_id(inner, event, None, None, None)?.cloned();
     let mut event_repository_id = subject_repository_id;
     derive_event_repository_from_refs(inner, event, &mut event_repository_id)?;
 
@@ -841,6 +926,32 @@ fn ensure_owned_event_repository_consistency(
     Ok(())
 }
 
+fn append_event_locked(inner: &mut InMemoryInner, event: &mut JobEvent) -> StoreResult<()> {
+    let next_sequence = inner
+        .next_event_sequence
+        .checked_add(1)
+        .ok_or(StoreError::SequenceOverflow)?;
+    inner.next_event_sequence = next_sequence;
+    event.sequence_number = next_sequence;
+
+    inner
+        .job_events_by_sequence
+        .insert(event.sequence_number, event.id.clone());
+    inner
+        .job_events_by_id
+        .insert(event.id.clone(), event.clone());
+
+    Ok(())
+}
+
+fn ensure_event_sequence_capacity(inner: &InMemoryInner, event_count: u64) -> StoreResult<()> {
+    inner
+        .next_event_sequence
+        .checked_add(event_count)
+        .map(|_| ())
+        .ok_or(StoreError::SequenceOverflow)
+}
+
 const fn severity_rank(severity: EventSeverity) -> u8 {
     match severity {
         EventSeverity::Debug => 0,
@@ -875,6 +986,16 @@ fn validate_new_job_event(
     event: &JobEvent,
     pending_job: Option<&JobRecord>,
 ) -> StoreResult<()> {
+    validate_new_job_event_with_pending_records(inner, event, pending_job, None, None)
+}
+
+fn validate_new_job_event_with_pending_records(
+    inner: &InMemoryInner,
+    event: &JobEvent,
+    pending_job: Option<&JobRecord>,
+    pending_tool_result: Option<&ToolResult>,
+    pending_audit_record: Option<&AuditRecord>,
+) -> StoreResult<()> {
     if inner.job_events_by_id.contains_key(&event.id) {
         return Err(StoreError::DuplicateId {
             collection: "job_events",
@@ -891,8 +1012,21 @@ fn validate_new_job_event(
         });
     }
 
-    let subject_repository_id = validate_event_subject(inner, event, pending_job)?;
-    validate_event_refs(inner, event, pending_job, subject_repository_id)
+    let subject_repository_id = validate_event_subject(
+        inner,
+        event,
+        pending_job,
+        pending_tool_result,
+        pending_audit_record,
+    )?;
+    validate_event_refs(
+        inner,
+        event,
+        pending_job,
+        pending_tool_result,
+        pending_audit_record,
+        subject_repository_id,
+    )
 }
 
 fn validate_initial_event_for_job(record: &JobRecord, event: &JobEvent) -> StoreResult<()> {
@@ -929,12 +1063,243 @@ fn validate_initial_event_for_job(record: &JobRecord, event: &JobEvent) -> Store
     Ok(())
 }
 
+fn validate_job_update(
+    inner: &InMemoryInner,
+    record: &JobRecord,
+    event: &JobEvent,
+) -> StoreResult<()> {
+    let existing = inner
+        .jobs
+        .get(&record.id)
+        .ok_or_else(|| StoreError::NotFound {
+            collection: "jobs",
+            id: id_debug(&record.id),
+        })?;
+    if record.latest_event_id != existing.latest_event_id {
+        return Err(StoreError::Conflict {
+            collection: "jobs",
+            reason: format!(
+                "job update for {} is stale: expected latest_event_id {:?}, got {:?}",
+                id_debug(&record.id),
+                existing.latest_event_id,
+                record.latest_event_id
+            ),
+        });
+    }
+    ensure_same_repository(
+        "jobs",
+        "job.repository_id",
+        &existing.repository_id,
+        &record.repository_id,
+    )?;
+    ensure_immutable_job_field(
+        &record.id,
+        "schema_version",
+        existing.schema_version,
+        record.schema_version,
+    )?;
+    ensure_immutable_job_field(
+        &record.id,
+        "created_at",
+        existing.created_at,
+        record.created_at,
+    )?;
+    ensure_immutable_job_field(
+        &record.id,
+        "requester",
+        &existing.requester,
+        &record.requester,
+    )?;
+    ensure_immutable_job_field(&record.id, "kind", &existing.kind, &record.kind)?;
+    ensure_immutable_job_field(&record.id, "goal", &existing.goal, &record.goal)?;
+    validate_job_lifecycle_update(existing, record, event)?;
+    validate_job_policy_summary_update(existing, record, event)?;
+    if event.refs.job_id.as_ref() != Some(&record.id) {
+        return Err(StoreError::InvalidReference {
+            collection: "job_events",
+            reason: format!(
+                "job update event refs.job_id must identify job {}",
+                id_debug(&record.id)
+            ),
+        });
+    }
+    if event.refs.repository_id.as_ref() != Some(&record.repository_id) {
+        return Err(StoreError::InvalidReference {
+            collection: "job_events",
+            reason: format!(
+                "job update event refs.repository_id must identify repository {}",
+                id_debug(&record.repository_id)
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_job_lifecycle_update(
+    existing: &JobRecord,
+    record: &JobRecord,
+    event: &JobEvent,
+) -> StoreResult<()> {
+    if record.updated_at < existing.updated_at {
+        return job_update_conflict(
+            &record.id,
+            format!(
+                "updated_at moved backwards from {:?} to {:?}",
+                existing.updated_at, record.updated_at
+            ),
+        );
+    }
+
+    if record.status != existing.status {
+        match &event.kind {
+            JobEventKind::JobStatusChanged { from, to }
+                if *from == existing.status && *to == record.status => {}
+            _ => {
+                return job_update_conflict(
+                    &record.id,
+                    format!(
+                        "status changed from {:?} to {:?} without matching JobStatusChanged event",
+                        existing.status, record.status
+                    ),
+                );
+            }
+        }
+
+        let mut expected = existing.clone();
+        expected
+            .transition_status(record.status, record.updated_at)
+            .map_err(|error| StoreError::Conflict {
+                collection: "jobs",
+                reason: format!(
+                    "job update for {} has invalid lifecycle transition: {error:?}",
+                    id_debug(&record.id)
+                ),
+            })?;
+        if record.started_at != expected.started_at || record.completed_at != expected.completed_at
+        {
+            return job_update_conflict(
+                &record.id,
+                format!(
+                    "lifecycle timestamps do not match transition from {:?} to {:?}",
+                    existing.status, record.status
+                ),
+            );
+        }
+    } else {
+        if matches!(event.kind, JobEventKind::JobStatusChanged { .. }) {
+            return job_update_conflict(
+                &record.id,
+                "JobStatusChanged event did not change materialized job status",
+            );
+        }
+        if record.started_at != existing.started_at || record.completed_at != existing.completed_at
+        {
+            return job_update_conflict(
+                &record.id,
+                "lifecycle timestamps changed without a status transition",
+            );
+        }
+    }
+
+    if record.status == JobStatus::Running && record.started_at.is_none() {
+        return job_update_conflict(&record.id, "running job must have started_at");
+    }
+    if record.status.is_terminal() && record.completed_at.is_none() {
+        return job_update_conflict(&record.id, "terminal job must have completed_at");
+    }
+    if !record.status.is_terminal() && record.completed_at.is_some() {
+        return job_update_conflict(&record.id, "non-terminal job cannot have completed_at");
+    }
+
+    Ok(())
+}
+
+fn validate_job_policy_summary_update(
+    existing: &JobRecord,
+    record: &JobRecord,
+    event: &JobEvent,
+) -> StoreResult<()> {
+    if record.policy_summary == existing.policy_summary {
+        return Ok(());
+    }
+
+    let JobEventKind::PolicyDecided { .. } = &event.kind else {
+        return job_update_conflict(
+            &record.id,
+            "policy_summary changed without a PolicyDecided event",
+        );
+    };
+    let summary_policy_id = record
+        .policy_summary
+        .as_ref()
+        .and_then(|summary| summary.decision_id.as_ref());
+    if summary_policy_id != event.refs.policy_decision_id.as_ref() {
+        return job_update_conflict(
+            &record.id,
+            "policy_summary decision_id must match event refs.policy_decision_id",
+        );
+    }
+
+    Ok(())
+}
+
+fn job_update_conflict(job_id: &JobId, reason: impl Into<String>) -> StoreResult<()> {
+    Err(StoreError::Conflict {
+        collection: "jobs",
+        reason: format!("job update for {} {}", id_debug(job_id), reason.into()),
+    })
+}
+
+fn validate_sibling_event_ids_are_unique(left: &JobEvent, right: &JobEvent) -> StoreResult<()> {
+    if left.id != right.id {
+        return Ok(());
+    }
+
+    Err(StoreError::DuplicateId {
+        collection: "job_events",
+        id: id_debug(&left.id),
+    })
+}
+
+fn ensure_immutable_job_field<T>(
+    job_id: &JobId,
+    field_name: &'static str,
+    existing: T,
+    incoming: T,
+) -> StoreResult<()>
+where
+    T: PartialEq + fmt::Debug,
+{
+    if existing == incoming {
+        return Ok(());
+    }
+
+    Err(StoreError::Conflict {
+        collection: "jobs",
+        reason: format!(
+            "job update for {} attempted to change immutable field {field_name}: existing {:?}, incoming {:?}",
+            id_debug(job_id),
+            existing,
+            incoming
+        ),
+    })
+}
+
 fn validate_event_subject<'a>(
     inner: &'a InMemoryInner,
     event: &JobEvent,
     pending_job: Option<&'a JobRecord>,
+    pending_tool_result: Option<&'a ToolResult>,
+    pending_audit_record: Option<&'a AuditRecord>,
 ) -> StoreResult<Option<&'a RepositoryId>> {
-    let subject_repository_id = subject_repository_id(inner, event, pending_job)?;
+    let subject_repository_id = subject_repository_id(
+        inner,
+        event,
+        pending_job,
+        pending_tool_result,
+        pending_audit_record,
+    )?;
     if let (Some(subject_repository_id), Some(ref_repository_id)) =
         (subject_repository_id, event.refs.repository_id.as_ref())
     {
@@ -953,6 +1318,8 @@ fn subject_repository_id<'a>(
     inner: &'a InMemoryInner,
     event: &JobEvent,
     pending_job: Option<&'a JobRecord>,
+    pending_tool_result: Option<&'a ToolResult>,
+    pending_audit_record: Option<&'a AuditRecord>,
 ) -> StoreResult<Option<&'a RepositoryId>> {
     match event.subject.subject_type {
         EventSubjectType::Repository => {
@@ -1001,6 +1368,10 @@ fn subject_repository_id<'a>(
                 .tool_results
                 .values()
                 .find(|tool_result| tool_result.id.as_str() == event.subject.subject_id)
+                .or_else(|| {
+                    pending_tool_result
+                        .filter(|tool_result| tool_result.id.as_str() == event.subject.subject_id)
+                })
                 .ok_or_else(|| subject_not_found("tool_results", event))?;
             let tool_invocation = inner
                 .tool_invocations
@@ -1020,6 +1391,10 @@ fn subject_repository_id<'a>(
                 .audit_records
                 .values()
                 .find(|audit_record| audit_record.id.as_str() == event.subject.subject_id)
+                .or_else(|| {
+                    pending_audit_record
+                        .filter(|audit_record| audit_record.id.as_str() == event.subject.subject_id)
+                })
                 .ok_or_else(|| subject_not_found("audit_records", event))?;
             Ok(Some(&audit_record.repository_id))
         }
@@ -1037,11 +1412,31 @@ fn validate_event_refs(
     inner: &InMemoryInner,
     event: &JobEvent,
     pending_job: Option<&JobRecord>,
+    pending_tool_result: Option<&ToolResult>,
+    pending_audit_record: Option<&AuditRecord>,
     subject_repository_id: Option<&RepositoryId>,
 ) -> StoreResult<()> {
     let mut event_repository_id = event.refs.repository_id.as_ref().or(subject_repository_id);
+    let mut event_job_id = match event.subject.subject_type {
+        EventSubjectType::Job => Some(event.subject.subject_id.as_str()),
+        _ => event.refs.job_id.as_ref().map(JobId::as_str),
+    };
+    let mut event_policy_decision_id = match event.subject.subject_type {
+        EventSubjectType::PolicyDecision => Some(event.subject.subject_id.as_str()),
+        _ => event
+            .refs
+            .policy_decision_id
+            .as_ref()
+            .map(PolicyDecisionId::as_str),
+    };
 
     if let Some(repository_id) = &event.refs.repository_id {
+        ensure_subject_ref_matches(
+            event,
+            EventSubjectType::Repository,
+            repository_id.as_str(),
+            "job_event.refs.repository_id",
+        )?;
         ensure_ref_exists(
             inner.repositories.contains_key(repository_id),
             "repositories",
@@ -1051,6 +1446,12 @@ fn validate_event_refs(
     }
 
     if let Some(job_id) = &event.refs.job_id {
+        ensure_subject_ref_matches(
+            event,
+            EventSubjectType::Job,
+            job_id.as_str(),
+            "job_event.refs.job_id",
+        )?;
         let job = inner
             .jobs
             .get(job_id)
@@ -1064,9 +1465,16 @@ fn validate_event_refs(
             &job.repository_id,
             "job_event.refs.job_id",
         )?;
+        ensure_event_job_consistency(&mut event_job_id, &job.id, "job_event.refs.job_id")?;
     }
 
     if let Some(policy_decision_id) = &event.refs.policy_decision_id {
+        ensure_subject_ref_matches(
+            event,
+            EventSubjectType::PolicyDecision,
+            policy_decision_id.as_str(),
+            "job_event.refs.policy_decision_id",
+        )?;
         let policy_decision = inner
             .policy_decisions
             .get(policy_decision_id)
@@ -1085,6 +1493,12 @@ fn validate_event_refs(
     }
 
     if let Some(lock_decision_id) = &event.refs.lock_decision_id {
+        ensure_subject_ref_matches(
+            event,
+            EventSubjectType::LockDecision,
+            lock_decision_id.as_str(),
+            "job_event.refs.lock_decision_id",
+        )?;
         let lock_decision =
             inner
                 .lock_decisions
@@ -1101,9 +1515,20 @@ fn validate_event_refs(
             &lock_decision.repository_id,
             "job_event.refs.lock_decision_id",
         )?;
+        ensure_event_policy_consistency(
+            &mut event_policy_decision_id,
+            &lock_decision.policy_decision_id,
+            "job_event.refs.lock_decision_id",
+        )?;
     }
 
     if let Some(tool_invocation_id) = &event.refs.tool_invocation_id {
+        ensure_subject_ref_matches(
+            event,
+            EventSubjectType::ToolInvocation,
+            tool_invocation_id.as_str(),
+            "job_event.refs.tool_invocation_id",
+        )?;
         let tool_invocation = inner
             .tool_invocations
             .get(tool_invocation_id)
@@ -1119,20 +1544,36 @@ fn validate_event_refs(
             &tool_invocation.repository_id,
             "job_event.refs.tool_invocation_id",
         )?;
+        ensure_event_job_consistency(
+            &mut event_job_id,
+            &tool_invocation.job_id,
+            "job_event.refs.tool_invocation_id",
+        )?;
+        ensure_event_policy_consistency(
+            &mut event_policy_decision_id,
+            &tool_invocation.policy_decision_id,
+            "job_event.refs.tool_invocation_id",
+        )?;
     }
 
     if let Some(tool_result_id) = &event.refs.tool_result_id {
-        let tool_result =
-            inner
-                .tool_results
-                .get(tool_result_id)
-                .ok_or_else(|| StoreError::NotFound {
-                    collection: "tool_results",
-                    id: format!(
-                        "{} (job_event.refs.tool_result_id)",
-                        id_debug(tool_result_id)
-                    ),
-                })?;
+        ensure_subject_ref_matches(
+            event,
+            EventSubjectType::ToolResult,
+            tool_result_id.as_str(),
+            "job_event.refs.tool_result_id",
+        )?;
+        let tool_result = inner
+            .tool_results
+            .get(tool_result_id)
+            .or_else(|| pending_tool_result.filter(|result| &result.id == tool_result_id))
+            .ok_or_else(|| StoreError::NotFound {
+                collection: "tool_results",
+                id: format!(
+                    "{} (job_event.refs.tool_result_id)",
+                    id_debug(tool_result_id)
+                ),
+            })?;
         let tool_invocation = inner
             .tool_invocations
             .get(&tool_result.invocation_id)
@@ -1149,27 +1590,185 @@ fn validate_event_refs(
             &tool_invocation.repository_id,
             "job_event.refs.tool_result_id",
         )?;
+        if event
+            .refs
+            .tool_invocation_id
+            .as_ref()
+            .is_some_and(|id| id != &tool_result.invocation_id)
+        {
+            return Err(StoreError::InvalidReference {
+                collection: "job_events",
+                reason: format!(
+                    "job_event.refs.tool_result_id {} belongs to invocation_id {}, not {:?}",
+                    id_debug(tool_result_id),
+                    id_debug(&tool_result.invocation_id),
+                    event.refs.tool_invocation_id
+                ),
+            });
+        }
+        ensure_event_job_consistency(
+            &mut event_job_id,
+            &tool_invocation.job_id,
+            "job_event.refs.tool_result_id",
+        )?;
+        ensure_event_policy_consistency(
+            &mut event_policy_decision_id,
+            &tool_invocation.policy_decision_id,
+            "job_event.refs.tool_result_id",
+        )?;
     }
 
     if let Some(audit_record_id) = &event.refs.audit_record_id {
-        let audit_record =
-            inner
-                .audit_records
-                .get(audit_record_id)
-                .ok_or_else(|| StoreError::NotFound {
-                    collection: "audit_records",
-                    id: format!(
-                        "{} (job_event.refs.audit_record_id)",
-                        id_debug(audit_record_id)
-                    ),
-                })?;
+        ensure_subject_ref_matches(
+            event,
+            EventSubjectType::AuditRecord,
+            audit_record_id.as_str(),
+            "job_event.refs.audit_record_id",
+        )?;
+        let audit_record = inner
+            .audit_records
+            .get(audit_record_id)
+            .or_else(|| pending_audit_record.filter(|record| &record.id == audit_record_id))
+            .ok_or_else(|| StoreError::NotFound {
+                collection: "audit_records",
+                id: format!(
+                    "{} (job_event.refs.audit_record_id)",
+                    id_debug(audit_record_id)
+                ),
+            })?;
         ensure_event_repository_consistency(
             &mut event_repository_id,
             &audit_record.repository_id,
             "job_event.refs.audit_record_id",
         )?;
+        ensure_event_policy_consistency(
+            &mut event_policy_decision_id,
+            &audit_record.policy_decision_id,
+            "job_event.refs.audit_record_id",
+        )?;
+        if let Some(tool_invocation_id) = &audit_record.tool_invocation_id {
+            let canonical_invocation =
+                inner
+                    .tool_invocations
+                    .get(tool_invocation_id)
+                    .ok_or_else(|| StoreError::Conflict {
+                        collection: "audit_records",
+                        reason: format!(
+                            "audit_record {} references missing invocation {}",
+                            id_debug(audit_record_id),
+                            id_debug(tool_invocation_id)
+                        ),
+                    })?;
+            if event
+                .refs
+                .tool_invocation_id
+                .as_ref()
+                .is_some_and(|id| id != tool_invocation_id)
+            {
+                return Err(StoreError::InvalidReference {
+                    collection: "job_events",
+                    reason: format!(
+                        "job_event.refs.audit_record_id {} belongs to invocation_id {}, not {:?}",
+                        id_debug(audit_record_id),
+                        id_debug(tool_invocation_id),
+                        event.refs.tool_invocation_id
+                    ),
+                });
+            }
+            ensure_event_job_consistency(
+                &mut event_job_id,
+                &canonical_invocation.job_id,
+                "job_event.refs.audit_record_id",
+            )?;
+            if let Some(tool_result_id) = &event.refs.tool_result_id {
+                let tool_result = inner
+                    .tool_results
+                    .get(tool_result_id)
+                    .or_else(|| pending_tool_result.filter(|result| &result.id == tool_result_id))
+                    .ok_or_else(|| StoreError::NotFound {
+                        collection: "tool_results",
+                        id: format!(
+                            "{} (job_event.refs.tool_result_id)",
+                            id_debug(tool_result_id)
+                        ),
+                    })?;
+                if tool_result.invocation_id != *tool_invocation_id {
+                    return Err(StoreError::InvalidReference {
+                        collection: "job_events",
+                        reason: format!(
+                            "job_event.refs.audit_record_id {} belongs to invocation_id {}, but tool_result_id {} belongs to invocation_id {}",
+                            id_debug(audit_record_id),
+                            id_debug(tool_invocation_id),
+                            id_debug(tool_result_id),
+                            id_debug(&tool_result.invocation_id)
+                        ),
+                    });
+                }
+            }
+        }
     }
 
+    Ok(())
+}
+
+fn ensure_subject_ref_matches(
+    event: &JobEvent,
+    expected_subject_type: EventSubjectType,
+    ref_id: &str,
+    context: &str,
+) -> StoreResult<()> {
+    if event.subject.subject_type != expected_subject_type || event.subject.subject_id == ref_id {
+        return Ok(());
+    }
+
+    Err(StoreError::InvalidReference {
+        collection: "job_events",
+        reason: format!(
+            "{context} {} does not match event.subject_id {} for subject_type {:?}",
+            ref_id, event.subject.subject_id, event.subject.subject_type
+        ),
+    })
+}
+
+fn ensure_event_job_consistency<'a>(
+    expected: &mut Option<&'a str>,
+    implied_job_id: &'a JobId,
+    context: &str,
+) -> StoreResult<()> {
+    ensure_event_identity_consistency(expected, implied_job_id.as_str(), context, "job_id")
+}
+
+fn ensure_event_policy_consistency<'a>(
+    expected: &mut Option<&'a str>,
+    implied_policy_decision_id: &'a PolicyDecisionId,
+    context: &str,
+) -> StoreResult<()> {
+    ensure_event_identity_consistency(
+        expected,
+        implied_policy_decision_id.as_str(),
+        context,
+        "policy_decision_id",
+    )
+}
+
+fn ensure_event_identity_consistency<'a>(
+    expected: &mut Option<&'a str>,
+    actual: &'a str,
+    context: &str,
+    field_name: &str,
+) -> StoreResult<()> {
+    if let Some(expected) = *expected {
+        if expected == actual {
+            return Ok(());
+        }
+
+        return Err(StoreError::InvalidReference {
+            collection: "job_events",
+            reason: format!("{context} implies {field_name} {actual}, not {expected}",),
+        });
+    }
+
+    *expected = Some(actual);
     Ok(())
 }
 
@@ -1335,6 +1934,14 @@ fn validate_tool_result_refs(inner: &InMemoryInner, record: &ToolResult) -> Stor
 }
 
 fn validate_audit_record_refs(inner: &InMemoryInner, record: &AuditRecord) -> StoreResult<()> {
+    validate_audit_record_refs_with_pending_tool_result(inner, record, None)
+}
+
+fn validate_audit_record_refs_with_pending_tool_result(
+    inner: &InMemoryInner,
+    record: &AuditRecord,
+    pending_tool_result: Option<&ToolResult>,
+) -> StoreResult<()> {
     ensure_ref_exists(
         inner.repositories.contains_key(&record.repository_id),
         "repositories",
@@ -1386,6 +1993,19 @@ fn validate_audit_record_refs(inner: &InMemoryInner, record: &AuditRecord) -> St
                 ),
             });
         }
+        if let Some(tool_result) = pending_tool_result {
+            if tool_result.invocation_id != *tool_invocation_id {
+                return Err(StoreError::InvalidReference {
+                    collection: "audit_records",
+                    reason: format!(
+                        "pending tool_result {} belongs to invocation_id {}, not {}",
+                        id_debug(&tool_result.id),
+                        id_debug(&tool_result.invocation_id),
+                        id_debug(tool_invocation_id)
+                    ),
+                });
+            }
+        }
     }
 
     Ok(())
@@ -1427,13 +2047,29 @@ fn ensure_ref_exists<Id: fmt::Debug>(
     })
 }
 
+fn ensure_ref_absent<Id: fmt::Debug>(
+    absent: bool,
+    collection: &'static str,
+    id: &Id,
+) -> StoreResult<()> {
+    if absent {
+        return Ok(());
+    }
+
+    Err(StoreError::DuplicateId {
+        collection,
+        id: id_debug(id),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{
         Actor, EventRefs, EventSeverity, EventSubject, EventSubjectType, JobEventKind, JobKind,
-        LedgerTimestamp, LockOwner, LockedScope, PolicyOutcome, RepositoryTrustState,
-        ResourceScope, RiskTier, StructuredValue, ToolResultField, ToolResultStatus,
+        LedgerTimestamp, LockOwner, LockedScope, PolicyOutcome, PolicySummary,
+        RepositoryTrustState, ResourceScope, RiskTier, StructuredValue, ToolResultField,
+        ToolResultStatus,
     };
 
     fn timestamp(value: i64) -> LedgerTimestamp {
@@ -1662,6 +2298,829 @@ mod tests {
             Err(StoreError::SequenceOverflow),
             store.append_job_event(job_event(repository.id))
         );
+    }
+
+    #[test]
+    fn append_job_event_and_update_job_rejects_stale_job_snapshot() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let stale_job = persist_job(&store, job);
+        let mut fresh_job = stale_job.clone();
+        fresh_job
+            .transition_status(JobStatus::Running, timestamp(5))
+            .unwrap();
+
+        let mut first_update = job_event(repository.id.clone());
+        first_update.subject = EventSubject::job(&fresh_job.id);
+        first_update.kind = JobEventKind::JobStatusChanged {
+            from: JobStatus::Queued,
+            to: JobStatus::Running,
+        };
+        first_update.refs.job_id = Some(fresh_job.id.clone());
+        store
+            .append_job_event_and_update_job(fresh_job, first_update)
+            .unwrap();
+
+        let mut stale_update = stale_job.clone();
+        stale_update
+            .transition_status(JobStatus::Canceled, timestamp(6))
+            .unwrap();
+        let mut stale_event = job_event(repository.id);
+        stale_event.subject = EventSubject::job(&stale_update.id);
+        stale_event.kind = JobEventKind::JobStatusChanged {
+            from: JobStatus::Queued,
+            to: JobStatus::Canceled,
+        };
+        stale_event.refs.job_id = Some(stale_update.id.clone());
+
+        assert!(matches!(
+            store.append_job_event_and_update_job(stale_update, stale_event),
+            Err(StoreError::Conflict {
+                collection: "jobs",
+                ..
+            })
+        ));
+        assert_eq!(
+            JobStatus::Running,
+            store.get_job(&stale_job.id).unwrap().status
+        );
+    }
+
+    #[test]
+    fn append_job_event_and_update_job_rejects_immutable_job_field_changes() {
+        fn assert_rejects_change(
+            mutate: impl FnOnce(&mut JobRecord),
+            expected_field_name: &'static str,
+        ) {
+            let store = InMemoryStore::new();
+            let repository = repository_record();
+            let job = job_record(repository.id.clone());
+
+            store.create_repository(repository.clone()).unwrap();
+            let mut job = persist_job(&store, job);
+            mutate(&mut job);
+
+            let mut event = job_event(repository.id);
+            event.subject = EventSubject::job(&job.id);
+            event.refs.job_id = Some(job.id.clone());
+
+            let error = store
+                .append_job_event_and_update_job(job, event)
+                .unwrap_err();
+
+            match error {
+                StoreError::Conflict { collection, reason } => {
+                    assert_eq!("jobs", collection);
+                    assert!(
+                        reason.contains(expected_field_name),
+                        "reason should name {expected_field_name}: {reason}"
+                    );
+                }
+                error => panic!("expected immutable field conflict, got {error:?}"),
+            }
+        }
+
+        assert_rejects_change(|job| job.schema_version += 1, "schema_version");
+        assert_rejects_change(|job| job.created_at = timestamp(99), "created_at");
+        assert_rejects_change(
+            |job| {
+                job.requester = Actor::User {
+                    id: "different-user".to_string(),
+                    display_name: None,
+                };
+            },
+            "requester",
+        );
+        assert_rejects_change(|job| job.kind = JobKind::Maintenance, "kind");
+        assert_rejects_change(|job| job.goal = "different goal".to_string(), "goal");
+    }
+
+    #[test]
+    fn append_job_event_and_update_job_rejects_invalid_lifecycle_updates() {
+        fn assert_rejects_lifecycle_update(mutate: impl FnOnce(&mut JobRecord)) {
+            let store = InMemoryStore::new();
+            let repository = repository_record();
+            let job = job_record(repository.id.clone());
+
+            store.create_repository(repository.clone()).unwrap();
+            let mut job = persist_job(&store, job);
+            mutate(&mut job);
+
+            let mut event = job_event(repository.id);
+            event.subject = EventSubject::job(&job.id);
+            event.refs.job_id = Some(job.id.clone());
+
+            assert!(matches!(
+                store.append_job_event_and_update_job(job, event),
+                Err(StoreError::Conflict {
+                    collection: "jobs",
+                    ..
+                })
+            ));
+        }
+
+        assert_rejects_lifecycle_update(|job| {
+            job.status = JobStatus::Succeeded;
+            job.updated_at = timestamp(10);
+            job.completed_at = Some(timestamp(10));
+        });
+        assert_rejects_lifecycle_update(|job| {
+            job.updated_at = timestamp(1);
+        });
+        assert_rejects_lifecycle_update(|job| {
+            job.status = JobStatus::Running;
+            job.updated_at = timestamp(10);
+        });
+    }
+
+    #[test]
+    fn append_job_event_and_update_job_rejects_policy_summary_without_policy_event() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let mut job = persist_job(&store, job);
+        let policy = policy_decision(repository.id.clone());
+        store.create_policy_decision(policy.clone()).unwrap();
+        job.policy_summary = Some(PolicySummary {
+            decision_id: Some(policy.id),
+            outcome: policy.outcome,
+            risk_tier: policy.risk_tier,
+            reason_code: policy.reason_code,
+        });
+
+        let mut event = job_event(repository.id);
+        event.subject = EventSubject::job(&job.id);
+        event.refs.job_id = Some(job.id.clone());
+
+        assert!(matches!(
+            store.append_job_event_and_update_job(job, event),
+            Err(StoreError::Conflict {
+                collection: "jobs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn record_tool_result_and_audit_with_events_rejects_without_partial_writes() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+        let policy = policy_decision(repository.id.clone());
+        let invocation = tool_invocation(repository.id.clone(), job.id.clone(), policy.id.clone());
+        let result = tool_result(invocation.id.clone());
+        let existing_audit = audit_record(
+            repository.id.clone(),
+            policy.id.clone(),
+            Some(invocation.id.clone()),
+        );
+        let duplicate_audit = existing_audit.clone();
+
+        store.create_policy_decision(policy.clone()).unwrap();
+        store.create_tool_invocation(invocation.clone()).unwrap();
+        store.create_audit_record(existing_audit).unwrap();
+
+        let result_event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(10),
+            subject: EventSubject::tool_result(&result.id),
+            kind: JobEventKind::ToolResultRecorded {
+                status: result.status,
+            },
+            severity: EventSeverity::Info,
+            public_message: "tool result recorded".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id.clone()),
+                job_id: Some(job.id.clone()),
+                policy_decision_id: Some(policy.id.clone()),
+                tool_invocation_id: Some(invocation.id.clone()),
+                tool_result_id: Some(result.id.clone()),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+        let audit_event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(11),
+            subject: EventSubject::audit_record(&duplicate_audit.id),
+            kind: JobEventKind::AuditRecorded,
+            severity: EventSeverity::Info,
+            public_message: "audit record created".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id),
+                job_id: Some(job.id.clone()),
+                policy_decision_id: Some(policy.id),
+                tool_invocation_id: Some(invocation.id),
+                tool_result_id: Some(result.id.clone()),
+                audit_record_id: Some(duplicate_audit.id.clone()),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+
+        assert!(matches!(
+            store.record_tool_result_and_audit_with_events(
+                job.clone(),
+                result,
+                result_event,
+                duplicate_audit,
+                audit_event,
+            ),
+            Err(StoreError::DuplicateId {
+                collection: "audit_records",
+                ..
+            })
+        ));
+        assert!(store.list_tool_results().unwrap().is_empty());
+        assert_eq!(
+            1,
+            store
+                .replay_job_events(EventCursor::Beginning, None)
+                .unwrap()
+                .len()
+        );
+        assert_eq!(job, store.get_job(&job.id).unwrap());
+    }
+
+    #[test]
+    fn record_tool_result_and_audit_with_events_rejects_duplicate_sibling_event_ids() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+        let policy = policy_decision(repository.id.clone());
+        let invocation = tool_invocation(repository.id.clone(), job.id.clone(), policy.id.clone());
+        let result = tool_result(invocation.id.clone());
+        let audit = audit_record(
+            repository.id.clone(),
+            policy.id.clone(),
+            Some(invocation.id.clone()),
+        );
+
+        store.create_policy_decision(policy.clone()).unwrap();
+        store.create_tool_invocation(invocation.clone()).unwrap();
+
+        let shared_event_id = JobEventId::new();
+        let result_event = JobEvent {
+            id: shared_event_id.clone(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(10),
+            subject: EventSubject::tool_result(&result.id),
+            kind: JobEventKind::ToolResultRecorded {
+                status: result.status,
+            },
+            severity: EventSeverity::Info,
+            public_message: "tool result recorded".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id.clone()),
+                job_id: Some(job.id.clone()),
+                policy_decision_id: Some(policy.id.clone()),
+                tool_invocation_id: Some(invocation.id.clone()),
+                tool_result_id: Some(result.id.clone()),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+        let audit_event = JobEvent {
+            id: shared_event_id,
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(11),
+            subject: EventSubject::audit_record(&audit.id),
+            kind: JobEventKind::AuditRecorded,
+            severity: EventSeverity::Info,
+            public_message: "audit record created".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id),
+                job_id: Some(job.id.clone()),
+                policy_decision_id: Some(policy.id),
+                tool_invocation_id: Some(invocation.id),
+                tool_result_id: Some(result.id.clone()),
+                audit_record_id: Some(audit.id.clone()),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+
+        assert!(matches!(
+            store.record_tool_result_and_audit_with_events(
+                job.clone(),
+                result,
+                result_event,
+                audit,
+                audit_event,
+            ),
+            Err(StoreError::DuplicateId {
+                collection: "job_events",
+                ..
+            })
+        ));
+        assert!(store.list_tool_results().unwrap().is_empty());
+        assert!(store.list_audit_records().unwrap().is_empty());
+        assert_eq!(job, store.get_job(&job.id).unwrap());
+    }
+
+    #[test]
+    fn record_tool_result_and_audit_with_events_rejects_wrong_audit_event_job_refs() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+        let other_job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+        let other_job = persist_job(&store, other_job);
+        let policy = policy_decision(repository.id.clone());
+        let invocation = tool_invocation(repository.id.clone(), job.id.clone(), policy.id.clone());
+        let result = tool_result(invocation.id.clone());
+        let audit = audit_record(
+            repository.id.clone(),
+            policy.id.clone(),
+            Some(invocation.id.clone()),
+        );
+
+        store.create_policy_decision(policy.clone()).unwrap();
+        store.create_tool_invocation(invocation.clone()).unwrap();
+
+        let result_event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(10),
+            subject: EventSubject::tool_result(&result.id),
+            kind: JobEventKind::ToolResultRecorded {
+                status: result.status,
+            },
+            severity: EventSeverity::Info,
+            public_message: "tool result recorded".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id.clone()),
+                job_id: Some(job.id.clone()),
+                policy_decision_id: Some(policy.id.clone()),
+                tool_invocation_id: Some(invocation.id.clone()),
+                tool_result_id: Some(result.id.clone()),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+        let audit_event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(11),
+            subject: EventSubject::audit_record(&audit.id),
+            kind: JobEventKind::AuditRecorded,
+            severity: EventSeverity::Info,
+            public_message: "audit record created".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id),
+                job_id: Some(other_job.id),
+                policy_decision_id: Some(policy.id),
+                tool_invocation_id: Some(invocation.id),
+                tool_result_id: Some(result.id.clone()),
+                audit_record_id: Some(audit.id.clone()),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+
+        assert!(matches!(
+            store.record_tool_result_and_audit_with_events(
+                job.clone(),
+                result,
+                result_event,
+                audit,
+                audit_event,
+            ),
+            Err(StoreError::InvalidReference {
+                collection: "job_events",
+                ..
+            })
+        ));
+        assert!(store.list_tool_results().unwrap().is_empty());
+        assert!(store.list_audit_records().unwrap().is_empty());
+        assert_eq!(job, store.get_job(&job.id).unwrap());
+    }
+
+    #[test]
+    fn job_events_reject_subject_and_ref_identity_mismatches() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+        let policy = policy_decision(repository.id.clone());
+        let invocation = tool_invocation(repository.id.clone(), job.id.clone(), policy.id.clone());
+        let result = tool_result(invocation.id.clone());
+        let audit = audit_record(
+            repository.id.clone(),
+            policy.id.clone(),
+            Some(invocation.id.clone()),
+        );
+
+        store.create_policy_decision(policy.clone()).unwrap();
+        store.create_tool_invocation(invocation.clone()).unwrap();
+
+        let result_event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(10),
+            subject: EventSubject::tool_result(&result.id),
+            kind: JobEventKind::ToolResultRecorded {
+                status: result.status,
+            },
+            severity: EventSeverity::Info,
+            public_message: "tool result recorded".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id.clone()),
+                job_id: Some(job.id.clone()),
+                policy_decision_id: Some(policy.id.clone()),
+                tool_invocation_id: Some(invocation.id.clone()),
+                tool_result_id: Some(ToolResultId::new()),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+        let audit_event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(11),
+            subject: EventSubject::audit_record(&audit.id),
+            kind: JobEventKind::AuditRecorded,
+            severity: EventSeverity::Info,
+            public_message: "audit record created".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id),
+                job_id: Some(job.id.clone()),
+                policy_decision_id: Some(policy.id),
+                tool_invocation_id: Some(invocation.id),
+                tool_result_id: Some(result.id.clone()),
+                audit_record_id: Some(audit.id.clone()),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+
+        assert!(matches!(
+            store.record_tool_result_and_audit_with_events(
+                job.clone(),
+                result,
+                result_event,
+                audit,
+                audit_event,
+            ),
+            Err(StoreError::InvalidReference {
+                collection: "job_events",
+                ..
+            })
+        ));
+        assert!(store.list_tool_results().unwrap().is_empty());
+        assert!(store.list_audit_records().unwrap().is_empty());
+        assert_eq!(job, store.get_job(&job.id).unwrap());
+    }
+
+    #[test]
+    fn job_events_reject_policy_refs_that_contradict_referenced_records() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+        let first_policy = policy_decision(repository.id.clone());
+        let second_policy = policy_decision(repository.id.clone());
+        let invocation = tool_invocation(
+            repository.id.clone(),
+            job.id.clone(),
+            first_policy.id.clone(),
+        );
+        let result = tool_result(invocation.id.clone());
+        let audit = audit_record(
+            repository.id.clone(),
+            first_policy.id.clone(),
+            Some(invocation.id.clone()),
+        );
+
+        store.create_policy_decision(first_policy.clone()).unwrap();
+        store.create_policy_decision(second_policy.clone()).unwrap();
+        store.create_tool_invocation(invocation.clone()).unwrap();
+
+        let invocation_event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(10),
+            subject: EventSubject::tool_invocation(&invocation.id),
+            kind: JobEventKind::ToolInvoked {
+                tool_id: invocation.tool_id.clone(),
+            },
+            severity: EventSeverity::Info,
+            public_message: "tool invoked".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id.clone()),
+                job_id: Some(job.id.clone()),
+                policy_decision_id: Some(second_policy.id.clone()),
+                tool_invocation_id: Some(invocation.id.clone()),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+        assert!(matches!(
+            store.append_job_event(invocation_event),
+            Err(StoreError::InvalidReference {
+                collection: "job_events",
+                ..
+            })
+        ));
+
+        store.create_tool_result(result.clone()).unwrap();
+        let result_event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(11),
+            subject: EventSubject::tool_result(&result.id),
+            kind: JobEventKind::ToolResultRecorded {
+                status: result.status,
+            },
+            severity: EventSeverity::Info,
+            public_message: "tool result recorded".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id.clone()),
+                job_id: Some(job.id.clone()),
+                policy_decision_id: Some(second_policy.id.clone()),
+                tool_invocation_id: Some(invocation.id.clone()),
+                tool_result_id: Some(result.id.clone()),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+        assert!(matches!(
+            store.append_job_event(result_event),
+            Err(StoreError::InvalidReference {
+                collection: "job_events",
+                ..
+            })
+        ));
+
+        store.create_audit_record(audit.clone()).unwrap();
+        let audit_event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(12),
+            subject: EventSubject::audit_record(&audit.id),
+            kind: JobEventKind::AuditRecorded,
+            severity: EventSeverity::Info,
+            public_message: "audit record created".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id),
+                job_id: Some(job.id),
+                policy_decision_id: Some(second_policy.id),
+                tool_invocation_id: Some(invocation.id),
+                audit_record_id: Some(audit.id),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+        assert!(matches!(
+            store.append_job_event(audit_event),
+            Err(StoreError::InvalidReference {
+                collection: "job_events",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn job_events_reject_mixed_implied_policy_refs_without_explicit_policy() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+        let first_policy = policy_decision(repository.id.clone());
+        let second_policy = policy_decision(repository.id.clone());
+        let lock_decision = lock_decision(repository.id.clone(), first_policy.id.clone());
+        let invocation = tool_invocation(
+            repository.id.clone(),
+            job.id.clone(),
+            second_policy.id.clone(),
+        );
+
+        store.create_policy_decision(first_policy).unwrap();
+        store.create_policy_decision(second_policy).unwrap();
+        store.create_lock_decision(lock_decision.clone()).unwrap();
+        store.create_tool_invocation(invocation.clone()).unwrap();
+
+        let event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(10),
+            subject: EventSubject::tool_invocation(&invocation.id),
+            kind: JobEventKind::ToolInvoked {
+                tool_id: invocation.tool_id.clone(),
+            },
+            severity: EventSeverity::Info,
+            public_message: "tool invoked".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id),
+                job_id: Some(job.id),
+                lock_decision_id: Some(lock_decision.id),
+                tool_invocation_id: Some(invocation.id),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+
+        assert!(matches!(
+            store.append_job_event(event),
+            Err(StoreError::InvalidReference {
+                collection: "job_events",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn job_events_reject_subject_job_conflicts_when_job_ref_is_omitted() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let subject_job = job_record(repository.id.clone());
+        let invocation_job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let subject_job = persist_job(&store, subject_job);
+        let invocation_job = persist_job(&store, invocation_job);
+        let policy = policy_decision(repository.id.clone());
+        let invocation = tool_invocation(
+            repository.id.clone(),
+            invocation_job.id.clone(),
+            policy.id.clone(),
+        );
+
+        store.create_policy_decision(policy.clone()).unwrap();
+        store.create_tool_invocation(invocation.clone()).unwrap();
+
+        let event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(10),
+            subject: EventSubject::job(&subject_job.id),
+            kind: JobEventKind::ToolInvoked {
+                tool_id: invocation.tool_id.clone(),
+            },
+            severity: EventSeverity::Info,
+            public_message: "tool invoked".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id),
+                policy_decision_id: Some(policy.id),
+                tool_invocation_id: Some(invocation.id),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+
+        assert!(matches!(
+            store.append_job_event(event),
+            Err(StoreError::InvalidReference {
+                collection: "job_events",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn job_events_reject_subject_policy_conflicts_when_policy_ref_is_omitted() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+        let subject_policy = policy_decision(repository.id.clone());
+        let invocation_policy = policy_decision(repository.id.clone());
+        let invocation = tool_invocation(
+            repository.id.clone(),
+            job.id.clone(),
+            invocation_policy.id.clone(),
+        );
+
+        store
+            .create_policy_decision(subject_policy.clone())
+            .unwrap();
+        store.create_policy_decision(invocation_policy).unwrap();
+        store.create_tool_invocation(invocation.clone()).unwrap();
+
+        let event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(10),
+            subject: EventSubject::policy_decision(&subject_policy.id),
+            kind: JobEventKind::ToolInvoked {
+                tool_id: invocation.tool_id.clone(),
+            },
+            severity: EventSeverity::Info,
+            public_message: "tool invoked".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id),
+                job_id: Some(job.id),
+                tool_invocation_id: Some(invocation.id),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+
+        assert!(matches!(
+            store.append_job_event(event),
+            Err(StoreError::InvalidReference {
+                collection: "job_events",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn job_events_reject_audit_record_refs_that_contradict_canonical_invocation() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+        let policy = policy_decision(repository.id.clone());
+        let first_invocation =
+            tool_invocation(repository.id.clone(), job.id.clone(), policy.id.clone());
+        let second_invocation =
+            tool_invocation(repository.id.clone(), job.id.clone(), policy.id.clone());
+        let result_for_second_invocation = tool_result(second_invocation.id.clone());
+        let audit_for_first_invocation = audit_record(
+            repository.id.clone(),
+            policy.id.clone(),
+            Some(first_invocation.id.clone()),
+        );
+
+        store.create_policy_decision(policy.clone()).unwrap();
+        store.create_tool_invocation(first_invocation).unwrap();
+        store
+            .create_tool_invocation(second_invocation.clone())
+            .unwrap();
+        store
+            .create_tool_result(result_for_second_invocation.clone())
+            .unwrap();
+        store
+            .create_audit_record(audit_for_first_invocation.clone())
+            .unwrap();
+
+        let audit_event = JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: timestamp(13),
+            subject: EventSubject::audit_record(&audit_for_first_invocation.id),
+            kind: JobEventKind::AuditRecorded,
+            severity: EventSeverity::Info,
+            public_message: "audit record created".to_string(),
+            refs: EventRefs {
+                repository_id: Some(repository.id),
+                job_id: Some(job.id),
+                policy_decision_id: Some(policy.id),
+                tool_result_id: Some(result_for_second_invocation.id),
+                audit_record_id: Some(audit_for_first_invocation.id),
+                ..EventRefs::default()
+            },
+            redactions: Vec::new(),
+        };
+
+        assert!(matches!(
+            store.append_job_event(audit_event),
+            Err(StoreError::InvalidReference {
+                collection: "job_events",
+                ..
+            })
+        ));
     }
 
     #[test]
