@@ -1,0 +1,154 @@
+# Storage And Ledger Design
+
+Atelia Secretary needs a local ledger before it needs a complex database. The
+store must make work inspectable, replayable, redacted where needed, and stable
+enough for clients and agents to trust.
+
+## Principles
+
+- Domain records are explicit.
+- Events and audit records are append-friendly.
+- Rendered tool output is not the source of truth.
+- Redaction must not destroy the existence of an event.
+- Schema migrations are versioned and recorded.
+
+## Store Shape
+
+The first store may be SQLite, another embedded database, or a file-backed
+append log. The architecture requires these logical collections:
+
+| Collection | Record |
+| --- | --- |
+| `repositories` | trusted workspace roots |
+| `jobs` | requested work |
+| `job_events` | ordered lifecycle and observation events |
+| `policy_decisions` | policy outcome before execution |
+| `tool_invocations` | attempted built-in or extension tool calls |
+| `tool_results` | canonical structured outputs |
+| `audit_records` | durable policy and execution evidence |
+| `schema_migrations` | applied storage migrations |
+
+## Record Requirements
+
+Every record includes:
+
+- id
+- schema version
+- created timestamp
+- updated timestamp where mutation is allowed
+- redaction state
+
+Append-only records use superseding events instead of in-place mutation.
+
+## Repository Records
+
+Repository records include:
+
+- display name
+- root path
+- allowed path scope
+- trust state
+- owner hint
+- last observed metadata
+
+Blocked repositories remain in the store so audit records and job history still
+resolve.
+
+## Job Records
+
+Job records include:
+
+- requester
+- repository id
+- kind
+- goal
+- status
+- policy summary
+- cancellation state
+- timestamps
+- latest event id
+
+Job status changes must create `job_event` records.
+
+## Event Records
+
+Events are the timeline clients and agents use to understand work.
+
+Event records include:
+
+- sequence number
+- event kind
+- subject type and id
+- severity
+- public message
+- referenced ids
+- redaction markers
+
+Events should be compact enough to stream but complete enough to replay.
+
+## Audit Records
+
+Audit records answer: who or what asked for an action, what policy decided, what
+ran, and what effect occurred.
+
+Audit records include:
+
+- actor / requester
+- repository id
+- requested capability
+- policy decision id
+- tool invocation id, if any
+- effect summary
+- output refs
+- redactions
+
+Audit records are append-only. If detail must be redacted later, preserve a
+redacted record with the original id and redaction reason.
+
+## Tool Results
+
+Tool results store canonical structured data:
+
+- tool id
+- invocation id
+- status
+- schema ref
+- typed fields
+- evidence refs
+- truncation metadata
+- redaction metadata
+
+TOON, JSON, or text renderings are derived views.
+
+## Migration Policy
+
+Storage migrations must be:
+
+- ordered;
+- idempotent where possible;
+- recorded in `schema_migrations`;
+- able to report `storage_status: migrating`;
+- blocked from running while jobs are executing unless explicitly safe.
+
+If a migration fails, the daemon should start in `degraded` or `read_only`
+state rather than silently accepting new work.
+
+## Retention
+
+Initial retention is conservative:
+
+- keep repository, job, policy, and audit records indefinitely;
+- allow large tool artifacts to expire only when a metadata tombstone remains;
+- keep enough event history for clients to replay recent work;
+- never remove security-relevant audit evidence without explicit policy.
+
+## AX Check
+
+The ledger should help agents orient quickly:
+
+- one job id links to policy, events, tool calls, outputs, and audit records;
+- event replay lets an agent recover after restart without asking the user what
+  happened;
+- redaction markers tell the agent that data existed but was intentionally
+  hidden;
+- canonical tool results let agents change output format without rerunning work.

@@ -39,6 +39,13 @@ Core design:
 - [Secretary Philosophy](docs/philosophy/secretary.md)
 - [Architecture](docs/architecture.md)
 - [Secretary Runtime Architecture](docs/runtime-architecture.md)
+- [Protocol Contract](docs/protocol-contract.md)
+- [Storage And Ledger Design](docs/storage-ledger.md)
+- [Policy And Approval Model](docs/policy-approval.md)
+- [Execution Semantics](docs/execution-semantics.md)
+- [Error And Recovery Taxonomy](docs/error-recovery.md)
+- [Agent Workflows And AX Review](docs/agent-workflows.md)
+- [Implementation Breakdown](docs/implementation-breakdown.md)
 - [Security](docs/security.md)
 
 Implementation contracts:
