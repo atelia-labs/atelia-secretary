@@ -61,6 +61,9 @@ The protocol must support:
 - audit trails;
 - client capability discovery.
 
+The first implementation target for this surface is defined in
+[MVP Runtime Contract](mvp-runtime-contract.md).
+
 The transport choice can evolve, but the domain contracts should remain stable
 and versioned.
 
@@ -106,3 +109,4 @@ extension runtime behavior, and operational AX analytics live in:
 - [Tool Output Schema](tool-output-schema.md)
 - [Extensions Runtime](extensions-runtime.md)
 - [Operational AX Analytics](operational-ax-analytics.md)
+- [MVP Runtime Contract](mvp-runtime-contract.md)

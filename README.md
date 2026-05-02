@@ -34,6 +34,7 @@ repository focuses on the daemon implementation that executes those contracts.
 
 - [Secretary Philosophy](docs/philosophy/secretary.md)
 - [Architecture](docs/architecture.md)
+- [MVP Runtime Contract](docs/mvp-runtime-contract.md)
 - [Tool Catalog](docs/tool-catalog.md)
 - [Tool Definition Schema](docs/tool-definition-schema.md)
 - [Tool Output Schema](docs/tool-output-schema.md)
