@@ -125,8 +125,8 @@ TOON、JSON、text rendering は derived view です。
 - policy decision id
 - owner job/process id
 - locked path または repository scope
-- locked timestamp
-- expiration timestamp
+- `locked_at`
+- `expires_at`
 - status: `held`, `released`, `expired`, `reclaimed`
 
 daemon は protected effect より前に lock decision を書き込みます。restart 時は expired lock を reclaim event として append し、job を継続する前に policy を再評価します。

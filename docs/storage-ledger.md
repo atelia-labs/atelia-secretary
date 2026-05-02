@@ -132,8 +132,8 @@ TOON, JSON, or text renderings are derived views.
 - policy decision id
 - owner job/process id
 - locked path or repository scope
-- locked timestamp
-- expiration timestamp
+- `locked_at`
+- `expires_at`
 - status: `held`, `released`, `expired`, `reclaimed`
 
 The daemon writes the lock decision before the protected effect. On restart it
@@ -150,12 +150,14 @@ Storage migrations must be:
 - able to report `storage_status: migrating`;
 - blocked from running while jobs are executing unless explicitly safe.
 
-Before migration, the daemon must acquire a single migration lock recorded in
-`schema_migrations` with leader id, started timestamp, safe flag, and timeout.
+Before migration, the daemon must acquire a single migration lock stored as a
+well-known `migration_lock` record inside the `schema_migrations` collection.
+The record contains leader id, started timestamp, safe flag, and timeout. All
+daemons create, update, or read that record to acquire or release the lock.
 Running jobs are drained until the configured timeout; if they cannot drain, the
 daemon enters `degraded` or `read_only` and records the failure. Non-leader
 daemons report `storage_status: migrating` and do not accept new mutating work
-until the migration lock is released.
+until the migration lock is released or expires.
 
 If a migration fails, the daemon should start in `degraded` or `read_only`
 state rather than silently accepting new work.

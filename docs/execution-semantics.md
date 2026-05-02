@@ -61,6 +61,14 @@ state is `canceled`. If timeout is detected first, the terminal state is
 state. A cooperative stop that began before timeout stays `canceled`; a
 `force_stop` triggered strictly by timeout is `failed`.
 
+| Scenario | Precedence | Terminal state |
+| --- | --- | --- |
+| cancellation requested, then timeout fires | cancellation was observed before timeout | `canceled` |
+| cancellation and timeout share the same logical instant | cooperative cancellation wins the tie | `canceled` |
+| timeout fires, then cancellation is requested | timeout was detected first | `failed` |
+| cooperative stop begins, then timeout fires during grace period | cooperative stop began before timeout | `canceled` |
+| timeout triggers `force_stop` | force stop is caused strictly by timeout | `failed` |
+
 ## Concurrency
 
 The daemon should start conservative:
