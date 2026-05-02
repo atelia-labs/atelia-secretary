@@ -10,7 +10,7 @@ const DOMAIN_SCHEMA_VERSION: u32 = 1;
 
 macro_rules! opaque_id {
     ($name:ident, $prefix:literal) => {
-        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -44,6 +44,16 @@ macro_rules! opaque_id {
         impl Default for $name {
             fn default() -> Self {
                 Self::new()
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::try_from_string(value).map_err(serde::de::Error::custom)
             }
         }
     };
@@ -592,6 +602,7 @@ impl LockDecision {
         match self.status {
             LockStatus::Reclaimed => Ok(false),
             LockStatus::Held | LockStatus::Expired => {
+                self.ensure_monotonic_reclaim_timestamp(reclaimed_at)?;
                 self.status = LockStatus::Reclaimed;
                 self.reclaimed_at = Some(reclaimed_at);
                 self.updated_at = reclaimed_at;
@@ -600,12 +611,30 @@ impl LockDecision {
             LockStatus::Released => Err(LockReclaimError::AlreadyReleased),
         }
     }
+
+    fn ensure_monotonic_reclaim_timestamp(
+        &self,
+        reclaimed_at: LedgerTimestamp,
+    ) -> Result<(), LockReclaimError> {
+        if reclaimed_at < self.updated_at {
+            return Err(LockReclaimError::NonMonotonicTimestamp {
+                at: reclaimed_at,
+                latest: self.updated_at,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LockReclaimError {
     OwnerMismatch,
     AlreadyReleased,
+    NonMonotonicTimestamp {
+        at: LedgerTimestamp,
+        latest: LedgerTimestamp,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -924,6 +953,10 @@ mod tests {
         );
         assert!(RepositoryId::try_from_string(job_id.as_str()).is_err());
         assert!(RepositoryId::try_from_string("repo_not-a-uuid").is_err());
+
+        let invalid_deserializer: StrDeserializer<'_, serde::de::value::Error> =
+            "repo_not-a-uuid".into_deserializer();
+        assert!(RepositoryId::deserialize(invalid_deserializer).is_err());
     }
 
     #[test]
@@ -1052,5 +1085,29 @@ mod tests {
             Some(LedgerTimestamp::from_unix_millis(3000)),
             lock.reclaimed_at
         );
+    }
+
+    #[test]
+    fn lock_reclaim_rejects_non_monotonic_timestamp_without_mutating() {
+        let owner = LockOwner::Job(JobId::new());
+        let mut lock = LockDecision::new(
+            RepositoryId::new(),
+            PolicyDecisionId::new(),
+            owner.clone(),
+            LockedScope::Repository,
+            LedgerTimestamp::from_unix_millis(1000),
+            LedgerTimestamp::from_unix_millis(2000),
+        );
+
+        assert_eq!(
+            Err(LockReclaimError::NonMonotonicTimestamp {
+                at: LedgerTimestamp::from_unix_millis(500),
+                latest: LedgerTimestamp::from_unix_millis(1000),
+            }),
+            lock.reclaim(&owner, LedgerTimestamp::from_unix_millis(500))
+        );
+        assert_eq!(LockStatus::Held, lock.status);
+        assert_eq!(LedgerTimestamp::from_unix_millis(1000), lock.updated_at);
+        assert_eq!(None, lock.reclaimed_at);
     }
 }

@@ -42,6 +42,7 @@ pub enum StoreError {
     InvalidCursor {
         reason: String,
     },
+    SequenceOverflow,
 }
 
 impl fmt::Display for StoreError {
@@ -57,6 +58,7 @@ impl fmt::Display for StoreError {
                 write!(f, "{collection} conflict: {reason}")
             }
             StoreError::InvalidCursor { reason } => write!(f, "invalid event cursor: {reason}"),
+            StoreError::SequenceOverflow => write!(f, "job event sequence overflowed"),
         }
     }
 }
@@ -187,8 +189,12 @@ impl SecretaryStore for InMemoryStore {
             });
         }
 
-        inner.next_event_sequence += 1;
-        event.sequence_number = inner.next_event_sequence;
+        let next_sequence = inner
+            .next_event_sequence
+            .checked_add(1)
+            .ok_or(StoreError::SequenceOverflow)?;
+        inner.next_event_sequence = next_sequence;
+        event.sequence_number = next_sequence;
 
         inner
             .job_events_by_sequence
@@ -314,6 +320,7 @@ impl SecretaryStore for InMemoryStore {
 
     fn create_tool_invocation(&self, record: ToolInvocation) -> StoreResult<()> {
         let mut inner = self.lock()?;
+        validate_tool_invocation_refs(&inner, &record)?;
         insert_record(
             &mut inner.tool_invocations,
             record.id.clone(),
@@ -332,6 +339,7 @@ impl SecretaryStore for InMemoryStore {
 
     fn create_tool_result(&self, record: ToolResult) -> StoreResult<()> {
         let mut inner = self.lock()?;
+        validate_tool_result_refs(&inner, &record)?;
         insert_record(
             &mut inner.tool_results,
             record.id.clone(),
@@ -350,6 +358,7 @@ impl SecretaryStore for InMemoryStore {
 
     fn create_audit_record(&self, record: AuditRecord) -> StoreResult<()> {
         let mut inner = self.lock()?;
+        validate_audit_record_refs(&inner, &record)?;
         insert_record(
             &mut inner.audit_records,
             record.id.clone(),
@@ -422,13 +431,92 @@ fn is_active_lock_status<Status: fmt::Debug>(status: &Status) -> bool {
     )
 }
 
+fn validate_tool_invocation_refs(
+    inner: &InMemoryInner,
+    record: &ToolInvocation,
+) -> StoreResult<()> {
+    ensure_ref_exists(
+        inner.jobs.contains_key(&record.job_id),
+        "jobs",
+        &record.job_id,
+        "tool_invocation.job_id",
+    )?;
+    ensure_ref_exists(
+        inner.repositories.contains_key(&record.repository_id),
+        "repositories",
+        &record.repository_id,
+        "tool_invocation.repository_id",
+    )?;
+    ensure_ref_exists(
+        inner
+            .policy_decisions
+            .contains_key(&record.policy_decision_id),
+        "policy_decisions",
+        &record.policy_decision_id,
+        "tool_invocation.policy_decision_id",
+    )
+}
+
+fn validate_tool_result_refs(inner: &InMemoryInner, record: &ToolResult) -> StoreResult<()> {
+    ensure_ref_exists(
+        inner.tool_invocations.contains_key(&record.invocation_id),
+        "tool_invocations",
+        &record.invocation_id,
+        "tool_result.invocation_id",
+    )
+}
+
+fn validate_audit_record_refs(inner: &InMemoryInner, record: &AuditRecord) -> StoreResult<()> {
+    ensure_ref_exists(
+        inner.repositories.contains_key(&record.repository_id),
+        "repositories",
+        &record.repository_id,
+        "audit_record.repository_id",
+    )?;
+    ensure_ref_exists(
+        inner
+            .policy_decisions
+            .contains_key(&record.policy_decision_id),
+        "policy_decisions",
+        &record.policy_decision_id,
+        "audit_record.policy_decision_id",
+    )?;
+
+    if let Some(tool_invocation_id) = &record.tool_invocation_id {
+        ensure_ref_exists(
+            inner.tool_invocations.contains_key(tool_invocation_id),
+            "tool_invocations",
+            tool_invocation_id,
+            "audit_record.tool_invocation_id",
+        )?;
+    }
+
+    Ok(())
+}
+
+fn ensure_ref_exists<Id: fmt::Debug>(
+    exists: bool,
+    collection: &'static str,
+    id: &Id,
+    context: &str,
+) -> StoreResult<()> {
+    if exists {
+        return Ok(());
+    }
+
+    Err(StoreError::NotFound {
+        collection,
+        id: format!("{} ({context})", id_debug(id)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{
         Actor, EventRefs, EventSeverity, EventSubject, EventSubjectType, JobEventKind, JobKind,
         LedgerTimestamp, LockOwner, LockedScope, PolicyOutcome, RepositoryTrustState,
-        ResourceScope, RiskTier,
+        ResourceScope, RiskTier, StructuredValue, ToolResultField, ToolResultStatus,
     };
 
     fn timestamp(value: i64) -> LedgerTimestamp {
@@ -522,6 +610,68 @@ mod tests {
         )
     }
 
+    fn tool_invocation(
+        repository_id: RepositoryId,
+        job_id: JobId,
+        policy_decision_id: PolicyDecisionId,
+    ) -> ToolInvocation {
+        ToolInvocation {
+            id: ToolInvocationId::new(),
+            schema_version: 1,
+            created_at: timestamp(7),
+            job_id,
+            repository_id,
+            policy_decision_id,
+            actor: actor(),
+            tool_id: "fs.search".to_string(),
+            requested_capability: "filesystem.search".to_string(),
+            args_summary: "search docs".to_string(),
+            resolved_paths: Vec::new(),
+            timeout_millis: Some(1000),
+            redactions: Vec::new(),
+        }
+    }
+
+    fn tool_result(invocation_id: ToolInvocationId) -> ToolResult {
+        ToolResult {
+            id: ToolResultId::new(),
+            schema_version: 1,
+            created_at: timestamp(8),
+            invocation_id,
+            tool_id: "fs.search".to_string(),
+            status: ToolResultStatus::Succeeded,
+            schema_ref: Some("tool_result.v1".to_string()),
+            fields: vec![ToolResultField {
+                key: "summary".to_string(),
+                value: StructuredValue::String("ok".to_string()),
+            }],
+            evidence_refs: Vec::new(),
+            output_refs: Vec::new(),
+            truncation: None,
+            redactions: Vec::new(),
+        }
+    }
+
+    fn audit_record(
+        repository_id: RepositoryId,
+        policy_decision_id: PolicyDecisionId,
+        tool_invocation_id: Option<ToolInvocationId>,
+    ) -> AuditRecord {
+        AuditRecord {
+            id: AuditRecordId::new(),
+            schema_version: 1,
+            created_at: timestamp(9),
+            actor: actor(),
+            repository_id,
+            requested_capability: "filesystem.search".to_string(),
+            policy_decision_id,
+            tool_invocation_id,
+            effect_summary: "searched docs".to_string(),
+            output_refs: Vec::new(),
+            redactions: Vec::new(),
+        }
+    }
+
     #[test]
     fn create_list_get_repository_records() {
         let store = InMemoryStore::new();
@@ -556,6 +706,17 @@ mod tests {
         assert_eq!(first.sequence_number, 1);
         assert_eq!(second.sequence_number, 2);
         assert_eq!(store.get_job_event(&first.id).unwrap(), first);
+    }
+
+    #[test]
+    fn append_event_reports_sequence_overflow() {
+        let store = InMemoryStore::new();
+        store.lock().unwrap().next_event_sequence = u64::MAX;
+
+        assert_eq!(
+            Err(StoreError::SequenceOverflow),
+            store.append_job_event(job_event())
+        );
     }
 
     #[test]
@@ -668,5 +829,73 @@ mod tests {
 
         store.create_policy_decision(policy).unwrap();
         store.create_lock_decision(lock).unwrap();
+    }
+
+    #[test]
+    fn tool_records_require_existing_parents() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+        let policy = policy_decision(repository.id.clone());
+        let invocation = tool_invocation(repository.id.clone(), job.id.clone(), policy.id.clone());
+        let result = tool_result(invocation.id.clone());
+        let audit = audit_record(
+            repository.id.clone(),
+            policy.id.clone(),
+            Some(invocation.id.clone()),
+        );
+
+        assert!(matches!(
+            store.create_tool_invocation(invocation.clone()),
+            Err(StoreError::NotFound {
+                collection: "jobs",
+                ..
+            })
+        ));
+
+        store.create_repository(repository).unwrap();
+        store.create_job(job).unwrap();
+
+        assert!(matches!(
+            store.create_tool_invocation(invocation.clone()),
+            Err(StoreError::NotFound {
+                collection: "policy_decisions",
+                ..
+            })
+        ));
+
+        store.create_policy_decision(policy).unwrap();
+        store.create_tool_invocation(invocation.clone()).unwrap();
+        store.create_tool_result(result.clone()).unwrap();
+        store.create_audit_record(audit.clone()).unwrap();
+
+        assert_eq!(store.get_tool_result(&result.id).unwrap(), result);
+        assert_eq!(store.get_audit_record(&audit.id).unwrap(), audit);
+    }
+
+    #[test]
+    fn tool_result_and_audit_reject_missing_invocation() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let policy = policy_decision(repository.id.clone());
+        let invocation = tool_invocation(repository.id.clone(), JobId::new(), policy.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        store.create_policy_decision(policy.clone()).unwrap();
+
+        assert!(matches!(
+            store.create_tool_result(tool_result(invocation.id.clone())),
+            Err(StoreError::NotFound {
+                collection: "tool_invocations",
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.create_audit_record(audit_record(repository.id, policy.id, Some(invocation.id))),
+            Err(StoreError::NotFound {
+                collection: "tool_invocations",
+                ..
+            })
+        ));
     }
 }
