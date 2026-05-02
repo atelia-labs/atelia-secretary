@@ -1,0 +1,384 @@
+//! Daemon service skeleton for Atelia Secretary (Slice 4).
+//!
+//! Owns daemon health/status metadata, an in-memory
+//! [`SecretaryRuntime`], and exposes a synchronous service API for health
+//! checks and repository registration/listing.
+
+use atelia_core::{
+    DefaultPolicyEngine, InMemoryStore, LedgerTimestamp, RepositoryId, RepositoryRecord,
+    RepositoryTrustState, SecretaryRuntime, SecretaryStore,
+};
+
+const DAEMON_VERSION: &str = "0.1.0";
+const PROTOCOL_VERSION: &str = "v1";
+const STORAGE_VERSION: &str = "in-memory-v1";
+
+// ---------------------------------------------------------------------------
+// Health types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum DaemonStatus {
+    Starting,
+    Ready,
+    Degraded,
+    Stopping,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum StorageStatus {
+    Ready,
+    Migrating,
+    ReadOnly,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonHealth {
+    pub daemon_status: DaemonStatus,
+    pub storage_status: StorageStatus,
+    pub daemon_version: String,
+    pub protocol_version: String,
+    pub storage_version: String,
+    pub capabilities: Vec<String>,
+    pub repository_count: usize,
+    pub started_at: LedgerTimestamp,
+}
+
+// ---------------------------------------------------------------------------
+// Service errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ServiceError {
+    Store(atelia_core::StoreError),
+    InvalidArgument { reason: String },
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(err) => write!(f, "{err}"),
+            Self::InvalidArgument { reason } => write!(f, "invalid argument: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ServiceError {}
+
+impl From<atelia_core::StoreError> for ServiceError {
+    fn from(err: atelia_core::StoreError) -> Self {
+        Self::Store(err)
+    }
+}
+
+#[allow(dead_code)]
+pub type ServiceResult<T> = Result<T, ServiceError>;
+
+// ---------------------------------------------------------------------------
+// Register-request DTO
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct RegisterRepositoryRequest {
+    pub display_name: String,
+    pub root_path: String,
+    pub trust_state: RepositoryTrustState,
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+/// Thin service façade over an in-memory [`SecretaryRuntime`].
+///
+/// All methods are synchronous because the underlying store and policy engine
+/// are synchronous. The Tokio entrypoint in `main.rs` wraps this in an async
+/// runtime for signal handling only.
+pub struct SecretaryService {
+    runtime: SecretaryRuntime<InMemoryStore, DefaultPolicyEngine>,
+    started_at: LedgerTimestamp,
+    daemon_status: DaemonStatus,
+}
+
+impl SecretaryService {
+    /// Create a new service backed by an in-memory store and default policy.
+    pub fn new() -> Self {
+        Self {
+            runtime: SecretaryRuntime::in_memory(),
+            started_at: LedgerTimestamp::now(),
+            daemon_status: DaemonStatus::Starting,
+        }
+    }
+
+    /// Transition the daemon into [`DaemonStatus::Ready`].
+    pub fn set_ready(&mut self) {
+        self.daemon_status = DaemonStatus::Ready;
+    }
+
+    /// Transition the daemon into [`DaemonStatus::Stopping`].
+    pub fn set_stopping(&mut self) {
+        self.daemon_status = DaemonStatus::Stopping;
+    }
+
+    /// Return the current daemon health snapshot.
+    pub fn health(&self) -> DaemonHealth {
+        let repository_count = self
+            .runtime
+            .store()
+            .list_repositories()
+            .map(|repos| repos.len())
+            .unwrap_or(0);
+
+        DaemonHealth {
+            daemon_status: self.daemon_status,
+            storage_status: StorageStatus::Ready,
+            daemon_version: DAEMON_VERSION.to_string(),
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            storage_version: STORAGE_VERSION.to_string(),
+            capabilities: vec![
+                "health".to_string(),
+                "register_repository".to_string(),
+                "list_repositories".to_string(),
+            ],
+            repository_count,
+            started_at: self.started_at,
+        }
+    }
+
+    /// Register a new repository and persist it in the store.
+    #[allow(dead_code)]
+    pub fn register_repository(
+        &self,
+        request: RegisterRepositoryRequest,
+    ) -> ServiceResult<RepositoryRecord> {
+        if request.display_name.is_empty() {
+            return Err(ServiceError::InvalidArgument {
+                reason: "display_name must not be empty".to_string(),
+            });
+        }
+        if request.root_path.is_empty() {
+            return Err(ServiceError::InvalidArgument {
+                reason: "root_path must not be empty".to_string(),
+            });
+        }
+
+        let record = RepositoryRecord::new(
+            request.display_name,
+            request.root_path,
+            request.trust_state,
+            LedgerTimestamp::now(),
+        );
+        self.runtime.store().create_repository(record.clone())?;
+        Ok(record)
+    }
+
+    /// List all registered repositories.
+    #[allow(dead_code)]
+    pub fn list_repositories(&self) -> ServiceResult<Vec<RepositoryRecord>> {
+        Ok(self.runtime.store().list_repositories()?)
+    }
+
+    /// Look up a single repository by id.
+    #[allow(dead_code)]
+    pub fn get_repository(&self, id: &RepositoryId) -> ServiceResult<RepositoryRecord> {
+        Ok(self.runtime.store().get_repository(id)?)
+    }
+}
+
+impl Default for SecretaryService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atelia_core::RepositoryTrustState;
+
+    fn ready_service() -> SecretaryService {
+        let mut svc = SecretaryService::new();
+        svc.set_ready();
+        svc
+    }
+
+    // -- health tests -------------------------------------------------------
+
+    #[test]
+    fn health_returns_ready_after_set_ready() {
+        let svc = ready_service();
+        let health = svc.health();
+        assert_eq!(health.daemon_status, DaemonStatus::Ready);
+        assert_eq!(health.storage_status, StorageStatus::Ready);
+        assert_eq!(health.daemon_version, DAEMON_VERSION);
+        assert_eq!(health.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(health.storage_version, STORAGE_VERSION);
+    }
+
+    #[test]
+    fn health_starts_starting() {
+        let svc = SecretaryService::new();
+        assert_eq!(svc.health().daemon_status, DaemonStatus::Starting);
+    }
+
+    #[test]
+    fn health_reflects_stopping() {
+        let mut svc = SecretaryService::new();
+        svc.set_stopping();
+        assert_eq!(svc.health().daemon_status, DaemonStatus::Stopping);
+    }
+
+    #[test]
+    fn health_reports_capabilities() {
+        let health = ready_service().health();
+        assert!(health.capabilities.contains(&"health".to_string()));
+        assert!(health
+            .capabilities
+            .contains(&"register_repository".to_string()));
+        assert!(health
+            .capabilities
+            .contains(&"list_repositories".to_string()));
+    }
+
+    #[test]
+    fn health_reports_zero_repositories_initially() {
+        assert_eq!(ready_service().health().repository_count, 0);
+    }
+
+    #[test]
+    fn health_records_started_at() {
+        let svc = SecretaryService::new();
+        let health = svc.health();
+        assert!(health.started_at.unix_millis > 0);
+    }
+
+    // -- register / list round trip -----------------------------------------
+
+    #[test]
+    fn register_repository_returns_record() {
+        let svc = ready_service();
+        let record = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "test-repo".to_string(),
+                root_path: "/tmp/test".to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .expect("register should succeed");
+
+        assert_eq!(record.display_name, "test-repo");
+        assert_eq!(record.root_path, "/tmp/test");
+        assert_eq!(record.trust_state, RepositoryTrustState::Trusted);
+        assert!(record.id.has_valid_prefix());
+    }
+
+    #[test]
+    fn register_rejects_empty_display_name() {
+        let svc = ready_service();
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "".to_string(),
+                root_path: "/tmp/test".to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn register_rejects_empty_root_path() {
+        let svc = ready_service();
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "test-repo".to_string(),
+                root_path: "".to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn register_list_round_trip() {
+        let svc = ready_service();
+
+        let r1 = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "repo-a".to_string(),
+                root_path: "/a".to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .expect("register a");
+        let r2 = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "repo-b".to_string(),
+                root_path: "/b".to_string(),
+                trust_state: RepositoryTrustState::ReadOnly,
+            })
+            .expect("register b");
+
+        let repos = svc.list_repositories().expect("list should succeed");
+        assert_eq!(repos.len(), 2);
+
+        let ids: Vec<_> = repos.iter().map(|r| r.id.clone()).collect();
+        assert!(ids.contains(&r1.id));
+        assert!(ids.contains(&r2.id));
+    }
+
+    #[test]
+    fn health_updates_repository_count() {
+        let svc = ready_service();
+
+        assert_eq!(svc.health().repository_count, 0);
+
+        svc.register_repository(RegisterRepositoryRequest {
+            display_name: "repo-a".to_string(),
+            root_path: "/a".to_string(),
+            trust_state: RepositoryTrustState::Trusted,
+        })
+        .expect("register a");
+
+        assert_eq!(svc.health().repository_count, 1);
+
+        svc.register_repository(RegisterRepositoryRequest {
+            display_name: "repo-b".to_string(),
+            root_path: "/b".to_string(),
+            trust_state: RepositoryTrustState::Trusted,
+        })
+        .expect("register b");
+
+        assert_eq!(svc.health().repository_count, 2);
+    }
+
+    #[test]
+    fn get_repository_after_register() {
+        let svc = ready_service();
+        let record = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "lookup-repo".to_string(),
+                root_path: "/lookup".to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .expect("register");
+
+        let fetched = svc.get_repository(&record.id).expect("get should succeed");
+        assert_eq!(fetched.id, record.id);
+        assert_eq!(fetched.display_name, "lookup-repo");
+    }
+
+    #[test]
+    fn get_repository_not_found() {
+        let svc = ready_service();
+        let missing_id = RepositoryId::new();
+        let err = svc.get_repository(&missing_id).unwrap_err();
+        assert!(matches!(err, ServiceError::Store(_)));
+    }
+}
