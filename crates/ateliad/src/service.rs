@@ -285,13 +285,15 @@ impl SecretaryService {
         &self,
         repository_id: Option<RepositoryId>,
         status: Option<JobStatus>,
+        page_size: Option<usize>,
+        page_token: Option<String>,
     ) -> ServiceResult<JobPage> {
         Ok(self.lifecycle.query_jobs(JobQuery {
             repository_id,
             status,
             requester: None,
-            page_size: None,
-            page_token: None,
+            page_size,
+            page_token,
         })?)
     }
 
@@ -663,10 +665,63 @@ mod tests {
         assert_eq!(fetched.id, receipt.job.id);
 
         let page = svc
-            .list_jobs(Some(repository.id), Some(JobStatus::Succeeded))
+            .list_jobs(Some(repository.id), Some(JobStatus::Succeeded), None, None)
             .expect("list jobs should succeed");
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].id, receipt.job.id);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn list_jobs_request_forwards_pagination() {
+        let svc = ready_service();
+        let root = test_repo_dir("job-list-pagination");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-pagination-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .expect("register should succeed");
+        let repository_id = repository.id;
+
+        svc.submit_job(SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository_id.clone(),
+            kind: JobKind::Read,
+            goal: "first".to_string(),
+        })
+        .expect("submit should succeed");
+        svc.submit_job(SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository_id.clone(),
+            kind: JobKind::Read,
+            goal: "second".to_string(),
+        })
+        .expect("submit should succeed");
+
+        let first = svc
+            .list_jobs(
+                Some(repository_id.clone()),
+                Some(JobStatus::Succeeded),
+                Some(1),
+                None,
+            )
+            .expect("list jobs should succeed");
+        assert_eq!(first.jobs.len(), 1);
+        assert!(first.next_page_token.is_some());
+
+        let second = svc
+            .list_jobs(
+                Some(repository_id),
+                Some(JobStatus::Succeeded),
+                Some(1),
+                first.next_page_token,
+            )
+            .expect("list jobs should succeed");
+        assert_eq!(second.jobs.len(), 1);
+        assert_ne!(second.jobs[0].id, first.jobs[0].id);
 
         let _ = fs::remove_dir_all(root);
     }

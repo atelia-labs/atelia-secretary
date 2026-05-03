@@ -16,6 +16,7 @@ use atelia_core::{
     Actor, CancellationState, JobId, JobKind, JobRecord, JobStatus, PolicyOutcome, RepositoryId,
     RepositoryRecord, RepositoryTrustState, RiskTier, StoreError,
 };
+use std::convert::TryFrom;
 
 pub const TRANSPORT_BLOCKER: &str =
     "tonic/prost server dependencies are not configured for ateliad";
@@ -51,7 +52,7 @@ impl SecretaryRpcServer {
             .register_repository(ServiceRegisterRepositoryRequest {
                 display_name: request.display_name,
                 root_path: request.root_path,
-                trust_state: request.trust_state,
+                trust_state: request.trust_state.try_into()?,
             })?;
 
         Ok(RegisterRepositoryResponse {
@@ -80,7 +81,7 @@ impl SecretaryRpcServer {
     pub fn submit_job(&self, request: SubmitJobRequest) -> RpcResult<SubmitJobResponse> {
         let repository_id = parse_repository_id(&request.repository_id)?;
         let receipt = self.service.submit_job(ServiceSubmitJobRequest {
-            requester: request.requester,
+            requester: Actor::try_from(request.requester)?,
             repository_id,
             kind: parse_job_kind(&request.kind)?,
             goal: request.goal,
@@ -116,7 +117,13 @@ impl SecretaryRpcServer {
             .as_deref()
             .map(parse_repository_id)
             .transpose()?;
-        let page = self.service.list_jobs(repository_id, request.status)?;
+        let status = match request.status {
+            None => None,
+            Some(status) => job_status_from_rpc(status)?,
+        };
+        let page =
+            self.service
+                .list_jobs(repository_id, status, request.page_size, request.page_token)?;
 
         Ok(ListJobsResponse {
             metadata: self.metadata(),
@@ -203,7 +210,7 @@ pub struct HealthResponse {
 impl From<DaemonHealth> for HealthResponse {
     fn from(health: DaemonHealth) -> Self {
         Self {
-            status: daemon_status_label(health.daemon_status).to_string(),
+            status: health_status_label(health.daemon_status, health.storage_status).to_string(),
             daemon_version: health.daemon_version,
             protocol_version: health.protocol_version,
             storage_version: health.storage_version,
@@ -237,7 +244,7 @@ impl From<ServiceProtocolMetadata> for ProtocolMetadata {
 pub struct RegisterRepositoryRequest {
     pub display_name: String,
     pub root_path: String,
-    pub trust_state: RepositoryTrustState,
+    pub trust_state: RpcRepositoryTrustState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,7 +267,7 @@ pub struct Repository {
     pub repository_id: String,
     pub display_name: String,
     pub root_path: String,
-    pub trust_state: RepositoryTrustState,
+    pub trust_state: RpcRepositoryTrustState,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
 }
@@ -271,7 +278,7 @@ impl From<RepositoryRecord> for Repository {
             repository_id: record.id.as_str().to_string(),
             display_name: record.display_name,
             root_path: record.root_path,
-            trust_state: record.trust_state,
+            trust_state: record.trust_state.into(),
             created_at_unix_ms: record.created_at.unix_millis,
             updated_at_unix_ms: record.updated_at.unix_millis,
         }
@@ -281,7 +288,7 @@ impl From<RepositoryRecord> for Repository {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitJobRequest {
     pub repository_id: String,
-    pub requester: Actor,
+    pub requester: RpcActorDto,
     pub kind: String,
     pub goal: String,
 }
@@ -307,7 +314,9 @@ pub struct GetJobResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListJobsRequest {
     pub repository_id: Option<String>,
-    pub status: Option<JobStatus>,
+    pub status: Option<RpcJobStatus>,
+    pub page_size: Option<usize>,
+    pub page_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,6 +428,145 @@ fn parse_job_kind(value: &str) -> RpcResult<JobKind> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcRepositoryTrustState {
+    Unspecified,
+    Trusted,
+    ReadOnly,
+    Blocked,
+}
+
+impl From<RepositoryTrustState> for RpcRepositoryTrustState {
+    fn from(value: RepositoryTrustState) -> Self {
+        match value {
+            RepositoryTrustState::Trusted => RpcRepositoryTrustState::Trusted,
+            RepositoryTrustState::ReadOnly => RpcRepositoryTrustState::ReadOnly,
+            RepositoryTrustState::Blocked => RpcRepositoryTrustState::Blocked,
+        }
+    }
+}
+
+impl TryFrom<RpcRepositoryTrustState> for RepositoryTrustState {
+    type Error = RpcError;
+
+    fn try_from(value: RpcRepositoryTrustState) -> Result<Self, Self::Error> {
+        match value {
+            RpcRepositoryTrustState::Unspecified => {
+                Err(RpcError::invalid_argument("trust_state is required"))
+            }
+            RpcRepositoryTrustState::Trusted => Ok(RepositoryTrustState::Trusted),
+            RpcRepositoryTrustState::ReadOnly => Ok(RepositoryTrustState::ReadOnly),
+            RpcRepositoryTrustState::Blocked => Ok(RepositoryTrustState::Blocked),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcActorDto {
+    User {
+        id: String,
+        display_name: Option<String>,
+    },
+    Agent {
+        id: String,
+        display_name: Option<String>,
+    },
+    Extension {
+        id: String,
+    },
+    System {
+        id: String,
+    },
+}
+
+impl From<Actor> for RpcActorDto {
+    fn from(actor: Actor) -> Self {
+        match actor {
+            Actor::User { id, display_name } => Self::User { id, display_name },
+            Actor::Agent { id, display_name } => Self::Agent { id, display_name },
+            Actor::Extension { id } => Self::Extension { id },
+            Actor::System { id } => Self::System { id },
+        }
+    }
+}
+
+impl TryFrom<RpcActorDto> for Actor {
+    type Error = RpcError;
+
+    fn try_from(value: RpcActorDto) -> Result<Self, Self::Error> {
+        match value {
+            RpcActorDto::User { id, display_name } => {
+                if id.trim().is_empty() {
+                    return Err(RpcError::invalid_argument("actor.id must not be empty"));
+                }
+                Ok(Actor::User { id, display_name })
+            }
+            RpcActorDto::Agent { id, display_name } => {
+                if id.trim().is_empty() {
+                    return Err(RpcError::invalid_argument("actor.id must not be empty"));
+                }
+                Ok(Actor::Agent { id, display_name })
+            }
+            RpcActorDto::Extension { id } => {
+                if id.trim().is_empty() {
+                    return Err(RpcError::invalid_argument("actor.id must not be empty"));
+                }
+                Ok(Actor::Extension { id })
+            }
+            RpcActorDto::System { id } => {
+                if id.trim().is_empty() {
+                    return Err(RpcError::invalid_argument("actor.id must not be empty"));
+                }
+                Ok(Actor::System { id })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcJobStatus {
+    Unspecified,
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Blocked,
+    Canceled,
+}
+
+impl TryFrom<RpcJobStatus> for JobStatus {
+    type Error = RpcError;
+
+    fn try_from(value: RpcJobStatus) -> Result<Self, Self::Error> {
+        match value {
+            RpcJobStatus::Unspecified => Err(RpcError::invalid_argument("status is required")),
+            RpcJobStatus::Queued => Ok(JobStatus::Queued),
+            RpcJobStatus::Running => Ok(JobStatus::Running),
+            RpcJobStatus::Succeeded => Ok(JobStatus::Succeeded),
+            RpcJobStatus::Failed => Ok(JobStatus::Failed),
+            RpcJobStatus::Blocked => Ok(JobStatus::Blocked),
+            RpcJobStatus::Canceled => Ok(JobStatus::Canceled),
+        }
+    }
+}
+
+fn job_status_from_rpc(status: RpcJobStatus) -> RpcResult<Option<JobStatus>> {
+    if let RpcJobStatus::Unspecified = status {
+        return Ok(None);
+    }
+
+    Ok(Some(status.try_into()?))
+}
+
+fn health_status_label(daemon_status: DaemonStatus, storage_status: StorageStatus) -> &'static str {
+    match (storage_status, daemon_status) {
+        (StorageStatus::Unavailable, _) => "unavailable",
+        (StorageStatus::Migrating | StorageStatus::ReadOnly, _) => "degraded",
+        (_, DaemonStatus::Degraded) => "degraded",
+        _ => daemon_status_label(daemon_status),
+    }
+}
+
 fn store_error_to_rpc(error: StoreError) -> RpcError {
     let code = match error {
         StoreError::NotFound { .. } => RpcErrorCode::NotFound,
@@ -519,7 +667,14 @@ mod tests {
         SecretaryRpcServer::new(service)
     }
 
-    fn actor() -> Actor {
+    fn actor() -> RpcActorDto {
+        RpcActorDto::Agent {
+            id: "agent:test".to_string(),
+            display_name: Some("Test Agent".to_string()),
+        }
+    }
+
+    fn actor_record() -> Actor {
         Actor::Agent {
             id: "agent:test".to_string(),
             display_name: Some("Test Agent".to_string()),
@@ -560,6 +715,49 @@ mod tests {
     }
 
     #[test]
+    fn health_status_reflects_storage_failure_non_ready_states() {
+        let unavailable = HealthResponse::from(DaemonHealth {
+            daemon_status: DaemonStatus::Ready,
+            storage_status: StorageStatus::Unavailable,
+            daemon_version: "daemon".to_string(),
+            protocol_version: "protocol".to_string(),
+            storage_version: "storage".to_string(),
+            capabilities: Vec::new(),
+            repository_count: 0,
+            started_at: atelia_core::LedgerTimestamp::from_unix_millis(0),
+        });
+        assert_eq!(unavailable.status, "unavailable");
+
+        let read_only = HealthResponse::from(DaemonHealth {
+            daemon_status: DaemonStatus::Ready,
+            storage_status: StorageStatus::ReadOnly,
+            daemon_version: "daemon".to_string(),
+            protocol_version: "protocol".to_string(),
+            storage_version: "storage".to_string(),
+            capabilities: Vec::new(),
+            repository_count: 0,
+            started_at: atelia_core::LedgerTimestamp::from_unix_millis(0),
+        });
+        assert_eq!(read_only.status, "degraded");
+    }
+
+    #[test]
+    fn dto_conversion_roundtrip_for_actor_and_trust_state() {
+        let rpc_trust_state = RpcRepositoryTrustState::Trusted;
+        let domain_state = RepositoryTrustState::try_from(rpc_trust_state.clone())
+            .expect("trusted trust state maps to core enum");
+        let rpc_round_trip = RpcRepositoryTrustState::from(domain_state);
+
+        assert_eq!(rpc_round_trip, rpc_trust_state);
+
+        let rpc_actor = actor();
+        let domain_actor = Actor::try_from(rpc_actor.clone()).expect("actor maps to core enum");
+        let actor_round_trip = RpcActorDto::from(domain_actor);
+
+        assert_eq!(actor_round_trip, rpc_actor);
+    }
+
+    #[test]
     fn register_list_submit_and_get_job_round_trip() {
         let server = ready_server();
         let root = test_repo_dir("round-trip");
@@ -568,7 +766,7 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "rpc-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
-                trust_state: RepositoryTrustState::Trusted,
+                trust_state: RpcRepositoryTrustState::Trusted,
             })
             .expect("register should succeed");
 
@@ -602,11 +800,68 @@ mod tests {
         let jobs = server
             .list_jobs(ListJobsRequest {
                 repository_id: Some(registered.repository.repository_id),
-                status: Some(JobStatus::Succeeded),
+                status: Some(RpcJobStatus::Succeeded),
+                page_size: None,
+                page_token: None,
             })
             .expect("list jobs should succeed");
         assert_eq!(jobs.jobs.len(), 1);
         assert_eq!(jobs.jobs[0].job_id, submitted.job.job_id);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn list_jobs_request_forwards_pagination() {
+        let server = ready_server();
+        let root = test_repo_dir("pagination");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "pagination-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RpcRepositoryTrustState::Trusted,
+            })
+            .expect("register should succeed");
+
+        server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "one".to_string(),
+            })
+            .expect("submit job should succeed");
+        server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "two".to_string(),
+            })
+            .expect("submit job should succeed");
+
+        let first = server
+            .list_jobs(ListJobsRequest {
+                repository_id: Some(registered.repository.repository_id.clone()),
+                status: Some(RpcJobStatus::Succeeded),
+                page_size: Some(1),
+                page_token: None,
+            })
+            .expect("list jobs should succeed");
+        assert_eq!(first.jobs.len(), 1);
+        assert!(first.next_page_token.is_some());
+
+        let second = server
+            .list_jobs(ListJobsRequest {
+                repository_id: Some(registered.repository.repository_id),
+                status: Some(RpcJobStatus::Succeeded),
+                page_size: Some(1),
+                page_token: first.next_page_token,
+            })
+            .expect("list jobs should succeed");
+        assert_eq!(second.jobs.len(), 1);
+        assert_ne!(second.jobs[0].job_id, first.jobs[0].job_id);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -619,7 +874,7 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "cancel-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
-                trust_state: RepositoryTrustState::Trusted,
+                trust_state: RpcRepositoryTrustState::Trusted,
             })
             .expect("register should succeed");
         let submitted = server
@@ -667,7 +922,7 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "first-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
-                trust_state: RepositoryTrustState::Trusted,
+                trust_state: RpcRepositoryTrustState::Trusted,
             })
             .expect("register should succeed");
 
@@ -675,7 +930,7 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "second-repo".to_string(),
                 root_path: root.join(".").to_string_lossy().to_string(),
-                trust_state: RepositoryTrustState::Trusted,
+                trust_state: RpcRepositoryTrustState::Trusted,
             })
             .unwrap_err();
 
@@ -686,7 +941,7 @@ mod tests {
     #[test]
     fn job_dto_maps_absent_timestamps_and_event_id_to_none() {
         let record = JobRecord::new(
-            actor(),
+            actor_record(),
             RepositoryId::new(),
             JobKind::Read,
             "dry run".to_string(),
@@ -710,7 +965,7 @@ mod tests {
         let decision_id_str = decision_id.as_str().to_string();
 
         let mut record = JobRecord::new(
-            actor(),
+            actor_record(),
             RepositoryId::new(),
             JobKind::Read,
             "dry run".to_string(),
