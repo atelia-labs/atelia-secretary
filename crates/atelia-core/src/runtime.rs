@@ -9,9 +9,10 @@ use crate::domain::{
     JobEvent, JobEventId, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
     JobStatusTransitionError, LedgerTimestamp, PolicyDecision, PolicyOutcome, PolicySummary,
     RepositoryId, ResolvedPath, ResourceScope, StructuredValue, ToolInvocation, ToolInvocationId,
-    ToolResult, ToolResultField, ToolResultId, ToolResultStatus,
+    ToolResult, ToolResultField, ToolResultId, ToolResultStatus, TruncationMetadata,
 };
 use crate::policy::{DefaultPolicyEngine, PolicyEngine, PolicyInput, DEFAULT_POLICY_VERSION};
+use crate::settings::{OversizeOutputPolicy, ToolOutputDefaults};
 use crate::store::{EventCursor, InMemoryStore, JobPage, JobQuery, SecretaryStore, StoreError};
 use crate::tool_output::{
     render_tool_result, OutputFormat, RenderOptions, RenderedToolOutput, ToolOutputRenderError,
@@ -30,6 +31,7 @@ pub struct RuntimeJobRequest {
     pub resource_scope: ResourceScope,
     pub approval_available: bool,
     pub render_options: RenderOptions,
+    pub tool_output_defaults: ToolOutputDefaults,
     pub artifact_spillover: Option<RuntimeArtifactSpillover>,
 }
 
@@ -51,6 +53,7 @@ impl RuntimeJobRequest {
             },
             approval_available: true,
             render_options: RenderOptions::new(OutputFormat::Toon),
+            tool_output_defaults: ToolOutputDefaults::default(),
             artifact_spillover: None,
         }
     }
@@ -74,6 +77,11 @@ impl RuntimeJobRequest {
 
     pub fn with_render_options(mut self, render_options: RenderOptions) -> Self {
         self.render_options = render_options;
+        self
+    }
+
+    pub fn with_tool_output_defaults(mut self, defaults: ToolOutputDefaults) -> Self {
+        self.tool_output_defaults = defaults;
         self
     }
 
@@ -123,6 +131,7 @@ pub enum RuntimeError {
     ToolOutputRender(ToolOutputRenderError),
     Artifact(ArtifactError),
     InvalidToolResult { reason: String },
+    ToolOutputTooLarge { reason: String },
 }
 
 impl fmt::Display for RuntimeError {
@@ -135,6 +144,7 @@ impl fmt::Display for RuntimeError {
             Self::ToolOutputRender(error) => write!(f, "{error}"),
             Self::Artifact(error) => write!(f, "{error}"),
             Self::InvalidToolResult { reason } => write!(f, "invalid tool result: {reason}"),
+            Self::ToolOutputTooLarge { reason } => write!(f, "{reason}"),
         }
     }
 }
@@ -429,6 +439,58 @@ where
                 )?;
                 return Err(error.into());
             }
+        } else {
+            let max_inline_bytes =
+                max_inline_bytes_as_usize(request.tool_output_defaults.max_inline_bytes);
+            match request.tool_output_defaults.oversize_policy {
+                OversizeOutputPolicy::SpillToArtifactRef => {
+                    let spillover = RuntimeArtifactSpillover::local_default(max_inline_bytes);
+                    let artifact_store = LocalArtifactStore::new(spillover.store_config.clone());
+                    if let Err(error) = spill_large_tool_result_fields(
+                        &mut result,
+                        &artifact_store,
+                        repository.id.as_str(),
+                        &spillover.options,
+                    ) {
+                        let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
+                        append_failed_job_event(
+                            &self.store,
+                            &mut job,
+                            &mut events,
+                            "artifact spillover failed",
+                            failure_refs,
+                        )?;
+                        return Err(error.into());
+                    }
+                }
+                OversizeOutputPolicy::RejectOversize => {
+                    if let Some(reason) =
+                        reject_oversized_tool_result(&result, &request.tool_output_defaults)
+                    {
+                        let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
+                        append_failed_job_event(
+                            &self.store,
+                            &mut job,
+                            &mut events,
+                            "tool result exceeded output size limits",
+                            failure_refs,
+                        )?;
+                        return Err(RuntimeError::ToolOutputTooLarge { reason });
+                    }
+                }
+                OversizeOutputPolicy::TruncateWithMetadata => {
+                    if let Some(report) =
+                        truncate_oversized_tool_result_fields(&mut result, max_inline_bytes)
+                    {
+                        result.truncation = Some(merge_runtime_truncation(
+                            result.truncation.take(),
+                            report.original_bytes,
+                            report.retained_bytes,
+                            "runtime truncate_with_metadata",
+                        ));
+                    }
+                }
+            }
         }
         let result_event = job_event(
             EventSubject::tool_result(&result.id),
@@ -657,6 +719,198 @@ fn validate_runtime_tool_result(
     Ok(())
 }
 
+fn reject_oversized_tool_result(
+    result: &ToolResult,
+    defaults: &ToolOutputDefaults,
+) -> Option<String> {
+    let oversized: Vec<(String, usize)> = result
+        .fields
+        .iter()
+        .filter_map(|field| {
+            oversized_field_bytes(field, max_inline_bytes_as_usize(defaults.max_inline_bytes))
+                .map(|size| (field.key.clone(), size))
+        })
+        .collect();
+
+    if oversized.is_empty() {
+        None
+    } else {
+        let details = oversized
+            .iter()
+            .map(|(key, size)| format!("{key} ({size} bytes)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Some(format!(
+            "tool output field(s) exceed max_inline_bytes={} with configured policy reject_oversize: {}",
+            defaults.max_inline_bytes, details
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToolResultTruncationReport {
+    fields: usize,
+    original_bytes: u64,
+    retained_bytes: u64,
+}
+
+fn truncate_oversized_tool_result_fields(
+    result: &mut ToolResult,
+    max_inline_bytes: usize,
+) -> Option<ToolResultTruncationReport> {
+    let mut report = ToolResultTruncationReport {
+        fields: 0,
+        original_bytes: 0,
+        retained_bytes: 0,
+    };
+
+    for field in &mut result.fields {
+        let Some(original_bytes) = oversized_field_bytes(field, max_inline_bytes) else {
+            continue;
+        };
+
+        let truncated_field = match &field.value {
+            StructuredValue::String(value) => {
+                truncate_string_value(value, max_inline_bytes).map(|truncated_value| {
+                    let retained_bytes = truncated_value.len() as u64;
+                    (StructuredValue::String(truncated_value), retained_bytes)
+                })
+            }
+            StructuredValue::StringList(values) => {
+                let (truncated_values, retained_bytes) =
+                    truncate_string_list(values, max_inline_bytes);
+                Some((
+                    StructuredValue::StringList(truncated_values),
+                    retained_bytes,
+                ))
+            }
+            StructuredValue::Null | StructuredValue::Bool(_) | StructuredValue::Integer(_) => None,
+        };
+
+        if let Some((value, retained_bytes)) = truncated_field {
+            field.value = value;
+            report.fields += 1;
+            report.original_bytes = report.original_bytes.saturating_add(original_bytes as u64);
+            report.retained_bytes = report.retained_bytes.saturating_add(retained_bytes);
+        }
+    }
+
+    if report.fields == 0 {
+        None
+    } else {
+        Some(report)
+    }
+}
+
+fn merge_runtime_truncation(
+    existing: Option<TruncationMetadata>,
+    original_bytes: u64,
+    retained_bytes: u64,
+    reason: &str,
+) -> TruncationMetadata {
+    match existing {
+        Some(existing) => TruncationMetadata {
+            original_bytes: existing.original_bytes.saturating_add(original_bytes),
+            retained_bytes: existing.retained_bytes.saturating_add(retained_bytes),
+            reason: format!("{}; {}", existing.reason, reason),
+        },
+        None => TruncationMetadata {
+            original_bytes,
+            retained_bytes,
+            reason: reason.to_string(),
+        },
+    }
+}
+
+fn truncate_string_value(value: &str, max_inline_bytes: usize) -> Option<String> {
+    if value.len() <= max_inline_bytes {
+        return None;
+    }
+
+    let mut end = max_inline_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    Some(value[..end].to_string())
+}
+
+fn truncate_string_list(values: &[String], max_inline_bytes: usize) -> (Vec<String>, u64) {
+    let mut kept_values: Vec<String> = Vec::new();
+    let mut kept_bytes: usize = 0;
+
+    for (index, value) in values.iter().enumerate() {
+        let separator = usize::from(index > 0);
+        let remaining = max_inline_bytes.saturating_sub(kept_bytes.saturating_add(separator));
+        if remaining == 0 {
+            break;
+        }
+
+        if value.len() <= remaining {
+            kept_values.push(value.clone());
+            kept_bytes += separator + value.len();
+            continue;
+        }
+
+        let truncation_end = {
+            let mut offset = 0usize;
+            let mut end = 0usize;
+            for ch in value.chars() {
+                let next = offset + ch.len_utf8();
+                if next > remaining {
+                    break;
+                }
+                offset = next;
+                end = next;
+            }
+            end
+        };
+
+        if truncation_end > 0 {
+            kept_values.push(value[..truncation_end].to_string());
+            kept_bytes += separator + truncation_end;
+        }
+        break;
+    }
+
+    (kept_values, kept_bytes as u64)
+}
+
+fn oversized_field_bytes(field: &ToolResultField, max_inline_bytes: usize) -> Option<usize> {
+    let bytes = match &field.value {
+        StructuredValue::String(value) => value.len(),
+        StructuredValue::StringList(values) => string_list_byte_len(values),
+        StructuredValue::Null | StructuredValue::Bool(_) | StructuredValue::Integer(_) => {
+            return None
+        }
+    };
+
+    if bytes > max_inline_bytes {
+        Some(bytes)
+    } else {
+        None
+    }
+}
+
+fn string_list_byte_len(values: &[String]) -> usize {
+    let mut bytes = 0usize;
+    for (index, value) in values.iter().enumerate() {
+        bytes = bytes.saturating_add(value.len());
+        if index + 1 < values.len() {
+            bytes = bytes.saturating_add(1);
+        }
+    }
+    bytes
+}
+
+fn max_inline_bytes_as_usize(max_inline_bytes: u64) -> usize {
+    match usize::try_from(max_inline_bytes) {
+        Ok(max_inline_bytes) => max_inline_bytes,
+        Err(_) => usize::MAX,
+    }
+}
+
 fn append_failed_job_event<S>(
     store: &S,
     job: &mut JobRecord,
@@ -778,7 +1032,10 @@ fn tool_result_event_severity(status: ToolResultStatus) -> EventSeverity {
 mod tests {
     use super::*;
     use crate::domain::{RepositoryRecord, RepositoryTrustState};
+    use crate::settings::{OversizeOutputPolicy, ToolOutputDefaults};
     use crate::store::EventCursor;
+    use std::ffi::OsString;
+    use std::sync::{LazyLock, Mutex};
 
     fn actor() -> Actor {
         Actor::Agent {
@@ -787,6 +1044,8 @@ mod tests {
         }
     }
 
+    static XDG_DATA_HOME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
     fn repository() -> RepositoryRecord {
         RepositoryRecord::new(
             "atelia-secretary",
@@ -794,6 +1053,28 @@ mod tests {
             RepositoryTrustState::Trusted,
             LedgerTimestamp::from_unix_millis(1_700_000_000_000),
         )
+    }
+
+    struct XdgDataHomeGuard {
+        original: Option<OsString>,
+    }
+
+    impl XdgDataHomeGuard {
+        fn with_path(path: &std::path::Path) -> Self {
+            let original = std::env::var_os("XDG_DATA_HOME");
+            std::env::set_var("XDG_DATA_HOME", path);
+            Self { original }
+        }
+    }
+
+    impl Drop for XdgDataHomeGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.original.take() {
+                std::env::set_var("XDG_DATA_HOME", value);
+            } else {
+                std::env::remove_var("XDG_DATA_HOME");
+            }
+        }
     }
 
     #[derive(Debug, Clone, Default)]
@@ -958,6 +1239,49 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct LargeOutputListTool {
+        values: Vec<String>,
+    }
+
+    impl RuntimeTool for LargeOutputListTool {
+        fn tool_id(&self) -> &'static str {
+            "secretary.large_output_list_fixture"
+        }
+
+        fn requested_capability(&self) -> &'static str {
+            "capability.discovery"
+        }
+
+        fn declared_effect(&self) -> &'static str {
+            "return a large string list field"
+        }
+
+        fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+            format!("goal={}", request.goal)
+        }
+
+        fn execute(&self, invocation: &ToolInvocation, _request: &RuntimeJobRequest) -> ToolResult {
+            ToolResult {
+                id: ToolResultId::new(),
+                schema_version: RUNTIME_SCHEMA_VERSION,
+                created_at: LedgerTimestamp::now(),
+                invocation_id: invocation.id.clone(),
+                tool_id: invocation.tool_id.clone(),
+                status: ToolResultStatus::Succeeded,
+                schema_ref: Some("tool_result.large_output_list_fixture.v1".to_string()),
+                fields: vec![ToolResultField {
+                    key: "content".to_string(),
+                    value: StructuredValue::StringList(self.values.clone()),
+                }],
+                evidence_refs: Vec::new(),
+                output_refs: Vec::new(),
+                truncation: None,
+                redactions: Vec::new(),
+            }
+        }
+    }
+
     #[test]
     fn echo_tool_job_records_policy_execution_result_audit_and_rendered_output() {
         let runtime = SecretaryRuntime::in_memory();
@@ -1071,6 +1395,197 @@ mod tests {
         assert!(rendered.contains("output_refs[1]"));
         assert!(rendered.contains("artifact_ref "));
         std::fs::remove_dir_all(artifact_root).ok();
+    }
+
+    #[test]
+    fn runtime_spills_large_tool_output_by_default_output_policy_without_explicit_spill_config() {
+        let _guard = XDG_DATA_HOME_LOCK.lock().unwrap();
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let artifact_root = std::env::temp_dir().join(format!(
+            "atelia-runtime-tool-output-defaults-{}",
+            LedgerTimestamp::now().unix_millis
+        ));
+        let _xdg_data_home = XdgDataHomeGuard::with_path(&artifact_root);
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "large output",
+        )
+        .with_tool_output_defaults(ToolOutputDefaults {
+            max_inline_bytes: 8,
+            oversize_policy: OversizeOutputPolicy::SpillToArtifactRef,
+            ..ToolOutputDefaults::default()
+        });
+        let tool = LargeOutputTool {
+            content: "0123456789abcdef".to_string(),
+        };
+
+        let receipt = runtime.run_tool_job(request, &tool).unwrap();
+        let result = receipt.tool_result.unwrap();
+
+        assert_eq!(1, result.output_refs.len());
+        assert_eq!(
+            result.output_refs,
+            receipt.audit_record.as_ref().unwrap().output_refs
+        );
+        assert_eq!(
+            "0123456789abcdef",
+            std::fs::read_to_string(&result.output_refs[0].uri).unwrap()
+        );
+
+        std::fs::remove_dir_all(&artifact_root).ok();
+    }
+
+    #[test]
+    fn runtime_rejects_oversized_tool_output_when_policy_is_reject() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "oversized output",
+        )
+        .with_tool_output_defaults(ToolOutputDefaults {
+            max_inline_bytes: 8,
+            oversize_policy: OversizeOutputPolicy::RejectOversize,
+            ..ToolOutputDefaults::default()
+        });
+        let tool = LargeOutputTool {
+            content: "0123456789abcdef".to_string(),
+        };
+
+        let error = runtime.run_tool_job(request, &tool).unwrap_err();
+
+        assert!(matches!(error, RuntimeError::ToolOutputTooLarge { .. }));
+        assert!(runtime.store().list_tool_results().unwrap().is_empty());
+        let jobs = runtime.store().list_jobs().unwrap();
+        assert_eq!(1, jobs.len());
+        assert_eq!(JobStatus::Failed, jobs[0].status);
+        assert!(jobs[0].completed_at.is_some());
+    }
+
+    #[test]
+    fn runtime_truncates_oversized_string_tool_output_fields_without_explicit_spillover() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "oversized output",
+        )
+        .with_tool_output_defaults(ToolOutputDefaults {
+            max_inline_bytes: 8,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+            ..ToolOutputDefaults::default()
+        });
+        let tool = LargeOutputTool {
+            content: "0123456789abcdef".to_string(),
+        };
+
+        let receipt = runtime.run_tool_job(request, &tool).unwrap();
+        let result = receipt.tool_result.unwrap();
+        let content = result
+            .fields
+            .iter()
+            .find(|field| field.key == "content")
+            .and_then(|field| match &field.value {
+                StructuredValue::String(value) => Some(value.as_str()),
+                _ => None,
+            })
+            .expect("content field should be a string");
+        assert_eq!(content.len(), 8);
+        assert_eq!(content, "01234567");
+
+        let truncation = result
+            .truncation
+            .expect("truncation metadata should be set");
+        assert_eq!(truncation.original_bytes, 16);
+        assert_eq!(truncation.retained_bytes, 8);
+        assert_eq!(truncation.reason, "runtime truncate_with_metadata");
+        assert!(result.output_refs.is_empty());
+        assert!(receipt.audit_record.unwrap().output_refs.is_empty());
+    }
+
+    #[test]
+    fn runtime_truncates_oversized_string_list_tool_output_fields_without_explicit_spillover() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "oversized list output",
+        )
+        .with_tool_output_defaults(ToolOutputDefaults {
+            max_inline_bytes: 8,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+            ..ToolOutputDefaults::default()
+        });
+        let tool = LargeOutputListTool {
+            values: vec!["hello".into(), "world".into(), "!!!".into()],
+        };
+
+        let receipt = runtime.run_tool_job(request, &tool).unwrap();
+        let result = receipt.tool_result.unwrap();
+        let content = result
+            .fields
+            .iter()
+            .find(|field| field.key == "content")
+            .and_then(|field| match &field.value {
+                StructuredValue::StringList(values) => Some(values.clone()),
+                _ => None,
+            })
+            .expect("content field should be a list");
+        assert_eq!(content, vec!["hello".to_string(), "wo".to_string()]);
+
+        let truncation = result
+            .truncation
+            .expect("truncation metadata should be set");
+        assert_eq!(truncation.original_bytes, 15);
+        assert_eq!(truncation.retained_bytes, 8);
+        assert_eq!(truncation.reason, "runtime truncate_with_metadata");
+    }
+
+    #[test]
+    fn oversized_field_bytes_counts_string_list_with_newline_separators() {
+        let field = ToolResultField {
+            key: "content".to_string(),
+            value: StructuredValue::StringList(vec!["aa".into(), "bb".into(), "c".into()]),
+        };
+
+        assert_eq!(oversized_field_bytes(&field, 4), Some(7));
+        assert_eq!(oversized_field_bytes(&field, 7), None);
+
+        let empty_field = ToolResultField {
+            key: "empty".to_string(),
+            value: StructuredValue::StringList(Vec::new()),
+        };
+        assert_eq!(oversized_field_bytes(&empty_field, 0), None);
     }
 
     #[test]
