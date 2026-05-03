@@ -10,6 +10,8 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_ARTIFACT_APP_DIR: &str = "atelia-secretary";
@@ -127,8 +129,8 @@ impl LocalArtifactStore {
         let dir = self.config.root_dir.join(scope_dir_name);
         let path = dir.join(file_name);
 
-        fs::create_dir_all(&dir)?;
-        fs::write(&path, bytes)?;
+        create_scope_dir(&dir)?;
+        write_file_bytes(&path, bytes)?;
 
         Ok(OutputRef {
             id,
@@ -138,6 +140,49 @@ impl LocalArtifactStore {
             digest: None,
         })
     }
+}
+
+fn create_scope_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        builder.create(path)?;
+        return fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+
+    #[cfg(not(unix))]
+    return fs::create_dir_all(path);
+}
+
+fn write_file_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = {
+        #[cfg(unix)]
+        {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true).mode(0o600);
+            options.open(path)?
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            options.open(path)?
+        }
+    };
+
+    use std::io::Write;
+    file.write_all(bytes)?;
+    file.flush()?;
+
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +350,8 @@ mod tests {
     use super::*;
     use crate::domain::{LedgerTimestamp, ToolInvocationId, ToolResultId, ToolResultStatus};
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(name: &str) -> PathBuf {
@@ -493,5 +540,72 @@ mod tests {
 
         assert!(matches!(error, ArtifactError::Io(_)));
         assert_eq!(expected, result);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_artifacts_with_restrictive_unix_permissions() {
+        let root = temp_root("perm");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let reference = store
+            .write_bytes("repo_example", "search output", "text/plain", b"hello")
+            .unwrap();
+
+        let dir = root.join("repo_example");
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(0o700, dir_mode);
+
+        let file_mode = fs::metadata(&reference.uri).unwrap().permissions().mode() & 0o777;
+        assert_eq!(0o600, file_mode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrites_existing_artifact_with_restrictive_unix_mode() {
+        let root = temp_root("existing-perm");
+        let dir = root.join("repo_example");
+        create_scope_dir(&dir).unwrap();
+        let file_path = dir.join("existing.artifact");
+
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&file_path)
+                .unwrap();
+            use std::io::Write;
+            file.write_all(b"loose").unwrap();
+        }
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let pre_mode = fs::metadata(&file_path).unwrap().permissions().mode() & 0o777;
+        assert_ne!(0o600, pre_mode);
+
+        write_file_bytes(&file_path, b"second").unwrap();
+
+        let post_mode = fs::metadata(&file_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(0o600, post_mode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tightens_existing_scope_directory_permissions_on_write() {
+        let root = temp_root("existing-scope");
+        let dir = root.join("repo_example");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let reference = store
+            .write_bytes("repo_example", "search output", "text/plain", b"hello")
+            .unwrap();
+
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(0o700, dir_mode);
+
+        let file_mode = fs::metadata(&reference.uri).unwrap().permissions().mode() & 0o777;
+        assert_eq!(0o600, file_mode);
     }
 }
