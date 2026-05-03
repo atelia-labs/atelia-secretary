@@ -480,7 +480,8 @@ fn validate_provenance(
 
     match boundary {
         ExtensionBoundary::LocalDevelopment => {
-            if (manifest.provenance.signature.is_none() || manifest.provenance.signer.is_none())
+            if (!has_non_empty_trimmed(manifest.provenance.signature.as_deref())
+                || !has_non_empty_trimmed(manifest.provenance.signer.as_deref()))
                 && !policy.allow_local_unsigned
             {
                 return Err(ExtensionValidationError::ProvenanceRequired {
@@ -491,25 +492,13 @@ fn validate_provenance(
             }
         }
         ExtensionBoundary::Official | ExtensionBoundary::ThirdParty => {
-            if manifest
-                .provenance
-                .signature
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-            {
+            if !has_non_empty_trimmed(manifest.provenance.signature.as_deref()) {
                 return Err(ExtensionValidationError::ProvenanceRequired {
                     field: "provenance.signature",
                     reason: "non-local extensions must be signed".to_string(),
                 });
             }
-            if manifest
-                .provenance
-                .signer
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-            {
+            if !has_non_empty_trimmed(manifest.provenance.signer.as_deref()) {
                 return Err(ExtensionValidationError::ProvenanceRequired {
                     field: "provenance.signer",
                     reason: "non-local extensions must identify a signer".to_string(),
@@ -520,25 +509,13 @@ fn validate_provenance(
 
     match manifest.provenance.source {
         ProvenanceSource::Github => {
-            if manifest
-                .provenance
-                .repository
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-            {
+            if !has_non_empty_trimmed(manifest.provenance.repository.as_deref()) {
                 return Err(ExtensionValidationError::ProvenanceRequired {
                     field: "provenance.repository",
                     reason: "github-sourced extensions must declare a repository".to_string(),
                 });
             }
-            if manifest
-                .provenance
-                .commit
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-            {
+            if !has_non_empty_trimmed(manifest.provenance.commit.as_deref()) {
                 return Err(ExtensionValidationError::ProvenanceRequired {
                     field: "provenance.commit",
                     reason: "github-sourced extensions must declare a commit".to_string(),
@@ -546,13 +523,7 @@ fn validate_provenance(
             }
         }
         ProvenanceSource::Registry => {
-            if manifest
-                .provenance
-                .registry_identity
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-            {
+            if !has_non_empty_trimmed(manifest.provenance.registry_identity.as_deref()) {
                 return Err(ExtensionValidationError::ProvenanceRequired {
                     field: "provenance.registry_identity",
                     reason: "registry-sourced extensions must declare registry identity"
@@ -714,6 +685,10 @@ fn require_non_empty(field: &'static str, value: &str) -> ExtensionValidationRes
     }
 }
 
+fn has_non_empty_trimmed(value: Option<&str>) -> bool {
+    !value.unwrap_or_default().trim().is_empty()
+}
+
 fn require_reverse_dns_id(field: &'static str, value: &str) -> ExtensionValidationResult<()> {
     if value.starts_with('.') || value.ends_with('.') || !value.contains('.') {
         return Err(ExtensionValidationError::InvalidField {
@@ -822,8 +797,13 @@ impl ExtensionRegistry {
         Self::new(ManifestValidationPolicy::default())
     }
 
-    pub fn add_blocklist_entry(&mut self, entry: BlocklistEntry) {
+    pub fn add_blocklist_entry(&mut self, entry: BlocklistEntry) -> RegistryResult<()> {
+        if matches!(entry.key, BlockKey::VulnerabilityId(_)) {
+            return Err(RegistryError::UnsupportedBlocklistKey { key: entry.key });
+        }
+
         self.blocklist.push(entry);
+        Ok(())
     }
 
     pub fn install(
@@ -890,8 +870,14 @@ impl ExtensionRegistry {
                     extension_id: extension_id.to_string(),
                 })?;
 
-        self.active_versions
-            .insert(extension_id.to_string(), previous_version.clone());
+        let previous_manifest = self
+            .manifests
+            .get(extension_id)
+            .and_then(|records| records.get(&previous_version))
+            .ok_or_else(|| RegistryError::RollbackUnavailable {
+                extension_id: extension_id.to_string(),
+            })?;
+        self.ensure_not_blocked(previous_manifest)?;
 
         let previous_record = self
             .records
@@ -900,6 +886,9 @@ impl ExtensionRegistry {
             .ok_or_else(|| RegistryError::RollbackUnavailable {
                 extension_id: extension_id.to_string(),
             })?;
+
+        self.active_versions
+            .insert(extension_id.to_string(), previous_version.clone());
         previous_record.status = ExtensionInstallStatus::InstalledPreviousVersion;
 
         Ok(previous_record.clone())
@@ -1182,6 +1171,9 @@ fn permission_matches(pattern: &str, permission: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
     Validation(ExtensionValidationError),
+    UnsupportedBlocklistKey {
+        key: BlockKey,
+    },
     Blocked {
         extension_id: String,
         reason: BlockReason,
@@ -1209,6 +1201,9 @@ impl fmt::Display for RegistryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Validation(error) => write!(f, "{error}"),
+            Self::UnsupportedBlocklistKey { key } => {
+                write!(f, "unsupported blocklist key: {key:?}")
+            }
             Self::Blocked {
                 extension_id,
                 reason,
@@ -1401,6 +1396,53 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_provenance_fields_are_treated_as_missing() {
+        let mut local = manifest("local.test.whitespace");
+        local.provenance.source = ProvenanceSource::Local;
+        local.provenance.signature = Some("   ".to_string());
+        local.provenance.signer = Some("\n\t".to_string());
+
+        let err = local
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::ProvenanceRequired {
+                field: "provenance.signature",
+                ..
+            }
+        ));
+
+        let mut github = manifest("com.example.github");
+        github.provenance.source = ProvenanceSource::Github;
+        github.provenance.repository = Some("   ".to_string());
+        let err = github
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::ProvenanceRequired {
+                field: "provenance.repository",
+                ..
+            }
+        ));
+
+        let mut registry = manifest("com.example.registry");
+        registry.provenance.source = ProvenanceSource::Registry;
+        registry.provenance.registry_identity = Some(" \t ".to_string());
+        let err = registry
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::ProvenanceRequired {
+                field: "provenance.registry_identity",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn backend_process_runtime_is_local_development_only() {
         let mut process = manifest("local.test.process");
         process.provenance.source = ProvenanceSource::Local;
@@ -1450,11 +1492,13 @@ mod tests {
     #[test]
     fn registry_blocks_install_before_local_enablement() {
         let mut registry = ExtensionRegistry::in_memory();
-        registry.add_blocklist_entry(BlocklistEntry {
-            key: BlockKey::ExtensionId("com.example.extension".to_string()),
-            reason: BlockReason::UserBlocked,
-            note: None,
-        });
+        registry
+            .add_blocklist_entry(BlocklistEntry {
+                key: BlockKey::ExtensionId("com.example.extension".to_string()),
+                reason: BlockReason::UserBlocked,
+                note: None,
+            })
+            .unwrap();
 
         let err = registry
             .install(manifest("com.example.extension"), InstallOptions::default())
@@ -1467,6 +1511,61 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn unsupported_vulnerability_block_key_is_rejected() {
+        let mut registry = ExtensionRegistry::in_memory();
+        let err = registry.add_blocklist_entry(BlocklistEntry {
+            key: BlockKey::VulnerabilityId("CVE-0000-0000".to_string()),
+            reason: BlockReason::VulnerableVersion,
+            note: None,
+        });
+
+        assert!(matches!(
+            err,
+            Err(RegistryError::UnsupportedBlocklistKey { .. })
+        ));
+    }
+
+    #[test]
+    fn rollback_fails_without_state_change_when_previous_version_is_blocked() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let mut next = manifest("com.example.extension");
+        next.version = "1.1.0".to_string();
+        next.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        next.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        registry.install(next, InstallOptions::default()).unwrap();
+
+        registry
+            .add_blocklist_entry(BlocklistEntry {
+                key: BlockKey::ArtifactDigest(ARTIFACT_DIGEST.to_string()),
+                reason: BlockReason::VulnerableVersion,
+                note: None,
+            })
+            .unwrap();
+
+        let err = registry.rollback("com.example.extension").unwrap_err();
+        assert!(matches!(err, RegistryError::Blocked { .. }));
+        assert_eq!(
+            registry
+                .active_record("com.example.extension")
+                .unwrap()
+                .version,
+            "1.1.0"
+        );
+        assert_eq!(
+            registry
+                .active_record("com.example.extension")
+                .unwrap()
+                .status,
+            ExtensionInstallStatus::Installed
+        );
     }
 
     #[test]
