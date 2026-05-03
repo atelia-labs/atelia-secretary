@@ -1103,7 +1103,9 @@ pub struct ExtensionStatusSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstallExtensionRequest {
     pub manifest: ExtensionManifest,
+    #[serde(default)]
     pub approve_local_unsigned: bool,
+    #[serde(default)]
     pub allow_local_process_runtime: bool,
 }
 
@@ -2219,6 +2221,20 @@ mod tests {
 
         assert!(request.include_blocked);
         assert_eq!(request, ListExtensionsRequest::default());
+    }
+
+    #[test]
+    fn install_extension_request_deserializes_manifest_only_with_false_defaults() {
+        let request: InstallExtensionRequest = serde_json::from_value(serde_json::json!({
+            "manifest": manifest("com.example.extension"),
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request,
+            InstallExtensionRequest::with_defaults(manifest("com.example.extension"))
+        );
+        assert_eq!(InstallOptions::from(request), InstallOptions::default());
     }
 
     #[test]
