@@ -342,18 +342,20 @@ impl ToolOutputDefaults {
     }
 
     pub fn render_policy(&self) -> ToolOutputRenderPolicy {
-        self.render_policy_with_render_options(&self.render_options)
+        self.render_policy_with_render_options(None)
     }
 
     pub fn render_policy_with_render_options(
         &self,
-        requested_render_options: &RenderOptions,
+        requested_render_options: Option<&RenderOptions>,
     ) -> ToolOutputRenderPolicy {
         let mut render_options = self.render_options();
-        render_options.format = requested_render_options.format;
-        render_options.include_policy = requested_render_options.include_policy;
-        render_options.include_diagnostics = requested_render_options.include_diagnostics;
-        render_options.include_cost = requested_render_options.include_cost;
+        if let Some(requested_render_options) = requested_render_options {
+            render_options.format = requested_render_options.format;
+            render_options.include_policy = requested_render_options.include_policy;
+            render_options.include_diagnostics = requested_render_options.include_diagnostics;
+            render_options.include_cost = requested_render_options.include_cost;
+        }
 
         apply_verbosity_constraints(&mut render_options, self.verbosity);
 
@@ -909,12 +911,12 @@ mod tests {
             oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
         };
 
-        let policy = defaults.render_policy_with_render_options(&RenderOptions {
+        let policy = defaults.render_policy_with_render_options(Some(&RenderOptions {
             format: OutputFormat::Json,
             include_policy: true,
             include_diagnostics: true,
             include_cost: true,
-        });
+        }));
 
         assert_eq!(policy.render_options.format, OutputFormat::Json);
         assert!(!policy.render_options.include_policy);
@@ -924,6 +926,27 @@ mod tests {
         assert!(!policy.include_evidence_refs);
         assert!(!policy.include_output_refs);
         assert!(!policy.include_redactions);
+    }
+
+    #[test]
+    fn defaults_render_policy_without_request_render_options_uses_defaults() {
+        let defaults = ToolOutputDefaults {
+            render_options: RenderOptions {
+                format: OutputFormat::Json,
+                include_policy: true,
+                include_diagnostics: false,
+                include_cost: true,
+            },
+            max_inline_bytes: DEFAULT_MAX_INLINE_BYTES,
+            max_inline_lines: 4,
+            verbosity: ToolOutputVerbosity::Normal,
+            granularity: ToolOutputGranularity::Full,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        };
+
+        let policy = defaults.render_policy_with_render_options(None);
+
+        assert_eq!(policy.render_options, defaults.render_options);
     }
 
     #[test]
