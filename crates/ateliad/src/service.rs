@@ -16,7 +16,8 @@ use atelia_core::{
     RepositoryTrustState, ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse,
     RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
     ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange,
-    ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId, TruncationMetadata,
+    ToolOutputSettingsError, ToolOutputSettingsScope, ToolOutputVerbosity, ToolResultId,
+    TruncationMetadata,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -2115,7 +2116,7 @@ mod tests {
             ToolOutputSettingsScope::repository(canonical_repository.id.clone())
                 .for_tool(tool_result.tool_id.clone()),
             ToolOutputOverrides {
-                verbosity: Some(atelia_core::ToolOutputVerbosity::Debug),
+                verbosity: Some(ToolOutputVerbosity::Debug),
                 include_policy: Some(true),
                 ..ToolOutputOverrides::default()
             },
@@ -2127,7 +2128,7 @@ mod tests {
             ToolOutputSettingsScope::repository(wrong_repository.id.clone())
                 .for_tool(tool_result.tool_id.clone()),
             ToolOutputOverrides {
-                verbosity: Some(atelia_core::ToolOutputVerbosity::Normal),
+                verbosity: Some(ToolOutputVerbosity::Normal),
                 include_policy: Some(false),
                 ..ToolOutputOverrides::default()
             },
