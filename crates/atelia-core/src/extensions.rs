@@ -199,7 +199,9 @@ pub struct ExtensionToolOutputDefinition {
     pub format: Option<String>,
     pub verbosity: Option<String>,
     pub language_mode: Option<String>,
+    #[serde(default)]
     pub fields: Vec<String>,
+    #[serde(default)]
     pub redactions: Vec<String>,
     pub include_policy: Option<bool>,
     pub include_cost: Option<bool>,
@@ -211,6 +213,7 @@ pub struct ExtensionHookDefinition {
     pub hook_id: String,
     pub trigger: Option<String>,
     pub verification: Option<String>,
+    #[serde(default)]
     pub required_capabilities: Vec<String>,
     pub action: Option<String>,
     pub status: Option<String>,
@@ -223,12 +226,14 @@ pub struct ExtensionWebhookDefinition {
     pub event: Option<String>,
     pub endpoint: Option<String>,
     pub verification: Option<String>,
+    #[serde(default)]
     pub required_capabilities: Vec<String>,
     pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ExtensionComposition {
+    #[serde(default)]
     pub attachments: Vec<ExtensionCompositionAttachment>,
 }
 
@@ -240,6 +245,7 @@ pub struct ExtensionCompositionAttachment {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ExtensionMigration {
+    #[serde(default)]
     pub from: Vec<String>,
     pub notes: Option<String>,
 }
@@ -517,6 +523,8 @@ fn validate_manifest(
     validate_tool_output(manifest)?;
     validate_hooks(manifest, boundary)?;
     validate_webhooks(manifest, boundary)?;
+    validate_composition(manifest)?;
+    validate_migration(manifest)?;
 
     Ok(ValidatedExtensionManifest {
         manifest: manifest.clone(),
@@ -1036,6 +1044,25 @@ fn validate_webhooks(
     Ok(())
 }
 
+fn validate_composition(manifest: &ExtensionManifest) -> ExtensionValidationResult<()> {
+    for attachment in &manifest.composition.attachments {
+        require_reverse_dns_id(
+            "composition.attachments.extension_id",
+            &attachment.extension_id,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_migration(manifest: &ExtensionManifest) -> ExtensionValidationResult<()> {
+    for version in &manifest.migration.from {
+        require_semver("migration.from", version)?;
+    }
+
+    Ok(())
+}
+
 fn validate_required_string(
     field: &'static str,
     value: Option<&str>,
@@ -1086,7 +1113,7 @@ fn validate_http_endpoint(
     value: Option<&str>,
 ) -> ExtensionValidationResult<()> {
     let Some(value) = value else {
-        return Ok(());
+        return Err(ExtensionValidationError::MissingField { field });
     };
 
     require_non_empty(field, value)?;
@@ -2593,20 +2620,22 @@ mod tests {
             }
         ));
 
-        let mut legacy_missing_endpoint = manifest("com.example.webhook-legacy-endpoint");
-        legacy_missing_endpoint
-            .types
-            .push(ExtensionKind::WebhookReceiver);
-        legacy_missing_endpoint
-            .webhooks
-            .push(ExtensionWebhookDefinition {
-                endpoint: None,
-                ..webhook_definition("wh_review")
-            });
+        let mut missing_endpoint = manifest("com.example.webhook-missing-endpoint");
+        missing_endpoint.types.push(ExtensionKind::WebhookReceiver);
+        missing_endpoint.webhooks.push(ExtensionWebhookDefinition {
+            endpoint: None,
+            ..webhook_definition("wh_review")
+        });
 
-        legacy_missing_endpoint
+        let err = missing_endpoint
             .validate(&ManifestValidationPolicy::default())
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::MissingField {
+                field: "webhooks.endpoint",
+            }
+        ));
     }
 
     #[test]
@@ -3357,6 +3386,114 @@ mod tests {
         assert!(deserialized.composition.attachments.is_empty());
         assert!(deserialized.migration.from.is_empty());
         assert!(deserialized.migration.notes.is_none());
+    }
+
+    #[test]
+    fn nested_section_arrays_deserialize_as_defaults_when_omitted() {
+        let mut extension = manifest("com.example.missing-nested-arrays");
+        extension.tool_output.push(tool_output_definition("ping"));
+        extension.hooks.push(hook_definition("hk_review"));
+        extension.webhooks.push(webhook_definition("wh_review"));
+        extension
+            .composition
+            .attachments
+            .push(ExtensionCompositionAttachment {
+                extension_id: "com.example.partner".to_string(),
+                required: Some(true),
+            });
+        extension.migration.from.push("1.0.0".to_string());
+
+        let mut serialized = serde_json::to_value(&extension).unwrap();
+        let object = serialized
+            .as_object_mut()
+            .expect("manifest should serialize to an object");
+
+        object
+            .get_mut("tool_output")
+            .and_then(|value| value.as_array_mut())
+            .expect("tool_output should be an array")[0]
+            .as_object_mut()
+            .expect("tool_output entry should be an object")
+            .remove("fields");
+        object
+            .get_mut("tool_output")
+            .and_then(|value| value.as_array_mut())
+            .expect("tool_output should be an array")[0]
+            .as_object_mut()
+            .expect("tool_output entry should be an object")
+            .remove("redactions");
+        object
+            .get_mut("hooks")
+            .and_then(|value| value.as_array_mut())
+            .expect("hooks should be an array")[0]
+            .as_object_mut()
+            .expect("hook entry should be an object")
+            .remove("required_capabilities");
+        object
+            .get_mut("webhooks")
+            .and_then(|value| value.as_array_mut())
+            .expect("webhooks should be an array")[0]
+            .as_object_mut()
+            .expect("webhook entry should be an object")
+            .remove("required_capabilities");
+        object
+            .get_mut("composition")
+            .and_then(|value| value.as_object_mut())
+            .expect("composition should be an object")
+            .remove("attachments");
+        object
+            .get_mut("migration")
+            .and_then(|value| value.as_object_mut())
+            .expect("migration should be an object")
+            .remove("from");
+
+        let deserialized: ExtensionManifest = serde_json::from_value(serialized).unwrap();
+        assert!(deserialized.tool_output[0].fields.is_empty());
+        assert!(deserialized.tool_output[0].redactions.is_empty());
+        assert!(deserialized.hooks[0].required_capabilities.is_empty());
+        assert!(deserialized.webhooks[0].required_capabilities.is_empty());
+        assert!(deserialized.composition.attachments.is_empty());
+        assert!(deserialized.migration.from.is_empty());
+    }
+
+    #[test]
+    fn composition_attachment_extension_ids_must_use_reverse_dns_namespaces() {
+        let mut extension = manifest("com.example.invalid-composition");
+        extension
+            .composition
+            .attachments
+            .push(ExtensionCompositionAttachment {
+                extension_id: "not-a-reverse-dns-id".to_string(),
+                required: Some(true),
+            });
+
+        let err = extension
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "composition.attachments.extension_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn migration_from_versions_must_be_valid_semver() {
+        let mut extension = manifest("com.example.invalid-migration");
+        extension.migration.from.push("1.0".to_string());
+
+        let err = extension
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "migration.from",
+                ..
+            }
+        ));
     }
 
     #[test]
