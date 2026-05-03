@@ -364,12 +364,13 @@ impl SecretaryRpcServer {
         &self,
         request: GetToolOutputDefaultsRequest,
     ) -> RpcResult<GetToolOutputDefaultsResponse> {
-        let scope = parse_tool_output_scope(request.scope.clone())?;
-        let defaults = self.service.get_tool_output_defaults(scope.clone())?;
+        let core_scope = parse_tool_output_scope(request.scope.clone())?;
+        let scope = RpcToolOutputScope::try_from(core_scope.clone())?;
+        let defaults = self.service.get_tool_output_defaults(core_scope)?;
 
         Ok(GetToolOutputDefaultsResponse {
             metadata: self.metadata(),
-            scope: RpcToolOutputScope::from(scope),
+            scope,
             defaults: RpcToolOutputDefaults::from(defaults),
         })
     }
@@ -387,7 +388,7 @@ impl SecretaryRpcServer {
 
         Ok(UpdateToolOutputDefaultsResponse {
             metadata: self.metadata(),
-            change: RpcToolOutputSettingsChange::from(change),
+            change: RpcToolOutputSettingsChange::try_from(change)?,
         })
     }
 
@@ -407,8 +408,8 @@ impl SecretaryRpcServer {
         let changes = page
             .changes
             .into_iter()
-            .map(RpcToolOutputSettingsChange::from)
-            .collect();
+            .map(RpcToolOutputSettingsChange::try_from)
+            .collect::<RpcResult<Vec<_>>>()?;
 
         Ok(ListToolOutputSettingsHistoryResponse {
             metadata: self.metadata(),
@@ -708,17 +709,19 @@ pub struct RpcToolOutputSettingsChange {
     pub changed_at_unix_ms: i64,
 }
 
-impl From<ToolOutputSettingsChange> for RpcToolOutputSettingsChange {
-    fn from(change: ToolOutputSettingsChange) -> Self {
-        Self {
+impl TryFrom<ToolOutputSettingsChange> for RpcToolOutputSettingsChange {
+    type Error = RpcError;
+
+    fn try_from(change: ToolOutputSettingsChange) -> RpcResult<Self> {
+        Ok(Self {
             schema_version: change.schema_version,
             actor: RpcActorDto::from(change.actor),
-            scope: RpcToolOutputScope::from(change.scope),
+            scope: RpcToolOutputScope::try_from(change.scope)?,
             old_defaults: RpcToolOutputDefaults::from(change.old_defaults),
             new_defaults: RpcToolOutputDefaults::from(change.new_defaults),
             reason: change.reason,
             changed_at_unix_ms: change.changed_at.unix_millis,
-        }
+        })
     }
 }
 
@@ -904,9 +907,11 @@ impl TryFrom<RpcOversizeOutputPolicy> for OversizeOutputPolicy {
     }
 }
 
-impl From<ToolOutputSettingsScope> for RpcToolOutputScope {
-    fn from(scope: ToolOutputSettingsScope) -> Self {
-        Self {
+impl TryFrom<ToolOutputSettingsScope> for RpcToolOutputScope {
+    type Error = RpcError;
+
+    fn try_from(scope: ToolOutputSettingsScope) -> RpcResult<Self> {
+        Ok(Self {
             level: match scope.level {
                 atelia_core::ToolOutputSettingsLevel::Workspace => {
                     RpcToolOutputScopeLevel::Workspace
@@ -918,7 +923,7 @@ impl From<ToolOutputSettingsScope> for RpcToolOutputScope {
                 }
                 atelia_core::ToolOutputSettingsLevel::Project { project_id } => {
                     RpcToolOutputScopeLevel::Project {
-                        project_id: project_id_to_string(&project_id),
+                        project_id: project_id_to_string(&project_id)?,
                     }
                 }
                 atelia_core::ToolOutputSettingsLevel::Session { session_id } => {
@@ -929,7 +934,7 @@ impl From<ToolOutputSettingsScope> for RpcToolOutputScope {
                 }
             },
             tool_id: scope.tool_id,
-        }
+        })
     }
 }
 
@@ -1538,11 +1543,19 @@ fn parse_project_id(value: String) -> RpcResult<ProjectId> {
     Ok(project_id)
 }
 
-fn project_id_to_string(project_id: &ProjectId) -> String {
-    serde_json::to_string(project_id)
-        .unwrap_or_else(|_| "\"\"".to_string())
-        .trim_matches('"')
-        .to_string()
+pub(crate) fn project_id_to_string(project_id: &ProjectId) -> RpcResult<String> {
+    let value = serde_json::to_value(project_id).map_err(|error| RpcError {
+        code: RpcErrorCode::Internal,
+        reason: format!("failed to serialize project_id in tool output scope: {error}"),
+    })?;
+
+    value
+        .as_str()
+        .map(|value| value.to_string())
+        .ok_or_else(|| RpcError {
+            code: RpcErrorCode::Internal,
+            reason: "project_id serialization did not produce a string".to_string(),
+        })
 }
 
 fn parse_repository_allowed_scope(

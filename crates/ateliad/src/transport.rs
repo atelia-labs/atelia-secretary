@@ -308,12 +308,13 @@ fn parse_event_severity(value: Option<String>) -> Result<Option<rpc::RpcEventSev
         return Ok(None);
     };
 
-    match value.as_str() {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "debug" => Ok(Some(rpc::RpcEventSeverity::Debug)),
         "info" => Ok(Some(rpc::RpcEventSeverity::Info)),
         "warning" | "warn" => Ok(Some(rpc::RpcEventSeverity::Warning)),
         "error" => Ok(Some(rpc::RpcEventSeverity::Error)),
-        unknown => Err(format!("unknown min_severity '{unknown}'")),
+        _ => Err(format!("unknown min_severity '{value}'")),
     }
 }
 
@@ -348,34 +349,34 @@ fn parse_replay_events_payload(
     })
 }
 
-fn core_tool_output_scope_to_rpc(scope: ToolOutputSettingsScope) -> rpc::RpcToolOutputScope {
-    let level = match scope.level {
-        atelia_core::ToolOutputSettingsLevel::Workspace => rpc::RpcToolOutputScopeLevel::Workspace,
-        atelia_core::ToolOutputSettingsLevel::Repository { repository_id } => {
-            rpc::RpcToolOutputScopeLevel::Repository {
-                repository_id: repository_id.as_str().to_string(),
+fn core_tool_output_scope_to_rpc(
+    scope: ToolOutputSettingsScope,
+) -> Result<rpc::RpcToolOutputScope> {
+    Ok(rpc::RpcToolOutputScope {
+        level: match scope.level {
+            atelia_core::ToolOutputSettingsLevel::Workspace => {
+                rpc::RpcToolOutputScopeLevel::Workspace
             }
-        }
-        atelia_core::ToolOutputSettingsLevel::Project { project_id } => {
-            rpc::RpcToolOutputScopeLevel::Project {
-                project_id: serde_json::to_string(&project_id)
-                    .unwrap_or_else(|_| "\"\"".to_string())
-                    .trim_matches('"')
-                    .to_string(),
+            atelia_core::ToolOutputSettingsLevel::Repository { repository_id } => {
+                rpc::RpcToolOutputScopeLevel::Repository {
+                    repository_id: repository_id.as_str().to_string(),
+                }
             }
-        }
-        atelia_core::ToolOutputSettingsLevel::Session { session_id } => {
-            rpc::RpcToolOutputScopeLevel::Session { session_id }
-        }
-        atelia_core::ToolOutputSettingsLevel::AgentProfile { agent_id } => {
-            rpc::RpcToolOutputScopeLevel::AgentProfile { agent_id }
-        }
-    };
-
-    rpc::RpcToolOutputScope {
-        level,
+            atelia_core::ToolOutputSettingsLevel::Project { project_id } => {
+                rpc::RpcToolOutputScopeLevel::Project {
+                    project_id: rpc::project_id_to_string(&project_id)
+                        .map_err(|error| anyhow!(error.reason))?,
+                }
+            }
+            atelia_core::ToolOutputSettingsLevel::Session { session_id } => {
+                rpc::RpcToolOutputScopeLevel::Session { session_id }
+            }
+            atelia_core::ToolOutputSettingsLevel::AgentProfile { agent_id } => {
+                rpc::RpcToolOutputScopeLevel::AgentProfile { agent_id }
+            }
+        },
         tool_id: scope.tool_id,
-    }
+    })
 }
 fn core_tool_output_overrides_to_rpc(
     overrides: ToolOutputOverrides,
@@ -1064,7 +1065,10 @@ async fn dispatch_get_tool_output_defaults(
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
     match rpc_server.get_tool_output_defaults(rpc::GetToolOutputDefaultsRequest {
-        scope: core_tool_output_scope_to_rpc(payload.scope),
+        scope: match core_tool_output_scope_to_rpc(payload.scope) {
+            Ok(scope) => scope,
+            Err(error) => return transport_error_response(next_state, error),
+        },
     }) {
         Ok(response) => match serialize_tool_output_defaults_response(response) {
             Ok(body) => (StatusCode::OK, Json(ApiResponse::ok(body))).into_response(),
@@ -1094,7 +1098,10 @@ async fn dispatch_update_tool_output_defaults(
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
     match rpc_server.update_tool_output_defaults(rpc::UpdateToolOutputDefaultsRequest {
-        scope: core_tool_output_scope_to_rpc(payload.scope),
+        scope: match core_tool_output_scope_to_rpc(payload.scope) {
+            Ok(scope) => scope,
+            Err(error) => return transport_error_response(next_state, error),
+        },
         actor: rpc::RpcActorDto::from(payload.actor),
         reason: payload.reason,
         overrides: core_tool_output_overrides_to_rpc(payload.overrides),
@@ -1127,7 +1134,13 @@ async fn dispatch_list_tool_output_settings_history(
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
     match rpc_server.list_tool_output_settings_history(rpc::ListToolOutputSettingsHistoryRequest {
-        scope: payload.scope.map(core_tool_output_scope_to_rpc),
+        scope: match payload.scope {
+            Some(scope) => match core_tool_output_scope_to_rpc(scope) {
+                Ok(scope) => Some(scope),
+                Err(error) => return transport_error_response(next_state, error),
+            },
+            None => None,
+        },
         limit: payload.limit,
         offset: payload.offset,
         cursor: payload.cursor,
@@ -1946,6 +1959,46 @@ mod tests {
             Some(rpc::RpcRepositoryTrustState::Blocked)
         );
         assert!(parse_trust_state(Some("bad-value".to_string())).is_err());
+    }
+
+    #[test]
+    fn parse_event_severity_trims_and_normalizes_known_values() {
+        assert_eq!(
+            parse_event_severity(Some("Info".to_string())).expect("info"),
+            Some(rpc::RpcEventSeverity::Info)
+        );
+        assert_eq!(
+            parse_event_severity(Some(" warning ".to_string())).expect("warning"),
+            Some(rpc::RpcEventSeverity::Warning)
+        );
+        assert_eq!(
+            parse_event_severity(Some("WARN".to_string())).expect("warn"),
+            Some(rpc::RpcEventSeverity::Warning)
+        );
+        assert!(parse_event_severity(Some("not-a-severity".to_string())).is_err());
+    }
+
+    #[test]
+    fn core_tool_output_scope_to_rpc_preserves_project_id() {
+        let project_id = ProjectId::new();
+        let project_id_string = serde_json::to_value(&project_id)
+            .expect("project id should serialize")
+            .as_str()
+            .expect("project id should serialize to a string")
+            .to_string();
+        let rpc_scope =
+            core_tool_output_scope_to_rpc(ToolOutputSettingsScope::project(project_id.clone()))
+                .expect("project scope should serialize");
+
+        assert_eq!(
+            rpc_scope,
+            rpc::RpcToolOutputScope {
+                level: rpc::RpcToolOutputScopeLevel::Project {
+                    project_id: project_id_string,
+                },
+                tool_id: None,
+            }
+        );
     }
 
     #[test]
