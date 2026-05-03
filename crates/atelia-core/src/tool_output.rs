@@ -259,10 +259,12 @@ fn render_toon(
 fn render_text(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> (String, Option<String>) {
     let rendered_result = renderable_result(result, policy);
     let fallback_reason = render_policy_fallback_reason(result, &rendered_result);
-    let summary = summary_field(&rendered_result).unwrap_or("no summary");
+    let summary = summary_field(&rendered_result)
+        .map(normalize_text_output_value)
+        .unwrap_or_else(|| "no summary".to_string());
     let mut parts = vec![format!(
         "{} {}: {}",
-        rendered_result.tool_id,
+        normalize_text_output_value(&rendered_result.tool_id),
         status_name(rendered_result.status),
         summary
     )];
@@ -288,7 +290,9 @@ fn render_text(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> (String,
     if let Some(truncation) = &rendered_result.truncation {
         parts.push(format!(
             "truncated {}/{} bytes: {}",
-            truncation.retained_bytes, truncation.original_bytes, truncation.reason
+            truncation.retained_bytes,
+            truncation.original_bytes,
+            normalize_text_output_value(&truncation.reason)
         ));
     }
 
@@ -299,7 +303,9 @@ fn render_text(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> (String,
             .map(|redaction| {
                 format!(
                     "{} ({}, redacted_at_ms {})",
-                    redaction.field_path, redaction.reason, redaction.redacted_at.unix_millis
+                    normalize_text_output_value(&redaction.field_path),
+                    normalize_text_output_value(&redaction.reason),
+                    redaction.redacted_at.unix_millis
                 )
             })
             .collect::<Vec<_>>()
@@ -495,13 +501,17 @@ fn truncate_json_rendering(result: &mut ToolResult, max_inline_lines: usize) -> 
     {
         None
     } else {
-        let _body_fits = serde_json::to_string(result)
+        let body_fits = serde_json::to_string(result)
             .ok()
             .is_some_and(|body| body.lines().count() <= max_inline_lines);
 
-        Some(format!(
-            "json rendering truncated to max_inline_lines={max_inline_lines}; omitted fields={omitted_fields}, evidence_refs={omitted_evidence_refs}, output_refs={omitted_output_refs}, redactions={omitted_redactions}"
-        ))
+        if body_fits {
+            None
+        } else {
+            Some(format!(
+                "json rendering truncated to max_inline_lines={max_inline_lines}; omitted fields={omitted_fields}, evidence_refs={omitted_evidence_refs}, output_refs={omitted_output_refs}, redactions={omitted_redactions}"
+            ))
+        }
     }
 }
 
@@ -798,6 +808,33 @@ fn render_optional_string(value: Option<&str>) -> String {
     value
         .map(render_toon_value)
         .unwrap_or_else(|| "null".to_string())
+}
+
+fn normalize_text_output_value(value: &str) -> String {
+    if !value
+        .chars()
+        .any(|character| matches!(character, '\r' | '\n'))
+    {
+        return value.to_string();
+    }
+
+    let mut normalized = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+
+    while let Some(character) = chars.next() {
+        match character {
+            '\r' => {
+                normalized.push(' ');
+                if matches!(chars.peek(), Some('\n')) {
+                    chars.next();
+                }
+            }
+            '\n' => normalized.push(' '),
+            _ => normalized.push(character),
+        }
+    }
+
+    normalized
 }
 
 fn render_toon_value(value: &str) -> String {
@@ -1207,6 +1244,32 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("render policy compacted output"));
+    }
+
+    #[test]
+    fn text_rendering_normalizes_dynamic_line_breaks_to_keep_single_line_output() {
+        let mut result = sample_result();
+        result.tool_id = "git_status\r\nsecondary".to_string();
+        result.fields[0].value = StructuredValue::String("2 modified\r\nfiles".to_string());
+        result.truncation = Some(TruncationMetadata {
+            original_bytes: 4096,
+            retained_bytes: 512,
+            reason: "artifact\r\nthreshold".to_string(),
+        });
+        result.redactions = vec![RedactionMarker {
+            field_path: "fields.secret\r\nnote".to_string(),
+            reason: "policy\r\nsecret".to_string(),
+            redacted_at: LedgerTimestamp::from_unix_millis(1_700_000_000_123),
+        }];
+
+        let rendered =
+            render_tool_result(&result, &RenderOptions::new(OutputFormat::Text)).unwrap();
+
+        assert_eq!(rendered.body.lines().count(), 1);
+        assert_eq!(
+            rendered.body,
+            "git_status secondary succeeded: 2 modified files; 3 field(s); 1 evidence ref(s); 1 output ref(s); truncated 512/4096 bytes: artifact threshold; 1 redaction(s): fields.secret note (policy secret, redacted_at_ms 1700000000123)"
+        );
     }
 
     #[test]
