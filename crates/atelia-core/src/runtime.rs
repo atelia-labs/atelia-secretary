@@ -4,8 +4,8 @@ use crate::domain::{
     Actor, AuditRecord, AuditRecordId, CancellationState, EventRefs, EventSeverity, EventSubject,
     JobEvent, JobEventId, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
     JobStatusTransitionError, LedgerTimestamp, PolicyDecision, PolicyOutcome, PolicySummary,
-    RepositoryId, ResourceScope, StructuredValue, ToolInvocation, ToolInvocationId, ToolResult,
-    ToolResultField, ToolResultId, ToolResultStatus,
+    RepositoryId, ResolvedPath, ResourceScope, StructuredValue, ToolInvocation, ToolInvocationId,
+    ToolResult, ToolResultField, ToolResultId, ToolResultStatus,
 };
 use crate::policy::{DefaultPolicyEngine, PolicyEngine, PolicyInput, DEFAULT_POLICY_VERSION};
 use crate::store::{EventCursor, InMemoryStore, JobPage, JobQuery, SecretaryStore, StoreError};
@@ -15,7 +15,7 @@ use crate::tool_output::{
 use std::error::Error;
 use std::fmt;
 
-const RUNTIME_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeJobRequest {
@@ -131,6 +131,9 @@ pub trait RuntimeTool {
     fn requested_capability(&self) -> &'static str;
     fn declared_effect(&self) -> &'static str;
     fn args_summary(&self, request: &RuntimeJobRequest) -> String;
+    fn resolved_paths(&self, _request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
+        Vec::new()
+    }
     fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult;
 }
 
@@ -335,7 +338,7 @@ where
             tool_id: tool.tool_id().to_string(),
             requested_capability: tool.requested_capability().to_string(),
             args_summary: tool.args_summary(&request),
-            resolved_paths: Vec::new(),
+            resolved_paths: tool.resolved_paths(&request),
             timeout_millis: None,
             redactions: Vec::new(),
         };
