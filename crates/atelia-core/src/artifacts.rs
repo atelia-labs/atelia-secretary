@@ -16,6 +16,8 @@ use std::io;
 use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -174,6 +176,7 @@ trait ArtifactWriter {
 
     fn update_spill_metadata(
         &self,
+        _scope: &str,
         _output_ref: &OutputRef,
         _original_bytes: Option<u64>,
         _retained_bytes: Option<u64>,
@@ -181,7 +184,7 @@ trait ArtifactWriter {
         Ok(())
     }
 
-    fn delete_artifact_record(&self, _output_ref: &OutputRef) -> ArtifactResult<()> {
+    fn delete_artifact_record(&self, _scope: &str, _output_ref: &OutputRef) -> ArtifactResult<()> {
         Ok(())
     }
 }
@@ -203,15 +206,16 @@ impl ArtifactWriter for LocalArtifactStore {
 
     fn update_spill_metadata(
         &self,
+        scope: &str,
         output_ref: &OutputRef,
         original_bytes: Option<u64>,
         retained_bytes: Option<u64>,
     ) -> ArtifactResult<()> {
-        update_record_bytes(self, &output_ref.id, original_bytes, retained_bytes)
+        update_record_bytes(self, scope, &output_ref.id, original_bytes, retained_bytes)
     }
 
-    fn delete_artifact_record(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
-        remove_record_bytes(self, &output_ref.id)
+    fn delete_artifact_record(&self, scope: &str, output_ref: &OutputRef) -> ArtifactResult<()> {
+        remove_record_bytes(self, scope, &output_ref.id)
     }
 }
 
@@ -294,16 +298,14 @@ impl LocalArtifactStore {
             digest: None,
         };
 
-        let mut records = match self.read_scope_records(&dir) {
-            Ok(records) => records,
-            Err(error) => {
-                let _ = self.delete_artifact(&output_ref);
-                let _ = fs::remove_file(&path);
-                return Err(error);
-            }
-        };
-        records.push(index_record);
-        if let Err(error) = self.write_scope_records(&dir, records) {
+        let write_result = (|| {
+            let _guard = ScopeIndexGuard::acquire(&dir)?;
+            let mut records = self.read_scope_records(&dir)?;
+            records.push(index_record);
+            self.write_scope_records_unlocked(&dir, records)
+        })();
+
+        if let Err(error) = write_result {
             let _ = self.delete_artifact(&output_ref);
             let _ = fs::remove_file(&path);
             return Err(error);
@@ -357,12 +359,12 @@ impl LocalArtifactStore {
         now: LedgerTimestamp,
         tombstone_reason: impl Into<String>,
     ) -> ArtifactResult<ArtifactExpirationReport> {
-        let mut records = self.list_records(scope)?;
+        let records = self.list_records(scope)?;
         let expected_scope = scope.map(sanitize_segment).transpose()?;
         let tombstone_reason = tombstone_reason.into();
-        let mut target_ids = HashSet::new();
+        let mut target_ids: HashSet<OutputRefId> = HashSet::new();
         for record_id in record_ids {
-            target_ids.insert(record_id);
+            target_ids.insert(record_id.clone());
         }
 
         let mut report = ArtifactExpirationReport::new(target_ids.len());
@@ -370,9 +372,8 @@ impl LocalArtifactStore {
             return Ok(report);
         }
 
-        let mut scope_groups: BTreeMap<String, Vec<LocalArtifactRecord>> = BTreeMap::new();
-        let mut records_to_delete: BTreeMap<String, Vec<(OutputRef, PathBuf)>> = BTreeMap::new();
-        for mut record in records.drain(..) {
+        let mut scope_targets: BTreeMap<String, HashSet<OutputRefId>> = BTreeMap::new();
+        for record in records {
             let sanitized_scope = sanitize_segment(&record.scope)?;
             if expected_scope
                 .as_ref()
@@ -390,40 +391,49 @@ impl LocalArtifactStore {
 
             if target_ids.contains(&record.id) {
                 report.matched += 1;
-
-                let path = Path::new(&record.path).to_path_buf();
-                let output_ref = OutputRef {
-                    id: record.id.clone(),
-                    uri: record.path.clone(),
-                    media_type: record.media_type.clone(),
-                    label: record.label.clone(),
-                    digest: None,
-                };
-                records_to_delete
-                    .entry(sanitized_scope.clone())
+                scope_targets
+                    .entry(sanitized_scope)
                     .or_default()
-                    .push((output_ref, path));
-
-                if record.tombstone.is_none() {
-                    report.tombstoned += 1;
-                    record.tombstone = Some(ArtifactTombstone {
-                        at: now,
-                        reason: tombstone_reason.clone(),
-                    });
-                }
+                    .insert(record.id);
             }
-
-            scope_groups
-                .entry(sanitized_scope)
-                .or_default()
-                .push(record);
         }
 
-        for (scope, records) in scope_groups {
+        for (scope, target_ids) in scope_targets {
             let scope_dir = self.config.root_dir.join(&scope);
-            self.write_scope_records(&scope_dir, records)?;
+            let mut deletions = Vec::new();
 
-            let mut deletions = records_to_delete.remove(&scope).unwrap_or_default();
+            {
+                let _guard = ScopeIndexGuard::acquire(&scope_dir)?;
+                let mut scope_records = self.read_scope_records(&scope_dir)?;
+                for record in &mut scope_records {
+                    if !target_ids.contains(&record.id) {
+                        continue;
+                    }
+
+                    if record.tombstone.is_none() {
+                        report.tombstoned += 1;
+                        record.tombstone = Some(ArtifactTombstone {
+                            at: now,
+                            reason: tombstone_reason.clone(),
+                        });
+                    }
+
+                    if validate_record_path(&self.config.root_dir, &scope, &record.id, &record.path)
+                    {
+                        let output_ref = OutputRef {
+                            id: record.id.clone(),
+                            uri: record.path.clone(),
+                            media_type: record.media_type.clone(),
+                            label: record.label.clone(),
+                            digest: None,
+                        };
+                        deletions.push((output_ref, Path::new(&record.path).to_path_buf()));
+                    }
+                }
+
+                self.write_scope_records_unlocked(&scope_dir, scope_records)?;
+            }
+
             for (output_ref, path) in deletions.drain(..) {
                 let existed = path.exists();
                 self.delete_artifact(&output_ref)?;
@@ -536,7 +546,21 @@ impl LocalArtifactStore {
         })
     }
 
+    #[cfg(test)]
     fn write_scope_records(
+        &self,
+        scope_dir: &Path,
+        records: Vec<LocalArtifactRecord>,
+    ) -> ArtifactResult<()> {
+        if !scope_dir.exists() && records.is_empty() {
+            return Ok(());
+        }
+
+        let _guard = ScopeIndexGuard::acquire(scope_dir)?;
+        self.write_scope_records_unlocked(scope_dir, records)
+    }
+
+    fn write_scope_records_unlocked(
         &self,
         scope_dir: &Path,
         mut records: Vec<LocalArtifactRecord>,
@@ -558,9 +582,16 @@ impl LocalArtifactStore {
                 .then_with(|| left.id.as_str().cmp(right.id.as_str()))
         });
         let serialized = serde_json::to_vec_pretty(&records)?;
-        let tmp = index_path.with_extension("json.tmp");
-        fs::write(&tmp, serialized)?;
-        fs::rename(&tmp, &index_path)?;
+        let counter = WRITE_FILE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = scope_dir.join(format!(".index-tmp-{counter}-{}", std::process::id()));
+        if let Err(error) = fs::write(&tmp, &serialized) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error.into());
+        }
+        if let Err(error) = rename_atomic(&tmp, &index_path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error.into());
+        }
         Ok(())
     }
     pub fn delete_artifact(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
@@ -595,6 +626,65 @@ impl LocalArtifactStore {
             Err(_) if self.config.root_dir.is_absolute() => Ok(self.config.root_dir.clone()),
             Err(_) => std::env::current_dir().map(|cwd| cwd.join(&self.config.root_dir)),
         }
+    }
+}
+
+struct ScopeIndexGuard {
+    #[cfg(unix)]
+    _file: fs::File,
+    #[cfg(not(unix))]
+    lock_path: PathBuf,
+}
+
+impl ScopeIndexGuard {
+    fn acquire(scope_dir: &Path) -> io::Result<Self> {
+        let lock_path = scope_dir.join(".index.lock");
+
+        #[cfg(unix)]
+        {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)?;
+            let fd = file.as_raw_fd();
+            let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "failed to acquire scope index lock at {}: lock is held",
+                        lock_path.display()
+                    ),
+                ));
+            }
+            Ok(Self { _file: file })
+        }
+
+        #[cfg(not(unix))]
+        {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => Ok(Self { lock_path }),
+                Err(e) => Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to acquire scope index lock at {}: {e}",
+                        lock_path.display()
+                    ),
+                )),
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for ScopeIndexGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
     }
 }
 
@@ -797,17 +887,20 @@ fn spill_large_tool_result_fields_with_writer(
                 output_ref
             }
             Err(error) => {
-                rollback_artifact_writes(store, &written_output_refs);
+                rollback_artifact_writes(store, scope, &written_output_refs);
                 return Err(error);
             }
         };
         let replacement = format!("artifact_ref {}", output_ref.uri);
         let retained_size = replacement.len() as u64;
         let original_size = bytes.len() as u64;
-        if let Err(error) =
-            store.update_spill_metadata(&output_ref, Some(original_size), Some(retained_size))
-        {
-            rollback_artifact_writes(store, &written_output_refs);
+        if let Err(error) = store.update_spill_metadata(
+            scope,
+            &output_ref,
+            Some(original_size),
+            Some(retained_size),
+        ) {
+            rollback_artifact_writes(store, scope, &written_output_refs);
             return Err(error);
         }
 
@@ -847,22 +940,24 @@ fn spill_large_tool_result_fields_with_writer(
     }))
 }
 
-fn rollback_artifact_writes(writer: &impl ArtifactWriter, output_refs: &[OutputRef]) {
+fn rollback_artifact_writes(writer: &impl ArtifactWriter, scope: &str, output_refs: &[OutputRef]) {
     for output_ref in output_refs {
         let _ = writer.delete_artifact_bytes(output_ref);
-        let _ = writer.delete_artifact_record(output_ref);
+        let _ = writer.delete_artifact_record(scope, output_ref);
     }
 }
 
 fn update_record_bytes(
     store: &LocalArtifactStore,
+    scope: &str,
     id: &OutputRefId,
     original_bytes: Option<u64>,
     retained_bytes: Option<u64>,
 ) -> ArtifactResult<()> {
-    let mut records = store.list_records(None)?;
+    let scope_dir = store.config.root_dir.join(sanitize_segment(scope)?);
+    let _guard = ScopeIndexGuard::acquire(&scope_dir)?;
+    let mut records = store.read_scope_records(&scope_dir)?;
     let mut needs_persist = false;
-    let mut scope = None;
 
     for record in &mut records {
         if record.id == *id {
@@ -874,7 +969,6 @@ fn update_record_bytes(
                 record.retained_bytes = Some(retained_bytes);
                 needs_persist = true;
             }
-            scope = Some(record.scope.clone());
             break;
         }
     }
@@ -883,30 +977,20 @@ fn update_record_bytes(
         return Ok(());
     }
 
-    let scope = scope.expect("record should have scope");
-    let scope_dir = store.config.root_dir.join(&scope);
-    let scoped_records = records
-        .into_iter()
-        .filter(|record| record.scope == scope)
-        .collect::<Vec<_>>();
-    store.write_scope_records(&scope_dir, scoped_records)?;
+    store.write_scope_records_unlocked(&scope_dir, records)?;
     Ok(())
 }
 
-fn remove_record_bytes(store: &LocalArtifactStore, id: &OutputRefId) -> ArtifactResult<()> {
-    let records = store.read_all_records()?;
-    let Some(scope) = records
-        .iter()
-        .find(|record| record.id == *id)
-        .map(|record| record.scope.clone())
-    else {
-        return Ok(());
-    };
-
-    let scope_dir = store.config.root_dir.join(&scope);
-    let mut scoped_records = store.read_scope_records(&scope_dir)?;
-    scoped_records.retain(|record| record.id != *id);
-    store.write_scope_records(&scope_dir, scoped_records)?;
+fn remove_record_bytes(
+    store: &LocalArtifactStore,
+    scope: &str,
+    id: &OutputRefId,
+) -> ArtifactResult<()> {
+    let scope_dir = store.config.root_dir.join(sanitize_segment(scope)?);
+    let _guard = ScopeIndexGuard::acquire(&scope_dir)?;
+    let mut records = store.read_scope_records(&scope_dir)?;
+    records.retain(|record| record.id != *id);
+    store.write_scope_records_unlocked(&scope_dir, records)?;
     Ok(())
 }
 
@@ -942,6 +1026,40 @@ fn expired_cutoff_millis(now: LedgerTimestamp, policy: &ArtifactRetentionPolicy)
     now.unix_millis.saturating_sub(retention_millis)
 }
 
+fn validate_record_path(
+    root_dir: &Path,
+    sanitized_scope: &str,
+    record_id: &OutputRefId,
+    record_path: &str,
+) -> bool {
+    let path = Path::new(record_path);
+
+    let file_name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name,
+        None => return false,
+    };
+
+    if file_name == DEFAULT_ARTIFACT_INDEX_FILE {
+        return false;
+    }
+
+    if !file_name.starts_with(record_id.as_str()) {
+        return false;
+    }
+
+    let expected_scope_dir = root_dir.join(sanitized_scope);
+    let canonical_scope_dir = match expected_scope_dir.canonicalize() {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+    let canonical_path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    canonical_path.starts_with(&canonical_scope_dir)
+}
+
 fn sanitize_segment(value: &str) -> ArtifactResult<String> {
     let sanitized = sanitize_label(value);
     if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
@@ -974,6 +1092,8 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::os::unix::io::AsRawFd;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -983,6 +1103,30 @@ mod tests {
             .unwrap()
             .as_nanos();
         env::temp_dir().join(format!("atelia-artifacts-{name}-{unique}"))
+    }
+
+    #[cfg(unix)]
+    fn hold_index_lock(scope_dir: &Path) -> fs::File {
+        let lock_path = scope_dir.join(".index.lock");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) },
+            0,
+            "failed to hold test lock"
+        );
+        file
+    }
+
+    #[cfg(not(unix))]
+    fn hold_index_lock(scope_dir: &Path) -> bool {
+        let lock_path = scope_dir.join(".index.lock");
+        fs::write(&lock_path, b"").unwrap();
+        true
     }
 
     fn result_with_field(key: &str, value: StructuredValue) -> ToolResult {
@@ -1186,6 +1330,59 @@ mod tests {
     }
 
     #[test]
+    fn safe_expire_artifact_records_skips_records_with_mismatched_filename() {
+        let root = temp_root("expire-bad-filename");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let mismatched_file = scope_dir.join("mismatched.artifact");
+        fs::write(&mismatched_file, b"stale").unwrap();
+        let record_id = OutputRefId::new();
+        let record = LocalArtifactRecord {
+            id: record_id.clone(),
+            scope: "repo_example".to_string(),
+            project_id: None,
+            repository_id: None,
+            path: mismatched_file.to_string_lossy().into_owned(),
+            uri: mismatched_file.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("mismatched".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+        store.write_scope_records(&scope_dir, vec![record]).unwrap();
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let report = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap();
+
+        assert_eq!(1, report.requested);
+        assert_eq!(1, report.matched);
+        assert_eq!(1, report.tombstoned);
+        assert_eq!(0, report.deleted_files);
+        assert!(
+            mismatched_file.exists(),
+            "file with mismatched name must not be deleted"
+        );
+
+        let records = store.list_records(None).unwrap();
+        assert_eq!(1, records.len());
+        assert_eq!(
+            Some("retention policy"),
+            records[0].tombstone.as_ref().map(|t| t.reason.as_str())
+        );
+    }
+
+    #[test]
     fn safe_expire_artifact_records_skips_paths_outside_root() {
         let root = temp_root("expire-outside-root");
         let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
@@ -1228,6 +1425,7 @@ mod tests {
         assert_eq!(1, report.requested);
         assert_eq!(1, report.matched);
         assert_eq!(1, report.tombstoned);
+        assert_eq!(0, report.deleted_files);
         assert!(outside_file.exists());
         let records = store.list_records(None).unwrap();
         assert_eq!(1, records.len());
@@ -1300,6 +1498,10 @@ mod tests {
             "forged index outside root must not be rewritten"
         );
         assert!(!escaped_root.join("index.json.tmp").exists());
+        assert!(
+            !escaped_root.join(".index.lock").exists(),
+            "no stale lock files in escaped root"
+        );
         assert!(Path::new(&scoped_artifact).exists());
         let records = store.list_records(Some("repo_example")).unwrap();
         assert_eq!(1, records.len());
@@ -1561,9 +1763,7 @@ mod tests {
             .unwrap();
 
         let scope_dir = root.join("repo_example");
-        let failing_tmp = scope_dir.join("index.json.tmp");
-        create_scope_dir(&scope_dir).unwrap();
-        fs::create_dir(&failing_tmp).unwrap();
+        let _held_lock = hold_index_lock(&scope_dir);
 
         let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
         let error = store
@@ -1586,9 +1786,9 @@ mod tests {
         let scope_dir = root.join("repo_example");
         create_scope_dir(&scope_dir).unwrap();
 
-        let forged_path = scope_dir.join("forged-directory");
-        fs::create_dir(&forged_path).unwrap();
         let record_id = OutputRefId::new();
+        let forged_path = scope_dir.join(format!("{}-forged", record_id.as_str()));
+        fs::create_dir(&forged_path).unwrap();
         let record = LocalArtifactRecord {
             id: record_id.clone(),
             scope: "repo_example".to_string(),
@@ -1626,7 +1826,7 @@ mod tests {
         );
         assert!(forged_path.exists());
 
-        let retry_path = scope_dir.join("retry.artifact");
+        let retry_path = scope_dir.join(format!("{}.artifact", record_id.as_str()));
         fs::write(&retry_path, b"retryable").unwrap();
 
         let mut retriable = records[0].clone();
@@ -1637,7 +1837,12 @@ mod tests {
             .unwrap();
 
         let report = store
-            .safe_expire_artifact_records(None, &[record_id], LedgerTimestamp::now(), "retry")
+            .safe_expire_artifact_records(
+                None,
+                std::slice::from_ref(&record_id),
+                LedgerTimestamp::now(),
+                "retry",
+            )
             .unwrap();
 
         assert_eq!(1, report.requested);
@@ -1648,15 +1853,45 @@ mod tests {
     }
 
     #[test]
+    fn write_bytes_with_metadata_cleans_up_when_scope_lock_is_held() {
+        let root = temp_root("write-lock-held");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+        let _held_lock = hold_index_lock(&scope_dir);
+
+        let error = store
+            .write_bytes_with_metadata(
+                "repo_example",
+                "search output",
+                "text/plain",
+                b"hello",
+                ArtifactWriteMetadata::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ArtifactError::Io(error) if matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::AlreadyExists
+        )));
+        let remaining_entries: Vec<_> = fs::read_dir(&scope_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(1, remaining_entries.len());
+        assert_eq!(".index.lock", remaining_entries[0].to_string_lossy());
+    }
+
+    #[test]
     fn safe_expire_artifacts_by_retention_retries_tombstoned_record_when_still_present() {
         let root = temp_root("expire-retry-tombstone-retention");
         let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
         let scope_dir = root.join("repo_example");
         create_scope_dir(&scope_dir).unwrap();
 
-        let forged_path = scope_dir.join("forged-directory");
-        fs::create_dir(&forged_path).unwrap();
         let record_id = OutputRefId::new();
+        let forged_path = scope_dir.join(format!("{}-forged", record_id.as_str()));
+        fs::create_dir(&forged_path).unwrap();
         let record = LocalArtifactRecord {
             id: record_id.clone(),
             scope: "repo_example".to_string(),
@@ -1695,7 +1930,7 @@ mod tests {
         );
         assert!(forged_path.exists());
 
-        let retry_path = scope_dir.join("retry.artifact");
+        let retry_path = scope_dir.join(format!("{}.artifact", record_id.as_str()));
         fs::write(&retry_path, b"retryable").unwrap();
 
         let mut retriable = records[0].clone();
@@ -1737,9 +1972,7 @@ mod tests {
             .unwrap();
 
         let failing_scope_dir = root.join("scope_z");
-        let failing_tmp = failing_scope_dir.join("index.json.tmp");
-        create_scope_dir(&failing_scope_dir).unwrap();
-        fs::create_dir(&failing_tmp).unwrap();
+        let _held_lock = hold_index_lock(&failing_scope_dir);
 
         let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
         let error = store
@@ -1897,8 +2130,12 @@ mod tests {
             self.delegate.delete_artifact(output_ref)
         }
 
-        fn delete_artifact_record(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
-            self.delegate.delete_artifact_record(output_ref)
+        fn delete_artifact_record(
+            &self,
+            scope: &str,
+            output_ref: &OutputRef,
+        ) -> ArtifactResult<()> {
+            self.delegate.delete_artifact_record(scope, output_ref)
         }
     }
 
@@ -2020,7 +2257,9 @@ mod tests {
         } else {
             Vec::new()
         };
-        assert!(entries.is_empty());
+        assert!(entries
+            .iter()
+            .all(|entry| entry.file_name().to_string_lossy() == ".index.lock"));
     }
 
     #[cfg(unix)]
