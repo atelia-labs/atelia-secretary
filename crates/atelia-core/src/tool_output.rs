@@ -162,15 +162,15 @@ fn render_toon(
     policy: &ToolOutputRenderPolicy,
     fallback_reason: Option<&str>,
 ) -> (String, Option<String>) {
-    let policy_fallback_reason = {
-        let result = &result;
-        render_policy_fallback_reason(result, policy)
-    };
-    let result = renderable_result(result, policy);
+    let rendered_result = renderable_result(result, policy);
+    let policy_fallback_reason = render_policy_fallback_reason(result, &rendered_result);
     let mut lines = Vec::new();
 
-    lines.push(format!("status {}", status_name(result.status)));
-    lines.push(format!("schema_version {}", schema_version(&result)));
+    lines.push(format!("status {}", status_name(rendered_result.status)));
+    lines.push(format!(
+        "schema_version {}",
+        schema_version(&rendered_result)
+    ));
     lines.push(format!("format {}", OutputFormat::Toon.as_str()));
 
     if let Some(reason) = fallback_reason {
@@ -184,15 +184,21 @@ fn render_toon(
         ));
     }
 
-    lines.push(format!("tool_id {}", render_toon_value(&result.tool_id)));
-    lines.push(format!("result_id {}", result.id.as_str()));
-    lines.push(format!("invocation_id {}", result.invocation_id.as_str()));
+    lines.push(format!(
+        "tool_id {}",
+        render_toon_value(&rendered_result.tool_id)
+    ));
+    lines.push(format!("result_id {}", rendered_result.id.as_str()));
+    lines.push(format!(
+        "invocation_id {}",
+        rendered_result.invocation_id.as_str()
+    ));
 
-    if let Some(schema_ref) = &result.schema_ref {
+    if let Some(schema_ref) = &rendered_result.schema_ref {
         lines.push(format!("schema_ref {}", render_toon_value(schema_ref)));
     }
 
-    let sections = toon_sections(&result);
+    let sections = toon_sections(&rendered_result);
     let mut truncation_reason = None;
     let mut body_lines = lines.len();
 
@@ -251,37 +257,43 @@ fn render_toon(
 }
 
 fn render_text(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> (String, Option<String>) {
-    let fallback_reason = render_policy_fallback_reason(result, policy);
-    let result = renderable_result(result, policy);
-    let summary = summary_field(&result).unwrap_or("no summary");
+    let rendered_result = renderable_result(result, policy);
+    let fallback_reason = render_policy_fallback_reason(result, &rendered_result);
+    let summary = summary_field(&rendered_result).unwrap_or("no summary");
     let mut parts = vec![format!(
         "{} {}: {}",
-        result.tool_id,
-        status_name(result.status),
+        rendered_result.tool_id,
+        status_name(rendered_result.status),
         summary
     )];
 
-    if !result.fields.is_empty() {
-        parts.push(format!("{} field(s)", result.fields.len()));
+    if !rendered_result.fields.is_empty() {
+        parts.push(format!("{} field(s)", rendered_result.fields.len()));
     }
 
-    if !result.evidence_refs.is_empty() {
-        parts.push(format!("{} evidence ref(s)", result.evidence_refs.len()));
+    if !rendered_result.evidence_refs.is_empty() {
+        parts.push(format!(
+            "{} evidence ref(s)",
+            rendered_result.evidence_refs.len()
+        ));
     }
 
-    if !result.output_refs.is_empty() {
-        parts.push(format!("{} output ref(s)", result.output_refs.len()));
+    if !rendered_result.output_refs.is_empty() {
+        parts.push(format!(
+            "{} output ref(s)",
+            rendered_result.output_refs.len()
+        ));
     }
 
-    if let Some(truncation) = &result.truncation {
+    if let Some(truncation) = &rendered_result.truncation {
         parts.push(format!(
             "truncated {}/{} bytes: {}",
             truncation.retained_bytes, truncation.original_bytes, truncation.reason
         ));
     }
 
-    if !result.redactions.is_empty() {
-        let markers = result
+    if !rendered_result.redactions.is_empty() {
+        let markers = rendered_result
             .redactions
             .iter()
             .map(|redaction| {
@@ -295,7 +307,7 @@ fn render_text(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> (String,
 
         parts.push(format!(
             "{} redaction(s): {}",
-            result.redactions.len(),
+            rendered_result.redactions.len(),
             markers
         ));
     }
@@ -307,9 +319,9 @@ fn render_json(
     result: &ToolResult,
     policy: &ToolOutputRenderPolicy,
 ) -> Result<(String, Option<String>), ToolOutputRenderError> {
-    let policy_fallback_reason = render_policy_fallback_reason(result, policy);
-    let mut result = renderable_result(result, policy);
-    let pretty_body = serde_json::to_string_pretty(&result).map_err(|error| {
+    let rendered_result = renderable_result(result, policy);
+    let policy_fallback_reason = render_policy_fallback_reason(result, &rendered_result);
+    let pretty_body = serde_json::to_string_pretty(&rendered_result).map_err(|error| {
         ToolOutputRenderError::JsonSerialize {
             reason: error.to_string(),
         }
@@ -325,6 +337,7 @@ fn render_json(
     let compact_fallback_reason = policy.max_inline_lines.map(|max_inline_lines| {
         format!("json rendering switched from pretty to compact to fit max_inline_lines={max_inline_lines}")
     });
+    let mut result = rendered_result.clone();
     let compact_body =
         serde_json::to_string(&result).map_err(|error| ToolOutputRenderError::JsonSerialize {
             reason: error.to_string(),
@@ -377,11 +390,7 @@ fn renderable_result(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> To
     result
 }
 
-fn render_policy_fallback_reason(
-    original: &ToolResult,
-    policy: &ToolOutputRenderPolicy,
-) -> Option<String> {
-    let rendered = renderable_result(original, policy);
+fn render_policy_fallback_reason(original: &ToolResult, rendered: &ToolResult) -> Option<String> {
     let omitted_fields = original.fields.len().saturating_sub(rendered.fields.len());
     let omitted_evidence_refs = original
         .evidence_refs
