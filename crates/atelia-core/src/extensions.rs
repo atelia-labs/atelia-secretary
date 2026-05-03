@@ -1776,14 +1776,8 @@ pub struct ExtensionStatusResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListExtensionsRequest {
-    #[serde(default = "ListExtensionsRequest::default_include_blocked")]
+    #[serde(default)]
     pub include_blocked: bool,
-}
-
-impl ListExtensionsRequest {
-    fn default_include_blocked() -> bool {
-        true
-    }
 }
 
 impl Default for ListExtensionsRequest {
@@ -1847,9 +1841,12 @@ impl ExtensionRegistryService {
         request: InstallExtensionRequest,
     ) -> RegistryResult<InstallExtensionResponse> {
         let options = InstallOptions::from(&request);
+        let InstallExtensionRequest {
+            manifest,
+        } = request;
         let record = self
             .registry
-            .install(request.manifest, options)
+            .install(manifest, options)
             .map(|record| InstallExtensionResponse { record })?;
         Ok(record)
     }
@@ -1867,15 +1864,17 @@ impl ExtensionRegistryService {
         &self,
         request: ListExtensionsRequest,
     ) -> RegistryResult<ListExtensionsResponse> {
-        let mut extensions: Vec<ExtensionStatusResponse> = self
+        let mut extensions = self
             .registry
             .list_extension_statuses()?
             .into_iter()
             .map(ExtensionStatusSnapshot::into)
-            .collect();
+            .collect::<Vec<_>>();
 
         if !request.include_blocked {
-            extensions.retain(|snapshot| snapshot.block.is_none());
+            extensions.retain(|snapshot: &ExtensionStatusResponse| {
+                snapshot.block.is_none()
+            });
         }
 
         Ok(ListExtensionsResponse { extensions })
@@ -3305,14 +3304,6 @@ mod tests {
     }
 
     #[test]
-    fn list_extensions_request_deserializes_missing_include_blocked_as_true() {
-        let request: ListExtensionsRequest = serde_json::from_str("{}").unwrap();
-
-        assert!(request.include_blocked);
-        assert_eq!(request, ListExtensionsRequest::default());
-    }
-
-    #[test]
     fn extension_manifest_serializes_empty_tools_as_missing_field() {
         let mut extension = manifest("com.example.empty-tools");
         extension.tools.clear();
@@ -3636,6 +3627,14 @@ mod tests {
                 .version,
             legacy_manifest.version
         );
+    }
+
+    #[test]
+    fn list_extensions_request_deserializes_missing_include_blocked_as_true() {
+        let request: ListExtensionsRequest = serde_json::from_str("{}").unwrap();
+
+        assert!(request.include_blocked);
+        assert_eq!(request, ListExtensionsRequest::default());
     }
 
     #[test]
