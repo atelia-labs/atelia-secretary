@@ -1036,6 +1036,54 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fs_list_classifies_symlinks_as_unknown() {
+        let env = TestEnv::new("list-symlink-unknown");
+        env.create_file("real.txt", "data");
+        env.create_dir("real_dir");
+        env.create_symlink("link_to_file", &env.root.join("real.txt"));
+        env.create_symlink("link_to_dir", &env.root.join("real_dir"));
+
+        let tool = FsListTool::new(&env.root);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+
+        let fc = result
+            .fields
+            .iter()
+            .find(|f| f.key == "file_count")
+            .unwrap();
+        let dc = result.fields.iter().find(|f| f.key == "dir_count").unwrap();
+        let uc = result
+            .fields
+            .iter()
+            .find(|f| f.key == "unknown_count")
+            .unwrap();
+        assert_eq!(1, integer_value(&fc.value)); // real.txt
+        assert_eq!(1, integer_value(&dc.value)); // real_dir
+        assert_eq!(2, integer_value(&uc.value)); // link_to_file + link_to_dir
+
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        assert!(string_value(&summary.value).contains("4 entries"));
+        assert!(string_value(&summary.value).contains("2 other"));
+
+        // Invariant: file_count + dir_count + unknown_count == entry_count
+        let entry_count = result
+            .fields
+            .iter()
+            .find(|f| f.key == "entry_count")
+            .unwrap();
+        let total: i64 =
+            integer_value(&fc.value) + integer_value(&dc.value) + integer_value(&uc.value);
+        assert_eq!(integer_value(&entry_count.value), total);
+
+        env.cleanup();
+    }
+
     // -- FsStatTool tests --
 
     #[test]
