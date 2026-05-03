@@ -2382,7 +2382,7 @@ mod tests {
             .unwrap()
             .reason
             .contains("max_inline_bytes=256"));
-        assert_eq!(response.rendered_output_metadata.degraded, true);
+        assert!(response.rendered_output_metadata.degraded);
         assert!(response
             .rendered_output_metadata
             .fallback_reason
