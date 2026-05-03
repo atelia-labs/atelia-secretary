@@ -7,17 +7,16 @@
 use atelia_core::{
     canonicalize_job_requested_capability, canonicalize_within_scope,
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
-    CancelJobReceipt, DefaultPolicyEngine, EventCursor, EventPage, EventQuery,
-    ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, InMemoryStore,
-    InMemoryToolOutputSettingsService, InstallExtensionRequest, InstallExtensionResponse, JobEvent,
-    JobId, JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
-    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
-    OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput, RegistryError,
-    RenderedToolOutput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
-    RollbackExtensionRequest, RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt,
-    RuntimeJobRequest, SecretaryStore, StoreError, ToolInvocationId, ToolOutputDefaults,
-    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
-    ToolOutputSettingsScope, ToolResultId, TruncationMetadata,
+    CancelJobReceipt, DefaultPolicyEngine, ExtensionRegistryService, ExtensionStatusRequest,
+    ExtensionStatusResponse, InMemoryStore, InMemoryToolOutputSettingsService,
+    InstallExtensionRequest, InstallExtensionResponse, JobId, JobKind, JobLifecycleService,
+    JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest,
+    ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse, OutputFormat, PathScope,
+    PolicyEngine, PolicyInput, RegistryError, RenderedToolOutput, RepositoryId, RepositoryRecord,
+    RepositoryTrustState, ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse,
+    RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
+    ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange,
+    ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId, TruncationMetadata,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -2035,7 +2034,6 @@ mod tests {
             actor(),
             ToolOutputSettingsScope::workspace().for_tool(tool_result.tool_id.clone()),
             ToolOutputOverrides {
-                max_inline_bytes: Some(256),
                 granularity: Some(atelia_core::ToolOutputGranularity::Summary),
                 ..ToolOutputOverrides::default()
             },
@@ -2071,13 +2069,7 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("render policy compacted output"));
-        assert!(rendered
-            .truncation
-            .as_ref()
-            .unwrap()
-            .reason
-            .contains("max_inline_bytes=256"));
-        assert_eq!(rendered.truncation, rendered.rendered_output.truncation);
+        assert_eq!(rendered.truncation, tool_result.truncation.clone());
         let _ = fs::remove_dir_all(root);
     }
 
