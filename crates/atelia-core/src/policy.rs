@@ -375,6 +375,15 @@ impl Capability {
     }
 }
 
+/// Canonicalize a job-submission capability hint into the daemon's supported
+/// job capability when the hint is informational.
+pub fn canonicalize_job_requested_capability(name: &str) -> Option<&'static str> {
+    match Capability::from_name(name) {
+        Capability::Informational => Some("capability.discovery"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

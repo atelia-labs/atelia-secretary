@@ -11,7 +11,10 @@ use crate::domain::{
     RepositoryId, ResolvedPath, ResourceScope, StructuredValue, ToolInvocation, ToolInvocationId,
     ToolResult, ToolResultField, ToolResultId, ToolResultStatus, TruncationMetadata,
 };
-use crate::policy::{DefaultPolicyEngine, PolicyEngine, PolicyInput, DEFAULT_POLICY_VERSION};
+use crate::policy::{
+    canonicalize_job_requested_capability, DefaultPolicyEngine, PolicyEngine, PolicyInput,
+    DEFAULT_POLICY_VERSION,
+};
 use crate::settings::{OversizeOutputPolicy, ToolOutputDefaults};
 use crate::store::{EventCursor, InMemoryStore, JobPage, JobQuery, SecretaryStore, StoreError};
 use crate::tool_output::{
@@ -29,6 +32,7 @@ pub struct RuntimeJobRequest {
     pub kind: JobKind,
     pub goal: String,
     pub resource_scope: ResourceScope,
+    pub requested_capabilities: Vec<String>,
     pub approval_available: bool,
     pub render_options: RenderOptions,
     pub tool_output_defaults: ToolOutputDefaults,
@@ -51,6 +55,7 @@ impl RuntimeJobRequest {
                 kind: "repository".to_string(),
                 value: ".".to_string(),
             },
+            requested_capabilities: Vec::new(),
             approval_available: true,
             render_options: RenderOptions::new(OutputFormat::Toon),
             tool_output_defaults: ToolOutputDefaults::default(),
@@ -67,6 +72,11 @@ impl RuntimeJobRequest {
             kind: kind.into(),
             value: value.into(),
         };
+        self
+    }
+
+    pub fn with_requested_capabilities(mut self, requested_capabilities: Vec<String>) -> Self {
+        self.requested_capabilities = requested_capabilities;
         self
     }
 
@@ -130,6 +140,7 @@ pub enum RuntimeError {
     JobStatusTransition(JobStatusTransitionError),
     ToolOutputRender(ToolOutputRenderError),
     Artifact(ArtifactError),
+    InvalidToolRequest { reason: String },
     InvalidToolResult { reason: String },
     ToolOutputTooLarge { reason: String },
 }
@@ -143,6 +154,7 @@ impl fmt::Display for RuntimeError {
             }
             Self::ToolOutputRender(error) => write!(f, "{error}"),
             Self::Artifact(error) => write!(f, "{error}"),
+            Self::InvalidToolRequest { reason } => write!(f, "invalid tool request: {reason}"),
             Self::InvalidToolResult { reason } => write!(f, "invalid tool result: {reason}"),
             Self::ToolOutputTooLarge { reason } => write!(f, "{reason}"),
         }
@@ -275,6 +287,17 @@ where
     where
         T: RuntimeTool,
     {
+        let requested_capability = tool.requested_capability().to_string();
+        let canonical_requested_capability = normalized_requested_capability(&requested_capability);
+        if canonical_requested_capability.is_empty() {
+            return Err(RuntimeError::InvalidToolRequest {
+                reason: "requested_capability must not be empty".to_string(),
+            });
+        }
+        validate_requested_capability_hints(
+            &request.requested_capabilities,
+            canonical_requested_capability,
+        )?;
         let repository = self.store.get_repository(&request.repository_id)?;
         let mut events = Vec::new();
         let mut job = JobRecord::new(
@@ -302,7 +325,7 @@ where
             PolicyInput::new(
                 request.requester.clone(),
                 request.repository_id.clone(),
-                tool.requested_capability(),
+                canonical_requested_capability,
                 request.resource_scope.clone(),
                 tool.declared_effect(),
                 repository.trust_state,
@@ -387,7 +410,7 @@ where
             policy_decision_id: policy_decision.id.clone(),
             actor: request.requester.clone(),
             tool_id: tool.tool_id().to_string(),
-            requested_capability: tool.requested_capability().to_string(),
+            requested_capability: canonical_requested_capability.to_string(),
             args_summary: tool.args_summary(&request),
             resolved_paths: tool.resolved_paths(&request),
             timeout_millis: None,
@@ -508,7 +531,7 @@ where
             created_at: LedgerTimestamp::now(),
             actor: request.requester,
             repository_id: request.repository_id,
-            requested_capability: tool.requested_capability().to_string(),
+            requested_capability: canonical_requested_capability.to_string(),
             policy_decision_id: policy_decision.id.clone(),
             tool_invocation_id: Some(invocation.id.clone()),
             effect_summary: format!("{} completed with {:?}", invocation.tool_id, result.status),
@@ -569,6 +592,39 @@ where
             events,
         })
     }
+}
+
+fn validate_requested_capability_hints(
+    requested_capabilities: &[String],
+    enforced_capability: &str,
+) -> RuntimeResult<()> {
+    if requested_capabilities
+        .iter()
+        .any(|capability| capability.trim().is_empty())
+    {
+        return Err(RuntimeError::InvalidToolRequest {
+            reason: "requested_capabilities must not contain empty entries".to_string(),
+        });
+    }
+
+    if let Some(mismatched) = requested_capabilities
+        .iter()
+        .map(|capability| normalized_requested_capability(capability))
+        .find(|capability| *capability != enforced_capability)
+    {
+        return Err(RuntimeError::InvalidToolRequest {
+            reason: format!(
+                "requested_capabilities contains {mismatched:?}, but tool requires {enforced_capability:?}"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn normalized_requested_capability(capability: &str) -> &str {
+    let trimmed = capability.trim();
+    canonicalize_job_requested_capability(trimmed).unwrap_or(trimmed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1116,6 +1172,44 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Default)]
+    struct ReadTool;
+
+    impl RuntimeTool for ReadTool {
+        fn tool_id(&self) -> &'static str {
+            "secretary.read_fixture"
+        }
+
+        fn requested_capability(&self) -> &'static str {
+            "filesystem.read"
+        }
+
+        fn declared_effect(&self) -> &'static str {
+            "read repository data"
+        }
+
+        fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+            format!("goal={}", request.goal)
+        }
+
+        fn execute(&self, invocation: &ToolInvocation, _request: &RuntimeJobRequest) -> ToolResult {
+            ToolResult {
+                id: ToolResultId::new(),
+                schema_version: RUNTIME_SCHEMA_VERSION,
+                created_at: LedgerTimestamp::now(),
+                invocation_id: invocation.id.clone(),
+                tool_id: invocation.tool_id.clone(),
+                status: ToolResultStatus::Succeeded,
+                schema_ref: None,
+                fields: Vec::new(),
+                evidence_refs: Vec::new(),
+                output_refs: Vec::new(),
+                truncation: None,
+                redactions: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
     struct WrongInvocationTool;
 
     impl RuntimeTool for WrongInvocationTool {
@@ -1342,7 +1436,7 @@ mod tests {
             "should not execute",
         );
 
-        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+        let receipt = runtime.run_tool_job(request, &ReadTool).unwrap();
 
         assert_eq!(JobStatus::Blocked, receipt.job.status);
         assert_eq!(PolicyOutcome::Blocked, receipt.policy_decision.outcome);
@@ -1716,6 +1810,271 @@ mod tests {
         assert_eq!(JobStatus::Failed, jobs[0].status);
         assert!(jobs[0].completed_at.is_some());
         assert!(runtime.store().list_tool_results().unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_uses_tool_capability_when_request_hints_are_empty() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "read workspace data",
+        );
+
+        let receipt = runtime.run_tool_job(request, &ReadTool).unwrap();
+
+        assert_eq!(
+            "filesystem.read",
+            receipt.policy_decision.requested_capability
+        );
+        assert_eq!(
+            "filesystem.read",
+            receipt
+                .tool_invocation
+                .as_ref()
+                .unwrap()
+                .requested_capability
+        );
+        assert_eq!(JobStatus::Succeeded, receipt.job.status);
+    }
+
+    #[test]
+    fn runtime_accepts_policy_check_alias_for_informational_capability() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "read workspace data",
+        )
+        .with_requested_capabilities(vec!["policy.check".to_string()]);
+
+        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+
+        assert_eq!(JobStatus::Succeeded, receipt.job.status);
+        assert_eq!(
+            "capability.discovery",
+            receipt.policy_decision.requested_capability
+        );
+        assert_eq!(
+            "capability.discovery",
+            receipt
+                .tool_invocation
+                .as_ref()
+                .unwrap()
+                .requested_capability
+        );
+        assert_eq!(
+            "capability.discovery",
+            receipt.audit_record.as_ref().unwrap().requested_capability
+        );
+    }
+
+    #[test]
+    fn runtime_accepts_canonical_hint_for_alias_requested_capability() {
+        #[derive(Debug, Clone, Default)]
+        struct AliasCapabilityTool;
+
+        impl RuntimeTool for AliasCapabilityTool {
+            fn tool_id(&self) -> &'static str {
+                "secretary.alias_capability_fixture"
+            }
+
+            fn requested_capability(&self) -> &'static str {
+                "policy.check"
+            }
+
+            fn declared_effect(&self) -> &'static str {
+                "produce a deterministic contract result without external effects"
+            }
+
+            fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+                format!("goal={}", request.goal)
+            }
+
+            fn execute(
+                &self,
+                invocation: &ToolInvocation,
+                request: &RuntimeJobRequest,
+            ) -> ToolResult {
+                ToolResult {
+                    id: ToolResultId::new(),
+                    schema_version: RUNTIME_SCHEMA_VERSION,
+                    created_at: LedgerTimestamp::now(),
+                    invocation_id: invocation.id.clone(),
+                    tool_id: invocation.tool_id.clone(),
+                    status: ToolResultStatus::Succeeded,
+                    schema_ref: Some("tool_result.secretary.alias_capability.v1".to_string()),
+                    fields: vec![
+                        ToolResultField {
+                            key: "summary".to_string(),
+                            value: StructuredValue::String(format!(
+                                "echoed goal: {}",
+                                request.goal
+                            )),
+                        },
+                        ToolResultField {
+                            key: "goal".to_string(),
+                            value: StructuredValue::String(request.goal.clone()),
+                        },
+                    ],
+                    evidence_refs: Vec::new(),
+                    output_refs: Vec::new(),
+                    truncation: None,
+                    redactions: Vec::new(),
+                }
+            }
+        }
+
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "read workspace data",
+        )
+        .with_requested_capabilities(vec!["capability.discovery".to_string()]);
+
+        let receipt = runtime.run_tool_job(request, &AliasCapabilityTool).unwrap();
+
+        assert_eq!(JobStatus::Succeeded, receipt.job.status);
+        assert_eq!(
+            "capability.discovery",
+            receipt.policy_decision.requested_capability
+        );
+        assert_eq!(
+            "capability.discovery",
+            receipt
+                .tool_invocation
+                .as_ref()
+                .unwrap()
+                .requested_capability
+        );
+        assert_eq!(
+            "capability.discovery",
+            receipt.audit_record.as_ref().unwrap().requested_capability
+        );
+    }
+
+    #[test]
+    fn runtime_rejects_mismatched_requested_capability_hints_before_side_effects() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "read workspace data",
+        )
+        .with_requested_capabilities(vec!["capability.discovery".to_string()]);
+
+        let error = runtime.run_tool_job(request, &ReadTool).unwrap_err();
+
+        assert!(matches!(error, RuntimeError::InvalidToolRequest { .. }));
+        assert!(runtime.store().list_jobs().unwrap().is_empty());
+        assert!(runtime.store().list_policy_decisions().unwrap().is_empty());
+        assert!(runtime.store().list_tool_invocations().unwrap().is_empty());
+        assert!(runtime.store().list_tool_results().unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_rejects_empty_tool_requested_capability_before_side_effects() {
+        #[derive(Debug, Clone, Default)]
+        struct EmptyCapabilityTool;
+
+        impl RuntimeTool for EmptyCapabilityTool {
+            fn tool_id(&self) -> &'static str {
+                "secretary.empty_capability_fixture"
+            }
+
+            fn requested_capability(&self) -> &'static str {
+                ""
+            }
+
+            fn declared_effect(&self) -> &'static str {
+                "produce a deterministic contract result without external effects"
+            }
+
+            fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+                format!("goal={}", request.goal)
+            }
+
+            fn execute(
+                &self,
+                invocation: &ToolInvocation,
+                _request: &RuntimeJobRequest,
+            ) -> ToolResult {
+                ToolResult {
+                    id: ToolResultId::new(),
+                    schema_version: RUNTIME_SCHEMA_VERSION,
+                    created_at: LedgerTimestamp::now(),
+                    invocation_id: invocation.id.clone(),
+                    tool_id: invocation.tool_id.clone(),
+                    status: ToolResultStatus::Succeeded,
+                    schema_ref: Some("tool_result.secretary.empty_capability.v1".to_string()),
+                    fields: vec![ToolResultField {
+                        key: "summary".to_string(),
+                        value: StructuredValue::String("unreachable".to_string()),
+                    }],
+                    evidence_refs: Vec::new(),
+                    output_refs: Vec::new(),
+                    truncation: None,
+                    redactions: Vec::new(),
+                }
+            }
+        }
+
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "read workspace data",
+        );
+
+        let error = runtime
+            .run_tool_job(request, &EmptyCapabilityTool)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RuntimeError::InvalidToolRequest { reason } if reason == "requested_capability must not be empty"
+        ));
+        assert!(runtime.store().list_jobs().unwrap().is_empty());
+        assert!(runtime.store().list_policy_decisions().unwrap().is_empty());
+        assert!(runtime.store().list_tool_invocations().unwrap().is_empty());
+        assert!(runtime.store().list_tool_results().unwrap().is_empty());
+        assert!(runtime.store().list_audit_records().unwrap().is_empty());
     }
 
     fn service_with_repo() -> (JobLifecycleService, RepositoryRecord) {
