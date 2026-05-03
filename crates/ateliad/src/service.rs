@@ -6,11 +6,13 @@
 
 use atelia_core::{
     Actor, CancelJobReceipt, DefaultPolicyEngine, InMemoryStore, JobId, JobKind,
-    JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, RepositoryId,
-    RepositoryRecord, RepositoryTrustState, ResourceScope, RuntimeError, RuntimeJobReceipt,
-    RuntimeJobRequest, SecretaryStore, StoreError,
+    JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, PathScope,
+    RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RuntimeError,
+    RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "1.0.0";
@@ -113,6 +115,8 @@ pub struct RegisterRepositoryRequest {
     pub display_name: String,
     pub root_path: String,
     pub trust_state: RepositoryTrustState,
+    pub allowed_scope: Option<PathScope>,
+    pub requester: Option<Actor>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,27 +131,23 @@ pub struct SubmitJobRequest {
     pub idempotency_key: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ListRepositoriesRequest {
     pub trust_state: Option<RepositoryTrustState>,
     pub page_size: Option<usize>,
     pub page_token: Option<String>,
 }
 
-impl Default for ListRepositoriesRequest {
-    fn default() -> Self {
-        Self {
-            trust_state: None,
-            page_size: None,
-            page_token: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ListRepositoriesPage {
     pub repositories: Vec<RepositoryRecord>,
     pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct IdempotentSubmitJob {
+    signature: String,
+    receipt: RuntimeJobReceipt,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +163,8 @@ pub struct SecretaryService {
     lifecycle: JobLifecycleService<InMemoryStore, DefaultPolicyEngine>,
     started_at: LedgerTimestamp,
     daemon_status: DaemonStatus,
+    idempotent_submissions: Mutex<HashMap<String, IdempotentSubmitJob>>,
+    cancellation_requesters: Mutex<HashMap<JobId, Actor>>,
 }
 
 impl SecretaryService {
@@ -172,6 +174,8 @@ impl SecretaryService {
             lifecycle: JobLifecycleService::in_memory(),
             started_at: LedgerTimestamp::now(),
             daemon_status: DaemonStatus::Starting,
+            idempotent_submissions: HashMap::new().into(),
+            cancellation_requesters: HashMap::new().into(),
         }
     }
 
@@ -249,12 +253,21 @@ impl SecretaryService {
         }
         let root_path = canonical_repository_root(&request.root_path)?;
 
-        let record = RepositoryRecord::new(
+        let mut record = RepositoryRecord::new(
             request.display_name,
             root_path,
             request.trust_state,
             LedgerTimestamp::now(),
         );
+        if let Some(mut requested_scope) = request.allowed_scope {
+            if requested_scope.allowed_paths.is_empty() {
+                requested_scope.allowed_paths = vec![record.root_path.clone()];
+            }
+            requested_scope.root_path = record.root_path.clone();
+            record.allowed_path_scope = requested_scope;
+        }
+        let _requester = request.requester;
+
         self.lifecycle
             .runtime()
             .store()
@@ -333,15 +346,35 @@ impl SecretaryService {
             });
         }
 
-        if request
+        let normalized_idempotency_key = request
             .idempotency_key
             .as_ref()
-            .is_some_and(|key| !key.trim().is_empty())
+            .map(|key| key.trim())
+            .filter(|key| !key.is_empty())
+            .map(str::to_string);
+        let request_signature = submit_job_request_signature(&request);
+        let mut idempotent_cache_lock = if let Some(idempotency_key) =
+            normalized_idempotency_key.as_deref()
         {
-            return Err(ServiceError::InvalidArgument {
-                reason: "idempotency_key is not yet supported by this daemon runtime".to_string(),
-            });
-        }
+            let cache = self
+                .idempotent_submissions
+                .lock()
+                .expect("idempotency cache lock poisoned");
+
+            if let Some(cached) = cache.get(idempotency_key) {
+                if cached.signature == request_signature {
+                    return Ok(cached.receipt.clone());
+                }
+                return Err(ServiceError::Conflict {
+                    reason: "idempotency_key was previously used for a different submit request"
+                        .to_string(),
+                });
+            }
+
+            Some((idempotency_key.to_string(), cache))
+        } else {
+            None
+        };
 
         let runtime_request = RuntimeJobRequest::new(
             request.requester,
@@ -362,7 +395,19 @@ impl SecretaryService {
                 .unwrap_or_else(|| ".".to_string()),
         );
 
-        Ok(self.lifecycle.submit_echo_job(runtime_request)?)
+        let receipt = self.lifecycle.submit_echo_job(runtime_request)?;
+
+        if let Some((idempotency_key, mut cache)) = idempotent_cache_lock.take() {
+            cache.insert(
+                idempotency_key,
+                IdempotentSubmitJob {
+                    signature: request_signature,
+                    receipt: receipt.clone(),
+                },
+            );
+        }
+
+        Ok(receipt)
     }
 
     /// List jobs with optional repository/status filtering.
@@ -371,13 +416,14 @@ impl SecretaryService {
         &self,
         repository_id: Option<RepositoryId>,
         status: Option<JobStatus>,
+        requester: Option<Actor>,
         page_size: Option<usize>,
         page_token: Option<String>,
     ) -> ServiceResult<JobPage> {
         Ok(self.lifecycle.query_jobs(JobQuery {
             repository_id,
             status,
-            requester: None,
+            requester,
             page_size,
             page_token,
         })?)
@@ -389,15 +435,30 @@ impl SecretaryService {
         Ok(self.lifecycle.get_job(id)?)
     }
 
+    pub fn cancellation_requester(&self, id: &JobId) -> Option<Actor> {
+        self.cancellation_requesters
+            .lock()
+            .expect("cancellation requesters cache lock poisoned")
+            .get(id)
+            .cloned()
+    }
+
     /// Request cancellation for a queued/running job.
     #[allow(dead_code)]
     pub fn cancel_job(
         &self,
         id: &JobId,
         reason: impl Into<String>,
-        _requester: Option<Actor>,
+        requester: Option<Actor>,
     ) -> ServiceResult<CancelJobReceipt> {
-        Ok(self.lifecycle.cancel_job(id, reason)?)
+        let receipt = self.lifecycle.cancel_job(id, reason)?;
+        if let Some(requester) = requester {
+            self.cancellation_requesters
+                .lock()
+                .expect("cancellation requesters cache lock poisoned")
+                .insert(id.clone(), requester);
+        }
+        Ok(receipt)
     }
 }
 
@@ -473,6 +534,45 @@ fn canonical_repository_root(root_path: &str) -> ServiceResult<String> {
     Ok(canonical.to_string_lossy().to_string())
 }
 
+fn actor_signature(actor: &Actor) -> String {
+    match actor {
+        Actor::User { id, display_name } => {
+            format!("user:{id}:{:?}", display_name)
+        }
+        Actor::Agent { id, display_name } => {
+            format!("agent:{id}:{:?}", display_name)
+        }
+        Actor::Extension { id } => format!("extension:{id}"),
+        Actor::System { id } => format!("system:{id}"),
+    }
+}
+
+fn submit_job_request_signature(request: &SubmitJobRequest) -> String {
+    let resource_scope = request.resource_scope.as_ref().map_or_else(
+        || "repository:.".to_string(),
+        |scope| format!("{}:{}", scope.kind, scope.value),
+    );
+    let mut requested_capabilities = request.requested_capabilities.clone();
+    requested_capabilities.sort();
+    let kind = match &request.kind {
+        JobKind::Read => "read",
+        JobKind::Mutate => "mutate",
+        JobKind::Process => "process",
+        JobKind::Maintenance => "maintenance",
+        JobKind::Other { name } => name.as_str(),
+    };
+
+    format!(
+        "requester={};repository={};kind={};goal={};resource_scope={};capabilities={};",
+        actor_signature(&request.requester),
+        request.repository_id.as_str(),
+        kind,
+        request.goal.trim(),
+        resource_scope,
+        requested_capabilities.join(","),
+    )
+}
+
 impl Default for SecretaryService {
     fn default() -> Self {
         Self::new()
@@ -487,8 +587,11 @@ impl Default for SecretaryService {
 mod tests {
     use super::*;
     use atelia_core::RepositoryTrustState;
+    use std::collections::HashSet;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::thread;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -601,6 +704,8 @@ mod tests {
                 display_name: "test-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register should succeed");
 
@@ -622,6 +727,8 @@ mod tests {
                 display_name: "".to_string(),
                 root_path: "/tmp/test".to_string(),
                 trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
@@ -635,6 +742,8 @@ mod tests {
                 display_name: "test-repo".to_string(),
                 root_path: "".to_string(),
                 trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
@@ -649,6 +758,8 @@ mod tests {
                 display_name: "not-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .unwrap_err();
 
@@ -665,6 +776,8 @@ mod tests {
             display_name: "repo-a".to_string(),
             root_path: root.to_string_lossy().to_string(),
             trust_state: RepositoryTrustState::Trusted,
+            allowed_scope: None,
+            requester: None,
         })
         .expect("first register should succeed");
 
@@ -673,6 +786,8 @@ mod tests {
                 display_name: "repo-b".to_string(),
                 root_path: root.join(".").to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::ReadOnly,
+                allowed_scope: None,
+                requester: None,
             })
             .unwrap_err();
 
@@ -692,6 +807,8 @@ mod tests {
                 display_name: "repo-a".to_string(),
                 root_path: root_a.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register a");
         let r2 = svc
@@ -699,6 +816,8 @@ mod tests {
                 display_name: "repo-b".to_string(),
                 root_path: root_b.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::ReadOnly,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register b");
 
@@ -723,18 +842,24 @@ mod tests {
             display_name: "repo-a".to_string(),
             root_path: root_a.to_string_lossy().to_string(),
             trust_state: RepositoryTrustState::Trusted,
+            allowed_scope: None,
+            requester: None,
         })
         .expect("register trusted should succeed");
         svc.register_repository(RegisterRepositoryRequest {
             display_name: "repo-b".to_string(),
             root_path: root_b.to_string_lossy().to_string(),
             trust_state: RepositoryTrustState::ReadOnly,
+            allowed_scope: None,
+            requester: None,
         })
         .expect("register read-only should succeed");
         svc.register_repository(RegisterRepositoryRequest {
             display_name: "repo-c".to_string(),
             root_path: root_c.to_string_lossy().to_string(),
             trust_state: RepositoryTrustState::Trusted,
+            allowed_scope: None,
+            requester: None,
         })
         .expect("register trusted should succeed");
 
@@ -794,6 +919,8 @@ mod tests {
             display_name: "repo-a".to_string(),
             root_path: root_a.to_string_lossy().to_string(),
             trust_state: RepositoryTrustState::Trusted,
+            allowed_scope: None,
+            requester: None,
         })
         .expect("register a");
 
@@ -803,6 +930,8 @@ mod tests {
             display_name: "repo-b".to_string(),
             root_path: root_b.to_string_lossy().to_string(),
             trust_state: RepositoryTrustState::Trusted,
+            allowed_scope: None,
+            requester: None,
         })
         .expect("register b");
 
@@ -820,6 +949,8 @@ mod tests {
                 display_name: "lookup-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register");
 
@@ -846,6 +977,13 @@ mod tests {
         }
     }
 
+    fn actor_two() -> Actor {
+        Actor::User {
+            id: "user:test-two".to_string(),
+            display_name: Some("Second Actor".to_string()),
+        }
+    }
+
     #[test]
     fn submit_get_and_list_job_round_trip() {
         let svc = ready_service();
@@ -855,6 +993,8 @@ mod tests {
                 display_name: "job-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register should succeed");
 
@@ -876,7 +1016,13 @@ mod tests {
         assert_eq!(fetched.id, receipt.job.id);
 
         let page = svc
-            .list_jobs(Some(repository.id), Some(JobStatus::Succeeded), None, None)
+            .list_jobs(
+                Some(repository.id),
+                Some(JobStatus::Succeeded),
+                None,
+                None,
+                None,
+            )
             .expect("list jobs should succeed");
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].id, receipt.job.id);
@@ -893,6 +1039,8 @@ mod tests {
                 display_name: "job-pagination-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register should succeed");
         let repository_id = repository.id;
@@ -922,6 +1070,7 @@ mod tests {
             .list_jobs(
                 Some(repository_id.clone()),
                 Some(JobStatus::Succeeded),
+                None,
                 Some(1),
                 None,
             )
@@ -933,6 +1082,7 @@ mod tests {
             .list_jobs(
                 Some(repository_id),
                 Some(JobStatus::Succeeded),
+                None,
                 Some(1),
                 first.next_page_token,
             )
@@ -970,6 +1120,8 @@ mod tests {
                 display_name: "job-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register should succeed");
 
@@ -990,18 +1142,32 @@ mod tests {
     }
 
     #[test]
-    fn submit_job_rejects_idempotency_key() {
+    fn submit_job_replays_idempotent_requests() {
         let svc = ready_service();
-        let root = test_repo_dir("unsupported-idempotency");
+        let root = test_repo_dir("supported-idempotency");
         let repository = svc
             .register_repository(RegisterRepositoryRequest {
                 display_name: "job-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register should succeed");
 
-        let err = svc
+        let first = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("request-123".to_string()),
+            })
+            .expect("first submit should succeed");
+
+        let second = svc
             .submit_job(SubmitJobRequest {
                 requester: actor(),
                 repository_id: repository.id,
@@ -1011,9 +1177,255 @@ mod tests {
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-123".to_string()),
             })
+            .expect("replayed submit should return same job");
+
+        assert_eq!(second.job.id, first.job.id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_idempotent_requests_are_serialized_concurrently() {
+        let svc = Arc::new(ready_service());
+        let root = test_repo_dir("concurrent-idempotency");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let repository_id = repository.id;
+        let mut handles = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let svc = svc.clone();
+            let repository_id = repository_id.clone();
+            handles.push(thread::spawn(move || {
+                svc.submit_job(SubmitJobRequest {
+                    requester: actor(),
+                    repository_id,
+                    kind: JobKind::Read,
+                    goal: "summarize".to_string(),
+                    resource_scope: None,
+                    requested_capabilities: Vec::new(),
+                    idempotency_key: Some("shared-key".to_string()),
+                })
+            }));
+        }
+
+        let job_ids = handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("worker thread should finish")
+                    .expect("submit should succeed")
+                    .job
+                    .id
+                    .as_str()
+                    .to_string()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(job_ids.len(), 1);
+
+        let page = svc
+            .list_jobs(
+                Some(repository_id),
+                Some(JobStatus::Succeeded),
+                None,
+                None,
+                None,
+            )
+            .expect("list jobs should succeed");
+        assert_eq!(page.jobs.len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_conflicting_idempotent_request() {
+        let svc = ready_service();
+        let root = test_repo_dir("conflicting-idempotency");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let first = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("request-123".to_string()),
+            })
+            .expect("first submit should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor_two(),
+                repository_id: first.job.repository_id,
+                kind: JobKind::Read,
+                goal: "different summary".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("request-123".to_string()),
+            })
             .unwrap_err();
 
-        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(matches!(err, ServiceError::Conflict { reason: _ }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn list_jobs_request_filters_requester() {
+        let svc = ready_service();
+        let root = test_repo_dir("job-list-requester");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        let repository_id = repository.id;
+
+        svc.submit_job(SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository_id.clone(),
+            kind: JobKind::Read,
+            goal: "from-first".to_string(),
+            resource_scope: None,
+            requested_capabilities: Vec::new(),
+            idempotency_key: None,
+        })
+        .expect("first submit should succeed");
+        svc.submit_job(SubmitJobRequest {
+            requester: actor_two(),
+            repository_id: repository_id.clone(),
+            kind: JobKind::Read,
+            goal: "from-second".to_string(),
+            resource_scope: None,
+            requested_capabilities: Vec::new(),
+            idempotency_key: None,
+        })
+        .expect("second submit should succeed");
+
+        let first_actor_jobs = svc
+            .list_jobs(
+                Some(repository_id.clone()),
+                Some(JobStatus::Succeeded),
+                Some(actor()),
+                Some(10),
+                None,
+            )
+            .expect("list first actor jobs");
+        assert_eq!(first_actor_jobs.jobs.len(), 1);
+        assert_eq!(first_actor_jobs.jobs[0].requester, actor());
+
+        let second_actor_jobs = svc
+            .list_jobs(
+                Some(repository_id.clone()),
+                Some(JobStatus::Succeeded),
+                Some(actor_two()),
+                Some(10),
+                None,
+            )
+            .expect("list second actor jobs");
+        assert_eq!(second_actor_jobs.jobs.len(), 1);
+        assert_eq!(second_actor_jobs.jobs[0].requester, actor_two());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancel_job_preserves_requester_for_follow_up_job_queries() {
+        let svc = ready_service();
+        let root = test_repo_dir("cancel-requester");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        let repository_id = repository.id.clone();
+
+        let queued_job = JobRecord::new(
+            actor(),
+            repository_id.clone(),
+            JobKind::Read,
+            "manual-cancel".to_string(),
+            atelia_core::LedgerTimestamp::from_unix_millis(2_000),
+        );
+        let initial_event = atelia_core::JobEvent {
+            id: atelia_core::JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 0,
+            created_at: atelia_core::LedgerTimestamp::from_unix_millis(2_001),
+            subject: atelia_core::EventSubject::job(&queued_job.id),
+            kind: atelia_core::JobEventKind::JobSubmitted,
+            severity: atelia_core::EventSeverity::Info,
+            public_message: "queued".to_string(),
+            refs: atelia_core::EventRefs {
+                repository_id: Some(repository_id.clone()),
+                job_id: Some(queued_job.id.clone()),
+                ..Default::default()
+            },
+            redactions: Vec::new(),
+        };
+        svc.lifecycle
+            .runtime()
+            .store()
+            .create_job_with_initial_event(queued_job.clone(), initial_event)
+            .expect("seeded queued job should be inserted");
+
+        let receipt = svc
+            .cancel_job(&queued_job.id, "test cancel".to_string(), Some(actor()))
+            .expect("queued job should be cancellable");
+        assert_eq!(receipt.job.id, queued_job.id);
+
+        let requester = svc
+            .cancellation_requester(&receipt.job.id)
+            .expect("cancel requester should be tracked");
+        assert_eq!(requester, actor());
+
+        let updated = svc
+            .list_jobs(
+                Some(repository_id.clone()),
+                Some(JobStatus::Canceled),
+                None,
+                None,
+                None,
+            )
+            .expect("list should return canceled job");
+        assert_eq!(updated.jobs.len(), 1);
+        assert_eq!(
+            svc.cancellation_requester(&updated.jobs[0].id)
+                .expect("listed job should keep cancel requester"),
+            actor()
+        );
+        let fetched = svc
+            .get_job(&queued_job.id)
+            .expect("get should return canceled job");
+        assert_eq!(
+            svc.cancellation_requester(&fetched.id)
+                .expect("get_job should keep cancel requester"),
+            actor()
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1027,6 +1439,8 @@ mod tests {
                 display_name: "   ".to_string(),
                 root_path: "/tmp/test".to_string(),
                 trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
@@ -1040,6 +1454,8 @@ mod tests {
                 display_name: "test-repo".to_string(),
                 root_path: "  \t ".to_string(),
                 trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));

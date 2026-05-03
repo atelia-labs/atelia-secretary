@@ -15,8 +15,8 @@ use crate::service::{
 };
 use atelia_core::{
     Actor, CancelJobReceipt, CancellationState, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
-    PolicyOutcome, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier,
-    StoreError,
+    PathScope, PolicyOutcome, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
+    RiskTier, StoreError,
 };
 use std::convert::TryFrom;
 
@@ -49,17 +49,37 @@ impl SecretaryRpcServer {
         &self,
         request: RegisterRepositoryRequest,
     ) -> RpcResult<RegisterRepositoryResponse> {
+        let trust_state = infer_repository_trust_state(&request.allowed_scope);
+        let requested_scope = request
+            .allowed_scope
+            .map(|scope| parse_repository_allowed_scope(scope, &request.root_path))
+            .transpose()?
+            .map(Some)
+            .unwrap_or(None);
+        let requester = request.requester.map(Actor::try_from).transpose()?;
+
         let repository = self
             .service
             .register_repository(ServiceRegisterRepositoryRequest {
                 display_name: request.display_name,
                 root_path: request.root_path,
-                trust_state: request.trust_state.try_into()?,
+                trust_state,
+                allowed_scope: requested_scope,
+                requester,
             })?;
 
         Ok(RegisterRepositoryResponse {
             metadata: self.metadata(),
             repository: Repository::from(repository),
+            policy: PolicyDecision {
+                decision_id: "n/a".to_string(),
+                outcome: "allowed".to_string(),
+                risk_tier: "r0".to_string(),
+                requested_capability: "repository.register".to_string(),
+                reason_code: "not_evaluated".to_string(),
+                reason: "register repository policy is not yet evaluated by this daemon surface"
+                    .to_string(),
+            },
         })
     }
 
@@ -117,10 +137,11 @@ impl SecretaryRpcServer {
     pub fn get_job(&self, request: GetJobRequest) -> RpcResult<GetJobResponse> {
         let job_id = parse_job_id(&request.job_id)?;
         let job = self.service.get_job(&job_id)?;
+        let cancellation_requester = self.service.cancellation_requester(&job_id);
 
         Ok(GetJobResponse {
             metadata: self.metadata(),
-            job: Job::from(job),
+            job: Job::from_with_cancellation_requester(job, cancellation_requester.as_ref()),
         })
     }
 
@@ -134,13 +155,26 @@ impl SecretaryRpcServer {
             None => None,
             Some(status) => job_status_from_rpc(status)?,
         };
-        let page =
-            self.service
-                .list_jobs(repository_id, status, request.page_size, request.page_token)?;
+        let requester = request.requester.map(Actor::try_from).transpose()?;
+        let page = self.service.list_jobs(
+            repository_id,
+            status,
+            requester,
+            request.page_size,
+            request.page_token,
+        )?;
+        let jobs = page
+            .jobs
+            .into_iter()
+            .map(|job| {
+                let cancellation_requester = self.service.cancellation_requester(&job.id);
+                Job::from_with_cancellation_requester(job, cancellation_requester.as_ref())
+            })
+            .collect();
 
         Ok(ListJobsResponse {
             metadata: self.metadata(),
-            jobs: page.jobs.into_iter().map(Job::from).collect(),
+            jobs,
             next_page_token: page.next_page_token,
         })
     }
@@ -150,8 +184,8 @@ impl SecretaryRpcServer {
         let requester = Actor::try_from(request.requester)?;
         let receipt = self
             .service
-            .cancel_job(&job_id, request.reason, Some(requester))?;
-        let cancellation = job_cancellation_from_receipt(&receipt);
+            .cancel_job(&job_id, request.reason, Some(requester.clone()))?;
+        let cancellation = job_cancellation_from_receipt(&receipt, Some(&requester));
 
         Ok(CancelJobResponse {
             metadata: self.metadata(),
@@ -261,13 +295,15 @@ impl From<ServiceProtocolMetadata> for ProtocolMetadata {
 pub struct RegisterRepositoryRequest {
     pub display_name: String,
     pub root_path: String,
-    pub trust_state: RpcRepositoryTrustState,
+    pub allowed_scope: Option<RpcPathScope>,
+    pub requester: Option<RpcActorDto>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterRepositoryResponse {
     pub metadata: ProtocolMetadata,
     pub repository: Repository,
+    pub policy: PolicyDecision,
 }
 
 // Mirrors proto's `ListRepositoriesRequest` contract.
@@ -292,6 +328,7 @@ pub struct Repository {
     pub repository_id: String,
     pub display_name: String,
     pub root_path: String,
+    pub allowed_scope: RpcPathScope,
     pub trust_state: RpcRepositoryTrustState,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
@@ -303,6 +340,7 @@ impl From<RepositoryRecord> for Repository {
             repository_id: record.id.as_str().to_string(),
             display_name: record.display_name,
             root_path: record.root_path,
+            allowed_scope: rpc_path_scope_from_record(&record.allowed_path_scope),
             trust_state: record.trust_state.into(),
             created_at_unix_ms: record.created_at.unix_millis,
             updated_at_unix_ms: record.updated_at.unix_millis,
@@ -343,6 +381,7 @@ pub struct GetJobResponse {
 pub struct ListJobsRequest {
     pub repository_id: Option<String>,
     pub status: Option<RpcJobStatus>,
+    pub requester: Option<RpcActorDto>,
     pub page_size: Option<usize>,
     pub page_token: Option<String>,
 }
@@ -411,7 +450,16 @@ pub struct JobCancellation {
 
 impl From<JobRecord> for Job {
     fn from(record: JobRecord) -> Self {
-        let cancellation = job_cancellation_from_record(&record);
+        Job::from_with_cancellation_requester(record, None)
+    }
+}
+
+impl Job {
+    fn from_with_cancellation_requester(
+        record: JobRecord,
+        cancellation_requester: Option<&Actor>,
+    ) -> Self {
+        let cancellation = job_cancellation_from_record(&record, cancellation_requester);
         Self {
             job_id: record.id.as_str().to_string(),
             repository_id: record.repository_id.as_str().to_string(),
@@ -476,6 +524,46 @@ fn parse_list_repositories_request(
         page_size: request.page_size,
         page_token: request.page_token,
     })
+}
+
+fn parse_repository_allowed_scope(
+    value: RpcPathScope,
+    repository_root: &str,
+) -> RpcResult<PathScope> {
+    if !value.include_patterns.is_empty() || !value.exclude_patterns.is_empty() {
+        return Err(RpcError::invalid_argument(
+            "repository allowed_scope include_patterns/exclude_patterns are not yet supported",
+        ));
+    }
+
+    if value.roots.len() > 1 {
+        return Err(RpcError::invalid_argument(
+            "repository allowed_scope currently supports only one root entry",
+        ));
+    }
+
+    let first_root = value
+        .roots
+        .first()
+        .cloned()
+        .unwrap_or_else(|| ".".to_string());
+    Ok(PathScope {
+        root_path: repository_root.to_string(),
+        allowed_paths: vec![first_root],
+    })
+}
+
+fn rpc_path_scope_from_record(allowed_scope: &PathScope) -> RpcPathScope {
+    RpcPathScope {
+        kind: RpcPathScopeKind::Repository,
+        roots: if allowed_scope.allowed_paths.is_empty() {
+            vec![allowed_scope.root_path.clone()]
+        } else {
+            allowed_scope.allowed_paths.clone()
+        },
+        include_patterns: Vec::new(),
+        exclude_patterns: Vec::new(),
+    }
 }
 
 fn parse_path_scope(value: RpcPathScope) -> RpcResult<Option<ResourceScope>> {
@@ -743,10 +831,13 @@ fn cancellation_state_label(state: CancellationState) -> &'static str {
     }
 }
 
-fn job_cancellation_from_record(record: &JobRecord) -> JobCancellation {
+fn job_cancellation_from_record(
+    record: &JobRecord,
+    requested_by: Option<&Actor>,
+) -> JobCancellation {
     JobCancellation {
         state: cancellation_state_label(record.cancellation_state).to_string(),
-        requested_by: None,
+        requested_by: requested_by.map(|actor| RpcActorDto::from(actor.clone())),
         reason: None,
         requested_at_unix_ms: None,
         completed_at_unix_ms: match record.cancellation_state {
@@ -756,7 +847,20 @@ fn job_cancellation_from_record(record: &JobRecord) -> JobCancellation {
     }
 }
 
-fn job_cancellation_from_receipt(receipt: &CancelJobReceipt) -> JobCancellation {
+fn infer_repository_trust_state(allowed_scope: &Option<RpcPathScope>) -> RepositoryTrustState {
+    // The current protocol does not carry explicit repository trust state; until
+    // policy-based derivation exists, infer a safe default from the requested
+    // scope and keep this logic centralized in the RPC boundary.
+    match allowed_scope.as_ref().map(|scope| &scope.kind) {
+        Some(RpcPathScopeKind::ReadOnly) => RepositoryTrustState::ReadOnly,
+        _ => RepositoryTrustState::Trusted,
+    }
+}
+
+fn job_cancellation_from_receipt(
+    receipt: &CancelJobReceipt,
+    requested_by: Option<&Actor>,
+) -> JobCancellation {
     let requested_event = receipt
         .events
         .iter()
@@ -764,7 +868,7 @@ fn job_cancellation_from_receipt(receipt: &CancelJobReceipt) -> JobCancellation 
 
     JobCancellation {
         state: cancellation_state_label(receipt.job.cancellation_state).to_string(),
-        requested_by: None,
+        requested_by: requested_by.map(|actor| RpcActorDto::from(actor.clone())),
         reason: requested_event.map(|event| event.public_message.clone()),
         requested_at_unix_ms: requested_event.map(|event| event.created_at.unix_millis),
         completed_at_unix_ms: receipt.job.completed_at.map(|ts| ts.unix_millis),
@@ -904,7 +1008,8 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "rpc-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
-                trust_state: RpcRepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register should succeed");
 
@@ -946,12 +1051,62 @@ mod tests {
             .list_jobs(ListJobsRequest {
                 repository_id: Some(registered.repository.repository_id),
                 status: Some(RpcJobStatus::Succeeded),
+                requester: None,
                 page_size: None,
                 page_token: None,
             })
             .expect("list jobs should succeed");
         assert_eq!(jobs.jobs.len(), 1);
         assert_eq!(jobs.jobs[0].job_id, submitted.job.job_id);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_repository_defaults_to_trusted_without_allowed_scope() {
+        let server = ready_server();
+        let root = test_repo_dir("trusted-default");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "rpc-trust-default".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        assert_eq!(
+            registered.repository.trust_state,
+            RpcRepositoryTrustState::Trusted
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_repository_infers_read_only_from_allowed_scope() {
+        let server = ready_server();
+        let root = test_repo_dir("readonly-by-scope");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "rpc-trust-readonly".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: Some(RpcPathScope {
+                    kind: RpcPathScopeKind::ReadOnly,
+                    roots: vec![".".to_string()],
+                    include_patterns: Vec::new(),
+                    exclude_patterns: Vec::new(),
+                }),
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        assert_eq!(
+            registered.repository.trust_state,
+            RpcRepositoryTrustState::ReadOnly
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -967,21 +1122,24 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "repo-a".to_string(),
                 root_path: root_a.to_string_lossy().to_string(),
-                trust_state: RpcRepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register trusted should succeed");
         server
             .register_repository(RegisterRepositoryRequest {
                 display_name: "repo-b".to_string(),
                 root_path: root_b.to_string_lossy().to_string(),
-                trust_state: RpcRepositoryTrustState::ReadOnly,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register read-only should succeed");
         server
             .register_repository(RegisterRepositoryRequest {
                 display_name: "repo-c".to_string(),
                 root_path: root_c.to_string_lossy().to_string(),
-                trust_state: RpcRepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register trusted should succeed");
 
@@ -1045,7 +1203,8 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "pagination-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
-                trust_state: RpcRepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register should succeed");
 
@@ -1076,6 +1235,7 @@ mod tests {
             .list_jobs(ListJobsRequest {
                 repository_id: Some(registered.repository.repository_id.clone()),
                 status: Some(RpcJobStatus::Succeeded),
+                requester: None,
                 page_size: Some(1),
                 page_token: None,
             })
@@ -1087,6 +1247,7 @@ mod tests {
             .list_jobs(ListJobsRequest {
                 repository_id: Some(registered.repository.repository_id),
                 status: Some(RpcJobStatus::Succeeded),
+                requester: None,
                 page_size: Some(1),
                 page_token: first.next_page_token,
             })
@@ -1105,7 +1266,8 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "cancel-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
-                trust_state: RpcRepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register should succeed");
         let submitted = server
@@ -1160,7 +1322,8 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "scope-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
-                trust_state: RpcRepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register should succeed");
 
@@ -1193,7 +1356,8 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "feature-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
-                trust_state: RpcRepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register should succeed");
 
@@ -1212,7 +1376,7 @@ mod tests {
 
         let with_idempotency = server
             .submit_job(SubmitJobRequest {
-                repository_id: registered.repository.repository_id,
+                repository_id: registered.repository.repository_id.clone(),
                 requester: actor(),
                 kind: "read".to_string(),
                 goal: "second".to_string(),
@@ -1220,8 +1384,32 @@ mod tests {
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-key".to_string()),
             })
+            .expect("submit job should succeed");
+        let replayed = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "second".to_string(),
+                path_scope: None,
+                idempotency_key: Some("request-key".to_string()),
+                requested_capabilities: Vec::new(),
+            })
+            .expect("replay should return same job");
+        assert_eq!(with_idempotency.job.job_id, replayed.job.job_id);
+
+        let conflicting = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id,
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "conflicting goal".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("request-key".to_string()),
+            })
             .unwrap_err();
-        assert_eq!(with_idempotency.code, RpcErrorCode::InvalidArgument);
+        assert_eq!(conflicting.code, RpcErrorCode::Conflict);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1235,7 +1423,8 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "first-repo".to_string(),
                 root_path: root.to_string_lossy().to_string(),
-                trust_state: RpcRepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .expect("register should succeed");
 
@@ -1243,7 +1432,8 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "second-repo".to_string(),
                 root_path: root.join(".").to_string_lossy().to_string(),
-                trust_state: RpcRepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
             })
             .unwrap_err();
 
@@ -1370,7 +1560,7 @@ mod tests {
             events: vec![event],
         };
 
-        let cancellation = job_cancellation_from_receipt(&receipt);
+        let cancellation = job_cancellation_from_receipt(&receipt, None);
 
         assert_eq!(cancellation.state, "requested");
         assert_eq!(
@@ -1384,6 +1574,40 @@ mod tests {
         assert_eq!(
             cancellation.completed_at_unix_ms,
             Some(completion_timestamp.unix_millis)
+        );
+    }
+
+    #[test]
+    fn cancellation_dto_from_receipt_preserves_requester() {
+        let requested_by = actor_record();
+        let timestamp = atelia_core::LedgerTimestamp::from_unix_millis(8_000);
+        let receipt = CancelJobReceipt {
+            job: JobRecord::new(
+                requested_by.clone(),
+                RepositoryId::new(),
+                JobKind::Read,
+                "cleanup".to_string(),
+                atelia_core::LedgerTimestamp::from_unix_millis(7_000),
+            ),
+            events: vec![atelia_core::JobEvent {
+                id: atelia_core::JobEventId::new(),
+                schema_version: 1,
+                sequence_number: 1,
+                created_at: timestamp,
+                subject: atelia_core::EventSubject::job(&JobId::new()),
+                kind: JobEventKind::CancellationRequested,
+                severity: atelia_core::EventSeverity::Warning,
+                public_message: "operator requested".to_string(),
+                refs: atelia_core::EventRefs::default(),
+                redactions: Vec::new(),
+            }],
+        };
+
+        let cancellation = job_cancellation_from_receipt(&receipt, Some(&requested_by));
+
+        assert_eq!(
+            cancellation.requested_by,
+            Some(RpcActorDto::from(requested_by))
         );
     }
 
