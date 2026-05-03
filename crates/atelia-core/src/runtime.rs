@@ -29,6 +29,7 @@ pub struct RuntimeJobRequest {
     pub kind: JobKind,
     pub goal: String,
     pub resource_scope: ResourceScope,
+    pub requested_capabilities: Vec<String>,
     pub approval_available: bool,
     pub render_options: RenderOptions,
     pub tool_output_defaults: ToolOutputDefaults,
@@ -51,6 +52,7 @@ impl RuntimeJobRequest {
                 kind: "repository".to_string(),
                 value: ".".to_string(),
             },
+            requested_capabilities: Vec::new(),
             approval_available: true,
             render_options: RenderOptions::new(OutputFormat::Toon),
             tool_output_defaults: ToolOutputDefaults::default(),
@@ -67,6 +69,11 @@ impl RuntimeJobRequest {
             kind: kind.into(),
             value: value.into(),
         };
+        self
+    }
+
+    pub fn with_requested_capabilities(mut self, requested_capabilities: Vec<String>) -> Self {
+        self.requested_capabilities = requested_capabilities;
         self
     }
 
@@ -284,6 +291,11 @@ where
             request.goal.clone(),
             LedgerTimestamp::now(),
         );
+        let requested_capability = request
+            .requested_capabilities
+            .first()
+            .cloned()
+            .unwrap_or_else(|| tool.requested_capability().to_string());
 
         let initial_event = job_event(
             EventSubject::job(&job.id),
@@ -302,7 +314,7 @@ where
             PolicyInput::new(
                 request.requester.clone(),
                 request.repository_id.clone(),
-                tool.requested_capability(),
+                requested_capability.clone(),
                 request.resource_scope.clone(),
                 tool.declared_effect(),
                 repository.trust_state,
@@ -387,7 +399,7 @@ where
             policy_decision_id: policy_decision.id.clone(),
             actor: request.requester.clone(),
             tool_id: tool.tool_id().to_string(),
-            requested_capability: tool.requested_capability().to_string(),
+            requested_capability,
             args_summary: tool.args_summary(&request),
             resolved_paths: tool.resolved_paths(&request),
             timeout_millis: None,

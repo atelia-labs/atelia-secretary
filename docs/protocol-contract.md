@@ -109,8 +109,13 @@ allowed local scope, and is not already blocked by policy.
 - latest event id (optional)
 - cancellation details (`state` plus request/completion metadata when present)
 
+Requested capability hints are provided on `SubmitJobRequest` and normalized for
+policy and idempotency, but they are not echoed on `Job` yet.
+
 `SubmitJob` must not execute work immediately before policy has been evaluated.
 The first observable effect is a persisted `job` and `job_event`.
+Successful submissions may be replayed by `idempotency_key`; failed submissions
+are not currently cached as replay results.
 
 ### Event
 

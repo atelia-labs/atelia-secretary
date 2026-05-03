@@ -5,15 +5,16 @@
 //! registration/listing, and the first supported job lifecycle calls.
 
 use atelia_core::{
-    Actor, ApplyBlocklistRequest, ApplyBlocklistResponse, CancelJobReceipt, DefaultPolicyEngine,
-    ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, InMemoryStore,
-    InMemoryToolOutputSettingsService, InstallExtensionRequest, InstallExtensionResponse, JobId,
-    JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
-    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
-    PathScope, PolicyEngine, PolicyInput, RegistryError, RepositoryId, RepositoryRecord,
-    RepositoryTrustState, ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse,
-    RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
-    ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
+    canonicalize_job_requested_capability, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
+    CancelJobReceipt, DefaultPolicyEngine, ExtensionRegistryService, ExtensionStatusRequest,
+    ExtensionStatusResponse, InMemoryStore, InMemoryToolOutputSettingsService,
+    InstallExtensionRequest, InstallExtensionResponse, JobId, JobKind, JobLifecycleService,
+    JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest,
+    ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse, PathScope, PolicyEngine,
+    PolicyInput, RegistryError, RepositoryId, RepositoryRecord, RepositoryTrustState,
+    ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse, RuntimeError,
+    RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError, ToolOutputDefaults,
+    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
     ToolOutputSettingsScope,
 };
 use std::collections::HashMap;
@@ -506,12 +507,8 @@ impl SecretaryService {
             });
         }
 
-        if !request.requested_capabilities.is_empty() {
-            return Err(ServiceError::InvalidArgument {
-                reason:
-                    "requested_capabilities is not yet supported; submit one capability via a future-capable transport".to_string(),
-            });
-        }
+        let requested_capabilities =
+            normalize_requested_capabilities(&request.requested_capabilities)?;
 
         let normalized_idempotency_key = request
             .idempotency_key
@@ -519,7 +516,7 @@ impl SecretaryService {
             .map(|key| key.trim())
             .filter(|key| !key.is_empty())
             .map(str::to_string);
-        let request_signature = submit_job_request_signature(&request);
+        let request_signature = submit_job_request_signature(&request, &requested_capabilities);
         let mut idempotent_cache_lock = if let Some(idempotency_key) =
             normalized_idempotency_key.as_deref()
         {
@@ -549,6 +546,7 @@ impl SecretaryService {
             request.kind,
             request.goal,
         )
+        .with_requested_capabilities(requested_capabilities)
         .with_resource_scope(
             request
                 .resource_scope
@@ -823,13 +821,52 @@ fn actor_signature(actor: &Actor) -> String {
     }
 }
 
-fn submit_job_request_signature(request: &SubmitJobRequest) -> String {
+fn normalize_requested_capabilities(
+    requested_capabilities: &[String],
+) -> ServiceResult<Vec<String>> {
+    let mut normalized = Vec::new();
+
+    for capability in requested_capabilities {
+        let trimmed = capability.trim();
+        if trimmed.is_empty() {
+            return Err(ServiceError::InvalidArgument {
+                reason: "requested_capabilities must not contain empty entries".to_string(),
+            });
+        }
+
+        let canonical = canonicalize_job_requested_capability(trimmed).ok_or_else(|| {
+            ServiceError::InvalidArgument {
+                reason: format!(
+                    "requested_capabilities contains unsupported capability: {trimmed}"
+                ),
+            }
+        })?;
+
+        if !normalized.iter().any(|existing| existing == canonical) {
+            normalized.push(canonical.to_string());
+        }
+    }
+
+    if normalized.is_empty() {
+        normalized.push(
+            canonicalize_job_requested_capability("capability.discovery")
+                .expect("capability.discovery must be canonicalizable")
+                .to_string(),
+        );
+    }
+
+    normalized.sort();
+    Ok(normalized)
+}
+
+fn submit_job_request_signature(
+    request: &SubmitJobRequest,
+    requested_capabilities: &[String],
+) -> String {
     let resource_scope = request.resource_scope.as_ref().map_or_else(
         || "repository:.".to_string(),
         |scope| format!("{}:{}", scope.kind, scope.value),
     );
-    let mut requested_capabilities = request.requested_capabilities.clone();
-    requested_capabilities.sort();
     let kind = match &request.kind {
         JobKind::Read => "read",
         JobKind::Mutate => "mutate",
@@ -2137,7 +2174,94 @@ mod tests {
     }
 
     #[test]
-    fn submit_job_rejects_requested_capabilities() {
+    fn submit_job_accepts_supported_requested_capabilities() {
+        let svc = ready_service();
+        let root = test_repo_dir("unsupported-capabilities");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let first = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: vec!["policy.check".to_string()],
+                idempotency_key: Some("request-123".to_string()),
+            })
+            .expect("submit should succeed");
+        assert_eq!(
+            first.policy_decision.requested_capability,
+            "capability.discovery"
+        );
+        let second = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: vec!["capability.discovery".to_string()],
+                idempotency_key: Some("request-123".to_string()),
+            })
+            .expect("normalized alias should replay the same job");
+
+        assert_eq!(first.job.id, second.job.id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_treats_empty_requested_capabilities_like_capability_discovery() {
+        let svc = ready_service();
+        let root = test_repo_dir("empty-capability-idempotency");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let first = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("request-123".to_string()),
+            })
+            .expect("submit should succeed");
+
+        let second = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: vec!["capability.discovery".to_string()],
+                idempotency_key: Some("request-123".to_string()),
+            })
+            .expect("normalized capability should replay the same job");
+
+        assert_eq!(first.job.id, second.job.id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_unsupported_requested_capabilities() {
         let svc = ready_service();
         let root = test_repo_dir("unsupported-capabilities");
         let repository = svc
@@ -2157,7 +2281,7 @@ mod tests {
                 kind: JobKind::Read,
                 goal: "summarize".to_string(),
                 resource_scope: None,
-                requested_capabilities: vec!["capability.discovery".to_string()],
+                requested_capabilities: vec!["filesystem.write".to_string()],
                 idempotency_key: None,
             })
             .unwrap_err();

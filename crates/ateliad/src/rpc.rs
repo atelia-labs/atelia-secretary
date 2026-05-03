@@ -2592,7 +2592,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_job_rejects_requested_capabilities_and_idempotency_key() {
+    fn submit_job_accepts_supported_requested_capabilities_and_idempotency_key() {
         let server = ready_server();
         let root = test_repo_dir("unsupported-submission-fields");
         let registered = server
@@ -2604,7 +2604,22 @@ mod tests {
             })
             .expect("register should succeed");
 
-        let no_capabilities = server
+        let first_response = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "first".to_string(),
+                path_scope: None,
+                requested_capabilities: vec!["policy.check".to_string()],
+                idempotency_key: Some("request-key".to_string()),
+            })
+            .expect("submit should succeed");
+        assert_eq!(
+            first_response.policy.requested_capability,
+            "capability.discovery"
+        );
+        let replayed = server
             .submit_job(SubmitJobRequest {
                 repository_id: registered.repository.repository_id.clone(),
                 requester: actor(),
@@ -2612,10 +2627,10 @@ mod tests {
                 goal: "first".to_string(),
                 path_scope: None,
                 requested_capabilities: vec!["capability.discovery".to_string()],
-                idempotency_key: None,
+                idempotency_key: Some("request-key".to_string()),
             })
-            .unwrap_err();
-        assert_eq!(no_capabilities.code, RpcErrorCode::InvalidArgument);
+            .expect("replay should return same job");
+        assert_eq!(first_response.job.job_id, replayed.job.job_id);
 
         let with_idempotency = server
             .submit_job(SubmitJobRequest {
@@ -2625,7 +2640,7 @@ mod tests {
                 goal: "second".to_string(),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
-                idempotency_key: Some("request-key".to_string()),
+                idempotency_key: Some("request-key-2".to_string()),
             })
             .expect("submit job should succeed");
         let replayed = server
@@ -2635,7 +2650,7 @@ mod tests {
                 kind: "read".to_string(),
                 goal: "second".to_string(),
                 path_scope: None,
-                idempotency_key: Some("request-key".to_string()),
+                idempotency_key: Some("request-key-2".to_string()),
                 requested_capabilities: Vec::new(),
             })
             .expect("replay should return same job");
@@ -2654,6 +2669,34 @@ mod tests {
             .unwrap_err();
         assert_eq!(conflicting.code, RpcErrorCode::Conflict);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_unsupported_requested_capabilities() {
+        let server = ready_server();
+        let root = test_repo_dir("unsupported-submission-capabilities");
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "feature-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let error = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id,
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "unsupported".to_string(),
+                path_scope: None,
+                requested_capabilities: vec!["filesystem.write".to_string()],
+                idempotency_key: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::InvalidArgument);
         let _ = fs::remove_dir_all(root);
     }
 
