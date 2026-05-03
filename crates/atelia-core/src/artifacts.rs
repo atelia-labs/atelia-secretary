@@ -832,19 +832,19 @@ impl LocalArtifactStore {
     }
     pub fn delete_artifact(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
         let path = Path::new(&output_ref.uri);
-        let Some(parent) = path.parent() else {
+        let Ok(_metadata) = fs::symlink_metadata(path) else {
             return Ok(());
         };
 
         let root = self.canonical_root_dir().map_err(ArtifactError::Io)?;
 
-        let canonical_parent = match parent.canonicalize() {
+        let resolved_path = match path.canonicalize() {
             Ok(path) => path,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(ArtifactError::Io(error)),
         };
 
-        if !canonical_parent.starts_with(&root) {
+        if !resolved_path.starts_with(&root) {
             return Ok(());
         }
 
@@ -1166,126 +1166,6 @@ fn rename_atomic(source: &Path, destination: &Path) -> io::Result<()> {
         Err(error) => Err(error),
     }
 }
-
-fn create_scope_dir(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
-        builder.mode(0o700);
-        builder.create(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-    }
-
-    #[cfg(not(unix))]
-    fs::create_dir_all(path)
-}
-
-fn write_file_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_file_bytes_inner(path, bytes, false)
-}
-
-#[cfg(test)]
-fn write_file_bytes_with_injected_failure(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_file_bytes_inner(path, bytes, true)
-}
-
-fn write_file_bytes_inner(path: &Path, bytes: &[u8], fail_after_write: bool) -> io::Result<()> {
-    let mut open_result = None;
-
-    for attempt in 0..64 {
-        let temp_path = temporary_file_path(path, attempt);
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-
-        #[cfg(unix)]
-        {
-            options.mode(0o600);
-        }
-
-        match options.open(&temp_path) {
-            Ok(file) => {
-                open_result = Some((file, temp_path));
-                break;
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-
-    let (mut file, temp_path) = open_result.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "failed to create temporary artifact file",
-        )
-    })?;
-
-    let cleanup_temp_file = || {
-        let _ = fs::remove_file(&temp_path);
-    };
-
-    use std::io::Write;
-    if let Err(error) = file.write_all(bytes) {
-        cleanup_temp_file();
-        return Err(error);
-    }
-
-    if fail_after_write {
-        cleanup_temp_file();
-        return Err(io::Error::other("simulated post-write failure"));
-    }
-
-    if let Err(error) = file.flush() {
-        cleanup_temp_file();
-        return Err(error);
-    }
-
-    #[cfg(unix)]
-    {
-        if let Err(error) = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)) {
-            cleanup_temp_file();
-            return Err(error);
-        }
-    }
-
-    drop(file);
-
-    if let Err(error) = rename_atomic(&temp_path, path) {
-        cleanup_temp_file();
-        return Err(error);
-    }
-
-    Ok(())
-}
-
-fn temporary_file_path(path: &Path, attempt: u32) -> PathBuf {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("artifact");
-    let suffix = WRITE_FILE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    parent.join(format!(
-        "{WRITE_FILE_TMP_PREFIX}-{file_name}-{attempt}-{suffix}"
-    ))
-}
-
-fn rename_atomic(source: &Path, destination: &Path) -> io::Result<()> {
-    match fs::rename(source, destination) {
-        Ok(()) => Ok(()),
-        #[cfg(not(unix))]
-        Err(error) => match error.kind() {
-            ErrorKind::AlreadyExists => {
-                fs::remove_file(destination)?;
-                fs::rename(source, destination)
-            }
-            _ => Err(error),
-        },
-        #[cfg(unix)]
-        Err(error) => Err(error),
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultSpilloverOptions {
     pub max_inline_bytes: usize,
@@ -2075,7 +1955,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(&absolute_root);
     }
-
     #[test]
     fn spills_large_string_field_to_output_ref() {
         let root = temp_root("spill");
@@ -3281,21 +3160,6 @@ mod tests {
         ));
     }
     #[derive(Debug)]
-    struct FailingWriter {
-        writes: Cell<usize>,
-        fail_on: usize,
-    }
-
-    impl FailingWriter {
-        fn new(fail_on: usize) -> Self {
-            Self {
-                writes: Cell::new(0),
-                fail_on,
-            }
-        }
-    }
-
-    #[derive(Debug)]
     struct FailingLocalWriter {
         delegate: LocalArtifactStore,
         writes: Cell<usize>,
@@ -3345,33 +3209,6 @@ mod tests {
             self.delegate.delete_artifact_record(scope, output_ref)
         }
     }
-    impl ArtifactWriter for FailingWriter {
-        fn write_artifact_bytes(
-            &self,
-            scope: &str,
-            label: &str,
-            media_type: &str,
-            bytes: &[u8],
-        ) -> ArtifactResult<OutputRef> {
-            let write_count = self.writes.get() + 1;
-            self.writes.set(write_count);
-
-            if write_count == self.fail_on {
-                return Err(ArtifactError::Io(std::io::Error::other(
-                    "simulated write failure",
-                )));
-            }
-
-            Ok(OutputRef {
-                id: OutputRefId::new(),
-                uri: format!("file://{scope}/{label}/{}-bytes", bytes.len()),
-                media_type: media_type.to_string(),
-                label: Some(label.to_string()),
-                digest: None,
-            })
-        }
-    }
-
     #[test]
     fn rolls_back_partial_artifact_writes_on_later_failure() {
         let root = temp_root("spill-rollback");
@@ -3425,126 +3262,6 @@ mod tests {
         assert!(entries
             .iter()
             .all(|entry| entry.file_name().to_string_lossy() == ".index.lock"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn writes_artifacts_with_restrictive_unix_permissions() {
-        let root = temp_root("perm");
-        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
-        let reference = store
-            .write_bytes("repo_example", "search output", "text/plain", b"hello")
-            .unwrap();
-
-        let dir = root.join("repo_example");
-        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(0o700, dir_mode);
-
-        let file_mode = fs::metadata(&reference.uri).unwrap().permissions().mode() & 0o777;
-        assert_eq!(0o600, file_mode);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rewrites_existing_artifact_with_restrictive_unix_mode() {
-        let root = temp_root("existing-perm");
-        let dir = root.join("repo_example");
-        create_scope_dir(&dir).unwrap();
-        let file_path = dir.join("existing.artifact");
-
-        {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&file_path)
-                .unwrap();
-            use std::io::Write;
-            file.write_all(b"loose").unwrap();
-        }
-        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o644)).unwrap();
-
-        let pre_mode = fs::metadata(&file_path).unwrap().permissions().mode() & 0o777;
-        assert_ne!(0o600, pre_mode);
-
-        write_file_bytes(&file_path, b"second").unwrap();
-
-        let post_mode = fs::metadata(&file_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(0o600, post_mode);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tightens_existing_scope_directory_permissions_on_write() {
-        let root = temp_root("existing-scope");
-        let dir = root.join("repo_example");
-        fs::create_dir_all(&root).unwrap();
-        fs::create_dir(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
-
-        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
-        let reference = store
-            .write_bytes("repo_example", "search output", "text/plain", b"hello")
-            .unwrap();
-
-        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(0o700, dir_mode);
-
-        let file_mode = fs::metadata(&reference.uri).unwrap().permissions().mode() & 0o777;
-        assert_eq!(0o600, file_mode);
-    }
-
-    #[test]
-    fn rolls_back_partial_artifact_writes_on_later_failure() {
-        let root = temp_root("spill-rollback");
-        let delegate = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
-        let mut result = ToolResult {
-            id: ToolResultId::new(),
-            schema_version: 1,
-            created_at: LedgerTimestamp::now(),
-            invocation_id: ToolInvocationId::new(),
-            tool_id: "fs.search".to_string(),
-            status: ToolResultStatus::Succeeded,
-            schema_ref: Some("tool_result.test.v1".to_string()),
-            fields: vec![
-                ToolResultField {
-                    key: "matches".to_string(),
-                    value: StructuredValue::String("abcdef".into()),
-                },
-                ToolResultField {
-                    key: "summary".to_string(),
-                    value: StructuredValue::String("ghijkl".into()),
-                },
-            ],
-            evidence_refs: Vec::new(),
-            output_refs: Vec::new(),
-            truncation: None,
-            redactions: Vec::new(),
-        };
-        let expected = result.clone();
-        let writer = FailingLocalWriter::new(delegate, 2);
-
-        let error = spill_large_tool_result_fields_with_writer(
-            &mut result,
-            &writer,
-            "repo_example",
-            &ToolResultSpilloverOptions::new(4),
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, ArtifactError::Io(_)));
-        assert_eq!(expected, result);
-
-        let scope_dir = root.join("repo_example");
-        let entries = if scope_dir.exists() {
-            fs::read_dir(&scope_dir)
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap()
-        } else {
-            Vec::new()
-        };
-        assert!(entries.is_empty());
     }
 
     #[cfg(unix)]
