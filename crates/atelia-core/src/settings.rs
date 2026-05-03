@@ -411,8 +411,6 @@ fn apply_verbosity_constraints(render_options: &mut RenderOptions, verbosity: To
             render_options.include_cost = false;
         }
         ToolOutputVerbosity::Expanded => {
-            render_options.include_policy = true;
-            render_options.include_diagnostics = true;
             render_options.include_cost = false;
         }
         ToolOutputVerbosity::Debug => {
@@ -891,8 +889,8 @@ mod tests {
         let policy = defaults.render_policy();
 
         assert_eq!(policy.render_options.format, OutputFormat::Json);
-        assert!(policy.render_options.include_policy);
-        assert!(policy.render_options.include_diagnostics);
+        assert!(!policy.render_options.include_policy);
+        assert!(!policy.render_options.include_diagnostics);
         assert!(!policy.render_options.include_cost);
         assert_eq!(policy.max_fields, Some(1));
         assert!(!policy.include_evidence_refs);
@@ -1028,6 +1026,35 @@ mod tests {
         };
 
         let policy = defaults.render_policy_with_render_options(None);
+
+        assert_eq!(policy.render_options.format, OutputFormat::Json);
+        assert!(!policy.render_options.include_policy);
+        assert!(!policy.render_options.include_diagnostics);
+        assert!(!policy.render_options.include_cost);
+    }
+
+    #[test]
+    fn defaults_render_policy_expanded_preserves_requested_false_optional_channels() {
+        let defaults = ToolOutputDefaults {
+            render_options: RenderOptions {
+                format: OutputFormat::Text,
+                include_policy: true,
+                include_diagnostics: true,
+                include_cost: true,
+            },
+            max_inline_bytes: DEFAULT_MAX_INLINE_BYTES,
+            max_inline_lines: 4,
+            verbosity: ToolOutputVerbosity::Expanded,
+            granularity: ToolOutputGranularity::Full,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        };
+
+        let policy = defaults.render_policy_with_render_options(Some(&RenderOptions {
+            format: OutputFormat::Json,
+            include_policy: false,
+            include_diagnostics: false,
+            include_cost: true,
+        }));
 
         assert_eq!(policy.render_options.format, OutputFormat::Json);
         assert!(!policy.render_options.include_policy);
