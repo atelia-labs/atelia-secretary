@@ -3,6 +3,8 @@
 use crate::domain::{
     OutputRef, OutputRefId, StructuredValue, ToolResult, ToolResultField, TruncationMetadata,
 };
+#[cfg(test)]
+use std::cell::Cell;
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -69,6 +71,28 @@ impl From<io::Error> for ArtifactError {
 }
 
 pub type ArtifactResult<T> = Result<T, ArtifactError>;
+
+trait ArtifactWriter {
+    fn write_artifact_bytes(
+        &self,
+        scope: &str,
+        label: &str,
+        media_type: &str,
+        bytes: &[u8],
+    ) -> ArtifactResult<OutputRef>;
+}
+
+impl ArtifactWriter for LocalArtifactStore {
+    fn write_artifact_bytes(
+        &self,
+        scope: &str,
+        label: &str,
+        media_type: &str,
+        bytes: &[u8],
+    ) -> ArtifactResult<OutputRef> {
+        self.write_bytes(scope, label, media_type, bytes)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalArtifactStore {
@@ -149,16 +173,29 @@ pub fn spill_large_tool_result_fields(
     scope: &str,
     options: &ToolResultSpilloverOptions,
 ) -> ArtifactResult<Option<ToolResultSpilloverReport>> {
+    spill_large_tool_result_fields_with_writer(result, store, scope, options)
+}
+
+fn spill_large_tool_result_fields_with_writer(
+    result: &mut ToolResult,
+    store: &impl ArtifactWriter,
+    scope: &str,
+    options: &ToolResultSpilloverOptions,
+) -> ArtifactResult<Option<ToolResultSpilloverReport>> {
     if options.max_inline_bytes == 0 {
         return Ok(None);
     }
 
-    let mut spilled_fields = Vec::new();
     let mut original_bytes = 0u64;
     let mut retained_bytes = 0u64;
-    let mut output_refs = Vec::new();
+    let mut planned_spills: Vec<(
+        usize,     // field index
+        String,    // field key
+        String,    // replacement value
+        OutputRef, // temp output reference
+    )> = Vec::new();
 
-    for field in &mut result.fields {
+    for (index, field) in result.fields.iter().enumerate() {
         let Some(bytes) = spillable_field_bytes(field) else {
             continue;
         };
@@ -167,26 +204,37 @@ pub fn spill_large_tool_result_fields(
             continue;
         }
 
-        let output_ref = store.write_bytes(
+        let output_ref = store.write_artifact_bytes(
             scope,
-            format!("{}.{}", result.tool_id, field.key),
-            options.media_type.clone(),
+            &format!("{}.{}", result.tool_id, field.key),
+            &options.media_type,
             &bytes,
         )?;
         let replacement = format!("artifact_ref {}", output_ref.uri);
 
         original_bytes += bytes.len() as u64;
         retained_bytes += replacement.len() as u64;
-        spilled_fields.push(field.key.clone());
-        field.value = StructuredValue::String(replacement);
-        output_refs.push(output_ref);
+        planned_spills.push((index, field.key.clone(), replacement, output_ref));
     }
 
-    if spilled_fields.is_empty() {
+    if planned_spills.is_empty() {
         return Ok(None);
     }
 
-    result.output_refs.extend(output_refs);
+    let spilled_fields: Vec<String> = planned_spills
+        .iter()
+        .map(|(_, key, _, _)| key.clone())
+        .collect();
+
+    for (index, _key, replacement, _output_ref) in &planned_spills {
+        result.fields[*index].value = StructuredValue::String(replacement.clone());
+    }
+
+    result.output_refs.extend(
+        planned_spills
+            .into_iter()
+            .map(|(_, _, _, output_ref)| output_ref),
+    );
     result.truncation = Some(merge_truncation(
         result.truncation.take(),
         original_bytes,
@@ -362,5 +410,88 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ArtifactError::InvalidScope { .. }));
+    }
+
+    #[derive(Debug)]
+    struct FailingWriter {
+        writes: Cell<usize>,
+        fail_on: usize,
+    }
+
+    impl FailingWriter {
+        fn new(fail_on: usize) -> Self {
+            Self {
+                writes: Cell::new(0),
+                fail_on,
+            }
+        }
+    }
+
+    impl ArtifactWriter for FailingWriter {
+        fn write_artifact_bytes(
+            &self,
+            scope: &str,
+            label: &str,
+            media_type: &str,
+            bytes: &[u8],
+        ) -> ArtifactResult<OutputRef> {
+            let write_count = self.writes.get() + 1;
+            self.writes.set(write_count);
+
+            if write_count == self.fail_on {
+                return Err(ArtifactError::Io(std::io::Error::other(
+                    "simulated write failure",
+                )));
+            }
+
+            Ok(OutputRef {
+                id: OutputRefId::new(),
+                uri: format!("file://{scope}/{label}/{}-bytes", bytes.len()),
+                media_type: media_type.to_string(),
+                label: Some(label.to_string()),
+                digest: None,
+            })
+        }
+    }
+
+    #[test]
+    fn does_not_mutate_result_when_later_spill_write_fails() {
+        let mut result = ToolResult {
+            id: ToolResultId::new(),
+            schema_version: 1,
+            created_at: LedgerTimestamp::now(),
+            invocation_id: ToolInvocationId::new(),
+            tool_id: "fs.search".to_string(),
+            status: ToolResultStatus::Succeeded,
+            schema_ref: Some("tool_result.test.v1".to_string()),
+            fields: vec![
+                ToolResultField {
+                    key: "matches".to_string(),
+                    value: StructuredValue::String("abcdef".into()),
+                },
+                ToolResultField {
+                    key: "summary".to_string(),
+                    value: StructuredValue::String("ghijkl".into()),
+                },
+            ],
+            evidence_refs: Vec::new(),
+            output_refs: Vec::new(),
+            truncation: None,
+            redactions: Vec::new(),
+        };
+
+        let expected = result.clone();
+        let writer = FailingWriter::new(2);
+
+        let error = spill_large_tool_result_fields_with_writer(
+            &mut result,
+            &writer,
+            "repo_example",
+            &ToolResultSpilloverOptions::new(4),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ArtifactError::Io(_)));
+        assert_eq!(expected, result);
     }
 }
