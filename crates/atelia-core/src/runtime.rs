@@ -444,46 +444,82 @@ where
             )?;
             return Err(error);
         }
-        if let Some(spillover) = &request.artifact_spillover {
-            let artifact_store = LocalArtifactStore::new(spillover.store_config.clone());
-            if let Err(error) = spill_large_tool_result_fields(
-                &mut result,
-                &artifact_store,
-                repository.id.as_str(),
-                &spillover.options,
-            ) {
+
+        let render_policy = request
+            .tool_output_defaults
+            .render_policy_with_render_options(request.render_options.as_ref());
+        let rendered_output = match render_tool_result_with_policy(&result, &render_policy) {
+            Ok(rendered_output) => rendered_output,
+            Err(error) => {
                 let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
                 append_failed_job_event(
                     &self.store,
                     &mut job,
                     &mut events,
-                    "artifact spillover failed",
+                    "tool output rendering failed",
                     failure_refs,
                 )?;
-                return Err(error.into());
+                return Err(RuntimeError::ToolOutputRender(error));
+            }
+        };
+
+        let mut should_rerender_output = false;
+        let max_inline_bytes =
+            max_inline_bytes_as_usize(request.tool_output_defaults.max_inline_bytes);
+
+        if let Some(spillover) = &request.artifact_spillover {
+            let artifact_store = LocalArtifactStore::new(spillover.store_config.clone());
+            let report = spill_large_tool_result_fields(
+                &mut result,
+                &artifact_store,
+                repository.id.as_str(),
+                &spillover.options,
+            );
+            match report {
+                Ok(Some(_)) => {
+                    should_rerender_output = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
+                    append_failed_job_event(
+                        &self.store,
+                        &mut job,
+                        &mut events,
+                        "artifact spillover failed",
+                        failure_refs,
+                    )?;
+                    return Err(error.into());
+                }
             }
         } else {
-            let max_inline_bytes =
-                max_inline_bytes_as_usize(request.tool_output_defaults.max_inline_bytes);
             match request.tool_output_defaults.oversize_policy {
                 OversizeOutputPolicy::SpillToArtifactRef => {
                     let spillover = RuntimeArtifactSpillover::local_default(max_inline_bytes);
                     let artifact_store = LocalArtifactStore::new(spillover.store_config.clone());
-                    if let Err(error) = spill_large_tool_result_fields(
+                    let report = spill_large_tool_result_fields(
                         &mut result,
                         &artifact_store,
                         repository.id.as_str(),
                         &spillover.options,
-                    ) {
-                        let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
-                        append_failed_job_event(
-                            &self.store,
-                            &mut job,
-                            &mut events,
-                            "artifact spillover failed",
-                            failure_refs,
-                        )?;
-                        return Err(error.into());
+                    );
+                    match report {
+                        Ok(Some(_)) => {
+                            should_rerender_output = true;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let failure_refs =
+                                refs_for_invocation(&job, &policy_decision, &invocation);
+                            append_failed_job_event(
+                                &self.store,
+                                &mut job,
+                                &mut events,
+                                "artifact spillover failed",
+                                failure_refs,
+                            )?;
+                            return Err(error.into());
+                        }
                     }
                 }
                 OversizeOutputPolicy::RejectOversize => {
@@ -505,6 +541,7 @@ where
                     if let Some(report) =
                         truncate_oversized_tool_result_fields(&mut result, max_inline_bytes)
                     {
+                        should_rerender_output = true;
                         result.truncation = Some(merge_runtime_truncation(
                             result.truncation.take(),
                             report.original_bytes,
@@ -580,12 +617,24 @@ where
         );
         job.latest_event_id = events.last().map(|event| event.id.clone());
 
-        let rendered_output = render_tool_result_with_policy(
-            &result,
-            &request
-                .tool_output_defaults
-                .render_policy_with_render_options(request.render_options.as_ref()),
-        )?;
+        let rendered_output = if should_rerender_output {
+            match render_tool_result_with_policy(&result, &render_policy) {
+                Ok(rendered_output) => rendered_output,
+                Err(error) => {
+                    let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
+                    append_failed_job_event(
+                        &self.store,
+                        &mut job,
+                        &mut events,
+                        "tool output rendering failed",
+                        failure_refs,
+                    )?;
+                    return Err(RuntimeError::ToolOutputRender(error));
+                }
+            }
+        } else {
+            rendered_output
+        };
 
         Ok(RuntimeJobReceipt {
             job,
@@ -1800,7 +1849,7 @@ mod tests {
 
         let error = runtime.run_tool_job(request, &tool).unwrap_err();
 
-        assert!(matches!(error, RuntimeError::ToolOutputTooLarge { .. }));
+        assert!(matches!(error, RuntimeError::ToolOutputRender(_)));
         assert!(runtime.store().list_tool_results().unwrap().is_empty());
         let jobs = runtime.store().list_jobs().unwrap();
         assert_eq!(1, jobs.len());
@@ -1989,6 +2038,48 @@ mod tests {
         let jobs = runtime.store().list_jobs().unwrap();
         assert_eq!(1, jobs.len());
         assert_eq!(JobStatus::Failed, jobs[0].status);
+    }
+
+    #[test]
+    fn runtime_renders_tool_output_before_artifact_spillover() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+        let artifact_root = std::env::temp_dir().join(format!(
+            "atelia-runtime-artifacts-render-fail-{}",
+            LedgerTimestamp::now().unix_millis
+        ));
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "render fails before spill",
+        )
+        .with_artifact_spillover(RuntimeArtifactSpillover::new(
+            ArtifactStoreConfig::new(&artifact_root),
+            ToolResultSpilloverOptions::new(8),
+        ))
+        .with_tool_output_defaults(ToolOutputDefaults {
+            max_inline_bytes: 8,
+            oversize_policy: OversizeOutputPolicy::RejectOversize,
+            ..ToolOutputDefaults::default()
+        });
+        let tool = LargeOutputTool {
+            content: "0123456789abcdef".to_string(),
+        };
+
+        let error = runtime.run_tool_job(request, &tool).unwrap_err();
+
+        assert!(matches!(error, RuntimeError::ToolOutputRender { .. }));
+        assert!(runtime.store().list_tool_results().unwrap().is_empty());
+        assert!(!artifact_root.exists());
+        let jobs = runtime.store().list_jobs().unwrap();
+        assert_eq!(1, jobs.len());
+        assert_eq!(JobStatus::Failed, jobs[0].status);
+        assert!(jobs[0].completed_at.is_some());
     }
 
     #[test]

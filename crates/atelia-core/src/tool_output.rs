@@ -91,6 +91,7 @@ pub struct RenderedToolOutput {
     pub schema_version: String,
     pub body: String,
     pub fallback_reason: Option<String>,
+    pub truncation: Option<TruncationMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,31 +137,34 @@ pub fn render_tool_result_with_policy(
 
     match policy.render_options.format {
         OutputFormat::Toon => {
-            let (body, fallback_reason) = render_toon(result, policy, None)?;
+            let (body, fallback_reason, truncation) = render_toon(result, policy, None)?;
             Ok(RenderedToolOutput {
                 format: OutputFormat::Toon,
                 schema_version,
                 body,
                 fallback_reason,
+                truncation,
             })
         }
         OutputFormat::Text => {
-            let (body, fallback_reason) = render_text(result, policy)?;
+            let (body, fallback_reason, truncation) = render_text(result, policy)?;
             Ok(RenderedToolOutput {
                 format: OutputFormat::Text,
                 schema_version,
                 body,
                 fallback_reason,
+                truncation,
             })
         }
         OutputFormat::Json => {
-            let (body, fallback_reason) = render_json(result, policy)?;
+            let (body, fallback_reason, truncation) = render_json(result, policy)?;
 
             Ok(RenderedToolOutput {
                 format: OutputFormat::Json,
                 schema_version,
                 body,
                 fallback_reason,
+                truncation,
             })
         }
     }
@@ -170,8 +174,9 @@ fn render_toon(
     result: &ToolResult,
     policy: &ToolOutputRenderPolicy,
     fallback_reason: Option<&str>,
-) -> Result<(String, Option<String>), ToolOutputRenderError> {
+) -> Result<(String, Option<String>, Option<TruncationMetadata>), ToolOutputRenderError> {
     let (rendered_result, mut policy_fallback_reason) = renderable_result(result, policy)?;
+    let truncation = rendered_result.truncation.clone();
     policy_fallback_reason = combine_fallback_reasons(
         policy_fallback_reason,
         render_policy_fallback_reason(result, &rendered_result),
@@ -261,18 +266,19 @@ fn render_toon(
         let mut kept_lines = lines.into_iter().take(keep_len).collect::<Vec<_>>();
         kept_lines.extend(notice_lines);
         let fallback_reason = combine_fallback_reasons(policy_fallback_reason, Some(reason));
-        Ok((kept_lines.join("\n"), fallback_reason))
+        Ok((kept_lines.join("\n"), fallback_reason, truncation))
     } else {
         let fallback_reason = policy_fallback_reason;
-        Ok((lines.join("\n"), fallback_reason))
+        Ok((lines.join("\n"), fallback_reason, truncation))
     }
 }
 
 fn render_text(
     result: &ToolResult,
     policy: &ToolOutputRenderPolicy,
-) -> Result<(String, Option<String>), ToolOutputRenderError> {
+) -> Result<(String, Option<String>, Option<TruncationMetadata>), ToolOutputRenderError> {
     let (rendered_result, mut policy_fallback_reason) = renderable_result(result, policy)?;
+    let truncation = rendered_result.truncation.clone();
     policy_fallback_reason = combine_fallback_reasons(
         policy_fallback_reason,
         render_policy_fallback_reason(result, &rendered_result),
@@ -336,14 +342,15 @@ fn render_text(
         ));
     }
 
-    Ok((parts.join("; "), policy_fallback_reason))
+    Ok((parts.join("; "), policy_fallback_reason, truncation))
 }
 
 fn render_json(
     result: &ToolResult,
     policy: &ToolOutputRenderPolicy,
-) -> Result<(String, Option<String>), ToolOutputRenderError> {
+) -> Result<(String, Option<String>, Option<TruncationMetadata>), ToolOutputRenderError> {
     let (rendered_result, mut policy_fallback_reason) = renderable_result(result, policy)?;
+    let truncation = rendered_result.truncation.clone();
     policy_fallback_reason = combine_fallback_reasons(
         policy_fallback_reason,
         render_policy_fallback_reason(result, &rendered_result),
@@ -358,7 +365,7 @@ fn render_json(
         .max_inline_lines
         .is_none_or(|max_inline_lines| pretty_body.lines().count() <= max_inline_lines)
     {
-        return Ok((pretty_body, policy_fallback_reason));
+        return Ok((pretty_body, policy_fallback_reason, truncation));
     }
 
     let compact_fallback_reason = policy.max_inline_lines.map(|max_inline_lines| {
@@ -377,6 +384,7 @@ fn render_json(
         return Ok((
             compact_body,
             combine_fallback_reasons(policy_fallback_reason, compact_fallback_reason),
+            truncation,
         ));
     }
 
@@ -394,6 +402,7 @@ fn render_json(
             combine_fallback_reasons(policy_fallback_reason, compact_fallback_reason),
             fallback_reason,
         ),
+        truncation,
     ))
 }
 
@@ -1442,6 +1451,34 @@ mod tests {
     }
 
     #[test]
+    fn json_rendering_surfaces_render_time_truncation_metadata() {
+        let mut result = sample_result();
+        result.fields[1].value = StructuredValue::String("0123456789abcdef".to_string());
+        let policy = ToolOutputRenderPolicy {
+            render_options: RenderOptions::new(OutputFormat::Json),
+            max_fields: None,
+            max_inline_lines: None,
+            max_inline_bytes: Some(8),
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+            include_evidence_refs: true,
+            include_output_refs: true,
+            include_redactions: true,
+        };
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+        let truncation = rendered
+            .truncation
+            .expect("rendering should include truncation metadata");
+
+        let json: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
+        assert_eq!(json["tool_id"], "git_status");
+        assert_eq!(
+            truncation.reason,
+            "rendering truncated oversized tool output to max_inline_bytes=8"
+        );
+    }
+
+    #[test]
     fn toon_rendering_emits_truncation_notice_when_budget_is_smaller_than_prelude() {
         let result = sample_result();
         let policy = ToolOutputRenderPolicy {
@@ -1471,6 +1508,37 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("prelude_lines_omitted="));
+    }
+
+    #[test]
+    fn toon_rendering_surfaces_render_time_truncation_metadata() {
+        let mut result = sample_result();
+        result.fields[1].value = StructuredValue::String("0123456789abcdef".to_string());
+        let policy = ToolOutputRenderPolicy {
+            render_options: RenderOptions::default(),
+            max_fields: None,
+            max_inline_lines: None,
+            max_inline_bytes: Some(8),
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+            include_evidence_refs: true,
+            include_output_refs: true,
+            include_redactions: true,
+        };
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+        let truncation = rendered
+            .truncation
+            .expect("rendering should include truncation metadata");
+
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("rendering truncated oversized output"));
+        assert_eq!(
+            truncation.reason,
+            "rendering truncated oversized tool output to max_inline_bytes=8"
+        );
     }
 
     #[test]
@@ -1528,6 +1596,38 @@ mod tests {
         assert_eq!(
             rendered.body,
             "git_status secondary succeeded: 2 modified files; 3 field(s); 1 evidence ref(s); 1 output ref(s); truncated 512/4096 bytes: artifact threshold; 1 redaction(s): fields.secret note (policy secret, redacted_at_ms 1700000000123)"
+        );
+    }
+
+    #[test]
+    fn text_rendering_surfaces_render_time_truncation_metadata() {
+        let mut result = sample_result();
+        result.fields[1].value = StructuredValue::String("0123456789abcdef".to_string());
+        let policy = ToolOutputRenderPolicy {
+            render_options: RenderOptions::new(OutputFormat::Text),
+            max_fields: None,
+            max_inline_lines: None,
+            max_inline_bytes: Some(8),
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+            include_evidence_refs: true,
+            include_output_refs: true,
+            include_redactions: true,
+        };
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+        let truncation = rendered
+            .truncation
+            .expect("rendering should include truncation metadata");
+
+        assert!(rendered.body.contains("truncated"));
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("rendering truncated oversized output"));
+        assert_eq!(
+            truncation.reason,
+            "rendering truncated oversized tool output to max_inline_bytes=8"
         );
     }
 

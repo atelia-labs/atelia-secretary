@@ -672,6 +672,7 @@ impl SecretaryService {
             .map_err(|error| ServiceError::Internal {
                 reason: error.to_string(),
             })?;
+        let truncation = rendered_output.truncation.clone();
 
         Ok(RenderToolOutputResult {
             tool_result: CanonicalToolResultRef {
@@ -682,7 +683,7 @@ impl SecretaryService {
                 content_type: "application/json".to_string(),
             },
             rendered_output,
-            truncation: tool_result.truncation.clone(),
+            truncation,
         })
     }
 
@@ -1878,13 +1879,14 @@ mod tests {
                 requester: None,
             })
             .expect("repository registration should succeed");
+        let long_goal = "x".repeat(300);
 
         let receipt = svc
             .submit_job(SubmitJobRequest {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "render tool output".to_string(),
+                goal: long_goal.clone(),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -1896,6 +1898,7 @@ mod tests {
             actor(),
             ToolOutputSettingsScope::workspace().for_tool(tool_result.tool_id.clone()),
             ToolOutputOverrides {
+                max_inline_bytes: Some(256),
                 granularity: Some(atelia_core::ToolOutputGranularity::Summary),
                 ..ToolOutputOverrides::default()
             },
@@ -1931,7 +1934,13 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("render policy compacted output"));
-        assert_eq!(rendered.truncation, tool_result.truncation.clone());
+        assert!(rendered
+            .truncation
+            .as_ref()
+            .unwrap()
+            .reason
+            .contains("max_inline_bytes=256"));
+        assert_eq!(rendered.truncation, rendered.rendered_output.truncation);
         let _ = fs::remove_dir_all(root);
     }
 
