@@ -67,7 +67,7 @@ Required RPC groups:
 
 `HealthResponse` includes:
 
-- daemon status: `starting`, `ready`, `degraded`, `stopping`
+- daemon status: `starting`, `running`, `ready`, `degraded`, `stopping`
 - daemon version
 - protocol version
 - storage version
@@ -100,8 +100,8 @@ allowed local scope, and is not already blocked by policy.
 - status
 - policy summary
 - created / started / completed timestamps
-- latest event id
-- cancellation state
+- latest event id (optional)
+- cancellation details (`state` plus request/completion metadata when present)
 
 `SubmitJob` must not execute work immediately before policy has been evaluated.
 The first observable effect is a persisted `job` and `job_event`.
