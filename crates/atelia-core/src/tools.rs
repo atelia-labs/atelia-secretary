@@ -11,9 +11,14 @@ use crate::domain::{
 };
 use crate::runtime::RuntimeJobRequest;
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 
 const TOOLS_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_READ_MAX_LINES: usize = 120;
@@ -194,6 +199,37 @@ fn failed_result(
         None,
         Vec::new(),
     )
+}
+
+fn open_canonical_file_within_scope(canonical: &CanonicalPath) -> io::Result<File> {
+    let file = open_file_no_follow(&canonical.canonical)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let opened_path = fs::canonicalize(fd_path)?;
+        if !opened_path.starts_with(&canonical.root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "opened file escaped repository root",
+            ));
+        }
+    }
+
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_file_no_follow(path: &Path) -> io::Result<File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_file_no_follow(path: &Path) -> io::Result<File> {
+    fs::File::open(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -576,16 +612,19 @@ impl crate::runtime::RuntimeTool for FsReadTool {
             }
         };
 
-        if !canonical.canonical.is_file() {
-            return failed_result(
-                invocation,
-                schema_ref,
-                "read failed: target is not a file".to_string(),
-                canonical.display_path(),
-            );
-        }
+        let file = match open_canonical_file_within_scope(&canonical) {
+            Ok(file) => file,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "read failed: cannot open scoped file".to_string(),
+                    format!("{}: {}", canonical.display_path(), err),
+                );
+            }
+        };
 
-        let metadata = match fs::metadata(&canonical.canonical) {
+        let metadata = match file.metadata() {
             Ok(metadata) => metadata,
             Err(err) => {
                 return failed_result(
@@ -596,6 +635,15 @@ impl crate::runtime::RuntimeTool for FsReadTool {
                 );
             }
         };
+
+        if !metadata.is_file() {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "read failed: target is not a file".to_string(),
+                canonical.display_path(),
+            );
+        }
 
         if let Some(max_file_bytes) = self.max_file_bytes {
             if metadata.len() > max_file_bytes {
@@ -614,7 +662,7 @@ impl crate::runtime::RuntimeTool for FsReadTool {
         }
 
         let window = match read_text_window(
-            &canonical.canonical,
+            file,
             self.start_line,
             self.max_lines,
             self.max_chars,
@@ -992,14 +1040,13 @@ struct ReadWindow {
 }
 
 fn read_text_window(
-    path: &Path,
+    file: File,
     start_line: usize,
     max_lines: usize,
     max_chars: usize,
     max_scan_bytes: u64,
     include_line_numbers: bool,
 ) -> io::Result<ReadWindow> {
-    let file = fs::File::open(path)?;
     let mut reader = io::BufReader::new(file);
     let start_line = start_line.max(1);
 
@@ -1017,6 +1064,17 @@ fn read_text_window(
     let mut line_bytes = Vec::new();
 
     loop {
+        if current_line >= start_line {
+            if line_count >= max_lines {
+                truncated_by_lines = true;
+                break;
+            }
+            if used_chars >= max_chars {
+                truncated_by_chars = true;
+                break;
+            }
+        }
+
         if scanned_bytes >= max_scan_bytes {
             truncated_by_scan = !reader.fill_buf()?.is_empty();
             break;
@@ -1052,14 +1110,6 @@ fn read_text_window(
                 break;
             }
             continue;
-        }
-        if line_count >= max_lines {
-            truncated_by_lines = true;
-            break;
-        }
-        if used_chars >= max_chars {
-            truncated_by_chars = true;
-            break;
         }
 
         let line = match std::str::from_utf8(&line_bytes) {
@@ -1690,7 +1740,8 @@ mod tests {
         let env = TestEnv::new("read-crlf");
         env.create_file("crlf.txt", "a\r\nb");
 
-        let window = read_text_window(&env.root.join("crlf.txt"), 1, 2, 100, 1024, true).unwrap();
+        let file = File::open(env.root.join("crlf.txt")).unwrap();
+        let window = read_text_window(file, 1, 2, 100, 1024, true).unwrap();
 
         assert_eq!("1: a\n2: b", window.content);
         assert_eq!(4, window.retained_source_bytes);
