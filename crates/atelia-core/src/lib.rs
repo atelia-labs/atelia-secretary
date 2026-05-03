@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod domain;
+pub mod extensions;
 pub mod policy;
 pub mod runtime;
 pub mod settings;
@@ -10,6 +11,7 @@ pub mod tool_output;
 pub mod tools;
 
 pub use domain::*;
+pub use extensions::*;
 pub use policy::*;
 pub use runtime::*;
 pub use settings::*;

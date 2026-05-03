@@ -89,7 +89,9 @@ provenance:
   source: github | registry | local
   repository: null
   commit: null
+  registry_identity: null
   artifact_digest: sha256:...
+  manifest_digest: sha256:...
   signature: null
   signer: null
 migration:
@@ -99,6 +101,21 @@ migration:
 
 The manifest is an enforceable contract. If runtime behavior exceeds the
 manifest, Secretary blocks execution.
+
+Initial backend enforcement lives in `atelia-core::extensions` as
+`ExtensionManifest` validation plus an in-memory `ExtensionRegistry`. This
+first slice accepts backend `wasm-rust` / `wasm` manifests, explicit
+local-development process manifests, per-version provenance digests, blocklist
+checks, rollback pointers, and brokered service-call authorization. It does not
+execute WASM yet.
+
+The initial implementation also reserves concrete id boundaries:
+
+- official backend extensions use the `ai.atelia.*` namespace and the
+  `atelia-official` registry identity
+- local development extensions use the `local.*` namespace and require explicit
+  unsigned dev-mode approval when unsigned
+- third-party extensions cannot use the official or local namespaces
 
 ## Permission And Capability
 
