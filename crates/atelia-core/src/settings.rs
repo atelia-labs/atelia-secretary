@@ -285,16 +285,16 @@ fn scope_migration_depth(scope: &ToolOutputSettingsScope) -> usize {
 pub struct ToolOutputDefaults {
     pub render_options: RenderOptions,
     /// Number of bytes kept in the "inlined" renderer path before truncation.
-    /// Validation runs on deserialize/update, but policy application is not yet
-    /// wired to runtime rendering (tracked in follow-ups #20 and #17).
+    /// Validation runs on deserialize/update, and runtime policy can now enforce
+    /// oversize behavior against this threshold when requested.
     pub max_inline_bytes: u64,
     pub max_inline_lines: u32,
     /// Reserved for future renderer policy rollout; currently persisted and
     /// validated but not yet enforced by runtime output rendering.
     pub verbosity: ToolOutputVerbosity,
     pub granularity: ToolOutputGranularity,
-    /// Reserved for future runtime policy enforcement; currently persisted and
-    /// stored in settings, but not yet enforced in this PR.
+    /// Runtime policy for oversized canonical fields, including artifact spillover
+    /// and hard-reject behavior.
     pub oversize_policy: OversizeOutputPolicy,
 }
 

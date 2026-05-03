@@ -7,8 +7,8 @@
 use atelia_core::{
     Actor, CancelJobReceipt, DefaultPolicyEngine, InMemoryStore, JobId, JobKind,
     JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, PathScope,
-    RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RuntimeError,
-    RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
+    PolicyEngine, PolicyInput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
+    RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -131,6 +131,16 @@ pub struct SubmitJobRequest {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct CheckPolicyRequest {
+    pub repository_id: RepositoryId,
+    pub requester: Actor,
+    pub requested_capability: String,
+    pub action: String,
+    pub resource_scope: ResourceScope,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ListRepositoriesRequest {
     pub trust_state: Option<RepositoryTrustState>,
@@ -216,6 +226,7 @@ impl SecretaryService {
                 "health.v1".to_string(),
                 "repositories.v1".to_string(),
                 "jobs.v1".to_string(),
+                "policy.v1".to_string(),
             ],
             repository_count,
             started_at: self.started_at,
@@ -231,6 +242,7 @@ impl SecretaryService {
                 "health.v1".to_string(),
                 "repositories.v1".to_string(),
                 "jobs.v1".to_string(),
+                "policy.v1".to_string(),
             ],
         }
     }
@@ -408,6 +420,39 @@ impl SecretaryService {
         }
 
         Ok(receipt)
+    }
+
+    pub fn check_policy(
+        &self,
+        request: CheckPolicyRequest,
+    ) -> ServiceResult<atelia_core::PolicyDecision> {
+        if request.requested_capability.trim().is_empty() {
+            return Err(ServiceError::InvalidArgument {
+                reason: "requested_capability must not be empty".to_string(),
+            });
+        }
+        if request.action.trim().is_empty() {
+            return Err(ServiceError::InvalidArgument {
+                reason: "action must not be empty".to_string(),
+            });
+        }
+        let requested_capability = request.requested_capability.trim().to_string();
+        let action = request.action.trim().to_string();
+
+        let repository = self.get_repository(&request.repository_id)?;
+        let policy_input = PolicyInput::new(
+            request.requester,
+            request.repository_id,
+            requested_capability,
+            request.resource_scope,
+            action,
+            repository.trust_state,
+            true,
+            atelia_core::DEFAULT_POLICY_VERSION.to_string(),
+        );
+        let policy_engine = DefaultPolicyEngine::new();
+
+        Ok(policy_engine.evaluate(policy_input))
     }
 
     /// List jobs with optional repository/status filtering.
@@ -665,6 +710,7 @@ mod tests {
         assert!(health.capabilities.contains(&"health.v1".to_string()));
         assert!(health.capabilities.contains(&"repositories.v1".to_string()));
         assert!(health.capabilities.contains(&"jobs.v1".to_string()));
+        assert!(health.capabilities.contains(&"policy.v1".to_string()));
     }
 
     #[test]
@@ -691,6 +737,7 @@ mod tests {
             .capabilities
             .contains(&"repositories.v1".to_string()));
         assert!(metadata.capabilities.contains(&"jobs.v1".to_string()));
+        assert!(metadata.capabilities.contains(&"policy.v1".to_string()));
     }
 
     // -- register / list round trip -----------------------------------------
@@ -966,6 +1013,194 @@ mod tests {
         let missing_id = RepositoryId::new();
         let err = svc.get_repository(&missing_id).unwrap_err();
         assert!(matches!(err, ServiceError::Store(_)));
+    }
+
+    #[test]
+    fn check_policy_runs_preview_for_allowed_capability() {
+        let svc = ready_service();
+        let root = test_repo_dir("policy-check-allowed");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "check-policy-allowed".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let decision = svc
+            .check_policy(CheckPolicyRequest {
+                repository_id: repository.id,
+                requester: actor(),
+                requested_capability: "filesystem.read".to_string(),
+                action: "inspect".to_string(),
+                resource_scope: ResourceScope {
+                    kind: "repository".to_string(),
+                    value: ".".to_string(),
+                },
+            })
+            .expect("check policy should succeed");
+
+        assert_eq!(decision.outcome, atelia_core::PolicyOutcome::Allowed);
+        assert_eq!(decision.risk_tier, atelia_core::RiskTier::R1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn check_policy_blocks_repository_blocked_trust_state() {
+        let svc = ready_service();
+        let root = test_repo_dir("policy-check-blocked");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "check-policy-blocked".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Blocked,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let decision = svc
+            .check_policy(CheckPolicyRequest {
+                repository_id: repository.id,
+                requester: actor(),
+                requested_capability: "filesystem.read".to_string(),
+                action: "inspect".to_string(),
+                resource_scope: ResourceScope {
+                    kind: "repository".to_string(),
+                    value: ".".to_string(),
+                },
+            })
+            .expect("check policy should succeed");
+
+        assert_eq!(decision.outcome, atelia_core::PolicyOutcome::Blocked);
+        assert_eq!(decision.reason_code, "repository_blocked");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn check_policy_rejects_empty_requested_capability() {
+        let svc = ready_service();
+        let root = test_repo_dir("policy-check-empty-capability");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "policy-check-empty-capability".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .check_policy(CheckPolicyRequest {
+                repository_id: repository.id,
+                requester: actor(),
+                requested_capability: "".to_string(),
+                action: "inspect".to_string(),
+                resource_scope: ResourceScope {
+                    kind: "repository".to_string(),
+                    value: ".".to_string(),
+                },
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn check_policy_rejects_whitespace_requested_capability() {
+        let svc = ready_service();
+        let root = test_repo_dir("policy-check-whitespace-capability");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "policy-check-whitespace-capability".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .check_policy(CheckPolicyRequest {
+                repository_id: repository.id,
+                requester: actor(),
+                requested_capability: " \t".to_string(),
+                action: "inspect".to_string(),
+                resource_scope: ResourceScope {
+                    kind: "repository".to_string(),
+                    value: ".".to_string(),
+                },
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn check_policy_rejects_empty_action() {
+        let svc = ready_service();
+        let root = test_repo_dir("policy-check-empty-action");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "policy-check-empty-action".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .check_policy(CheckPolicyRequest {
+                repository_id: repository.id,
+                requester: actor(),
+                requested_capability: "filesystem.read".to_string(),
+                action: "".to_string(),
+                resource_scope: ResourceScope {
+                    kind: "repository".to_string(),
+                    value: ".".to_string(),
+                },
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn check_policy_rejects_whitespace_action() {
+        let svc = ready_service();
+        let root = test_repo_dir("policy-check-whitespace-action");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "policy-check-whitespace-action".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .check_policy(CheckPolicyRequest {
+                repository_id: repository.id,
+                requester: actor(),
+                requested_capability: "filesystem.read".to_string(),
+                action: "\n".to_string(),
+                resource_scope: ResourceScope {
+                    kind: "repository".to_string(),
+                    value: ".".to_string(),
+                },
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
     }
 
     // -- job lifecycle API --------------------------------------------------

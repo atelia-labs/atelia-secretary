@@ -8,7 +8,8 @@
 #![allow(dead_code)]
 
 use crate::service::{
-    DaemonHealth, DaemonStatus, ListRepositoriesRequest as ServiceListRepositoriesRequest,
+    CheckPolicyRequest as ServiceCheckPolicyRequest, DaemonHealth, DaemonStatus,
+    ListRepositoriesRequest as ServiceListRepositoriesRequest,
     ProtocolMetadata as ServiceProtocolMetadata,
     RegisterRepositoryRequest as ServiceRegisterRepositoryRequest, SecretaryService, ServiceError,
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
@@ -115,14 +116,39 @@ impl SecretaryRpcServer {
         Ok(SubmitJobResponse {
             metadata: self.metadata(),
             job: Job::from(receipt.job),
-            policy: PolicyDecision {
-                decision_id: receipt.policy_decision.id.as_str().to_string(),
-                outcome: policy_outcome_label(receipt.policy_decision.outcome).to_string(),
-                risk_tier: risk_tier_label(receipt.policy_decision.risk_tier).to_string(),
-                requested_capability: receipt.policy_decision.requested_capability,
-                reason_code: receipt.policy_decision.reason_code,
-                reason: receipt.policy_decision.user_reason,
-            },
+            policy: policy_decision_to_rpc(receipt.policy_decision),
+        })
+    }
+
+    pub fn check_policy(&self, request: CheckPolicyRequest) -> RpcResult<CheckPolicyResponse> {
+        if request.tool_result.is_some() {
+            return Err(RpcError::invalid_argument(
+                "tool_result is not supported for policy-check previews",
+            ));
+        }
+
+        let repository_id = parse_repository_id(&request.repository_id)?;
+        let requester = Actor::try_from(request.requester)?;
+        let requested_capability =
+            parse_non_empty_field("requested_capability", request.requested_capability)?;
+        let action = parse_non_empty_field("action", request.action)?;
+        let resource_scope = match request.path_scope {
+            Some(path_scope) => {
+                parse_path_scope(path_scope)?.unwrap_or_else(default_resource_scope)
+            }
+            None => default_resource_scope(),
+        };
+        let policy_decision = self.service.check_policy(ServiceCheckPolicyRequest {
+            repository_id,
+            requester,
+            requested_capability,
+            action,
+            resource_scope,
+        })?;
+
+        Ok(CheckPolicyResponse {
+            metadata: self.metadata(),
+            decision: policy_decision_to_rpc(policy_decision),
         })
     }
 
@@ -403,6 +429,31 @@ pub struct CancelJobResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckPolicyRequest {
+    pub repository_id: String,
+    pub requester: RpcActorDto,
+    pub requested_capability: String,
+    pub action: String,
+    pub path_scope: Option<RpcPathScope>,
+    pub tool_result: Option<ToolResultRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckPolicyResponse {
+    pub metadata: ProtocolMetadata,
+    pub decision: PolicyDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultRef {
+    pub tool_result_id: String,
+    pub tool_invocation_id: String,
+    pub job_id: String,
+    pub repository_id: String,
+    pub content_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcPathScope {
     pub kind: RpcPathScopeKind,
     pub roots: Vec<String>,
@@ -499,11 +550,39 @@ pub struct PolicyDecision {
     pub requested_capability: String,
     pub reason_code: String,
     pub reason: String,
+    pub approval_request_ref: Option<String>,
+    pub audit_ref: Option<String>,
 }
 
 fn parse_repository_id(value: &str) -> RpcResult<RepositoryId> {
     RepositoryId::try_from_string(value.to_string())
         .map_err(|_| RpcError::invalid_argument("repository_id must be a valid repository id"))
+}
+
+fn parse_non_empty_field(field_name: &str, value: String) -> RpcResult<String> {
+    let normalized = value.trim().to_string();
+    if normalized.is_empty() {
+        return Err(RpcError::invalid_argument(format!(
+            "{field_name} must not be empty"
+        )));
+    }
+
+    Ok(normalized)
+}
+
+fn validate_tool_result_ref(tool_result: ToolResultRef) -> RpcResult<ToolResultRef> {
+    if tool_result.tool_result_id.trim().is_empty()
+        && tool_result.tool_invocation_id.trim().is_empty()
+        && tool_result.job_id.trim().is_empty()
+        && tool_result.repository_id.trim().is_empty()
+        && tool_result.content_type.trim().is_empty()
+    {
+        return Err(RpcError::invalid_argument(
+            "tool_result must include at least one identifier",
+        ));
+    }
+
+    Ok(tool_result)
 }
 
 fn parse_list_repositories_request(
@@ -593,6 +672,30 @@ fn job_from_cancel_receipt(
     let mut job = Job::from_with_cancellation_requester(receipt.job, cancellation_requester);
     job.cancellation = cancellation.clone();
     (job, cancellation)
+}
+
+fn default_resource_scope() -> ResourceScope {
+    ResourceScope {
+        kind: "repository".to_string(),
+        value: ".".to_string(),
+    }
+}
+
+fn policy_decision_to_rpc(decision: atelia_core::PolicyDecision) -> PolicyDecision {
+    PolicyDecision {
+        decision_id: decision.id.as_str().to_string(),
+        outcome: policy_outcome_label(decision.outcome).to_string(),
+        risk_tier: risk_tier_label(decision.risk_tier).to_string(),
+        requested_capability: decision.requested_capability,
+        reason_code: decision.reason_code,
+        reason: decision.user_reason,
+        approval_request_ref: decision
+            .approval_request_ref
+            .map(|approval_request_ref| approval_request_ref.id.as_str().to_string()),
+        audit_ref: decision
+            .audit_ref
+            .map(|audit_ref| audit_ref.as_str().to_string()),
+    }
 }
 
 fn parse_path_scope(value: RpcPathScope) -> RpcResult<Option<ResourceScope>> {
@@ -1006,6 +1109,7 @@ mod tests {
             .capabilities
             .contains(&"repositories.v1".to_string()));
         assert!(response.capabilities.contains(&"jobs.v1".to_string()));
+        assert!(response.capabilities.contains(&"policy.v1".to_string()));
     }
 
     #[test]
@@ -1130,6 +1234,107 @@ mod tests {
 
         assert!(registered.policy.is_none());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn check_policy_returns_preview_decision() {
+        let server = ready_server();
+        let root = test_repo_dir("check-policy-success");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "check-policy-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let decision_response = server
+            .check_policy(CheckPolicyRequest {
+                repository_id: registered.repository.repository_id,
+                requester: actor(),
+                requested_capability: "filesystem.read".to_string(),
+                action: "inspect current files".to_string(),
+                path_scope: None,
+                tool_result: None,
+            })
+            .expect("check policy should succeed");
+
+        assert_eq!(decision_response.decision.outcome, "allowed");
+        assert_eq!(
+            decision_response.decision.requested_capability,
+            "filesystem.read"
+        );
+        assert_eq!(decision_response.decision.approval_request_ref, None);
+        assert_eq!(decision_response.decision.audit_ref, None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn check_policy_rejects_invalid_capability() {
+        let server = ready_server();
+        let root = test_repo_dir("check-policy-invalid-capability");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "check-policy-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let error = server
+            .check_policy(CheckPolicyRequest {
+                repository_id: registered.repository.repository_id,
+                requester: actor(),
+                requested_capability: "   ".to_string(),
+                action: "inspect".to_string(),
+                path_scope: None,
+                tool_result: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn check_policy_rejects_tool_result_ref_if_provided() {
+        let server = ready_server();
+        let root = test_repo_dir("check-policy-empty-tool-result");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "check-policy-tool-ref-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let error = server
+            .check_policy(CheckPolicyRequest {
+                repository_id: registered.repository.repository_id,
+                requester: actor(),
+                requested_capability: "filesystem.read".to_string(),
+                action: "inspect".to_string(),
+                path_scope: None,
+                tool_result: Some(ToolResultRef {
+                    tool_result_id: "tool_result_id".to_string(),
+                    tool_invocation_id: "tool_invocation_id".to_string(),
+                    job_id: "job_id".to_string(),
+                    repository_id: "repository_id".to_string(),
+                    content_type: "application/json".to_string(),
+                }),
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, RpcErrorCode::InvalidArgument);
         let _ = fs::remove_dir_all(root);
     }
 
