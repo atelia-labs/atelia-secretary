@@ -288,9 +288,11 @@ where
         T: RuntimeTool,
     {
         let requested_capability = tool.requested_capability().to_string();
+        let normalized_requested_capability =
+            normalized_requested_capability(&requested_capability);
         validate_requested_capability_hints(
             &request.requested_capabilities,
-            &requested_capability,
+            normalized_requested_capability,
         )?;
         let repository = self.store.get_repository(&request.repository_id)?;
         let mut events = Vec::new();
@@ -603,7 +605,7 @@ fn validate_requested_capability_hints(
 
     if let Some(mismatched) = requested_capabilities
         .iter()
-        .map(|capability| normalized_requested_capability_hint(capability))
+        .map(|capability| normalized_requested_capability(capability))
         .find(|capability| *capability != enforced_capability)
     {
         return Err(RuntimeError::InvalidToolRequest {
@@ -616,7 +618,7 @@ fn validate_requested_capability_hints(
     Ok(())
 }
 
-fn normalized_requested_capability_hint(capability: &str) -> &str {
+fn normalized_requested_capability(capability: &str) -> &str {
     let trimmed = capability.trim();
     canonicalize_job_requested_capability(trimmed).unwrap_or(trimmed)
 }
@@ -1873,6 +1875,95 @@ mod tests {
         );
         assert_eq!(
             "capability.discovery",
+            receipt.audit_record.as_ref().unwrap().requested_capability
+        );
+    }
+
+    #[test]
+    fn runtime_accepts_canonical_hint_for_alias_requested_capability() {
+        #[derive(Debug, Clone, Default)]
+        struct AliasCapabilityTool;
+
+        impl RuntimeTool for AliasCapabilityTool {
+            fn tool_id(&self) -> &'static str {
+                "secretary.alias_capability_fixture"
+            }
+
+            fn requested_capability(&self) -> &'static str {
+                "policy.check"
+            }
+
+            fn declared_effect(&self) -> &'static str {
+                "produce a deterministic contract result without external effects"
+            }
+
+            fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+                format!("goal={}", request.goal)
+            }
+
+            fn execute(
+                &self,
+                invocation: &ToolInvocation,
+                request: &RuntimeJobRequest,
+            ) -> ToolResult {
+                ToolResult {
+                    id: ToolResultId::new(),
+                    schema_version: RUNTIME_SCHEMA_VERSION,
+                    created_at: LedgerTimestamp::now(),
+                    invocation_id: invocation.id.clone(),
+                    tool_id: invocation.tool_id.clone(),
+                    status: ToolResultStatus::Succeeded,
+                    schema_ref: Some("tool_result.secretary.alias_capability.v1".to_string()),
+                    fields: vec![
+                        ToolResultField {
+                            key: "summary".to_string(),
+                            value: StructuredValue::String(format!(
+                                "echoed goal: {}",
+                                request.goal
+                            )),
+                        },
+                        ToolResultField {
+                            key: "goal".to_string(),
+                            value: StructuredValue::String(request.goal.clone()),
+                        },
+                    ],
+                    evidence_refs: Vec::new(),
+                    output_refs: Vec::new(),
+                    truncation: None,
+                    redactions: Vec::new(),
+                }
+            }
+        }
+
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "read workspace data",
+        )
+        .with_requested_capabilities(vec!["capability.discovery".to_string()]);
+
+        let receipt = runtime.run_tool_job(request, &AliasCapabilityTool).unwrap();
+
+        assert_eq!(JobStatus::Succeeded, receipt.job.status);
+        assert_eq!("policy.check", receipt.policy_decision.requested_capability);
+        assert_eq!(
+            "policy.check",
+            receipt
+                .tool_invocation
+                .as_ref()
+                .unwrap()
+                .requested_capability
+        );
+        assert_eq!(
+            "policy.check",
             receipt.audit_record.as_ref().unwrap().requested_capability
         );
     }
