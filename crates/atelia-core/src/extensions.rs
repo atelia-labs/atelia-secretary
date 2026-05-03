@@ -26,10 +26,59 @@ pub struct ExtensionManifest {
     pub compatibility: ExtensionCompatibility,
     pub entrypoints: ExtensionEntrypoints,
     pub permissions: BTreeMap<String, ExtensionPermission>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ExtensionToolDefinition>,
     pub services: ExtensionServices,
     pub failure: ExtensionFailure,
     pub provenance: ExtensionProvenance,
     pub bundle: Option<ExtensionBundleMembership>,
+}
+
+impl Default for ExtensionManifest {
+    fn default() -> Self {
+        Self {
+            schema: String::new(),
+            id: String::new(),
+            name: String::new(),
+            version: String::new(),
+            publisher: ExtensionPublisher {
+                name: String::new(),
+                url: None,
+            },
+            description: String::new(),
+            types: Vec::new(),
+            compatibility: ExtensionCompatibility {
+                atelia_protocol: String::new(),
+                atelia_secretary: String::new(),
+            },
+            entrypoints: ExtensionEntrypoints {
+                realm: ExtensionRealm::Backend,
+                runtime: ExtensionRuntime::WasmRust,
+                command: None,
+                image: None,
+                wasm: None,
+                protocol: String::new(),
+            },
+            permissions: BTreeMap::new(),
+            tools: Vec::new(),
+            services: ExtensionServices::default(),
+            failure: ExtensionFailure {
+                degrade: DegradeBehavior::ReturnUnavailable,
+                retry_policy: RetryPolicy::None,
+            },
+            provenance: ExtensionProvenance {
+                source: ProvenanceSource::Local,
+                repository: None,
+                commit: None,
+                registry_identity: None,
+                artifact_digest: String::new(),
+                manifest_digest: String::new(),
+                signature: None,
+                signer: None,
+            },
+            bundle: None,
+        }
+    }
 }
 
 impl ExtensionManifest {
@@ -99,6 +148,15 @@ pub enum ExtensionRuntime {
 pub struct ExtensionPermission {
     pub description: String,
     pub risk_tier: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionToolDefinition {
+    pub id: String,
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    #[serde(default)]
+    pub permissions_required: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -253,6 +311,13 @@ pub enum ExtensionValidationError {
         method: String,
         permission: String,
     },
+    MissingToolPermission {
+        tool: String,
+        permission: String,
+    },
+    DuplicateToolDeclaration {
+        tool: String,
+    },
 }
 
 impl fmt::Display for ExtensionValidationError {
@@ -301,6 +366,12 @@ impl fmt::Display for ExtensionValidationError {
                 f,
                 "service {service}.{method} requires undeclared permission {permission}"
             ),
+            Self::MissingToolPermission { tool, permission } => {
+                write!(f, "tool {tool} requires undeclared permission {permission}")
+            }
+            Self::DuplicateToolDeclaration { tool } => {
+                write!(f, "duplicate tool declaration {tool}")
+            }
         }
     }
 }
@@ -344,6 +415,7 @@ fn validate_manifest(
     validate_entrypoint(manifest, boundary, policy)?;
     validate_provenance(manifest, boundary, policy)?;
     validate_permissions(&manifest.permissions)?;
+    validate_tools(manifest)?;
     validate_services(manifest)?;
 
     Ok(ValidatedExtensionManifest {
@@ -549,6 +621,54 @@ fn validate_permissions(
                 return Err(ExtensionValidationError::InvalidField {
                     field: "permissions.risk_tier",
                     reason: format!("unsupported risk tier {risk_tier}"),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_tools(manifest: &ExtensionManifest) -> ExtensionValidationResult<()> {
+    let has_tool_type = manifest.types.contains(&ExtensionKind::Tool);
+    let has_tools = !manifest.tools.is_empty();
+
+    if has_tools && !has_tool_type {
+        return Err(ExtensionValidationError::InvalidField {
+            field: "types",
+            reason: "tool declarations require type tool".to_string(),
+        });
+    }
+
+    if has_tool_type && !has_tools {
+        return Err(ExtensionValidationError::MissingField { field: "tools" });
+    }
+
+    let mut seen_tool_ids = BTreeSet::new();
+    for tool in &manifest.tools {
+        require_non_empty("tools.id", &tool.id)?;
+        if !seen_tool_ids.insert(tool.id.clone()) {
+            return Err(ExtensionValidationError::DuplicateToolDeclaration {
+                tool: tool.id.clone(),
+            });
+        }
+
+        if tool.permissions.is_empty() && tool.permissions_required.is_empty() {
+            return Err(ExtensionValidationError::MissingField {
+                field: "tools.permissions",
+            });
+        }
+
+        let mut required_permissions = BTreeSet::new();
+        required_permissions.extend(tool.permissions.iter());
+        required_permissions.extend(tool.permissions_required.iter());
+
+        for permission in required_permissions {
+            require_permission_name(permission)?;
+            if !manifest.permissions.contains_key(permission) {
+                return Err(ExtensionValidationError::MissingToolPermission {
+                    tool: tool.id.clone(),
+                    permission: permission.clone(),
                 });
             }
         }
@@ -1526,6 +1646,7 @@ mod tests {
         "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const OTHER_MANIFEST_DIGEST: &str =
         "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const DEFAULT_TOOL_PERMISSION: &str = "tool.ping";
 
     fn permission(description: &str) -> ExtensionPermission {
         ExtensionPermission {
@@ -1535,6 +1656,12 @@ mod tests {
     }
 
     fn manifest(id: &str) -> ExtensionManifest {
+        let mut permissions = BTreeMap::new();
+        permissions.insert(
+            DEFAULT_TOOL_PERMISSION.to_string(),
+            permission("exposes the ping tool"),
+        );
+
         ExtensionManifest {
             schema: EXTENSION_MANIFEST_SCHEMA.to_string(),
             id: id.to_string(),
@@ -1558,7 +1685,12 @@ mod tests {
                 wasm: Some("extension.wasm".to_string()),
                 protocol: EXTENSION_RPC_PROTOCOL.to_string(),
             },
-            permissions: BTreeMap::new(),
+            permissions,
+            tools: vec![ExtensionToolDefinition {
+                id: "ping".to_string(),
+                permissions: vec![DEFAULT_TOOL_PERMISSION.to_string()],
+                permissions_required: Vec::new(),
+            }],
             services: ExtensionServices::default(),
             failure: ExtensionFailure {
                 degrade: DegradeBehavior::ReturnUnavailable,
@@ -1574,13 +1706,14 @@ mod tests {
                 signature: Some("signature".to_string()),
                 signer: Some("signer@example.com".to_string()),
             },
-            bundle: None,
+            ..ExtensionManifest::default()
         }
     }
 
     fn service_provider(id: &str, permission_name: &str) -> ExtensionManifest {
         let mut manifest = manifest(id);
         manifest.types = vec![ExtensionKind::Service];
+        manifest.tools.clear();
         manifest
             .permissions
             .insert(permission_name.to_string(), permission("provide service"));
@@ -1596,6 +1729,7 @@ mod tests {
     fn service_consumer(id: &str, callee_id: &str, permission_name: &str) -> ExtensionManifest {
         let mut manifest = manifest(id);
         manifest.types = vec![ExtensionKind::Service];
+        manifest.tools.clear();
         manifest.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
         manifest.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
         manifest
@@ -1629,6 +1763,76 @@ mod tests {
             .unwrap();
 
         assert_eq!(validated.boundary, ExtensionBoundary::ThirdParty);
+    }
+
+    #[test]
+    fn tool_type_requires_tool_declarations() {
+        let mut extension = manifest("com.example.tool");
+        extension.tools.clear();
+
+        let err = extension
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ExtensionValidationError::MissingField { field: "tools" }
+        ));
+    }
+
+    #[test]
+    fn tools_require_declared_extension_permissions() {
+        let mut extension = manifest("com.example.tool-permission");
+        extension.permissions.clear();
+
+        let err = extension
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+
+        match err {
+            ExtensionValidationError::MissingToolPermission { tool, permission } => {
+                assert_eq!(tool, "ping");
+                assert_eq!(permission, DEFAULT_TOOL_PERMISSION);
+            }
+            other => panic!("expected missing tool permission, got {other}"),
+        }
+    }
+
+    #[test]
+    fn tools_validate_permissions_from_both_permissions_fields() {
+        let mut extension = manifest("com.example.tool-permission-both");
+        extension.tools[0].permissions = vec![DEFAULT_TOOL_PERMISSION.to_string()];
+        extension.tools[0].permissions_required = vec!["tool.write".to_string()];
+
+        let err = extension
+            .validate(&ManifestValidationPolicy::default())
+            .expect_err("expected validation failure");
+
+        match err {
+            ExtensionValidationError::MissingToolPermission { tool, permission } => {
+                assert_eq!(tool, "ping");
+                assert_eq!(permission, "tool.write");
+            }
+            other => panic!("expected missing tool permission, got {other}"),
+        }
+    }
+
+    #[test]
+    fn tools_require_type_tool() {
+        let mut extension = manifest("com.example.tool-type-mismatch");
+        extension.types = vec![ExtensionKind::Service];
+
+        let err = extension
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "types",
+                reason: _,
+            }
+        ));
     }
 
     #[test]
@@ -2212,6 +2416,24 @@ mod tests {
 
         assert!(request.include_blocked);
         assert_eq!(request, ListExtensionsRequest::default());
+    }
+
+    #[test]
+    fn extension_manifest_serializes_empty_tools_as_missing_field() {
+        let mut extension = manifest("com.example.empty-tools");
+        extension.tools.clear();
+
+        let serialized = serde_json::to_value(&extension).unwrap();
+
+        assert!(
+            serialized.get("tools").is_none(),
+            "tools field should be omitted when empty"
+        );
+
+        let deserialized: ExtensionManifest =
+            serde_json::from_value(serialized).expect("missing tools should default to empty");
+
+        assert!(deserialized.tools.is_empty());
     }
 
     #[test]
