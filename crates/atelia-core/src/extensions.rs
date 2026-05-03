@@ -1776,8 +1776,14 @@ pub struct ExtensionStatusResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListExtensionsRequest {
-    #[serde(default)]
+    #[serde(default = "ListExtensionsRequest::default_include_blocked")]
     pub include_blocked: bool,
+}
+
+impl ListExtensionsRequest {
+    fn default_include_blocked() -> bool {
+        true
+    }
 }
 
 impl Default for ListExtensionsRequest {
@@ -1841,10 +1847,9 @@ impl ExtensionRegistryService {
         request: InstallExtensionRequest,
     ) -> RegistryResult<InstallExtensionResponse> {
         let options = InstallOptions::from(&request);
-        let InstallExtensionRequest { manifest, .. } = request;
         let record = self
             .registry
-            .install(manifest, options)
+            .install(request.manifest, options)
             .map(|record| InstallExtensionResponse { record })?;
         Ok(record)
     }
@@ -3301,7 +3306,6 @@ mod tests {
         assert_eq!(listed_status.status, ExtensionInstallStatus::Blocked);
     }
 
-    #[test]
     fn extension_manifest_serializes_empty_tools_as_missing_field() {
         let mut extension = manifest("com.example.empty-tools");
         extension.tools.clear();
@@ -3627,7 +3631,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn list_extensions_request_deserializes_missing_include_blocked_as_true() {
         let request: ListExtensionsRequest = serde_json::from_str("{}").unwrap();
 
@@ -3635,7 +3638,6 @@ mod tests {
         assert_eq!(request, ListExtensionsRequest::default());
     }
 
-    #[test]
     fn list_extensions_request_deserializes_include_blocked_false() {
         let request: ListExtensionsRequest =
             serde_json::from_str("{\"include_blocked\":false}").unwrap();
@@ -3688,7 +3690,6 @@ mod tests {
         assert_eq!(InstallOptions::from(request), InstallOptions::default());
     }
 
-    #[test]
     fn extension_service_blocklist_listing_works() {
         let mut service = ExtensionRegistryService::new();
         service
