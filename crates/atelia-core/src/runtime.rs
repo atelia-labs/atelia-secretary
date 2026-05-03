@@ -519,20 +519,18 @@ where
             }));
         }
 
-        job.cancellation_state = CancellationState::Requested;
+        let mut cancellation_requested_job = job.clone();
+        cancellation_requested_job.cancellation_state = CancellationState::Requested;
         let cancel_event = job_event(
-            EventSubject::job(&job.id),
+            EventSubject::job(&cancellation_requested_job.id),
             JobEventKind::CancellationRequested,
             EventSeverity::Warning,
             reason,
-            refs_for_job(&job),
+            refs_for_job(&cancellation_requested_job),
         );
-        let cancel_event = self
-            .runtime
-            .store()
-            .append_job_event_and_update_job(job.clone(), cancel_event)?;
-        job.latest_event_id = Some(cancel_event.id.clone());
 
+        job = cancellation_requested_job.clone();
+        job.latest_event_id = Some(cancel_event.id.clone());
         let now = LedgerTimestamp::now();
         job.transition_status(JobStatus::Canceled, now)?;
         let status_event = job_event(
@@ -545,10 +543,12 @@ where
             "job cancelled",
             refs_for_job(&job),
         );
-        let status_event = self
-            .runtime
-            .store()
-            .append_job_event_and_update_job(job.clone(), status_event)?;
+        let (cancel_event, status_event) = self.runtime.store().append_job_events_and_update_job(
+            cancellation_requested_job,
+            cancel_event,
+            job.clone(),
+            status_event,
+        )?;
         job.latest_event_id = Some(status_event.id.clone());
 
         Ok(CancelJobReceipt {
@@ -1090,6 +1090,61 @@ mod tests {
 
         let stored = service.get_job(&job.id).unwrap();
         assert_eq!(JobStatus::Canceled, stored.status);
+    }
+
+    #[test]
+    fn lifecycle_atomic_cancel_rejects_duplicate_event_without_partial_update() {
+        let (service, repo) = service_with_repo();
+        let job = seed_job_in_status(
+            service.runtime().store(),
+            repo.id.clone(),
+            JobStatus::Queued,
+        );
+
+        let mut cancellation_requested_job = job.clone();
+        cancellation_requested_job.cancellation_state = CancellationState::Requested;
+        let cancel_event = job_event(
+            EventSubject::job(&job.id),
+            JobEventKind::CancellationRequested,
+            EventSeverity::Warning,
+            "user requested cancel",
+            refs_for_job(&job),
+        );
+
+        let mut canceled_job = cancellation_requested_job.clone();
+        canceled_job.latest_event_id = Some(cancel_event.id.clone());
+        canceled_job
+            .transition_status(JobStatus::Canceled, LedgerTimestamp::now())
+            .unwrap();
+        let mut status_event = job_event(
+            EventSubject::job(&job.id),
+            JobEventKind::JobStatusChanged {
+                from: JobStatus::Queued,
+                to: JobStatus::Canceled,
+            },
+            EventSeverity::Warning,
+            "job cancelled",
+            refs_for_job(&canceled_job),
+        );
+        status_event.id = cancel_event.id.clone();
+
+        assert!(matches!(
+            service.runtime().store().append_job_events_and_update_job(
+                cancellation_requested_job,
+                cancel_event,
+                canceled_job,
+                status_event,
+            ),
+            Err(StoreError::DuplicateId {
+                collection: "job_events",
+                ..
+            })
+        ));
+
+        let stored = service.get_job(&job.id).unwrap();
+        assert_eq!(JobStatus::Queued, stored.status);
+        assert_eq!(CancellationState::NotRequested, stored.cancellation_state);
+        assert_eq!(job.latest_event_id, stored.latest_event_id);
     }
 
     #[test]

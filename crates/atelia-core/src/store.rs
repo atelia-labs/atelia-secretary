@@ -151,6 +151,13 @@ pub trait SecretaryStore: Send + Sync + 'static {
         record: JobRecord,
         event: JobEvent,
     ) -> StoreResult<JobEvent>;
+    fn append_job_events_and_update_job(
+        &self,
+        first_record: JobRecord,
+        first_event: JobEvent,
+        final_record: JobRecord,
+        final_event: JobEvent,
+    ) -> StoreResult<(JobEvent, JobEvent)>;
     fn replay_job_events(
         &self,
         cursor: EventCursor,
@@ -342,6 +349,33 @@ impl SecretaryStore for InMemoryStore {
         inner.jobs.insert(record.id.clone(), record);
 
         Ok(event)
+    }
+
+    fn append_job_events_and_update_job(
+        &self,
+        first_record: JobRecord,
+        mut first_event: JobEvent,
+        mut final_record: JobRecord,
+        mut final_event: JobEvent,
+    ) -> StoreResult<(JobEvent, JobEvent)> {
+        let mut inner = self.lock()?;
+
+        validate_sibling_event_ids_are_unique(&first_event, &final_event)?;
+        validate_job_update(&inner, &first_record, &first_event)?;
+        validate_new_job_event(&inner, &first_event, None)?;
+
+        let mut intermediate_record = first_record;
+        intermediate_record.latest_event_id = Some(first_event.id.clone());
+        validate_job_update_against(&intermediate_record, &final_record, &final_event)?;
+        validate_new_job_event(&inner, &final_event, None)?;
+        ensure_event_sequence_capacity(&inner, 2)?;
+
+        append_event_locked(&mut inner, &mut first_event)?;
+        append_event_locked(&mut inner, &mut final_event)?;
+        final_record.latest_event_id = Some(final_event.id.clone());
+        inner.jobs.insert(final_record.id.clone(), final_record);
+
+        Ok((first_event, final_event))
     }
 
     fn replay_job_events(
@@ -1086,6 +1120,14 @@ fn validate_job_update(
             ),
         });
     }
+    validate_job_update_against(existing, record, event)
+}
+
+fn validate_job_update_against(
+    existing: &JobRecord,
+    record: &JobRecord,
+    event: &JobEvent,
+) -> StoreResult<()> {
     ensure_same_repository(
         "jobs",
         "job.repository_id",
