@@ -1066,11 +1066,11 @@ fn read_text_window(
     loop {
         if current_line >= start_line {
             if line_count >= max_lines {
-                truncated_by_lines = true;
+                truncated_by_lines = !reader.fill_buf()?.is_empty();
                 break;
             }
             if used_chars >= max_chars {
-                truncated_by_chars = true;
+                truncated_by_chars = !reader.fill_buf()?.is_empty();
                 break;
             }
         }
@@ -1731,6 +1731,38 @@ mod tests {
         assert_eq!(ToolResultStatus::Succeeded, result.status);
         let content = result.fields.iter().find(|f| f.key == "content").unwrap();
         assert_eq!("abc", string_value(&content.value));
+        assert!(result.truncation.is_none());
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_exact_line_limit_at_eof_is_not_truncated() {
+        let env = TestEnv::new("read-lines-eof");
+        env.create_file("two.txt", "a\nb");
+
+        let tool = FsReadTool::new(&env.root).with_window(1, 2);
+        let invocation = fake_invocation(tool.tool_id());
+        let result = tool.execute(&invocation, &request_with_path("two.txt"));
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("a\nb", string_value(&content.value));
+        assert!(result.truncation.is_none());
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_exact_character_limit_at_eof_is_not_truncated() {
+        let env = TestEnv::new("read-chars-eof");
+        env.create_file("small.txt", "abcd");
+
+        let tool = FsReadTool::new(&env.root).with_max_chars(4);
+        let invocation = fake_invocation(tool.tool_id());
+        let result = tool.execute(&invocation, &request_with_path("small.txt"));
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("abcd", string_value(&content.value));
         assert!(result.truncation.is_none());
         env.cleanup();
     }
