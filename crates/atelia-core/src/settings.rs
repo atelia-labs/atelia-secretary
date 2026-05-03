@@ -405,10 +405,15 @@ fn apply_verbosity_constraints(render_options: &mut RenderOptions, verbosity: To
             render_options.include_diagnostics = false;
             render_options.include_cost = false;
         }
-        ToolOutputVerbosity::Normal => {}
+        ToolOutputVerbosity::Normal => {
+            render_options.include_policy = false;
+            render_options.include_diagnostics = false;
+            render_options.include_cost = false;
+        }
         ToolOutputVerbosity::Expanded => {
             render_options.include_policy = true;
             render_options.include_diagnostics = true;
+            render_options.include_cost = false;
         }
         ToolOutputVerbosity::Debug => {
             render_options.include_policy = true;
@@ -929,6 +934,67 @@ mod tests {
     }
 
     #[test]
+    fn defaults_render_policy_caps_requested_optional_channels_by_verbosity() {
+        let base_defaults = ToolOutputDefaults {
+            render_options: RenderOptions {
+                format: OutputFormat::Text,
+                include_policy: false,
+                include_diagnostics: false,
+                include_cost: false,
+            },
+            max_inline_bytes: DEFAULT_MAX_INLINE_BYTES,
+            max_inline_lines: 4,
+            verbosity: ToolOutputVerbosity::Normal,
+            granularity: ToolOutputGranularity::Full,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        };
+
+        let requested = RenderOptions {
+            format: OutputFormat::Json,
+            include_policy: true,
+            include_diagnostics: true,
+            include_cost: true,
+        };
+
+        let minimal = ToolOutputDefaults {
+            verbosity: ToolOutputVerbosity::Minimal,
+            ..base_defaults.clone()
+        }
+        .render_policy_with_render_options(Some(&requested));
+        assert_eq!(minimal.render_options.format, OutputFormat::Json);
+        assert!(!minimal.render_options.include_policy);
+        assert!(!minimal.render_options.include_diagnostics);
+        assert!(!minimal.render_options.include_cost);
+
+        let normal = ToolOutputDefaults {
+            verbosity: ToolOutputVerbosity::Normal,
+            ..base_defaults.clone()
+        }
+        .render_policy_with_render_options(Some(&requested));
+        assert!(!normal.render_options.include_policy);
+        assert!(!normal.render_options.include_diagnostics);
+        assert!(!normal.render_options.include_cost);
+
+        let expanded = ToolOutputDefaults {
+            verbosity: ToolOutputVerbosity::Expanded,
+            ..base_defaults.clone()
+        }
+        .render_policy_with_render_options(Some(&requested));
+        assert!(expanded.render_options.include_policy);
+        assert!(expanded.render_options.include_diagnostics);
+        assert!(!expanded.render_options.include_cost);
+
+        let debug = ToolOutputDefaults {
+            verbosity: ToolOutputVerbosity::Debug,
+            ..base_defaults
+        }
+        .render_policy_with_render_options(Some(&requested));
+        assert!(debug.render_options.include_policy);
+        assert!(debug.render_options.include_diagnostics);
+        assert!(debug.render_options.include_cost);
+    }
+
+    #[test]
     fn defaults_render_policy_without_request_render_options_uses_defaults() {
         let defaults = ToolOutputDefaults {
             render_options: RenderOptions {
@@ -946,7 +1012,10 @@ mod tests {
 
         let policy = defaults.render_policy_with_render_options(None);
 
-        assert_eq!(policy.render_options, defaults.render_options);
+        assert_eq!(policy.render_options.format, OutputFormat::Json);
+        assert!(!policy.render_options.include_policy);
+        assert!(!policy.render_options.include_diagnostics);
+        assert!(!policy.render_options.include_cost);
     }
 
     #[test]

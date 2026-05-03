@@ -1517,7 +1517,7 @@ mod tests {
 
         assert_eq!(rendered.format, OutputFormat::Json);
         assert_eq!(json["tool_id"], "secretary.echo");
-        assert!(json["fields"]
+        assert!(!json["fields"]
             .as_array()
             .unwrap()
             .iter()
@@ -1565,7 +1565,7 @@ mod tests {
 
         assert_eq!(rendered.format, OutputFormat::Json);
         assert_eq!(json["tool_id"], "secretary.echo");
-        assert!(json["fields"]
+        assert!(!json["fields"]
             .as_array()
             .unwrap()
             .iter()
