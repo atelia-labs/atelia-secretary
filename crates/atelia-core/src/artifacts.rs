@@ -149,11 +149,11 @@ fn create_scope_dir(path: &Path) -> io::Result<()> {
         builder.recursive(true);
         builder.mode(0o700);
         builder.create(path)?;
-        return fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
     }
 
     #[cfg(not(unix))]
-    return fs::create_dir_all(path);
+    fs::create_dir_all(path)
 }
 
 fn write_file_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
