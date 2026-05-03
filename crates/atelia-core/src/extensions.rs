@@ -1218,10 +1218,13 @@ impl ExtensionRegistryService {
             approve_local_unsigned,
             allow_local_process_runtime,
         } = request;
-        let options = InstallOptions {
-            approve_local_unsigned,
-            allow_local_process_runtime,
-        };
+        let mut options = InstallOptions::default();
+        if approve_local_unsigned {
+            options = options.approve_local_unsigned();
+        }
+        if allow_local_process_runtime {
+            options = options.allow_local_process_runtime();
+        }
         let record = self
             .registry
             .install(manifest, options)
