@@ -22,6 +22,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,7 +30,8 @@ use std::time::{Duration, Instant};
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1471,23 +1473,13 @@ struct ProcessExecutionOutcome {
 
 fn capture_text_output(bytes: Vec<u8>, max_output_bytes: usize) -> CapturedStream {
     let original_bytes = bytes.len();
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    let text_bytes = text.len();
-    if text_bytes <= max_output_bytes {
-        return CapturedStream {
-            text,
-            original_bytes,
-            retained_bytes: text_bytes,
-            truncated: false,
-        };
-    }
-
-    let retained = truncate_utf8_to_byte_boundary(&text, max_output_bytes).to_string();
+    let retained_bytes = original_bytes.min(max_output_bytes);
+    let text = String::from_utf8_lossy(&bytes[..retained_bytes]).into_owned();
     CapturedStream {
-        retained_bytes: retained.len(),
-        text: retained,
+        retained_bytes,
+        text,
         original_bytes,
-        truncated: true,
+        truncated: original_bytes > max_output_bytes,
     }
 }
 
@@ -1503,6 +1495,36 @@ fn read_child_stream(
     })
 }
 
+fn join_reader_with_timeout(
+    handle: thread::JoinHandle<io::Result<Vec<u8>>>,
+    timeout: Duration,
+) -> io::Result<(Vec<u8>, bool)> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(handle.join());
+    });
+
+    match receiver.recv_timeout(timeout) {
+        Ok(join_result) => match join_result {
+            Ok(bytes) => Ok((bytes?, false)),
+            Err(_) => Err(io::Error::other("reader thread panicked")),
+        },
+        Err(RecvTimeoutError::Timeout) => Ok((Vec::new(), true)),
+        Err(_) => Err(io::Error::other("reader join thread failed")),
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_tree(child: &mut std::process::Child) {
+    let pid = child.id() as i32;
+    let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+}
+
+#[cfg(not(unix))]
+fn kill_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
 fn wait_for_child(
     child: &mut std::process::Child,
     timeout: Duration,
@@ -1515,7 +1537,7 @@ fn wait_for_child(
         }
 
         if start.elapsed() >= timeout {
-            child.kill()?;
+            kill_process_tree(child);
             let status = child.wait()?;
             return Ok((Some(status), true));
         }
@@ -1547,6 +1569,8 @@ fn execute_explicit_argv_process(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.env_clear();
+    #[cfg(unix)]
+    command.process_group(0);
 
     let current_env: HashMap<String, String> = std::env::vars().collect();
     for key in env_allowlist {
@@ -1564,16 +1588,15 @@ fn execute_explicit_argv_process(
         .map_err(|error| format!("failed to spawn process: {error}"))?;
     let stdout_handle = read_child_stream(child.stdout.take());
     let stderr_handle = read_child_stream(child.stderr.take());
-    let (status, timed_out) = wait_for_child(&mut child, timeout)
+    let (status, mut timed_out) = wait_for_child(&mut child, timeout)
         .map_err(|error| format!("process wait failed: {error}"))?;
-    let stdout_bytes = stdout_handle
-        .join()
-        .map_err(|_| "stdout reader thread panicked".to_string())?
-        .map_err(|error| format!("stdout read failed: {error}"))?;
-    let stderr_bytes = stderr_handle
-        .join()
-        .map_err(|_| "stderr reader thread panicked".to_string())?
-        .map_err(|error| format!("stderr read failed: {error}"))?;
+    let (stdout_bytes, stdout_timed_out) =
+        join_reader_with_timeout(stdout_handle, Duration::from_millis(250))
+            .map_err(|error| format!("stdout read failed: {error}"))?;
+    let (stderr_bytes, stderr_timed_out) =
+        join_reader_with_timeout(stderr_handle, Duration::from_millis(250))
+            .map_err(|error| format!("stderr read failed: {error}"))?;
+    timed_out |= stdout_timed_out || stderr_timed_out;
 
     let stdout = capture_text_output(stdout_bytes, max_output_bytes);
     let stderr = capture_text_output(stderr_bytes, max_output_bytes);
@@ -4670,6 +4693,49 @@ mod tests {
         let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
         assert!(string_value(&summary.value).contains("timed out"));
         env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_times_out_with_child_process_descendants() {
+        let env = TestEnv::new("proc-timeout-descendant");
+        let start = Instant::now();
+
+        let tool = ProcExecTool::new(
+            &env.root,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 5 & sleep 5".to_string(),
+            ],
+        )
+        .with_timeout(Duration::from_millis(50));
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+        let elapsed = start.elapsed();
+
+        assert_eq!(ToolResultStatus::TimedOut, result.status);
+        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
+        assert_eq!(StructuredValue::Bool(true), timed_out.value);
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        assert!(string_value(&summary.value).contains("timed out"));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "timed out execution did not hard-stop"
+        );
+        env.cleanup();
+    }
+
+    #[test]
+    fn capture_text_output_tracks_retained_bytes_before_utf8_lossy() {
+        let bytes = vec![0xff, 0xfe, b'a', b'b', b'c'];
+        let stream = capture_text_output(bytes, 10);
+
+        assert_eq!(5, stream.original_bytes);
+        assert_eq!(5, stream.retained_bytes);
+        assert_eq!("��abc", stream.text);
+        assert!(!stream.truncated);
     }
 
     #[cfg(unix)]
