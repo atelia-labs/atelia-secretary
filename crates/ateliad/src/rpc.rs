@@ -1335,6 +1335,16 @@ fn parse_non_empty_field(field_name: &str, value: String) -> RpcResult<String> {
 }
 
 fn parse_event_query(request: ListEventsRequest) -> RpcResult<EventQuery> {
+    let page_size = match request.page_size {
+        Some(0) => {
+            return Err(RpcError::invalid_argument(
+                "page_size must be greater than 0",
+            ));
+        }
+        Some(page_size) => Some(page_size.min(MAX_WATCH_EVENTS_PAGE)),
+        None => Some(MAX_WATCH_EVENTS_PAGE),
+    };
+
     let repository_id = request
         .repository_id
         .as_deref()
@@ -1353,7 +1363,7 @@ fn parse_event_query(request: ListEventsRequest) -> RpcResult<EventQuery> {
         cursor,
         subject_ids: request.subject_ids,
         min_severity: request.min_severity.map(parse_event_severity),
-        page_size: request.page_size,
+        page_size,
         page_token: request.page_token,
     })
 }
@@ -3186,6 +3196,36 @@ mod tests {
         assert_ne!(second.jobs[0].job_id, first.jobs[0].job_id);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_event_query_rejects_zero_page_size() {
+        let err = parse_event_query(ListEventsRequest {
+            repository_id: None,
+            cursor: None,
+            subject_ids: Vec::new(),
+            min_severity: None,
+            page_size: Some(0),
+            page_token: None,
+        })
+        .unwrap_err();
+
+        assert_eq!(err.code, RpcErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_event_query_caps_page_size_to_maximum() {
+        let query = parse_event_query(ListEventsRequest {
+            repository_id: None,
+            cursor: None,
+            subject_ids: Vec::new(),
+            min_severity: None,
+            page_size: Some(MAX_WATCH_EVENTS_PAGE + 1),
+            page_token: None,
+        })
+        .expect("request with oversized page_size should be capped");
+
+        assert_eq!(query.page_size, Some(MAX_WATCH_EVENTS_PAGE));
     }
 
     #[test]
