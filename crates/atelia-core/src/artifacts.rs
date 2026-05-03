@@ -1,10 +1,13 @@
 //! Local artifact storage and spillover helpers for large tool outputs.
 
 use crate::domain::{
-    OutputRef, OutputRefId, StructuredValue, ToolResult, ToolResultField, TruncationMetadata,
+    LedgerTimestamp, OutputRef, OutputRefId, StructuredValue, ToolResult, ToolResultField,
+    TruncationMetadata,
 };
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::cell::Cell;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -15,12 +18,14 @@ use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 const WRITE_FILE_TMP_PREFIX: &str = ".atelia-artifact-tmp";
 static WRITE_FILE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const DEFAULT_ARTIFACT_APP_DIR: &str = "atelia-secretary";
 const DEFAULT_ARTIFACT_DIR: &str = "artifacts";
+const DEFAULT_ARTIFACT_INDEX_FILE: &str = "index.json";
 const DEFAULT_MEDIA_TYPE: &str = "text/plain; charset=utf-8";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,10 +52,73 @@ impl ArtifactStoreConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactTombstone {
+    pub at: LedgerTimestamp,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalArtifactRecord {
+    pub id: OutputRefId,
+    pub scope: String,
+    pub project_id: Option<String>,
+    pub repository_id: Option<String>,
+    pub path: String,
+    pub uri: String,
+    pub media_type: String,
+    pub label: Option<String>,
+    pub created_at: LedgerTimestamp,
+    pub original_bytes: Option<u64>,
+    pub retained_bytes: Option<u64>,
+    pub tombstone: Option<ArtifactTombstone>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtifactWriteMetadata {
+    pub project_id: Option<String>,
+    pub repository_id: Option<String>,
+    pub original_bytes: Option<u64>,
+    pub retained_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRetentionPolicy {
+    pub max_retention: Duration,
+}
+
+impl ArtifactRetentionPolicy {
+    pub fn new(max_retention: Duration) -> Self {
+        Self { max_retention }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactExpirationReport {
+    pub requested: usize,
+    pub matched: usize,
+    pub tombstoned: usize,
+    pub deleted_files: usize,
+    pub missing_files: usize,
+}
+
+impl ArtifactExpirationReport {
+    fn new(requested: usize) -> Self {
+        Self {
+            requested,
+            matched: 0,
+            tombstoned: 0,
+            deleted_files: 0,
+            missing_files: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ArtifactError {
     InvalidScope { scope: String },
     Io(io::Error),
+    InvalidIndex { path: String, reason: String },
 }
 
 impl fmt::Display for ArtifactError {
@@ -58,6 +126,9 @@ impl fmt::Display for ArtifactError {
         match self {
             Self::InvalidScope { scope } => write!(f, "invalid artifact scope: {scope}"),
             Self::Io(error) => write!(f, "artifact io failed: {error}"),
+            Self::InvalidIndex { path, reason } => {
+                write!(f, "artifact index corrupted at {path}: {reason}")
+            }
         }
     }
 }
@@ -65,7 +136,7 @@ impl fmt::Display for ArtifactError {
 impl Error for ArtifactError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidScope { .. } => None,
+            Self::InvalidScope { .. } | Self::InvalidIndex { .. } => None,
             Self::Io(error) => Some(error),
         }
     }
@@ -74,6 +145,15 @@ impl Error for ArtifactError {
 impl From<io::Error> for ArtifactError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for ArtifactError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::InvalidIndex {
+            path: "<serde>".to_string(),
+            reason: error.to_string(),
+        }
     }
 }
 
@@ -91,6 +171,19 @@ trait ArtifactWriter {
     fn delete_artifact_bytes(&self, _output_ref: &OutputRef) -> ArtifactResult<()> {
         Ok(())
     }
+
+    fn update_spill_metadata(
+        &self,
+        _output_ref: &OutputRef,
+        _original_bytes: Option<u64>,
+        _retained_bytes: Option<u64>,
+    ) -> ArtifactResult<()> {
+        Ok(())
+    }
+
+    fn delete_artifact_record(&self, _output_ref: &OutputRef) -> ArtifactResult<()> {
+        Ok(())
+    }
 }
 
 impl ArtifactWriter for LocalArtifactStore {
@@ -106,6 +199,19 @@ impl ArtifactWriter for LocalArtifactStore {
 
     fn delete_artifact_bytes(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
         self.delete_artifact(output_ref)
+    }
+
+    fn update_spill_metadata(
+        &self,
+        output_ref: &OutputRef,
+        original_bytes: Option<u64>,
+        retained_bytes: Option<u64>,
+    ) -> ArtifactResult<()> {
+        update_record_bytes(self, &output_ref.id, original_bytes, retained_bytes)
+    }
+
+    fn delete_artifact_record(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
+        remove_record_bytes(self, &output_ref.id)
     }
 }
 
@@ -134,26 +240,329 @@ impl LocalArtifactStore {
         media_type: impl Into<String>,
         bytes: &[u8],
     ) -> ArtifactResult<OutputRef> {
+        self.write_bytes_with_metadata(
+            scope,
+            label,
+            media_type,
+            bytes,
+            ArtifactWriteMetadata::default(),
+        )
+    }
+
+    pub fn write_bytes_with_metadata(
+        &self,
+        scope: &str,
+        label: impl AsRef<str>,
+        media_type: impl Into<String>,
+        bytes: &[u8],
+        metadata: ArtifactWriteMetadata,
+    ) -> ArtifactResult<OutputRef> {
         let scope_dir_name = sanitize_segment(scope)?;
-        let label = label.as_ref();
-        let safe_label = sanitize_label(label);
+        let scope_label = label.as_ref();
+        let safe_label = sanitize_label(scope_label);
         let id = OutputRefId::new();
         let file_name = format!("{}-{safe_label}.artifact", id.as_str());
-        let dir = self.config.root_dir.join(scope_dir_name);
+        let dir = self.config.root_dir.join(&scope_dir_name);
         let path = dir.join(file_name);
 
         create_scope_dir(&dir)?;
         write_file_bytes(&path, bytes)?;
 
-        Ok(OutputRef {
+        let uri = path.to_string_lossy().into_owned();
+        let media_type = media_type.into();
+        let created_at = LedgerTimestamp::now();
+        let index_record = LocalArtifactRecord {
+            id: id.clone(),
+            scope: scope_dir_name.clone(),
+            project_id: metadata.project_id,
+            repository_id: metadata.repository_id,
+            path: uri.clone(),
+            uri: uri.clone(),
+            media_type: media_type.clone(),
+            label: Some(scope_label.to_string()),
+            created_at,
+            original_bytes: metadata.original_bytes,
+            retained_bytes: metadata.retained_bytes,
+            tombstone: None,
+        };
+
+        let output_ref = OutputRef {
             id,
-            uri: path.to_string_lossy().into_owned(),
-            media_type: media_type.into(),
-            label: Some(label.to_string()),
+            uri: uri.clone(),
+            media_type: media_type.clone(),
+            label: Some(scope_label.to_string()),
             digest: None,
+        };
+
+        let mut records = match self.read_scope_records(&dir) {
+            Ok(records) => records,
+            Err(error) => {
+                let _ = self.delete_artifact(&output_ref);
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        };
+        records.push(index_record);
+        if let Err(error) = self.write_scope_records(&dir, records) {
+            let _ = self.delete_artifact(&output_ref);
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+
+        Ok(output_ref)
+    }
+
+    pub fn list_records(&self, scope: Option<&str>) -> ArtifactResult<Vec<LocalArtifactRecord>> {
+        let mut records = match scope {
+            Some(scope) => {
+                let scope_dir = self.scope_dir(scope)?;
+                if !scope_dir.exists() {
+                    return Ok(Vec::new());
+                }
+                self.read_scope_records(&scope_dir)?
+            }
+            None => self.read_all_records()?,
+        };
+
+        records.sort_by(|left, right| {
+            left.created_at
+                .unix_millis
+                .cmp(&right.created_at.unix_millis)
+                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+        });
+
+        Ok(records)
+    }
+
+    pub fn find_expired_artifact_records(
+        &self,
+        scope: Option<&str>,
+        now: LedgerTimestamp,
+        policy: &ArtifactRetentionPolicy,
+    ) -> ArtifactResult<Vec<LocalArtifactRecord>> {
+        let retention_cutoff = expired_cutoff_millis(now, policy);
+        let mut records = self.list_records(scope)?;
+
+        records.retain(|record| {
+            record.created_at.unix_millis <= retention_cutoff
+                && (record.tombstone.is_none() || Path::new(&record.path).exists())
+        });
+        Ok(records)
+    }
+
+    pub fn safe_expire_artifact_records(
+        &self,
+        scope: Option<&str>,
+        record_ids: &[OutputRefId],
+        now: LedgerTimestamp,
+        tombstone_reason: impl Into<String>,
+    ) -> ArtifactResult<ArtifactExpirationReport> {
+        let mut records = self.list_records(scope)?;
+        let expected_scope = scope.map(sanitize_segment).transpose()?;
+        let tombstone_reason = tombstone_reason.into();
+        let mut target_ids = HashSet::new();
+        for record_id in record_ids {
+            target_ids.insert(record_id);
+        }
+
+        let mut report = ArtifactExpirationReport::new(target_ids.len());
+        if report.requested == 0 || records.is_empty() {
+            return Ok(report);
+        }
+
+        let mut scope_groups: BTreeMap<String, Vec<LocalArtifactRecord>> = BTreeMap::new();
+        let mut records_to_delete: BTreeMap<String, Vec<(OutputRef, PathBuf)>> = BTreeMap::new();
+        for mut record in records.drain(..) {
+            let sanitized_scope = sanitize_segment(&record.scope)?;
+            if expected_scope
+                .as_ref()
+                .is_some_and(|expected| sanitized_scope != *expected)
+            {
+                return Err(ArtifactError::InvalidScope {
+                    scope: record.scope,
+                });
+            }
+            if sanitized_scope != record.scope {
+                return Err(ArtifactError::InvalidScope {
+                    scope: record.scope,
+                });
+            }
+
+            if target_ids.contains(&record.id) {
+                report.matched += 1;
+
+                let path = Path::new(&record.path).to_path_buf();
+                let output_ref = OutputRef {
+                    id: record.id.clone(),
+                    uri: record.path.clone(),
+                    media_type: record.media_type.clone(),
+                    label: record.label.clone(),
+                    digest: None,
+                };
+                records_to_delete
+                    .entry(sanitized_scope.clone())
+                    .or_default()
+                    .push((output_ref, path));
+
+                if record.tombstone.is_none() {
+                    report.tombstoned += 1;
+                    record.tombstone = Some(ArtifactTombstone {
+                        at: now,
+                        reason: tombstone_reason.clone(),
+                    });
+                }
+            }
+
+            scope_groups
+                .entry(sanitized_scope)
+                .or_default()
+                .push(record);
+        }
+
+        for (scope, records) in scope_groups {
+            let scope_dir = self.config.root_dir.join(&scope);
+            self.write_scope_records(&scope_dir, records)?;
+
+            let mut deletions = records_to_delete.remove(&scope).unwrap_or_default();
+            for (output_ref, path) in deletions.drain(..) {
+                let existed = path.exists();
+                self.delete_artifact(&output_ref)?;
+                let still_exists = path.exists();
+
+                if existed && !still_exists {
+                    report.deleted_files += 1;
+                } else if !existed && !still_exists {
+                    report.missing_files += 1;
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    pub fn safe_expire_artifacts_by_retention(
+        &self,
+        scope: Option<&str>,
+        now: LedgerTimestamp,
+        policy: &ArtifactRetentionPolicy,
+        tombstone_reason: impl Into<String>,
+    ) -> ArtifactResult<ArtifactExpirationReport> {
+        let expired_ids = self
+            .find_expired_artifact_records(scope, now, policy)?
+            .into_iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        self.safe_expire_artifact_records(scope, &expired_ids, now, tombstone_reason)
+    }
+
+    fn scope_dir(&self, scope: &str) -> ArtifactResult<PathBuf> {
+        Ok(self.config.root_dir.join(sanitize_segment(scope)?))
+    }
+
+    fn read_all_records(&self) -> ArtifactResult<Vec<LocalArtifactRecord>> {
+        if !self.config.root_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut scope_dirs: Vec<PathBuf> = fs::read_dir(&self.config.root_dir)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let is_dir = entry
+                    .file_type()
+                    .ok()
+                    .is_some_and(|file_type| file_type.is_dir());
+                if is_dir {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        scope_dirs.sort();
+        let mut records = Vec::new();
+        for scope_dir in scope_dirs {
+            let source_scope_name = scope_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let source_scope = sanitize_segment(source_scope_name)?;
+            if source_scope != source_scope_name {
+                return Err(ArtifactError::InvalidScope {
+                    scope: source_scope_name.to_string(),
+                });
+            }
+
+            let mut scoped_records = self.read_scope_records(&scope_dir)?;
+            for record in &mut scoped_records {
+                let record_scope = sanitize_segment(&record.scope)?;
+                if record.scope != record_scope {
+                    return Err(ArtifactError::InvalidScope {
+                        scope: record.scope.clone(),
+                    });
+                }
+                if record_scope != source_scope {
+                    return Err(ArtifactError::InvalidScope {
+                        scope: record.scope.clone(),
+                    });
+                }
+                record.scope = source_scope.clone();
+            }
+
+            records.extend(scoped_records);
+        }
+
+        Ok(records)
+    }
+
+    fn read_scope_records(&self, scope_dir: &Path) -> ArtifactResult<Vec<LocalArtifactRecord>> {
+        let index_path = scope_dir.join(DEFAULT_ARTIFACT_INDEX_FILE);
+        if !index_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let index_contents = fs::read_to_string(&index_path)?;
+        if index_contents.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        serde_json::from_str::<Vec<LocalArtifactRecord>>(&index_contents).map_err(|error| {
+            ArtifactError::InvalidIndex {
+                path: index_path.to_string_lossy().into_owned(),
+                reason: error.to_string(),
+            }
         })
     }
 
+    fn write_scope_records(
+        &self,
+        scope_dir: &Path,
+        mut records: Vec<LocalArtifactRecord>,
+    ) -> ArtifactResult<()> {
+        let index_path = scope_dir.join(DEFAULT_ARTIFACT_INDEX_FILE);
+        if records.is_empty() {
+            match fs::remove_file(&index_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            return Ok(());
+        }
+
+        records.sort_by(|left, right| {
+            left.created_at
+                .unix_millis
+                .cmp(&right.created_at.unix_millis)
+                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+        });
+        let serialized = serde_json::to_vec_pretty(&records)?;
+        let tmp = index_path.with_extension("json.tmp");
+        fs::write(&tmp, serialized)?;
+        fs::rename(&tmp, &index_path)?;
+        Ok(())
+    }
     pub fn delete_artifact(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
         let path = Path::new(&output_ref.uri);
         if !path.exists() {
@@ -393,6 +802,14 @@ fn spill_large_tool_result_fields_with_writer(
             }
         };
         let replacement = format!("artifact_ref {}", output_ref.uri);
+        let retained_size = replacement.len() as u64;
+        let original_size = bytes.len() as u64;
+        if let Err(error) =
+            store.update_spill_metadata(&output_ref, Some(original_size), Some(retained_size))
+        {
+            rollback_artifact_writes(store, &written_output_refs);
+            return Err(error);
+        }
 
         original_bytes += bytes.len() as u64;
         retained_bytes += replacement.len() as u64;
@@ -433,7 +850,64 @@ fn spill_large_tool_result_fields_with_writer(
 fn rollback_artifact_writes(writer: &impl ArtifactWriter, output_refs: &[OutputRef]) {
     for output_ref in output_refs {
         let _ = writer.delete_artifact_bytes(output_ref);
+        let _ = writer.delete_artifact_record(output_ref);
     }
+}
+
+fn update_record_bytes(
+    store: &LocalArtifactStore,
+    id: &OutputRefId,
+    original_bytes: Option<u64>,
+    retained_bytes: Option<u64>,
+) -> ArtifactResult<()> {
+    let mut records = store.list_records(None)?;
+    let mut needs_persist = false;
+    let mut scope = None;
+
+    for record in &mut records {
+        if record.id == *id {
+            if let Some(original_bytes) = original_bytes {
+                record.original_bytes = Some(original_bytes);
+                needs_persist = true;
+            }
+            if let Some(retained_bytes) = retained_bytes {
+                record.retained_bytes = Some(retained_bytes);
+                needs_persist = true;
+            }
+            scope = Some(record.scope.clone());
+            break;
+        }
+    }
+
+    if !needs_persist {
+        return Ok(());
+    }
+
+    let scope = scope.expect("record should have scope");
+    let scope_dir = store.config.root_dir.join(&scope);
+    let scoped_records = records
+        .into_iter()
+        .filter(|record| record.scope == scope)
+        .collect::<Vec<_>>();
+    store.write_scope_records(&scope_dir, scoped_records)?;
+    Ok(())
+}
+
+fn remove_record_bytes(store: &LocalArtifactStore, id: &OutputRefId) -> ArtifactResult<()> {
+    let records = store.read_all_records()?;
+    let Some(scope) = records
+        .iter()
+        .find(|record| record.id == *id)
+        .map(|record| record.scope.clone())
+    else {
+        return Ok(());
+    };
+
+    let scope_dir = store.config.root_dir.join(&scope);
+    let mut scoped_records = store.read_scope_records(&scope_dir)?;
+    scoped_records.retain(|record| record.id != *id);
+    store.write_scope_records(&scope_dir, scoped_records)?;
+    Ok(())
 }
 
 fn spillable_field_bytes(field: &ToolResultField) -> Option<Vec<u8>> {
@@ -461,6 +935,11 @@ fn merge_truncation(
             reason: "artifact spillover".to_string(),
         },
     }
+}
+
+fn expired_cutoff_millis(now: LedgerTimestamp, policy: &ArtifactRetentionPolicy) -> i64 {
+    let retention_millis = i64::try_from(policy.max_retention.as_millis()).unwrap_or(i64::MAX);
+    now.unix_millis.saturating_sub(retention_millis)
 }
 
 fn sanitize_segment(value: &str) -> ArtifactResult<String> {
@@ -495,6 +974,7 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(name: &str) -> PathBuf {
@@ -581,6 +1061,43 @@ mod tests {
     }
 
     #[test]
+    fn writes_artifact_index_metadata() {
+        let root = temp_root("index");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+
+        let reference = store
+            .write_bytes_with_metadata(
+                "repo_example",
+                "search output",
+                "text/plain",
+                b"hello",
+                ArtifactWriteMetadata {
+                    project_id: Some("project-1".to_string()),
+                    repository_id: Some("repo-a".to_string()),
+                    original_bytes: Some(5),
+                    retained_bytes: Some(7),
+                },
+            )
+            .unwrap();
+
+        let records = store.list_records(None).unwrap();
+        assert_eq!(1, records.len());
+
+        let record = &records[0];
+        assert_eq!(reference.id, record.id);
+        assert_eq!("repo_example", record.scope.as_str());
+        assert_eq!(Some("project-1".to_string()), record.project_id);
+        assert_eq!(Some("repo-a".to_string()), record.repository_id);
+        assert_eq!(reference.uri, record.path);
+        assert_eq!(reference.uri, record.uri);
+        assert_eq!("text/plain", record.media_type);
+        assert_eq!(Some("search output".to_string()), record.label);
+        assert_eq!(Some(5), record.original_bytes);
+        assert_eq!(Some(7), record.retained_bytes);
+        assert_eq!(None, record.tombstone);
+    }
+
+    #[test]
     fn spills_large_string_field_to_output_ref() {
         let root = temp_root("spill");
         let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
@@ -601,6 +1118,11 @@ mod tests {
             Some("artifact spillover"),
             result.truncation.as_ref().map(|t| t.reason.as_str())
         );
+        assert_eq!(6, report.original_bytes);
+        assert_eq!(
+            result.output_refs[0].uri.len() as u64 + 13,
+            report.retained_bytes
+        );
         assert_eq!(
             "abcdef",
             fs::read_to_string(&result.output_refs[0].uri).unwrap()
@@ -609,6 +1131,682 @@ mod tests {
             StructuredValue::String(value) => assert!(value.starts_with("artifact_ref ")),
             other => panic!("expected replacement string, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn finds_expired_artifact_records_without_deleting() {
+        let root = temp_root("expire-find");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let reference = store
+            .write_bytes("repo_example", "search output", "text/plain", b"hello")
+            .unwrap();
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let expired = store
+            .find_expired_artifact_records(None, LedgerTimestamp::now(), &policy)
+            .unwrap();
+
+        assert_eq!(1, expired.len());
+        assert_eq!(reference.id, expired[0].id);
+        let records = store.list_records(None).unwrap();
+        assert_eq!(None, records[0].tombstone);
+        assert!(Path::new(&reference.uri).exists());
+    }
+
+    #[test]
+    fn safe_expire_artifact_records_keeps_tombstone_metadata() {
+        let root = temp_root("expire-safe");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let reference = store
+            .write_bytes("repo_example", "search output", "text/plain", b"hello")
+            .unwrap();
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let report = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap();
+
+        assert_eq!(1, report.requested);
+        assert_eq!(1, report.matched);
+        assert_eq!(1, report.tombstoned);
+        assert_eq!(1, report.deleted_files);
+
+        let records = store.list_records(None).unwrap();
+        assert_eq!(
+            Some("retention policy"),
+            records[0].tombstone.as_ref().map(|t| t.reason.as_str())
+        );
+        assert_eq!(reference.id, records[0].id);
+        assert!(!Path::new(&reference.uri).exists());
+    }
+
+    #[test]
+    fn safe_expire_artifact_records_skips_paths_outside_root() {
+        let root = temp_root("expire-outside-root");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let outside_root = temp_root("expire-outside-root-target");
+        let outside_scope = outside_root.join("other_scope");
+        create_scope_dir(&outside_scope).unwrap();
+
+        let outside_file = outside_scope.join("outside.artifact");
+        fs::write(&outside_file, b"don't touch").unwrap();
+
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+        let forged = LocalArtifactRecord {
+            id: OutputRefId::new(),
+            scope: "repo_example".to_string(),
+            project_id: None,
+            repository_id: None,
+            path: outside_file.to_string_lossy().into_owned(),
+            uri: outside_file.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("forged".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+
+        store.write_scope_records(&scope_dir, vec![forged]).unwrap();
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let record_id = store.list_records(None).unwrap()[0].id.clone();
+        let report = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap();
+
+        assert_eq!(1, report.requested);
+        assert_eq!(1, report.matched);
+        assert_eq!(1, report.tombstoned);
+        assert!(outside_file.exists());
+        let records = store.list_records(None).unwrap();
+        assert_eq!(1, records.len());
+        assert_eq!(
+            Some("retention policy"),
+            records[0].tombstone.as_ref().map(|t| t.reason.as_str())
+        );
+        assert_eq!(record_id, records[0].id);
+    }
+
+    #[test]
+    fn safe_expire_artifact_records_rejects_forged_scope_traversal() {
+        let root = temp_root("expire-fake-scope");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let escaped_root = temp_root("expire-fake-scope-target");
+        create_scope_dir(&escaped_root).unwrap();
+
+        let escaped_index = escaped_root.join(DEFAULT_ARTIFACT_INDEX_FILE);
+        let escaped_index_before = b"do-not-touch".to_vec();
+        fs::write(&escaped_index, &escaped_index_before).unwrap();
+
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+        let scoped_artifact = scope_dir.join("artifact.artifact");
+        fs::write(&scoped_artifact, b"stale").unwrap();
+
+        let escaped_scope = format!(
+            "..{}{}",
+            std::path::MAIN_SEPARATOR,
+            escaped_root
+                .file_name()
+                .expect("temp root should have file name")
+                .to_string_lossy()
+        );
+        let forged = LocalArtifactRecord {
+            id: OutputRefId::new(),
+            scope: escaped_scope.clone(),
+            project_id: None,
+            repository_id: None,
+            path: scoped_artifact.to_string_lossy().into_owned(),
+            uri: scoped_artifact.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("forged".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+
+        store.write_scope_records(&scope_dir, vec![forged]).unwrap();
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let error = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidScope {
+                scope
+            } if scope == escaped_scope
+        ));
+        assert_eq!(
+            escaped_index_before,
+            fs::read(&escaped_index).unwrap(),
+            "forged index outside root must not be rewritten"
+        );
+        assert!(!escaped_root.join("index.json.tmp").exists());
+        assert!(Path::new(&scoped_artifact).exists());
+        let records = store.list_records(Some("repo_example")).unwrap();
+        assert_eq!(1, records.len());
+        assert_eq!(None, records[0].tombstone);
+        assert_eq!(records[0].scope, escaped_scope);
+    }
+
+    #[test]
+    fn safe_expire_artifact_records_rejects_forged_in_scope_record_scope() {
+        let root = temp_root("expire-fake-scope-inside-root");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_a = root.join("scope_a");
+        let scope_b = root.join("scope_b");
+        create_scope_dir(&scope_a).unwrap();
+        create_scope_dir(&scope_b).unwrap();
+
+        let scope_b_index = scope_b.join(DEFAULT_ARTIFACT_INDEX_FILE);
+        let scope_b_index_before = b"do-not-touch".to_vec();
+        fs::write(&scope_b_index, &scope_b_index_before).unwrap();
+
+        let reference = store
+            .write_bytes("scope_a", "search output", "text/plain", b"stale")
+            .unwrap();
+
+        let mut forged_record = store
+            .list_records(Some("scope_a"))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        forged_record.scope = "scope_b".to_string();
+        store
+            .write_scope_records(&scope_a, vec![forged_record])
+            .unwrap();
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let error = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidScope {
+                scope
+            } if scope == "scope_b"
+        ));
+        assert!(Path::new(&scope_b_index).exists());
+        assert_eq!(
+            scope_b_index_before,
+            fs::read(&scope_b_index).unwrap(),
+            "scope_b index must not be rewritten"
+        );
+        assert!(
+            Path::new(&reference.uri).exists(),
+            "forged artifact path inside root must not be deleted"
+        );
+
+        let records = store.list_records(Some("scope_a")).unwrap();
+        assert_eq!(1, records.len());
+        assert_eq!("scope_b", records[0].scope);
+    }
+
+    #[test]
+    fn safe_expire_artifacts_by_retention_rejects_forged_in_scope_record_scope() {
+        let root = temp_root("expire-fake-scope-inside-root-scoped");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_a = root.join("scope_a");
+        let scope_b = root.join("scope_b");
+        create_scope_dir(&scope_a).unwrap();
+        create_scope_dir(&scope_b).unwrap();
+
+        let scope_a_index = scope_a.join(DEFAULT_ARTIFACT_INDEX_FILE);
+        let scope_b_index = scope_b.join(DEFAULT_ARTIFACT_INDEX_FILE);
+        let scope_b_index_before = b"do-not-touch".to_vec();
+        fs::write(&scope_b_index, &scope_b_index_before).unwrap();
+
+        let reference = store
+            .write_bytes("scope_a", "search output", "text/plain", b"stale")
+            .unwrap();
+
+        let mut forged_record = store
+            .list_records(Some("scope_a"))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        forged_record.scope = "scope_b".to_string();
+        store
+            .write_scope_records(&scope_a, vec![forged_record])
+            .unwrap();
+        let scope_a_index_before = fs::read(&scope_a_index).unwrap();
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let error = store
+            .safe_expire_artifacts_by_retention(
+                Some("scope_a"),
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidScope {
+                scope
+            } if scope == "scope_b"
+        ));
+        assert!(Path::new(&scope_a_index).exists());
+        assert!(Path::new(&scope_b_index).exists());
+        assert_eq!(
+            scope_a_index_before,
+            fs::read(&scope_a_index).unwrap(),
+            "scope_a index must not be rewritten"
+        );
+        assert_eq!(
+            scope_b_index_before,
+            fs::read(&scope_b_index).unwrap(),
+            "scope_b index must not be rewritten"
+        );
+        assert!(
+            Path::new(&reference.uri).exists(),
+            "forged artifact path inside root must not be deleted"
+        );
+    }
+
+    #[test]
+    fn safe_expire_artifacts_by_retention_rejects_non_canonical_record_scope_within_scope_dir() {
+        let root = temp_root("expire-fake-record-scope-unscoped");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+        let artifact_path = scope_dir.join("artifact.artifact");
+        fs::write(&artifact_path, b"stale").unwrap();
+
+        let forged_record = LocalArtifactRecord {
+            id: OutputRefId::new(),
+            scope: "repo example".to_string(),
+            project_id: None,
+            repository_id: None,
+            path: artifact_path.to_string_lossy().into_owned(),
+            uri: artifact_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("forged".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+        store
+            .write_scope_records(&scope_dir, vec![forged_record])
+            .unwrap();
+
+        let index_path = scope_dir.join(DEFAULT_ARTIFACT_INDEX_FILE);
+        let index_before = fs::read(&index_path).unwrap();
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let error = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidScope { scope } if scope == "repo example"
+        ));
+        assert_eq!(index_before, fs::read(&index_path).unwrap());
+        assert!(artifact_path.exists());
+
+        let records = store.list_records(Some("repo_example")).unwrap();
+        assert_eq!(1, records.len());
+        assert_eq!("repo example", records[0].scope);
+        assert_eq!(None, records[0].tombstone);
+    }
+
+    #[test]
+    fn safe_expire_artifact_records_rejects_non_canonical_source_directory() {
+        let root = temp_root("expire-fake-non-canonical-source-dir");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+
+        let canonical_scope = "repo_example";
+        let reference = store
+            .write_bytes(canonical_scope, "search output", "text/plain", b"kept")
+            .unwrap();
+        let canonical_scope_dir = root.join(canonical_scope);
+        let canonical_index = canonical_scope_dir.join(DEFAULT_ARTIFACT_INDEX_FILE);
+        let canonical_index_before = fs::read(&canonical_index).unwrap();
+
+        let forged_dir_name = "repo example";
+        let forged_scope_dir = root.join(forged_dir_name);
+        create_scope_dir(&forged_scope_dir).unwrap();
+        let forged_artifact = forged_scope_dir.join("forged.artifact");
+        fs::write(&forged_artifact, b"forged").unwrap();
+        let forged_record = LocalArtifactRecord {
+            id: OutputRefId::new(),
+            scope: canonical_scope.to_string(),
+            project_id: None,
+            repository_id: None,
+            path: forged_artifact.to_string_lossy().into_owned(),
+            uri: forged_artifact.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("forged".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+        store
+            .write_scope_records(&forged_scope_dir, vec![forged_record])
+            .unwrap();
+        let forged_index = forged_scope_dir.join(DEFAULT_ARTIFACT_INDEX_FILE);
+        let forged_index_before = fs::read(&forged_index).unwrap();
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let error = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidScope { scope }
+            if scope == forged_dir_name
+        ));
+        assert_eq!(
+            canonical_index_before,
+            fs::read(&canonical_index).unwrap(),
+            "canonical index must not be rewritten"
+        );
+        assert_eq!(
+            forged_index_before,
+            fs::read(&forged_index).unwrap(),
+            "forged index must not be rewritten"
+        );
+        assert!(Path::new(&reference.uri).exists());
+        assert!(Path::new(&forged_artifact).exists());
+    }
+
+    #[test]
+    fn safe_expire_artifact_records_tombstones_before_delete_on_index_failure() {
+        let root = temp_root("expire-rollback");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let reference = store
+            .write_bytes("repo_example", "search output", "text/plain", b"hello")
+            .unwrap();
+
+        let scope_dir = root.join("repo_example");
+        let failing_tmp = scope_dir.join("index.json.tmp");
+        create_scope_dir(&scope_dir).unwrap();
+        fs::create_dir(&failing_tmp).unwrap();
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let error = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ArtifactError::Io(_)));
+        assert!(Path::new(&reference.uri).exists());
+    }
+
+    #[test]
+    fn safe_expire_artifact_records_retries_tombstoned_record_when_directly_targeted() {
+        let root = temp_root("expire-retry-tombstone");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let forged_path = scope_dir.join("forged-directory");
+        fs::create_dir(&forged_path).unwrap();
+        let record_id = OutputRefId::new();
+        let record = LocalArtifactRecord {
+            id: record_id.clone(),
+            scope: "repo_example".to_string(),
+            project_id: None,
+            repository_id: None,
+            path: forged_path.to_string_lossy().into_owned(),
+            uri: forged_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("forged".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+        store.write_scope_records(&scope_dir, vec![record]).unwrap();
+
+        let error = store
+            .safe_expire_artifact_records(
+                None,
+                std::slice::from_ref(&record_id),
+                LedgerTimestamp::now(),
+                "retention policy",
+            )
+            .unwrap_err();
+        assert!(matches!(error, ArtifactError::Io(_)));
+
+        let records = store.list_records(None).unwrap();
+        assert_eq!(1, records.len());
+        assert_eq!(
+            Some("retention policy"),
+            records[0]
+                .tombstone
+                .as_ref()
+                .map(|tombstone| tombstone.reason.as_str())
+        );
+        assert!(forged_path.exists());
+
+        let retry_path = scope_dir.join("retry.artifact");
+        fs::write(&retry_path, b"retryable").unwrap();
+
+        let mut retriable = records[0].clone();
+        retriable.path = retry_path.to_string_lossy().into_owned();
+        retriable.uri = retriable.path.clone();
+        store
+            .write_scope_records(&scope_dir, vec![retriable])
+            .unwrap();
+
+        let report = store
+            .safe_expire_artifact_records(None, &[record_id], LedgerTimestamp::now(), "retry")
+            .unwrap();
+
+        assert_eq!(1, report.requested);
+        assert_eq!(1, report.matched);
+        assert_eq!(0, report.tombstoned);
+        assert_eq!(1, report.deleted_files);
+        assert!(!retry_path.exists());
+    }
+
+    #[test]
+    fn safe_expire_artifacts_by_retention_retries_tombstoned_record_when_still_present() {
+        let root = temp_root("expire-retry-tombstone-retention");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let forged_path = scope_dir.join("forged-directory");
+        fs::create_dir(&forged_path).unwrap();
+        let record_id = OutputRefId::new();
+        let record = LocalArtifactRecord {
+            id: record_id.clone(),
+            scope: "repo_example".to_string(),
+            project_id: None,
+            repository_id: None,
+            path: forged_path.to_string_lossy().into_owned(),
+            uri: forged_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("forged".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+        store.write_scope_records(&scope_dir, vec![record]).unwrap();
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let error = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap_err();
+        assert!(matches!(error, ArtifactError::Io(_)));
+
+        let records = store.list_records(None).unwrap();
+        assert_eq!(1, records.len());
+        assert_eq!(
+            Some("retention policy"),
+            records[0]
+                .tombstone
+                .as_ref()
+                .map(|tombstone| tombstone.reason.as_str())
+        );
+        assert!(forged_path.exists());
+
+        let retry_path = scope_dir.join("retry.artifact");
+        fs::write(&retry_path, b"retryable").unwrap();
+
+        let mut retriable = records[0].clone();
+        retriable.path = retry_path.to_string_lossy().into_owned();
+        retriable.uri = retriable.path.clone();
+        store
+            .write_scope_records(&scope_dir, vec![retriable])
+            .unwrap();
+
+        let report = store
+            .safe_expire_artifacts_by_retention(None, LedgerTimestamp::now(), &policy, "retry")
+            .unwrap();
+
+        assert_eq!(1, report.requested);
+        assert_eq!(1, report.matched);
+        assert_eq!(0, report.tombstoned);
+        assert_eq!(1, report.deleted_files);
+        assert_eq!(0, report.missing_files);
+        assert_eq!(
+            Some("retention policy"),
+            store.list_records(None).unwrap()[0]
+                .tombstone
+                .as_ref()
+                .map(|tombstone| tombstone.reason.as_str())
+        );
+        assert!(!retry_path.exists());
+    }
+
+    #[test]
+    fn safe_expire_artifact_records_tombstones_for_earlier_scopes_are_not_orphaned_on_later_failure(
+    ) {
+        let root = temp_root("expire-multi-scope-rollback");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let retained_ref = store
+            .write_bytes("scope_a", "search output", "text/plain", b"retained")
+            .unwrap();
+        let failed_ref = store
+            .write_bytes("scope_z", "search output", "text/plain", b"failed")
+            .unwrap();
+
+        let failing_scope_dir = root.join("scope_z");
+        let failing_tmp = failing_scope_dir.join("index.json.tmp");
+        create_scope_dir(&failing_scope_dir).unwrap();
+        fs::create_dir(&failing_tmp).unwrap();
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let error = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ArtifactError::Io(_)));
+        assert!(!Path::new(&retained_ref.uri).exists());
+        assert!(Path::new(&failed_ref.uri).exists());
+
+        let records = store.list_records(None).unwrap();
+        let retained_record = records
+            .iter()
+            .find(|record| record.id == retained_ref.id)
+            .expect("retained scope record should remain indexed");
+        let failed_record = records
+            .iter()
+            .find(|record| record.id == failed_ref.id)
+            .expect("failed scope record should remain indexed");
+
+        assert_eq!(
+            Some("retention policy"),
+            retained_record
+                .tombstone
+                .as_ref()
+                .map(|t| t.reason.as_str())
+        );
+        assert_eq!(None, failed_record.tombstone);
+    }
+
+    #[test]
+    fn write_bytes_with_metadata_rolls_back_on_index_write_failure() {
+        let root = temp_root("write-index-rollback");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+        fs::write(scope_dir.join(DEFAULT_ARTIFACT_INDEX_FILE), b"not-json").unwrap();
+
+        let error = store
+            .write_bytes_with_metadata(
+                "repo_example",
+                "search output",
+                "text/plain",
+                b"hello",
+                ArtifactWriteMetadata::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ArtifactError::InvalidIndex { .. }));
+        let has_artifact_file = fs::read_dir(&scope_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".artifact"));
+        assert!(
+            !has_artifact_file,
+            "remaining artifact entries after rollback: {:?}",
+            fs::read_dir(&scope_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -697,6 +1895,10 @@ mod tests {
 
         fn delete_artifact_bytes(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
             self.delegate.delete_artifact(output_ref)
+        }
+
+        fn delete_artifact_record(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
+            self.delegate.delete_artifact_record(output_ref)
         }
     }
 
