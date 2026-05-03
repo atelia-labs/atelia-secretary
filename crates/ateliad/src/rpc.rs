@@ -1796,6 +1796,10 @@ mod tests {
             permissions,
             tools: Vec::new(),
             services: ExtensionServices::default(),
+            tool_output: Vec::new(),
+            hooks: Vec::new(),
+            webhooks: Vec::new(),
+            composition: Default::default(),
             failure: ExtensionFailure {
                 degrade: DegradeBehavior::ReturnUnavailable,
                 retry_policy: RetryPolicy::Bounded,
@@ -1811,6 +1815,7 @@ mod tests {
                 signer: Some("signer@example.com".to_string()),
             },
             bundle: None,
+            migration: Default::default(),
         }
     }
 
