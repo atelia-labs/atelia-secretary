@@ -16,6 +16,7 @@ use atelia_core::{
     RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore,
     StoreError, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
+    TruncationMetadata,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -195,6 +196,7 @@ pub struct RenderToolOutputRequest {
 pub struct RenderToolOutputResult {
     pub tool_result: CanonicalToolResultRef,
     pub rendered_output: RenderedToolOutput,
+    pub truncation: Option<TruncationMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -671,6 +673,7 @@ impl SecretaryService {
                 content_type: "application/json".to_string(),
             },
             rendered_output,
+            truncation: tool_result.truncation.clone(),
         })
     }
 
@@ -1866,6 +1869,7 @@ mod tests {
         assert!(rendered.rendered_output.body.contains("policy.state"));
         assert!(rendered.rendered_output.body.contains("render tool output"));
         assert!(rendered.rendered_output.fallback_reason.is_none());
+        assert_eq!(rendered.truncation, tool_result.truncation.clone());
         let _ = fs::remove_dir_all(root);
     }
 

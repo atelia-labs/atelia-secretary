@@ -42,8 +42,9 @@ diagnostic metadata.
 
 This table is the required service contract, not a description of the current
 protobuf implementation. The current daemon already exposes the health,
-repository, job, policy, tool-output settings, and `RenderToolOutput` groups;
-`WatchEvents` and `GetProjectStatus` are still planned contract surface.
+repository, job, policy, tool-output settings, `RenderToolOutput`, and
+extension RPC groups; `WatchEvents` and `GetProjectStatus` are still planned
+contract surface.
 
 Required RPC groups:
 

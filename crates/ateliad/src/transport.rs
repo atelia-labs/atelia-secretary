@@ -350,6 +350,16 @@ fn serialize_tool_result_ref(tool_result: &rpc::ToolResultRef) -> serde_json::Va
     })
 }
 
+fn serialize_rendered_tool_output_metadata(
+    metadata: &rpc::RenderedToolOutputMetadata,
+) -> serde_json::Value {
+    serde_json::json!({
+        "degraded": metadata.degraded,
+        "fallback_reason": metadata.fallback_reason,
+        "truncation": metadata.truncation,
+    })
+}
+
 fn serialize_render_tool_output_response(
     response: rpc::RenderToolOutputResponse,
 ) -> serde_json::Value {
@@ -358,6 +368,9 @@ fn serialize_render_tool_output_response(
         "tool_result": serialize_tool_result_ref(&response.tool_result),
         "format": serialize_output_format(&response.format),
         "rendered_output": response.rendered_output,
+        "rendered_output_metadata": serialize_rendered_tool_output_metadata(
+            &response.rendered_output_metadata
+        ),
     })
 }
 
@@ -1448,6 +1461,11 @@ mod tests {
             payload["data"]["tool_result"]["content_type"],
             "application/json"
         );
+        assert_eq!(
+            payload["data"]["rendered_output_metadata"]["degraded"],
+            false
+        );
+        assert!(payload["data"]["rendered_output_metadata"]["fallback_reason"].is_null());
         assert!(payload["data"]["rendered_output"]
             .as_str()
             .expect("rendered output string")

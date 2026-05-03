@@ -24,6 +24,7 @@ use atelia_core::{
     RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier, RollbackExtensionRequest,
     StoreError, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity, ToolResultId,
+    TruncationMetadata,
 };
 use std::convert::TryFrom;
 
@@ -296,12 +297,14 @@ impl SecretaryRpcServer {
                 repository_id: None,
                 format: request.format,
             })?;
+        let rendered_output_metadata = RenderedToolOutputMetadata::from(&rendered);
 
         Ok(RenderToolOutputResponse {
             metadata: self.metadata(),
             tool_result: tool_result_ref_from_canonical(rendered.tool_result),
             format: RpcOutputFormat::from(rendered.rendered_output.format),
             rendered_output: rendered.rendered_output.body,
+            rendered_output_metadata,
         })
     }
 
@@ -966,6 +969,27 @@ pub struct RenderToolOutputResponse {
     pub tool_result: ToolResultRef,
     pub format: RpcOutputFormat,
     pub rendered_output: String,
+    pub rendered_output_metadata: RenderedToolOutputMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedToolOutputMetadata {
+    pub degraded: bool,
+    pub fallback_reason: Option<String>,
+    pub truncation: Option<TruncationMetadata>,
+}
+
+impl From<&crate::service::RenderToolOutputResult> for RenderedToolOutputMetadata {
+    fn from(result: &crate::service::RenderToolOutputResult) -> Self {
+        let fallback_reason = result.rendered_output.fallback_reason.clone();
+        let truncation = result.truncation.clone();
+
+        Self {
+            degraded: fallback_reason.is_some() || truncation.is_some(),
+            fallback_reason,
+            truncation,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1966,6 +1990,12 @@ mod tests {
         assert_eq!(response.tool_result.content_type, "application/json");
         assert!(response.rendered_output.contains("policy.state"));
         assert!(response.rendered_output.contains("render tool output"));
+        assert!(!response.rendered_output_metadata.degraded);
+        assert!(response.rendered_output_metadata.fallback_reason.is_none());
+        assert_eq!(
+            response.rendered_output_metadata.truncation,
+            tool_result.truncation.clone()
+        );
     }
 
     #[test]
