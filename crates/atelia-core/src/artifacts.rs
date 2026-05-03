@@ -1276,7 +1276,6 @@ fn spill_large_tool_result_fields_with_writer(
         }
 
         let output_ref = match store.write_artifact_bytes(
-        let output_ref = store.write_artifact_bytes(
             scope,
             &format!("{}.{}", result.tool_id, field.key),
             &options.media_type,
@@ -1432,7 +1431,6 @@ fn remove_record_bytes(
     store.write_scope_records_unlocked(&scope_dir, records)?;
     Ok(())
 }
-
 fn spillable_field_bytes(field: &ToolResultField) -> Option<Vec<u8>> {
     match &field.value {
         StructuredValue::String(value) => Some(value.as_bytes().to_vec()),
@@ -3418,6 +3416,59 @@ mod tests {
 
         let file_mode = fs::metadata(&reference.uri).unwrap().permissions().mode() & 0o777;
         assert_eq!(0o600, file_mode);
+    }
+
+    #[test]
+    fn rolls_back_partial_artifact_writes_on_later_failure() {
+        let root = temp_root("spill-rollback");
+        let delegate = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let mut result = ToolResult {
+            id: ToolResultId::new(),
+            schema_version: 1,
+            created_at: LedgerTimestamp::now(),
+            invocation_id: ToolInvocationId::new(),
+            tool_id: "fs.search".to_string(),
+            status: ToolResultStatus::Succeeded,
+            schema_ref: Some("tool_result.test.v1".to_string()),
+            fields: vec![
+                ToolResultField {
+                    key: "matches".to_string(),
+                    value: StructuredValue::String("abcdef".into()),
+                },
+                ToolResultField {
+                    key: "summary".to_string(),
+                    value: StructuredValue::String("ghijkl".into()),
+                },
+            ],
+            evidence_refs: Vec::new(),
+            output_refs: Vec::new(),
+            truncation: None,
+            redactions: Vec::new(),
+        };
+        let expected = result.clone();
+        let writer = FailingLocalWriter::new(delegate, 2);
+
+        let error = spill_large_tool_result_fields_with_writer(
+            &mut result,
+            &writer,
+            "repo_example",
+            &ToolResultSpilloverOptions::new(4),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ArtifactError::Io(_)));
+        assert_eq!(expected, result);
+
+        let scope_dir = root.join("repo_example");
+        let entries = if scope_dir.exists() {
+            fs::read_dir(&scope_dir)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        } else {
+            Vec::new()
+        };
+        assert!(entries.is_empty());
     }
 
     #[cfg(unix)]
