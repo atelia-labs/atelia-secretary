@@ -812,8 +812,12 @@ impl ExtensionRegistry {
         options: InstallOptions,
     ) -> RegistryResult<ExtensionInstallRecord> {
         let mut validation_policy = self.validation_policy.clone();
-        validation_policy.allow_local_unsigned = options.approve_local_unsigned;
-        validation_policy.allow_local_process_runtime = options.allow_local_process_runtime;
+        if let Some(approve_local_unsigned) = options.approve_local_unsigned {
+            validation_policy.allow_local_unsigned = approve_local_unsigned;
+        }
+        if let Some(allow_local_process_runtime) = options.allow_local_process_runtime {
+            validation_policy.allow_local_process_runtime = allow_local_process_runtime;
+        }
 
         let validated = manifest.validate(&validation_policy)?;
         self.ensure_not_blocked(&validated.manifest)?;
@@ -1039,18 +1043,18 @@ impl ExtensionRegistry {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InstallOptions {
-    pub approve_local_unsigned: bool,
-    pub allow_local_process_runtime: bool,
+    pub approve_local_unsigned: Option<bool>,
+    pub allow_local_process_runtime: Option<bool>,
 }
 
 impl InstallOptions {
     pub fn approve_local_unsigned(mut self) -> Self {
-        self.approve_local_unsigned = true;
+        self.approve_local_unsigned = Some(true);
         self
     }
 
     pub fn allow_local_process_runtime(mut self) -> Self {
-        self.allow_local_process_runtime = true;
+        self.allow_local_process_runtime = Some(true);
         self
     }
 }
@@ -1120,11 +1124,17 @@ impl BlocklistEntry {
             BlockKey::ExtensionId(id) => manifest.id == *id,
             BlockKey::Version { id, version } => manifest.id == *id && manifest.version == *version,
             BlockKey::ArtifactDigest(digest) => manifest.provenance.artifact_digest == *digest,
-            BlockKey::Signer(signer) => manifest.provenance.signer.as_deref() == Some(signer),
-            BlockKey::Publisher(publisher) => manifest.publisher.name == *publisher,
-            BlockKey::SourceRepository(repository) => {
-                manifest.provenance.repository.as_deref() == Some(repository)
-            }
+            BlockKey::Signer(signer) => manifest
+                .provenance
+                .signer
+                .as_deref()
+                .is_some_and(|manifest_signer| manifest_signer.trim() == signer.trim()),
+            BlockKey::Publisher(publisher) => manifest.publisher.name.trim() == publisher.trim(),
+            BlockKey::SourceRepository(repository) => manifest
+                .provenance
+                .repository
+                .as_deref()
+                .is_some_and(|manifest_repository| manifest_repository.trim() == repository.trim()),
             BlockKey::PermissionPattern(pattern) => manifest
                 .permissions
                 .keys()
@@ -1511,6 +1521,102 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn install_options_default_preserves_validation_policy() {
+        let mut registry = ExtensionRegistry::new(ManifestValidationPolicy {
+            allow_local_unsigned: true,
+            allow_local_process_runtime: true,
+            ..ManifestValidationPolicy::default()
+        });
+
+        let mut unsigned = manifest("local.test.unsigned");
+        unsigned.provenance.source = ProvenanceSource::Local;
+        unsigned.provenance.registry_identity = None;
+        unsigned.provenance.signature = None;
+        unsigned.provenance.signer = None;
+
+        registry
+            .install(unsigned, InstallOptions::default())
+            .unwrap();
+
+        let mut process = manifest("local.test.process");
+        process.provenance.source = ProvenanceSource::Local;
+        process.provenance.registry_identity = None;
+        process.entrypoints.runtime = ExtensionRuntime::Process;
+        process.entrypoints.wasm = None;
+        process.entrypoints.command = Some("cargo run".to_string());
+
+        registry
+            .install(process, InstallOptions::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn blocklist_matches_trimmed_signer() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .add_blocklist_entry(BlocklistEntry {
+                key: BlockKey::Signer(" signer@example.com ".to_string()),
+                reason: BlockReason::UserBlocked,
+                note: None,
+            })
+            .unwrap();
+
+        let mut blocked = manifest("com.example.extension");
+        blocked.provenance.signer = Some(" signer@example.com ".to_string());
+
+        let err = registry
+            .install(blocked, InstallOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(err, RegistryError::Blocked { .. }));
+    }
+
+    #[test]
+    fn blocklist_matches_trimmed_publisher() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .add_blocklist_entry(BlocklistEntry {
+                key: BlockKey::Publisher(" Example Publisher ".to_string()),
+                reason: BlockReason::UserBlocked,
+                note: None,
+            })
+            .unwrap();
+
+        let mut blocked = manifest("com.example.extension");
+        blocked.publisher.name = " Example Publisher ".to_string();
+
+        let err = registry
+            .install(blocked, InstallOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(err, RegistryError::Blocked { .. }));
+    }
+
+    #[test]
+    fn blocklist_matches_trimmed_source_repository() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .add_blocklist_entry(BlocklistEntry {
+                key: BlockKey::SourceRepository("https://example.com/repo ".to_string()),
+                reason: BlockReason::UserBlocked,
+                note: None,
+            })
+            .unwrap();
+
+        let mut blocked = manifest("com.example.extension");
+        blocked.provenance.source = ProvenanceSource::Github;
+        blocked.provenance.registry_identity = Some("github-registry".to_string());
+        blocked.provenance.repository = Some(" https://example.com/repo ".to_string());
+        blocked.provenance.commit = Some("abc123".to_string());
+
+        let err = registry
+            .install(blocked, InstallOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(err, RegistryError::Blocked { .. }));
     }
 
     #[test]
