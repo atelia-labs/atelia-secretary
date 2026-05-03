@@ -4,12 +4,14 @@ use crate::domain::{
     ArtifactRef, OutputRef, RedactionMarker, StructuredValue, ToolResult, ToolResultStatus,
     TruncationMetadata,
 };
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 
 const TOOL_RESULT_SCHEMA_NAME: &str = "tool_result";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputFormat {
     #[default]
     Toon,
@@ -27,7 +29,7 @@ impl OutputFormat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RenderOptions {
     pub format: OutputFormat,
     pub include_policy: bool,
