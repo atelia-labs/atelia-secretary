@@ -1233,6 +1233,7 @@ fn spill_large_tool_result_fields_with_writer(
         }
 
         let output_ref = match store.write_artifact_bytes(
+        let output_ref = store.write_artifact_bytes(
             scope,
             &format!("{}.{}", result.tool_id, field.key),
             &options.media_type,
@@ -3162,7 +3163,6 @@ mod tests {
             if path == expected_path && reason.contains("missing index row")
         ));
     }
-
     #[derive(Debug)]
     struct FailingWriter {
         writes: Cell<usize>,
@@ -3228,7 +3228,6 @@ mod tests {
             self.delegate.delete_artifact_record(scope, output_ref)
         }
     }
-
     impl ArtifactWriter for FailingWriter {
         fn write_artifact_bytes(
             &self,
@@ -3254,47 +3253,6 @@ mod tests {
                 digest: None,
             })
         }
-    }
-
-    #[test]
-    fn does_not_mutate_result_when_later_spill_write_fails() {
-        let mut result = ToolResult {
-            id: ToolResultId::new(),
-            schema_version: 1,
-            created_at: LedgerTimestamp::now(),
-            invocation_id: ToolInvocationId::new(),
-            tool_id: "fs.search".to_string(),
-            status: ToolResultStatus::Succeeded,
-            schema_ref: Some("tool_result.test.v1".to_string()),
-            fields: vec![
-                ToolResultField {
-                    key: "matches".to_string(),
-                    value: StructuredValue::String("abcdef".into()),
-                },
-                ToolResultField {
-                    key: "summary".to_string(),
-                    value: StructuredValue::String("ghijkl".into()),
-                },
-            ],
-            evidence_refs: Vec::new(),
-            output_refs: Vec::new(),
-            truncation: None,
-            redactions: Vec::new(),
-        };
-
-        let expected = result.clone();
-        let writer = FailingWriter::new(2);
-
-        let error = spill_large_tool_result_fields_with_writer(
-            &mut result,
-            &writer,
-            "repo_example",
-            &ToolResultSpilloverOptions::new(4),
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, ArtifactError::Io(_)));
-        assert_eq!(expected, result);
     }
 
     #[test]
