@@ -289,6 +289,11 @@ where
     {
         let requested_capability = tool.requested_capability().to_string();
         let canonical_requested_capability = normalized_requested_capability(&requested_capability);
+        if canonical_requested_capability.is_empty() {
+            return Err(RuntimeError::InvalidToolRequest {
+                reason: "requested_capability must not be empty".to_string(),
+            });
+        }
         validate_requested_capability_hints(
             &request.requested_capabilities,
             canonical_requested_capability,
@@ -1994,6 +1999,82 @@ mod tests {
         assert!(runtime.store().list_policy_decisions().unwrap().is_empty());
         assert!(runtime.store().list_tool_invocations().unwrap().is_empty());
         assert!(runtime.store().list_tool_results().unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_rejects_empty_tool_requested_capability_before_side_effects() {
+        #[derive(Debug, Clone, Default)]
+        struct EmptyCapabilityTool;
+
+        impl RuntimeTool for EmptyCapabilityTool {
+            fn tool_id(&self) -> &'static str {
+                "secretary.empty_capability_fixture"
+            }
+
+            fn requested_capability(&self) -> &'static str {
+                ""
+            }
+
+            fn declared_effect(&self) -> &'static str {
+                "produce a deterministic contract result without external effects"
+            }
+
+            fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+                format!("goal={}", request.goal)
+            }
+
+            fn execute(
+                &self,
+                invocation: &ToolInvocation,
+                _request: &RuntimeJobRequest,
+            ) -> ToolResult {
+                ToolResult {
+                    id: ToolResultId::new(),
+                    schema_version: RUNTIME_SCHEMA_VERSION,
+                    created_at: LedgerTimestamp::now(),
+                    invocation_id: invocation.id.clone(),
+                    tool_id: invocation.tool_id.clone(),
+                    status: ToolResultStatus::Succeeded,
+                    schema_ref: Some("tool_result.secretary.empty_capability.v1".to_string()),
+                    fields: vec![ToolResultField {
+                        key: "summary".to_string(),
+                        value: StructuredValue::String("unreachable".to_string()),
+                    }],
+                    evidence_refs: Vec::new(),
+                    output_refs: Vec::new(),
+                    truncation: None,
+                    redactions: Vec::new(),
+                }
+            }
+        }
+
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "read workspace data",
+        );
+
+        let error = runtime
+            .run_tool_job(request, &EmptyCapabilityTool)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RuntimeError::InvalidToolRequest { reason } if reason == "requested_capability must not be empty"
+        ));
+        assert!(runtime.store().list_jobs().unwrap().is_empty());
+        assert!(runtime.store().list_policy_decisions().unwrap().is_empty());
+        assert!(runtime.store().list_tool_invocations().unwrap().is_empty());
+        assert!(runtime.store().list_tool_results().unwrap().is_empty());
+        assert!(runtime.store().list_audit_records().unwrap().is_empty());
     }
 
     fn service_with_repo() -> (JobLifecycleService, RepositoryRecord) {
