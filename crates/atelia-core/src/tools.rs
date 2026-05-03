@@ -1,7 +1,7 @@
 //! Built-in filesystem read tools for Atelia Secretary.
 //!
 //! Provides repository-scoped `fs.list`, `fs.stat`, and `fs.search` tools that
-//! implement [`RuntimeTool`] and enforce path canonicalization with symlink
+//! implement [`crate::runtime::RuntimeTool`] and enforce path canonicalization with symlink
 //! escape rejection per `docs/execution-semantics.md`.
 
 use crate::domain::{
@@ -501,6 +501,7 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
         let mut files_searched: u64 = 0;
         let mut truncated = false;
         let mut total_bytes: u64 = 0;
+        let mut retained_bytes: u64 = 0;
 
         if canonical.canonical.is_file() {
             files_searched = 1;
@@ -512,6 +513,7 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
                 &mut matches,
                 &mut truncated,
                 &mut total_bytes,
+                &mut retained_bytes,
             );
         } else if canonical.canonical.is_dir() {
             let _ = search_recursive(
@@ -524,13 +526,14 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
                 &mut files_searched,
                 &mut truncated,
                 &mut total_bytes,
+                &mut retained_bytes,
             );
         }
 
         let truncation = if truncated {
             Some(TruncationMetadata {
                 original_bytes: total_bytes,
-                retained_bytes: total_bytes.min(self.max_results as u64 * 256),
+                retained_bytes,
                 reason: format!("search results truncated at {} matches", self.max_results),
             })
         } else {
@@ -592,6 +595,7 @@ fn search_recursive(
     files_searched: &mut u64,
     truncated: &mut bool,
     total_bytes: &mut u64,
+    retained_bytes: &mut u64,
 ) -> io::Result<()> {
     let entries = fs::read_dir(dir)?;
     for entry in entries {
@@ -622,6 +626,7 @@ fn search_recursive(
                 files_searched,
                 truncated,
                 total_bytes,
+                retained_bytes,
             )?;
         } else if file_type.is_file() {
             let metadata = fs::metadata(&canonical)?;
@@ -637,12 +642,14 @@ fn search_recursive(
                 matches,
                 truncated,
                 total_bytes,
+                retained_bytes,
             );
         }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_file(
     path: &Path,
     root: &Path,
@@ -651,6 +658,7 @@ fn search_file(
     matches: &mut Vec<String>,
     truncated: &mut bool,
     total_bytes: &mut u64,
+    retained_bytes: &mut u64,
 ) -> io::Result<()> {
     let file = fs::File::open(path)?;
     *total_bytes += file.metadata()?.len();
@@ -668,7 +676,9 @@ fn search_file(
             Err(_) => continue,
         };
         if line.contains(pattern) {
-            matches.push(format!("{}:{}", relative, line_num + 1));
+            let match_ref = format!("{}:{}", relative, line_num + 1);
+            *retained_bytes += match_ref.len() as u64;
+            matches.push(match_ref);
         }
     }
     Ok(())
@@ -1044,6 +1054,19 @@ mod tests {
         assert!(result.truncation.is_some());
         let trunc = result.truncation.unwrap();
         assert!(trunc.reason.contains("truncated at 5 matches"));
+
+        // retained_bytes must equal the sum of match string byte lengths
+        let matches_field = result.fields.iter().find(|f| f.key == "matches").unwrap();
+        if let StructuredValue::StringList(ref list) = matches_field.value {
+            let expected: u64 = list.iter().map(|s| s.len() as u64).sum();
+            assert_eq!(expected, trunc.retained_bytes);
+        }
+        assert!(
+            trunc.retained_bytes <= trunc.original_bytes,
+            "retained_bytes ({}) should not exceed original_bytes ({})",
+            trunc.retained_bytes,
+            trunc.original_bytes,
+        );
         env.cleanup();
     }
 
