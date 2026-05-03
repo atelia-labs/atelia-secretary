@@ -1,12 +1,14 @@
 //! Daemon service skeleton for Atelia Secretary (Slice 4).
 //!
-//! Owns daemon health/status metadata, an in-memory
-//! [`SecretaryRuntime`], and exposes a synchronous service API for health
-//! checks and repository registration/listing.
+//! Owns daemon health/status metadata, an in-memory job lifecycle runtime, and
+//! exposes a synchronous service API for health checks, repository
+//! registration/listing, and the first supported job lifecycle calls.
 
 use atelia_core::{
-    DefaultPolicyEngine, InMemoryStore, LedgerTimestamp, RepositoryId, RepositoryRecord,
-    RepositoryTrustState, SecretaryRuntime, SecretaryStore,
+    Actor, CancelJobReceipt, DefaultPolicyEngine, InMemoryStore, JobId, JobKind,
+    JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, RepositoryId,
+    RepositoryRecord, RepositoryTrustState, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest,
+    SecretaryStore,
 };
 use std::path::PathBuf;
 
@@ -57,6 +59,7 @@ pub struct DaemonHealth {
 #[allow(dead_code)]
 pub enum ServiceError {
     Store(atelia_core::StoreError),
+    Runtime(RuntimeError),
     InvalidArgument { reason: String },
 }
 
@@ -64,6 +67,7 @@ impl std::fmt::Display for ServiceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Store(err) => write!(f, "{err}"),
+            Self::Runtime(err) => write!(f, "{err}"),
             Self::InvalidArgument { reason } => write!(f, "invalid argument: {reason}"),
         }
     }
@@ -74,6 +78,15 @@ impl std::error::Error for ServiceError {}
 impl From<atelia_core::StoreError> for ServiceError {
     fn from(err: atelia_core::StoreError) -> Self {
         Self::Store(err)
+    }
+}
+
+impl From<RuntimeError> for ServiceError {
+    fn from(err: RuntimeError) -> Self {
+        match err {
+            RuntimeError::Store(err) => Self::Store(err),
+            err => Self::Runtime(err),
+        }
     }
 }
 
@@ -92,17 +105,26 @@ pub struct RegisterRepositoryRequest {
     pub trust_state: RepositoryTrustState,
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SubmitJobRequest {
+    pub requester: Actor,
+    pub repository_id: RepositoryId,
+    pub kind: JobKind,
+    pub goal: String,
+}
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
 
-/// Thin service façade over an in-memory [`SecretaryRuntime`].
+/// Thin service facade over an in-memory job lifecycle runtime.
 ///
 /// All methods are synchronous because the underlying store and policy engine
 /// are synchronous. The Tokio entrypoint in `main.rs` wraps this in an async
 /// runtime for signal handling only.
 pub struct SecretaryService {
-    runtime: SecretaryRuntime<InMemoryStore, DefaultPolicyEngine>,
+    lifecycle: JobLifecycleService<InMemoryStore, DefaultPolicyEngine>,
     started_at: LedgerTimestamp,
     daemon_status: DaemonStatus,
 }
@@ -111,7 +133,7 @@ impl SecretaryService {
     /// Create a new service backed by an in-memory store and default policy.
     pub fn new() -> Self {
         Self {
-            runtime: SecretaryRuntime::in_memory(),
+            lifecycle: JobLifecycleService::in_memory(),
             started_at: LedgerTimestamp::now(),
             daemon_status: DaemonStatus::Starting,
         }
@@ -135,13 +157,14 @@ impl SecretaryService {
 
     /// Return the current daemon health snapshot.
     pub fn health(&self) -> DaemonHealth {
-        let (repository_count, storage_status) = match self.runtime.store().list_repositories() {
-            Ok(repos) => (repos.len(), StorageStatus::Ready),
-            Err(err) => {
-                tracing::warn!("storage health check failed: {err}");
-                (0, StorageStatus::Unavailable)
-            }
-        };
+        let (repository_count, storage_status) =
+            match self.lifecycle.runtime().store().list_repositories() {
+                Ok(repos) => (repos.len(), StorageStatus::Ready),
+                Err(err) => {
+                    tracing::warn!("storage health check failed: {err}");
+                    (0, StorageStatus::Unavailable)
+                }
+            };
 
         DaemonHealth {
             daemon_status: self.daemon_status,
@@ -149,7 +172,11 @@ impl SecretaryService {
             daemon_version: DAEMON_VERSION.to_string(),
             protocol_version: PROTOCOL_VERSION.to_string(),
             storage_version: STORAGE_VERSION.to_string(),
-            capabilities: vec!["health.v1".to_string(), "repositories.v1".to_string()],
+            capabilities: vec![
+                "health.v1".to_string(),
+                "repositories.v1".to_string(),
+                "jobs.v1".to_string(),
+            ],
             repository_count,
             started_at: self.started_at,
         }
@@ -179,7 +206,8 @@ impl SecretaryService {
             request.trust_state,
             LedgerTimestamp::now(),
         );
-        self.runtime
+        self.lifecycle
+            .runtime()
             .store()
             .create_repository(record.clone())
             .map_err(|err| match err {
@@ -197,13 +225,64 @@ impl SecretaryService {
     /// List all registered repositories.
     #[allow(dead_code)]
     pub fn list_repositories(&self) -> ServiceResult<Vec<RepositoryRecord>> {
-        Ok(self.runtime.store().list_repositories()?)
+        Ok(self.lifecycle.runtime().store().list_repositories()?)
     }
 
     /// Look up a single repository by id.
     #[allow(dead_code)]
     pub fn get_repository(&self, id: &RepositoryId) -> ServiceResult<RepositoryRecord> {
-        Ok(self.runtime.store().get_repository(id)?)
+        Ok(self.lifecycle.runtime().store().get_repository(id)?)
+    }
+
+    /// Submit the first supported daemon job, backed by the core echo tool.
+    #[allow(dead_code)]
+    pub fn submit_job(&self, request: SubmitJobRequest) -> ServiceResult<RuntimeJobReceipt> {
+        if request.goal.trim().is_empty() {
+            return Err(ServiceError::InvalidArgument {
+                reason: "goal must not be empty".to_string(),
+            });
+        }
+
+        let runtime_request = RuntimeJobRequest::new(
+            request.requester,
+            request.repository_id,
+            request.kind,
+            request.goal,
+        );
+
+        Ok(self.lifecycle.submit_echo_job(runtime_request)?)
+    }
+
+    /// List jobs with optional repository/status filtering.
+    #[allow(dead_code)]
+    pub fn list_jobs(
+        &self,
+        repository_id: Option<RepositoryId>,
+        status: Option<JobStatus>,
+    ) -> ServiceResult<JobPage> {
+        Ok(self.lifecycle.query_jobs(JobQuery {
+            repository_id,
+            status,
+            requester: None,
+            page_size: None,
+            page_token: None,
+        })?)
+    }
+
+    /// Look up a single job by id.
+    #[allow(dead_code)]
+    pub fn get_job(&self, id: &JobId) -> ServiceResult<JobRecord> {
+        Ok(self.lifecycle.get_job(id)?)
+    }
+
+    /// Request cancellation for a queued/running job.
+    #[allow(dead_code)]
+    pub fn cancel_job(
+        &self,
+        id: &JobId,
+        reason: impl Into<String>,
+    ) -> ServiceResult<CancelJobReceipt> {
+        Ok(self.lifecycle.cancel_job(id, reason)?)
     }
 }
 
@@ -316,6 +395,7 @@ mod tests {
         let health = ready_service().health();
         assert!(health.capabilities.contains(&"health.v1".to_string()));
         assert!(health.capabilities.contains(&"repositories.v1".to_string()));
+        assert!(health.capabilities.contains(&"jobs.v1".to_string()));
     }
 
     #[test]
@@ -505,6 +585,65 @@ mod tests {
         let missing_id = RepositoryId::new();
         let err = svc.get_repository(&missing_id).unwrap_err();
         assert!(matches!(err, ServiceError::Store(_)));
+    }
+
+    // -- job lifecycle API --------------------------------------------------
+
+    fn actor() -> Actor {
+        Actor::Agent {
+            id: "agent:test".to_string(),
+            display_name: Some("Test Agent".to_string()),
+        }
+    }
+
+    #[test]
+    fn submit_get_and_list_job_round_trip() {
+        let svc = ready_service();
+        let root = test_repo_dir("job-round");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .expect("register should succeed");
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "summarize status".to_string(),
+            })
+            .expect("submit should succeed");
+
+        assert_eq!(receipt.job.status, JobStatus::Succeeded);
+
+        let fetched = svc.get_job(&receipt.job.id).expect("get should succeed");
+        assert_eq!(fetched.id, receipt.job.id);
+
+        let page = svc
+            .list_jobs(Some(repository.id), Some(JobStatus::Succeeded))
+            .expect("list jobs should succeed");
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, receipt.job.id);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_empty_goal() {
+        let svc = ready_service();
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: RepositoryId::new(),
+                kind: JobKind::Read,
+                goal: " ".to_string(),
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
     }
 
     // -- whitespace-only validation tests ------------------------------------

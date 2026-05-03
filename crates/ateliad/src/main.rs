@@ -1,3 +1,4 @@
+mod rpc;
 mod service;
 
 use anyhow::Result;
@@ -13,18 +14,20 @@ async fn main() -> Result<()> {
     info!("Atelia Secretary daemon starting");
 
     service.set_running();
-    let health = service.health();
+    let mut rpc_server = rpc::SecretaryRpcServer::new(service);
+    let health = rpc_server.health(rpc::HealthRequest);
     info!(
         version = %health.daemon_version,
         protocol = %health.protocol_version,
         storage = %health.storage_version,
-        status = ?health.daemon_status,
-        "Daemon service initialized; RPC listener not wired yet"
+        status = %health.daemon_status,
+        transport_blocker = ?rpc_server.transport_blocker(),
+        "Daemon RPC boundary initialized; external listener not wired yet"
     );
 
     tokio::signal::ctrl_c().await?;
     info!("Atelia Secretary daemon stopping");
 
-    service.set_stopping();
+    rpc_server.service_mut().set_stopping();
     Ok(())
 }
