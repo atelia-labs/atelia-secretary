@@ -38,6 +38,7 @@ fn route_for_path(path: &str) -> Route {
     if let Some(extension_id) = path
         .strip_prefix("/v1/extensions/")
         .and_then(|path| path.strip_suffix("/status"))
+        .and_then(valid_extension_id)
     {
         return Route::ExtensionStatus {
             extension_id: extension_id.to_string(),
@@ -46,6 +47,7 @@ fn route_for_path(path: &str) -> Route {
     if let Some(extension_id) = path
         .strip_prefix("/v1/extensions/")
         .and_then(|path| path.strip_suffix("/rollback"))
+        .and_then(valid_extension_id)
     {
         return Route::RollbackExtension {
             extension_id: extension_id.to_string(),
@@ -59,6 +61,14 @@ fn route_for_path(path: &str) -> Route {
         "/v1/extensions/blocklist/apply" => Route::ApplyBlocklist,
         "/v1/extensions/blocklist/list" => Route::ListBlocklist,
         _ => Route::Unsupported,
+    }
+}
+
+fn valid_extension_id(extension_id: &str) -> Option<&str> {
+    if extension_id.is_empty() || extension_id.contains('/') {
+        None
+    } else {
+        Some(extension_id)
     }
 }
 
@@ -976,6 +986,19 @@ mod tests {
             Route::RollbackExtension {
                 extension_id: "com.example.extension".to_string()
             }
+        );
+        assert_eq!(route_for_path("/v1/extensions//status"), Route::Unsupported);
+        assert_eq!(
+            route_for_path("/v1/extensions/a/b/status"),
+            Route::Unsupported
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions//rollback"),
+            Route::Unsupported
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/a/b/rollback"),
+            Route::Unsupported
         );
         assert_eq!(route_for_path("/unknown"), Route::Unsupported);
         assert_eq!(route_for_path("/v1/health/"), Route::Unsupported);

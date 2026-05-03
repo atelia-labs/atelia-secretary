@@ -416,7 +416,7 @@ fn registry_error_to_rpc(error: atelia_core::RegistryError) -> RpcError {
             reason: error.to_string(),
         },
         atelia_core::RegistryError::ServiceUnavailable { .. } => RpcError {
-            code: RpcErrorCode::NotFound,
+            code: RpcErrorCode::Internal,
             reason: error.to_string(),
         },
     }
@@ -3030,14 +3030,14 @@ mod tests {
     }
 
     #[test]
-    fn registry_service_unavailable_maps_to_not_found() {
+    fn registry_service_unavailable_maps_to_internal() {
         let error = RpcError::from(ServiceError::ExtensionRegistry(
             atelia_core::RegistryError::ServiceUnavailable {
                 reason: "callee did not declare services.provides".to_string(),
             },
         ));
 
-        assert_eq!(error.code, RpcErrorCode::NotFound);
+        assert_eq!(error.code, RpcErrorCode::Internal);
         assert!(error.reason.contains("services.provides"));
     }
 }
