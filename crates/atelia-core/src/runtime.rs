@@ -1,14 +1,14 @@
 //! Synchronous Secretary runtime loop for bounded tool jobs.
 
 use crate::domain::{
-    Actor, AuditRecord, AuditRecordId, EventRefs, EventSeverity, EventSubject, JobEvent,
-    JobEventId, JobEventKind, JobKind, JobRecord, JobStatus, JobStatusTransitionError,
-    LedgerTimestamp, PolicyDecision, PolicyOutcome, PolicySummary, RepositoryId, ResourceScope,
-    StructuredValue, ToolInvocation, ToolInvocationId, ToolResult, ToolResultField, ToolResultId,
-    ToolResultStatus,
+    Actor, AuditRecord, AuditRecordId, CancellationState, EventRefs, EventSeverity, EventSubject,
+    JobEvent, JobEventId, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
+    JobStatusTransitionError, LedgerTimestamp, PolicyDecision, PolicyOutcome, PolicySummary,
+    RepositoryId, ResourceScope, StructuredValue, ToolInvocation, ToolInvocationId, ToolResult,
+    ToolResultField, ToolResultId, ToolResultStatus,
 };
 use crate::policy::{DefaultPolicyEngine, PolicyEngine, PolicyInput, DEFAULT_POLICY_VERSION};
-use crate::store::{InMemoryStore, SecretaryStore, StoreError};
+use crate::store::{EventCursor, InMemoryStore, JobPage, JobQuery, SecretaryStore, StoreError};
 use crate::tool_output::{
     render_tool_result, OutputFormat, RenderOptions, RenderedToolOutput, ToolOutputRenderError,
 };
@@ -452,6 +452,120 @@ where
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelJobReceipt {
+    pub job: JobRecord,
+    pub events: Vec<JobEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobLifecycleService<S = InMemoryStore, P = DefaultPolicyEngine> {
+    runtime: SecretaryRuntime<S, P>,
+}
+
+impl JobLifecycleService<InMemoryStore, DefaultPolicyEngine> {
+    pub fn in_memory() -> Self {
+        Self {
+            runtime: SecretaryRuntime::in_memory(),
+        }
+    }
+}
+
+impl<S, P> JobLifecycleService<S, P>
+where
+    S: SecretaryStore,
+    P: PolicyEngine,
+{
+    pub fn new(runtime: SecretaryRuntime<S, P>) -> Self {
+        Self { runtime }
+    }
+
+    pub fn runtime(&self) -> &SecretaryRuntime<S, P> {
+        &self.runtime
+    }
+
+    pub fn submit_echo_job(&self, request: RuntimeJobRequest) -> RuntimeResult<RuntimeJobReceipt> {
+        self.runtime.run_tool_job(request, &EchoTool)
+    }
+
+    pub fn get_job(&self, id: &JobId) -> RuntimeResult<JobRecord> {
+        Ok(self.runtime.store().get_job(id)?)
+    }
+
+    pub fn list_jobs(&self) -> RuntimeResult<Vec<JobRecord>> {
+        Ok(self.runtime.store().list_jobs()?)
+    }
+
+    pub fn query_jobs(&self, query: JobQuery) -> RuntimeResult<JobPage> {
+        Ok(self.runtime.store().query_jobs(query)?)
+    }
+
+    pub fn cancel_job(
+        &self,
+        id: &JobId,
+        reason: impl Into<String>,
+    ) -> RuntimeResult<CancelJobReceipt> {
+        let mut job = self.runtime.store().get_job(id)?;
+        let previous_status = job.status;
+
+        if !matches!(previous_status, JobStatus::Queued | JobStatus::Running) {
+            return Err(RuntimeError::Store(StoreError::Conflict {
+                collection: "jobs",
+                reason: format!(
+                    "job {} cannot be cancelled in state {:?}",
+                    id.as_str(),
+                    previous_status
+                ),
+            }));
+        }
+
+        let mut cancellation_requested_job = job.clone();
+        cancellation_requested_job.cancellation_state = CancellationState::Requested;
+        let cancel_event = job_event(
+            EventSubject::job(&cancellation_requested_job.id),
+            JobEventKind::CancellationRequested,
+            EventSeverity::Warning,
+            reason,
+            refs_for_job(&cancellation_requested_job),
+        );
+
+        job = cancellation_requested_job.clone();
+        job.latest_event_id = Some(cancel_event.id.clone());
+        let now = LedgerTimestamp::now();
+        job.transition_status(JobStatus::Canceled, now)?;
+        let status_event = job_event(
+            EventSubject::job(&job.id),
+            JobEventKind::JobStatusChanged {
+                from: previous_status,
+                to: JobStatus::Canceled,
+            },
+            EventSeverity::Warning,
+            "job cancelled",
+            refs_for_job(&job),
+        );
+        let (cancel_event, status_event) = self.runtime.store().append_job_events_and_update_job(
+            cancellation_requested_job,
+            cancel_event,
+            job.clone(),
+            status_event,
+        )?;
+        job.latest_event_id = Some(status_event.id.clone());
+
+        Ok(CancelJobReceipt {
+            job,
+            events: vec![cancel_event, status_event],
+        })
+    }
+
+    pub fn replay_events(
+        &self,
+        cursor: EventCursor,
+        limit: Option<usize>,
+    ) -> RuntimeResult<Vec<JobEvent>> {
+        Ok(self.runtime.store().replay_job_events(cursor, limit)?)
+    }
+}
+
 fn policy_summary(policy_decision: &PolicyDecision) -> PolicySummary {
     PolicySummary {
         decision_id: Some(policy_decision.id.clone()),
@@ -799,5 +913,293 @@ mod tests {
         assert_eq!(JobStatus::Failed, jobs[0].status);
         assert!(jobs[0].completed_at.is_some());
         assert!(runtime.store().list_tool_results().unwrap().is_empty());
+    }
+
+    fn service_with_repo() -> (JobLifecycleService, RepositoryRecord) {
+        let service = JobLifecycleService::in_memory();
+        let repo = repository();
+        service
+            .runtime()
+            .store()
+            .create_repository(repo.clone())
+            .unwrap();
+        (service, repo)
+    }
+
+    fn seed_job_in_status(
+        store: &dyn SecretaryStore,
+        repository_id: RepositoryId,
+        target_status: JobStatus,
+    ) -> JobRecord {
+        let created_at = LedgerTimestamp::from_unix_millis(1_700_000_001_000);
+        let mut job = JobRecord::new(
+            actor(),
+            repository_id,
+            JobKind::Read,
+            "seeded job",
+            created_at,
+        );
+
+        let submit_event = job_event(
+            EventSubject::job(&job.id),
+            JobEventKind::JobSubmitted,
+            EventSeverity::Info,
+            "job submitted",
+            refs_for_job(&job),
+        );
+        let event = store
+            .create_job_with_initial_event(job.clone(), submit_event)
+            .unwrap();
+        job.latest_event_id = Some(event.id);
+
+        if target_status != JobStatus::Queued {
+            let at = LedgerTimestamp::from_unix_millis(created_at.unix_millis + 1000);
+            let from = job.status;
+            job.transition_status(target_status, at).unwrap();
+            let status_event = job_event(
+                EventSubject::job(&job.id),
+                JobEventKind::JobStatusChanged {
+                    from,
+                    to: target_status,
+                },
+                EventSeverity::Info,
+                format!("job transitioned to {:?}", target_status),
+                refs_for_job(&job),
+            );
+            let event = store
+                .append_job_event_and_update_job(job.clone(), status_event)
+                .unwrap();
+            job.latest_event_id = Some(event.id);
+        }
+
+        job
+    }
+
+    #[test]
+    fn lifecycle_submit_echo_traverses_queued_running_succeeded() {
+        let (service, repo) = service_with_repo();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repo.id.clone(),
+            JobKind::Read,
+            "lifecycle echo test",
+        );
+        let receipt = service.submit_echo_job(request).unwrap();
+
+        assert_eq!(JobStatus::Succeeded, receipt.job.status);
+        assert!(receipt.job.started_at.is_some());
+        assert!(receipt.job.completed_at.is_some());
+        assert!(receipt.tool_result.is_some());
+
+        let stored = service.get_job(&receipt.job.id).unwrap();
+        assert_eq!(JobStatus::Succeeded, stored.status);
+
+        let all = service.list_jobs().unwrap();
+        assert_eq!(1, all.len());
+
+        let page = service
+            .query_jobs(JobQuery {
+                status: Some(JobStatus::Succeeded),
+                ..JobQuery::default()
+            })
+            .unwrap();
+        assert_eq!(1, page.jobs.len());
+        assert!(page.next_page_token.is_none());
+    }
+
+    #[test]
+    fn lifecycle_blocked_repo_stops_before_tool_execution() {
+        let service = JobLifecycleService::in_memory();
+        let mut repo = repository();
+        repo.trust_state = RepositoryTrustState::Blocked;
+        service
+            .runtime()
+            .store()
+            .create_repository(repo.clone())
+            .unwrap();
+
+        let request =
+            RuntimeJobRequest::new(actor(), repo.id.clone(), JobKind::Read, "blocked test");
+        let receipt = service.submit_echo_job(request).unwrap();
+
+        assert_eq!(JobStatus::Blocked, receipt.job.status);
+        assert!(receipt.tool_invocation.is_none());
+        assert!(receipt.tool_result.is_none());
+
+        let stored = service.get_job(&receipt.job.id).unwrap();
+        assert_eq!(JobStatus::Blocked, stored.status);
+    }
+
+    #[test]
+    fn lifecycle_cancel_queued_job_emits_ledger_events() {
+        let (service, repo) = service_with_repo();
+        let job = seed_job_in_status(
+            service.runtime().store(),
+            repo.id.clone(),
+            JobStatus::Queued,
+        );
+
+        let receipt = service
+            .cancel_job(&job.id, "user requested cancel")
+            .unwrap();
+
+        assert_eq!(JobStatus::Canceled, receipt.job.status);
+        assert_eq!(CancellationState::Requested, receipt.job.cancellation_state);
+        assert!(receipt.job.completed_at.is_some());
+        assert_eq!(2, receipt.events.len());
+        assert!(matches!(
+            receipt.events[0].kind,
+            JobEventKind::CancellationRequested
+        ));
+        assert!(matches!(
+            receipt.events[1].kind,
+            JobEventKind::JobStatusChanged {
+                from: JobStatus::Queued,
+                to: JobStatus::Canceled
+            }
+        ));
+
+        let stored = service.get_job(&job.id).unwrap();
+        assert_eq!(JobStatus::Canceled, stored.status);
+        assert_eq!(CancellationState::Requested, stored.cancellation_state);
+    }
+
+    #[test]
+    fn lifecycle_cancel_running_job_emits_ledger_events() {
+        let (service, repo) = service_with_repo();
+        let job = seed_job_in_status(
+            service.runtime().store(),
+            repo.id.clone(),
+            JobStatus::Running,
+        );
+
+        let receipt = service.cancel_job(&job.id, "timeout exceeded").unwrap();
+
+        assert_eq!(JobStatus::Canceled, receipt.job.status);
+        assert_eq!(CancellationState::Requested, receipt.job.cancellation_state);
+        assert!(receipt.job.completed_at.is_some());
+        assert_eq!(2, receipt.events.len());
+        assert!(matches!(
+            receipt.events[1].kind,
+            JobEventKind::JobStatusChanged {
+                from: JobStatus::Running,
+                to: JobStatus::Canceled
+            }
+        ));
+
+        let stored = service.get_job(&job.id).unwrap();
+        assert_eq!(JobStatus::Canceled, stored.status);
+    }
+
+    #[test]
+    fn lifecycle_atomic_cancel_rejects_duplicate_event_without_partial_update() {
+        let (service, repo) = service_with_repo();
+        let job = seed_job_in_status(
+            service.runtime().store(),
+            repo.id.clone(),
+            JobStatus::Queued,
+        );
+
+        let mut cancellation_requested_job = job.clone();
+        cancellation_requested_job.cancellation_state = CancellationState::Requested;
+        let cancel_event = job_event(
+            EventSubject::job(&job.id),
+            JobEventKind::CancellationRequested,
+            EventSeverity::Warning,
+            "user requested cancel",
+            refs_for_job(&job),
+        );
+
+        let mut canceled_job = cancellation_requested_job.clone();
+        canceled_job.latest_event_id = Some(cancel_event.id.clone());
+        canceled_job
+            .transition_status(JobStatus::Canceled, LedgerTimestamp::now())
+            .unwrap();
+        let mut status_event = job_event(
+            EventSubject::job(&job.id),
+            JobEventKind::JobStatusChanged {
+                from: JobStatus::Queued,
+                to: JobStatus::Canceled,
+            },
+            EventSeverity::Warning,
+            "job cancelled",
+            refs_for_job(&canceled_job),
+        );
+        status_event.id = cancel_event.id.clone();
+
+        assert!(matches!(
+            service.runtime().store().append_job_events_and_update_job(
+                cancellation_requested_job,
+                cancel_event,
+                canceled_job,
+                status_event,
+            ),
+            Err(StoreError::DuplicateId {
+                collection: "job_events",
+                ..
+            })
+        ));
+
+        let stored = service.get_job(&job.id).unwrap();
+        assert_eq!(JobStatus::Queued, stored.status);
+        assert_eq!(CancellationState::NotRequested, stored.cancellation_state);
+        assert_eq!(job.latest_event_id, stored.latest_event_id);
+    }
+
+    #[test]
+    fn lifecycle_cancel_rejects_terminal_job() {
+        let (service, repo) = service_with_repo();
+        let request =
+            RuntimeJobRequest::new(actor(), repo.id.clone(), JobKind::Read, "already done");
+        let done = service.submit_echo_job(request).unwrap();
+        assert_eq!(JobStatus::Succeeded, done.job.status);
+
+        let error = service.cancel_job(&done.job.id, "too late").unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::Store(StoreError::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn lifecycle_replay_events_from_cursors() {
+        let (service, repo) = service_with_repo();
+
+        let r1 = service
+            .submit_echo_job(RuntimeJobRequest::new(
+                actor(),
+                repo.id.clone(),
+                JobKind::Read,
+                "first job",
+            ))
+            .unwrap();
+        let _r2 = service
+            .submit_echo_job(RuntimeJobRequest::new(
+                actor(),
+                repo.id.clone(),
+                JobKind::Read,
+                "second job",
+            ))
+            .unwrap();
+
+        let all = service.replay_events(EventCursor::Beginning, None).unwrap();
+        assert_eq!(14, all.len());
+
+        let mid_event = &r1.events[3];
+        let after = service
+            .replay_events(EventCursor::AfterEventId(mid_event.id.clone()), None)
+            .unwrap();
+        assert_eq!(10, after.len());
+
+        let limited = service
+            .replay_events(EventCursor::Beginning, Some(5))
+            .unwrap();
+        assert_eq!(5, limited.len());
+
+        let after_seq = service
+            .replay_events(EventCursor::AfterSequence(mid_event.sequence_number), None)
+            .unwrap();
+        assert_eq!(after.len(), after_seq.len());
     }
 }
