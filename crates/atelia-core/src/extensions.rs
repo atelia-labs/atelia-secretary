@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::net::Ipv6Addr;
+use std::str::FromStr;
 
 pub const EXTENSION_MANIFEST_SCHEMA: &str = "atelia.extension.v1";
 pub const EXTENSION_RPC_PROTOCOL: &str = "atelia-extension-rpc.v1";
@@ -25,13 +27,25 @@ pub struct ExtensionManifest {
     pub types: Vec<ExtensionKind>,
     pub compatibility: ExtensionCompatibility,
     pub entrypoints: ExtensionEntrypoints,
+    #[serde(default)]
     pub permissions: BTreeMap<String, ExtensionPermission>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ExtensionToolDefinition>,
+    #[serde(default)]
     pub services: ExtensionServices,
+    #[serde(default)]
+    pub tool_output: Vec<ExtensionToolOutputDefinition>,
+    #[serde(default)]
+    pub hooks: Vec<ExtensionHookDefinition>,
+    #[serde(default)]
+    pub webhooks: Vec<ExtensionWebhookDefinition>,
+    #[serde(default)]
+    pub composition: ExtensionComposition,
     pub failure: ExtensionFailure,
     pub provenance: ExtensionProvenance,
     pub bundle: Option<ExtensionBundleMembership>,
+    #[serde(default)]
+    pub migration: ExtensionMigration,
 }
 
 impl Default for ExtensionManifest {
@@ -62,6 +76,10 @@ impl Default for ExtensionManifest {
             permissions: BTreeMap::new(),
             tools: Vec::new(),
             services: ExtensionServices::default(),
+            tool_output: Vec::new(),
+            hooks: Vec::new(),
+            webhooks: Vec::new(),
+            composition: ExtensionComposition::default(),
             failure: ExtensionFailure {
                 degrade: DegradeBehavior::ReturnUnavailable,
                 retry_policy: RetryPolicy::None,
@@ -77,6 +95,7 @@ impl Default for ExtensionManifest {
                 signer: None,
             },
             bundle: None,
+            migration: ExtensionMigration::default(),
         }
     }
 }
@@ -102,12 +121,21 @@ pub enum ExtensionKind {
     Tool,
     Service,
     HookProvider,
+    WebhookReceiver,
     ToolOutputCustomizer,
+    Workflow,
+    Notification,
     ApprovalAgent,
-    DelegatedAgentProvider,
+    Review,
+    ReviewAgent,
+    AgentProvider,
+    #[serde(alias = "delegated_agent_provider")]
+    DelegatedAgent,
     MemoryProvider,
     MemoryStrategy,
-    ClientSurface,
+    Integration,
+    #[serde(alias = "client_surface")]
+    Presentation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,6 +191,63 @@ pub struct ExtensionToolDefinition {
 pub struct ExtensionServices {
     pub provides: Vec<ExtensionServiceDefinition>,
     pub consumes: Vec<ExtensionServiceDependency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionToolOutputDefinition {
+    pub tool_id: String,
+    pub format: Option<String>,
+    pub verbosity: Option<String>,
+    pub language_mode: Option<String>,
+    #[serde(default)]
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub redactions: Vec<String>,
+    pub include_policy: Option<bool>,
+    pub include_cost: Option<bool>,
+    pub include_diagnostics: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionHookDefinition {
+    pub hook_id: String,
+    pub trigger: Option<String>,
+    pub verification: Option<String>,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    pub action: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionWebhookDefinition {
+    pub webhook_id: String,
+    pub source: Option<String>,
+    pub event: Option<String>,
+    pub endpoint: Option<String>,
+    pub verification: Option<String>,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionComposition {
+    #[serde(default)]
+    pub attachments: Vec<ExtensionCompositionAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionCompositionAttachment {
+    pub extension_id: String,
+    pub required: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionMigration {
+    #[serde(default)]
+    pub from: Vec<String>,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -318,6 +403,15 @@ pub enum ExtensionValidationError {
     DuplicateToolDeclaration {
         tool: String,
     },
+    DuplicateToolOutputDeclaration {
+        tool_id: String,
+    },
+    DuplicateHookDeclaration {
+        hook_id: String,
+    },
+    DuplicateWebhookDeclaration {
+        webhook_id: String,
+    },
 }
 
 impl fmt::Display for ExtensionValidationError {
@@ -372,6 +466,15 @@ impl fmt::Display for ExtensionValidationError {
             Self::DuplicateToolDeclaration { tool } => {
                 write!(f, "duplicate tool declaration {tool}")
             }
+            Self::DuplicateToolOutputDeclaration { tool_id } => {
+                write!(f, "duplicate tool output declaration {tool_id}")
+            }
+            Self::DuplicateHookDeclaration { hook_id } => {
+                write!(f, "duplicate hook declaration {hook_id}")
+            }
+            Self::DuplicateWebhookDeclaration { webhook_id } => {
+                write!(f, "duplicate webhook declaration {webhook_id}")
+            }
         }
     }
 }
@@ -417,6 +520,11 @@ fn validate_manifest(
     validate_permissions(&manifest.permissions)?;
     validate_tools(manifest)?;
     validate_services(manifest)?;
+    validate_tool_output(manifest)?;
+    validate_hooks(manifest, boundary)?;
+    validate_webhooks(manifest, boundary)?;
+    validate_composition(manifest)?;
+    validate_migration(manifest)?;
 
     Ok(ValidatedExtensionManifest {
         manifest: manifest.clone(),
@@ -751,6 +859,390 @@ fn validate_services(manifest: &ExtensionManifest) -> ExtensionValidationResult<
     Ok(())
 }
 
+fn validate_tool_output(manifest: &ExtensionManifest) -> ExtensionValidationResult<()> {
+    let has_tool_output_kind = manifest
+        .types
+        .contains(&ExtensionKind::ToolOutputCustomizer);
+    let declares_tool_output = !manifest.tool_output.is_empty();
+
+    if declares_tool_output && !has_tool_output_kind {
+        return Err(ExtensionValidationError::InvalidField {
+            field: "types",
+            reason: "tool output declarations require type tool_output_customizer".to_string(),
+        });
+    }
+
+    let declared_tools = manifest
+        .tools
+        .iter()
+        .map(|tool| tool.id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    let mut seen_tool_output_ids = BTreeSet::new();
+
+    for tool_output in &manifest.tool_output {
+        require_trimmed_non_empty("tool_output.tool_id", &tool_output.tool_id)?;
+        if !seen_tool_output_ids.insert(tool_output.tool_id.clone()) {
+            return Err(ExtensionValidationError::DuplicateToolOutputDeclaration {
+                tool_id: tool_output.tool_id.clone(),
+            });
+        }
+
+        validate_optional_choice(
+            "tool_output.format",
+            tool_output.format.as_deref(),
+            &["toon", "json"],
+        )?;
+        validate_optional_choice(
+            "tool_output.verbosity",
+            tool_output.verbosity.as_deref(),
+            &["minimal", "normal", "expanded", "debug"],
+        )?;
+        validate_optional_choice(
+            "tool_output.language_mode",
+            tool_output.language_mode.as_deref(),
+            &["user", "english_agent", "mixed"],
+        )?;
+        validate_string_list("tool_output.fields", &tool_output.fields)?;
+        validate_string_list("tool_output.redactions", &tool_output.redactions)?;
+
+        if !declared_tools.contains(tool_output.tool_id.as_str()) {
+            return Err(ExtensionValidationError::InvalidField {
+                field: "tool_output.tool_id",
+                reason: format!(
+                    "tool output customization targets undeclared tool {}",
+                    tool_output.tool_id
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_hooks(
+    manifest: &ExtensionManifest,
+    boundary: ExtensionBoundary,
+) -> ExtensionValidationResult<()> {
+    let has_hook_provider_kind = manifest.types.contains(&ExtensionKind::HookProvider);
+    let declares_hooks = !manifest.hooks.is_empty();
+
+    if declares_hooks && !has_hook_provider_kind {
+        return Err(ExtensionValidationError::InvalidField {
+            field: "types",
+            reason: "hook declarations require type hook_provider".to_string(),
+        });
+    }
+
+    let mut seen_hook_ids = BTreeSet::new();
+
+    for hook in &manifest.hooks {
+        require_trimmed_non_empty("hooks.hook_id", &hook.hook_id)?;
+        if !seen_hook_ids.insert(hook.hook_id.clone()) {
+            return Err(ExtensionValidationError::DuplicateHookDeclaration {
+                hook_id: hook.hook_id.clone(),
+            });
+        }
+        validate_required_string("hooks.trigger", hook.trigger.as_deref())?;
+        validate_optional_choice(
+            "hooks.verification",
+            hook.verification.as_deref(),
+            &["hmac", "github_signature", "oidc", "none_for_local_only"],
+        )?;
+        if matches!(hook.verification.as_deref(), Some("none_for_local_only"))
+            && boundary != ExtensionBoundary::LocalDevelopment
+        {
+            return Err(ExtensionValidationError::InvalidField {
+                field: "hooks.verification",
+                reason: "none_for_local_only is only allowed for local-development manifests"
+                    .to_string(),
+            });
+        }
+        validate_string_list("hooks.required_capabilities", &hook.required_capabilities)?;
+        for capability in &hook.required_capabilities {
+            require_permission_name(capability)?;
+        }
+        validate_optional_choice(
+            "hooks.action",
+            hook.action.as_deref(),
+            &[
+                "workflow",
+                "tool",
+                "notification",
+                "memory_update",
+                "extension_action",
+            ],
+        )?;
+        validate_optional_choice(
+            "hooks.status",
+            hook.status.as_deref(),
+            &["enabled", "disabled", "blocked", "needs_approval"],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_webhooks(
+    manifest: &ExtensionManifest,
+    boundary: ExtensionBoundary,
+) -> ExtensionValidationResult<()> {
+    let has_webhook_receiver_kind = manifest.types.contains(&ExtensionKind::WebhookReceiver);
+    let declares_webhooks = !manifest.webhooks.is_empty();
+
+    if declares_webhooks && !has_webhook_receiver_kind {
+        return Err(ExtensionValidationError::InvalidField {
+            field: "types",
+            reason: "webhook declarations require type webhook_receiver".to_string(),
+        });
+    }
+
+    let mut seen_webhook_ids = BTreeSet::new();
+
+    for webhook in &manifest.webhooks {
+        require_trimmed_non_empty("webhooks.webhook_id", &webhook.webhook_id)?;
+        if !seen_webhook_ids.insert(webhook.webhook_id.clone()) {
+            return Err(ExtensionValidationError::DuplicateWebhookDeclaration {
+                webhook_id: webhook.webhook_id.clone(),
+            });
+        }
+        validate_optional_choice(
+            "webhooks.source",
+            webhook.source.as_deref(),
+            &["atelia", "github", "external"],
+        )?;
+        validate_required_string("webhooks.event", webhook.event.as_deref())?;
+        validate_http_endpoint("webhooks.endpoint", webhook.endpoint.as_deref())?;
+        validate_optional_choice(
+            "webhooks.verification",
+            webhook.verification.as_deref(),
+            &["hmac", "github_signature", "oidc", "none_for_local_only"],
+        )?;
+        if matches!(webhook.verification.as_deref(), Some("none_for_local_only"))
+            && boundary != ExtensionBoundary::LocalDevelopment
+        {
+            return Err(ExtensionValidationError::InvalidField {
+                field: "webhooks.verification",
+                reason: "none_for_local_only is only allowed for local-development manifests"
+                    .to_string(),
+            });
+        }
+        validate_string_list(
+            "webhooks.required_capabilities",
+            &webhook.required_capabilities,
+        )?;
+        for capability in &webhook.required_capabilities {
+            require_permission_name(capability)?;
+        }
+        validate_optional_choice(
+            "webhooks.status",
+            webhook.status.as_deref(),
+            &["enabled", "disabled", "blocked", "needs_approval"],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_composition(manifest: &ExtensionManifest) -> ExtensionValidationResult<()> {
+    for attachment in &manifest.composition.attachments {
+        require_reverse_dns_id(
+            "composition.attachments.extension_id",
+            &attachment.extension_id,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_migration(manifest: &ExtensionManifest) -> ExtensionValidationResult<()> {
+    for version in &manifest.migration.from {
+        require_semver("migration.from", version)?;
+    }
+
+    Ok(())
+}
+
+fn validate_required_string(
+    field: &'static str,
+    value: Option<&str>,
+) -> ExtensionValidationResult<()> {
+    let Some(value) = value else {
+        return Err(ExtensionValidationError::MissingField { field });
+    };
+
+    require_non_empty(field, value)?;
+    if value.chars().any(char::is_whitespace) {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must not contain whitespace".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_optional_choice(
+    field: &'static str,
+    value: Option<&str>,
+    allowed: &[&str],
+) -> ExtensionValidationResult<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+
+    require_non_empty(field, value)?;
+    if value.chars().any(char::is_whitespace) {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must not contain whitespace".to_string(),
+        });
+    }
+    if !allowed.contains(&value) {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: format!("must be one of: {}", allowed.join(", ")),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_http_endpoint(
+    field: &'static str,
+    value: Option<&str>,
+) -> ExtensionValidationResult<()> {
+    let Some(value) = value else {
+        return Err(ExtensionValidationError::MissingField { field });
+    };
+
+    require_non_empty(field, value)?;
+    if value.chars().any(char::is_whitespace) {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must not contain whitespace".to_string(),
+        });
+    }
+    let Some(rest) = value.strip_prefix("https://") else {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must start with https://".to_string(),
+        });
+    };
+
+    validate_https_endpoint_authority(field, rest)
+}
+
+fn validate_https_endpoint_authority(
+    field: &'static str,
+    value: &str,
+) -> ExtensionValidationResult<()> {
+    let authority = value.split(['/', '?', '#']).next().unwrap_or_default();
+
+    if authority.is_empty() {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must include a host".to_string(),
+        });
+    }
+
+    if authority.contains('@') {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must not contain userinfo".to_string(),
+        });
+    }
+
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        let Some((host, remainder)) = stripped.split_once(']') else {
+            return Err(ExtensionValidationError::InvalidField {
+                field,
+                reason: "must contain a closing ] for IPv6 hosts".to_string(),
+            });
+        };
+        if host.is_empty() {
+            return Err(ExtensionValidationError::InvalidField {
+                field,
+                reason: "must include a host".to_string(),
+            });
+        }
+        if Ipv6Addr::from_str(host).is_err() {
+            return Err(ExtensionValidationError::InvalidField {
+                field,
+                reason: "must contain a valid IPv6 host inside brackets".to_string(),
+            });
+        }
+        if !remainder.is_empty() {
+            let Some(port) = remainder.strip_prefix(':') else {
+                return Err(ExtensionValidationError::InvalidField {
+                    field,
+                    reason: "must separate the host and path with /".to_string(),
+                });
+            };
+            if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+                return Err(ExtensionValidationError::InvalidField {
+                    field,
+                    reason: "port must be numeric".to_string(),
+                });
+            }
+        }
+        return Ok(());
+    } else {
+        authority
+    };
+
+    let (host, port) = match host.rsplit_once(':') {
+        Some((candidate_host, candidate_port))
+            if !candidate_host.contains(':') && !candidate_port.is_empty() =>
+        {
+            (candidate_host, Some(candidate_port))
+        }
+        _ => (host, None),
+    };
+
+    if host.is_empty() || host.starts_with('.') || host.ends_with('.') {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must include a valid host".to_string(),
+        });
+    }
+
+    if host
+        .chars()
+        .any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
+    {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "host contains invalid characters".to_string(),
+        });
+    }
+
+    if let Some(port) = port {
+        if !port.chars().all(|c| c.is_ascii_digit()) {
+            return Err(ExtensionValidationError::InvalidField {
+                field,
+                reason: "port must be numeric".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_string_list(field: &'static str, values: &[String]) -> ExtensionValidationResult<()> {
+    for value in values {
+        require_non_empty(field, value)?;
+        if value.chars().any(char::is_whitespace) {
+            return Err(ExtensionValidationError::InvalidField {
+                field,
+                reason: "must not contain whitespace".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn require_declared_service_permission(
     permissions: &BTreeMap<String, ExtensionPermission>,
     service: &str,
@@ -803,6 +1295,17 @@ fn require_non_empty(field: &'static str, value: &str) -> ExtensionValidationRes
     } else {
         Ok(())
     }
+}
+
+fn require_trimmed_non_empty(field: &'static str, value: &str) -> ExtensionValidationResult<()> {
+    require_non_empty(field, value)?;
+    if value.trim() != value {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must not contain surrounding whitespace".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn has_non_empty_trimmed(value: Option<&str>) -> bool {
@@ -1756,6 +2259,43 @@ mod tests {
         }
     }
 
+    fn tool_output_definition(tool_id: &str) -> ExtensionToolOutputDefinition {
+        ExtensionToolOutputDefinition {
+            tool_id: tool_id.to_string(),
+            format: Some("toon".to_string()),
+            verbosity: Some("normal".to_string()),
+            language_mode: Some("english_agent".to_string()),
+            fields: vec!["summary".to_string()],
+            redactions: vec!["secret".to_string()],
+            include_policy: Some(true),
+            include_cost: Some(false),
+            include_diagnostics: Some(true),
+        }
+    }
+
+    fn hook_definition(hook_id: &str) -> ExtensionHookDefinition {
+        ExtensionHookDefinition {
+            hook_id: hook_id.to_string(),
+            trigger: Some("pull_request.opened".to_string()),
+            verification: Some("github_signature".to_string()),
+            required_capabilities: vec!["review.comment".to_string()],
+            action: Some("workflow".to_string()),
+            status: Some("enabled".to_string()),
+        }
+    }
+
+    fn webhook_definition(webhook_id: &str) -> ExtensionWebhookDefinition {
+        ExtensionWebhookDefinition {
+            webhook_id: webhook_id.to_string(),
+            source: Some("github".to_string()),
+            event: Some("pull_request.opened".to_string()),
+            endpoint: Some("https://example.com/webhook".to_string()),
+            verification: Some("hmac".to_string()),
+            required_capabilities: vec!["network.webhook.receive:github".to_string()],
+            status: Some("enabled".to_string()),
+        }
+    }
+
     #[test]
     fn validates_backend_wasm_rust_manifest() {
         let validated = manifest("com.example.extension")
@@ -1831,6 +2371,360 @@ mod tests {
             ExtensionValidationError::InvalidField {
                 field: "types",
                 reason: _,
+            }
+        ));
+    }
+
+    #[test]
+    fn duplicate_tool_output_declarations_are_rejected() {
+        let mut extension = manifest("com.example.duplicate-tool-output");
+        extension.types.push(ExtensionKind::ToolOutputCustomizer);
+        extension.tool_output.push(tool_output_definition("ping"));
+        extension.tool_output.push(tool_output_definition("ping"));
+
+        let err = extension
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ExtensionValidationError::DuplicateToolOutputDeclaration { tool_id }
+                if tool_id == "ping"
+        ));
+    }
+
+    #[test]
+    fn duplicate_hook_and_webhook_declarations_are_rejected() {
+        let mut hooks = manifest("com.example.duplicate-hooks");
+        hooks.types.push(ExtensionKind::HookProvider);
+        hooks.hooks.push(hook_definition("hk_review"));
+        hooks.hooks.push(hook_definition("hk_review"));
+
+        let err = hooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ExtensionValidationError::DuplicateHookDeclaration { hook_id }
+                if hook_id == "hk_review"
+        ));
+
+        let mut webhooks = manifest("com.example.duplicate-webhooks");
+        webhooks.types.push(ExtensionKind::WebhookReceiver);
+        webhooks.webhooks.push(webhook_definition("wh_review"));
+        webhooks.webhooks.push(webhook_definition("wh_review"));
+
+        let err = webhooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ExtensionValidationError::DuplicateWebhookDeclaration { webhook_id }
+                if webhook_id == "wh_review"
+        ));
+    }
+
+    #[test]
+    fn local_only_hook_and_webhook_verification_is_rejected_for_non_local_manifests() {
+        let mut hooks = manifest("com.example.hook-verification");
+        hooks.types.push(ExtensionKind::HookProvider);
+        hooks.hooks.push(ExtensionHookDefinition {
+            verification: Some("none_for_local_only".to_string()),
+            ..hook_definition("hk_review")
+        });
+
+        let err = hooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "hooks.verification",
+                ..
+            }
+        ));
+
+        let mut webhooks = manifest("com.example.webhook-verification");
+        webhooks.types.push(ExtensionKind::WebhookReceiver);
+        webhooks.webhooks.push(ExtensionWebhookDefinition {
+            verification: Some("none_for_local_only".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        let err = webhooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "webhooks.verification",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn local_only_hook_and_webhook_verification_is_allowed_for_local_manifests() {
+        let mut hooks = manifest("local.test.hook-verification");
+        hooks.provenance.source = ProvenanceSource::Local;
+        hooks.provenance.registry_identity = None;
+        hooks.provenance.signature = None;
+        hooks.provenance.signer = None;
+        hooks.types.push(ExtensionKind::HookProvider);
+        hooks.hooks.push(ExtensionHookDefinition {
+            verification: Some("none_for_local_only".to_string()),
+            ..hook_definition("hk_review")
+        });
+
+        hooks
+            .validate(&ManifestValidationPolicy::default().with_local_unsigned())
+            .unwrap();
+
+        let mut webhooks = manifest("local.test.webhook-verification");
+        webhooks.provenance.source = ProvenanceSource::Local;
+        webhooks.provenance.registry_identity = None;
+        webhooks.provenance.signature = None;
+        webhooks.provenance.signer = None;
+        webhooks.types.push(ExtensionKind::WebhookReceiver);
+        webhooks.webhooks.push(ExtensionWebhookDefinition {
+            verification: Some("none_for_local_only".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        webhooks
+            .validate(&ManifestValidationPolicy::default().with_local_unsigned())
+            .unwrap();
+    }
+
+    #[test]
+    fn security_sensitive_section_fields_are_validated() {
+        let mut extension = manifest("com.example.invalid-tool-output");
+        extension.types.push(ExtensionKind::ToolOutputCustomizer);
+        extension.tool_output.push(ExtensionToolOutputDefinition {
+            tool_id: "ping".to_string(),
+            format: Some("markdown".to_string()),
+            verbosity: Some("verbose".to_string()),
+            language_mode: Some("human".to_string()),
+            fields: vec!["summary".to_string()],
+            redactions: vec!["secret".to_string()],
+            include_policy: Some(true),
+            include_cost: Some(false),
+            include_diagnostics: Some(true),
+        });
+
+        let err = extension
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "tool_output.format",
+                ..
+            }
+        ));
+
+        let mut hooks = manifest("com.example.invalid-hook");
+        hooks.types.push(ExtensionKind::HookProvider);
+        hooks.hooks.push(ExtensionHookDefinition {
+            hook_id: "hk_review".to_string(),
+            trigger: Some("pull request opened".to_string()),
+            verification: Some("oauth".to_string()),
+            required_capabilities: vec!["review.comment".to_string()],
+            action: Some("workflow".to_string()),
+            status: Some("enabled".to_string()),
+        });
+
+        let err = hooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "hooks.trigger",
+                ..
+            }
+        ));
+
+        let mut webhooks = manifest("com.example.invalid-webhook");
+        webhooks.types.push(ExtensionKind::WebhookReceiver);
+        webhooks.webhooks.push(ExtensionWebhookDefinition {
+            webhook_id: "wh_review".to_string(),
+            source: Some("slack".to_string()),
+            event: Some("pull_request.opened".to_string()),
+            endpoint: Some("ftp://example.com/webhook".to_string()),
+            verification: Some("hmac".to_string()),
+            required_capabilities: vec!["network.webhook.receive:github".to_string()],
+            status: Some("enabled".to_string()),
+        });
+
+        let err = webhooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "webhooks.source",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn webhook_endpoints_require_https_and_preserve_legacy_omission_compatibility() {
+        let mut webhooks = manifest("com.example.webhook-endpoint");
+        webhooks.types.push(ExtensionKind::WebhookReceiver);
+        webhooks.webhooks.push(ExtensionWebhookDefinition {
+            endpoint: Some("https://example.com/webhook".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        webhooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap();
+
+        let mut http_webhook = manifest("com.example.webhook-http");
+        http_webhook.types.push(ExtensionKind::WebhookReceiver);
+        http_webhook.webhooks.push(ExtensionWebhookDefinition {
+            endpoint: Some("http://example.com/webhook".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        let err = http_webhook
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "webhooks.endpoint",
+                ..
+            }
+        ));
+
+        let mut malformed_webhook = manifest("com.example.webhook-malformed");
+        malformed_webhook.types.push(ExtensionKind::WebhookReceiver);
+        malformed_webhook.webhooks.push(ExtensionWebhookDefinition {
+            endpoint: Some("https:/example.com/webhook".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        let err = malformed_webhook
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "webhooks.endpoint",
+                ..
+            }
+        ));
+
+        let mut missing_endpoint = manifest("com.example.webhook-missing-endpoint");
+        missing_endpoint.types.push(ExtensionKind::WebhookReceiver);
+        missing_endpoint.webhooks.push(ExtensionWebhookDefinition {
+            endpoint: None,
+            ..webhook_definition("wh_review")
+        });
+
+        let err = missing_endpoint
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::MissingField {
+                field: "webhooks.endpoint",
+            }
+        ));
+    }
+
+    #[test]
+    fn webhook_endpoints_reject_invalid_bracketed_ipv6_hosts() {
+        let mut webhooks = manifest("com.example.webhook-bracketed-host");
+        webhooks.types.push(ExtensionKind::WebhookReceiver);
+        webhooks.webhooks.push(ExtensionWebhookDefinition {
+            endpoint: Some("https://[foo]/webhook".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        let err = webhooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "webhooks.endpoint",
+                ..
+            }
+        ));
+
+        let mut ipv6_webhook = manifest("com.example.webhook-ipv6");
+        ipv6_webhook.types.push(ExtensionKind::WebhookReceiver);
+        ipv6_webhook.webhooks.push(ExtensionWebhookDefinition {
+            endpoint: Some("https://[2001:db8::1]/webhook".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        ipv6_webhook
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn whitespace_padded_duplicate_declaration_ids_are_rejected() {
+        let mut tool_output = manifest("com.example.whitespace-tool-output");
+        tool_output.types.push(ExtensionKind::ToolOutputCustomizer);
+        tool_output.tool_output.push(tool_output_definition("ping"));
+        tool_output
+            .tool_output
+            .push(tool_output_definition(" ping "));
+
+        let err = tool_output
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "tool_output.tool_id",
+                ..
+            }
+        ));
+
+        let mut hooks = manifest("com.example.whitespace-hooks");
+        hooks.types.push(ExtensionKind::HookProvider);
+        hooks.hooks.push(hook_definition("hk_review"));
+        hooks.hooks.push(ExtensionHookDefinition {
+            hook_id: " hk_review ".to_string(),
+            ..hook_definition("hk_review")
+        });
+
+        let err = hooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "hooks.hook_id",
+                ..
+            }
+        ));
+
+        let mut webhooks = manifest("com.example.whitespace-webhooks");
+        webhooks.types.push(ExtensionKind::WebhookReceiver);
+        webhooks.webhooks.push(webhook_definition("wh_review"));
+        webhooks.webhooks.push(ExtensionWebhookDefinition {
+            webhook_id: " wh_review ".to_string(),
+            ..webhook_definition("wh_review")
+        });
+
+        let err = webhooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "webhooks.webhook_id",
+                ..
             }
         ));
     }
@@ -2434,6 +3328,314 @@ mod tests {
             serde_json::from_value(serialized).expect("missing tools should default to empty");
 
         assert!(deserialized.tools.is_empty());
+    }
+
+    #[test]
+    fn extension_manifest_roundtrips_extended_sections_with_defaults() {
+        let mut extension = manifest("com.example.extended-sections");
+        extension.tool_output.push(tool_output_definition("ping"));
+        extension.hooks.push(hook_definition("hk_review"));
+        extension.webhooks.push(webhook_definition("wh_review"));
+        extension
+            .composition
+            .attachments
+            .push(ExtensionCompositionAttachment {
+                extension_id: "com.example.partner".to_string(),
+                required: Some(true),
+            });
+        extension.migration.from.push("1.0.0".to_string());
+        extension.migration.notes = Some("backfills tool output defaults".to_string());
+
+        let serialized = serde_json::to_value(&extension).unwrap();
+
+        assert!(serialized.get("tool_output").is_some());
+        assert!(serialized.get("hooks").is_some());
+        assert!(serialized.get("webhooks").is_some());
+        assert!(serialized.get("composition").is_some());
+        assert!(serialized.get("migration").is_some());
+
+        let deserialized: ExtensionManifest = serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized.tool_output.len(), 1);
+        assert_eq!(deserialized.hooks.len(), 1);
+        assert_eq!(deserialized.webhooks.len(), 1);
+        assert_eq!(deserialized.composition.attachments.len(), 1);
+        assert_eq!(deserialized.migration.from, vec!["1.0.0".to_string()]);
+        assert_eq!(
+            deserialized.migration.notes.as_deref(),
+            Some("backfills tool output defaults")
+        );
+    }
+
+    #[test]
+    fn extension_manifest_deserializes_missing_extended_sections_as_defaults() {
+        let extension = manifest("com.example.missing-sections");
+        let mut serialized = serde_json::to_value(&extension).unwrap();
+        let object = serialized
+            .as_object_mut()
+            .expect("manifest should serialize to an object");
+        object.remove("tool_output");
+        object.remove("hooks");
+        object.remove("webhooks");
+        object.remove("composition");
+        object.remove("migration");
+
+        let deserialized: ExtensionManifest = serde_json::from_value(serialized).unwrap();
+        assert!(deserialized.tool_output.is_empty());
+        assert!(deserialized.hooks.is_empty());
+        assert!(deserialized.webhooks.is_empty());
+        assert!(deserialized.composition.attachments.is_empty());
+        assert!(deserialized.migration.from.is_empty());
+        assert!(deserialized.migration.notes.is_none());
+    }
+
+    #[test]
+    fn nested_section_arrays_deserialize_as_defaults_when_omitted() {
+        let mut extension = manifest("com.example.missing-nested-arrays");
+        extension.tool_output.push(tool_output_definition("ping"));
+        extension.hooks.push(hook_definition("hk_review"));
+        extension.webhooks.push(webhook_definition("wh_review"));
+        extension
+            .composition
+            .attachments
+            .push(ExtensionCompositionAttachment {
+                extension_id: "com.example.partner".to_string(),
+                required: Some(true),
+            });
+        extension.migration.from.push("1.0.0".to_string());
+
+        let mut serialized = serde_json::to_value(&extension).unwrap();
+        let object = serialized
+            .as_object_mut()
+            .expect("manifest should serialize to an object");
+
+        object
+            .get_mut("tool_output")
+            .and_then(|value| value.as_array_mut())
+            .expect("tool_output should be an array")[0]
+            .as_object_mut()
+            .expect("tool_output entry should be an object")
+            .remove("fields");
+        object
+            .get_mut("tool_output")
+            .and_then(|value| value.as_array_mut())
+            .expect("tool_output should be an array")[0]
+            .as_object_mut()
+            .expect("tool_output entry should be an object")
+            .remove("redactions");
+        object
+            .get_mut("hooks")
+            .and_then(|value| value.as_array_mut())
+            .expect("hooks should be an array")[0]
+            .as_object_mut()
+            .expect("hook entry should be an object")
+            .remove("required_capabilities");
+        object
+            .get_mut("webhooks")
+            .and_then(|value| value.as_array_mut())
+            .expect("webhooks should be an array")[0]
+            .as_object_mut()
+            .expect("webhook entry should be an object")
+            .remove("required_capabilities");
+        object
+            .get_mut("composition")
+            .and_then(|value| value.as_object_mut())
+            .expect("composition should be an object")
+            .remove("attachments");
+        object
+            .get_mut("migration")
+            .and_then(|value| value.as_object_mut())
+            .expect("migration should be an object")
+            .remove("from");
+
+        let deserialized: ExtensionManifest = serde_json::from_value(serialized).unwrap();
+        assert!(deserialized.tool_output[0].fields.is_empty());
+        assert!(deserialized.tool_output[0].redactions.is_empty());
+        assert!(deserialized.hooks[0].required_capabilities.is_empty());
+        assert!(deserialized.webhooks[0].required_capabilities.is_empty());
+        assert!(deserialized.composition.attachments.is_empty());
+        assert!(deserialized.migration.from.is_empty());
+    }
+
+    #[test]
+    fn composition_attachment_extension_ids_must_use_reverse_dns_namespaces() {
+        let mut extension = manifest("com.example.invalid-composition");
+        extension
+            .composition
+            .attachments
+            .push(ExtensionCompositionAttachment {
+                extension_id: "not-a-reverse-dns-id".to_string(),
+                required: Some(true),
+            });
+
+        let err = extension
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "composition.attachments.extension_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn migration_from_versions_must_be_valid_semver() {
+        let mut extension = manifest("com.example.invalid-migration");
+        extension.migration.from.push("1.0".to_string());
+
+        let err = extension
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "migration.from",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn extension_kind_roundtrips_extended_taxonomy_and_aliases() {
+        let kinds = vec![
+            ExtensionKind::Tool,
+            ExtensionKind::Service,
+            ExtensionKind::HookProvider,
+            ExtensionKind::WebhookReceiver,
+            ExtensionKind::ToolOutputCustomizer,
+            ExtensionKind::Workflow,
+            ExtensionKind::Notification,
+            ExtensionKind::ApprovalAgent,
+            ExtensionKind::Review,
+            ExtensionKind::ReviewAgent,
+            ExtensionKind::AgentProvider,
+            ExtensionKind::DelegatedAgent,
+            ExtensionKind::MemoryProvider,
+            ExtensionKind::MemoryStrategy,
+            ExtensionKind::Integration,
+            ExtensionKind::Presentation,
+        ];
+
+        let serialized = serde_json::to_value(&kinds).unwrap();
+        let deserialized: Vec<ExtensionKind> = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(deserialized, kinds);
+
+        let legacy_aliases: Vec<ExtensionKind> = serde_json::from_value(serde_json::json!([
+            "client_surface",
+            "delegated_agent_provider"
+        ]))
+        .unwrap();
+        assert_eq!(
+            legacy_aliases,
+            vec![ExtensionKind::Presentation, ExtensionKind::DelegatedAgent]
+        );
+
+        assert_eq!(
+            serialized,
+            serde_json::json!([
+                "tool",
+                "service",
+                "hook_provider",
+                "webhook_receiver",
+                "tool_output_customizer",
+                "workflow",
+                "notification",
+                "approval_agent",
+                "review",
+                "review_agent",
+                "agent_provider",
+                "delegated_agent",
+                "memory_provider",
+                "memory_strategy",
+                "integration",
+                "presentation"
+            ])
+        );
+    }
+
+    #[test]
+    fn extended_taxonomy_manifest_validates_with_new_sections() {
+        let mut extension = manifest("com.example.taxonomy");
+        extension.types = vec![
+            ExtensionKind::Tool,
+            ExtensionKind::Service,
+            ExtensionKind::ToolOutputCustomizer,
+            ExtensionKind::HookProvider,
+            ExtensionKind::WebhookReceiver,
+            ExtensionKind::Workflow,
+            ExtensionKind::Notification,
+            ExtensionKind::ApprovalAgent,
+            ExtensionKind::Review,
+            ExtensionKind::ReviewAgent,
+            ExtensionKind::AgentProvider,
+            ExtensionKind::DelegatedAgent,
+            ExtensionKind::MemoryProvider,
+            ExtensionKind::MemoryStrategy,
+            ExtensionKind::Integration,
+            ExtensionKind::Presentation,
+        ];
+        extension.permissions.insert(
+            "service.review.comments".to_string(),
+            permission("provide service"),
+        );
+        extension
+            .services
+            .provides
+            .push(ExtensionServiceDefinition {
+                service: "review.comments".to_string(),
+                method: "summarize".to_string(),
+                schema_version: "v1".to_string(),
+                required_permission: "service.review.comments".to_string(),
+            });
+        extension.tool_output.push(tool_output_definition("ping"));
+        extension.hooks.push(hook_definition("hk_review"));
+        extension.webhooks.push(webhook_definition("wh_review"));
+
+        let validated = extension
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap();
+        assert_eq!(validated.boundary, ExtensionBoundary::ThirdParty);
+    }
+
+    #[test]
+    fn extended_taxonomy_manifest_installs_without_legacy_sections() {
+        let mut extension = manifest("com.example.legacy-taxonomy");
+        extension.types = vec![
+            ExtensionKind::Tool,
+            ExtensionKind::ToolOutputCustomizer,
+            ExtensionKind::HookProvider,
+            ExtensionKind::WebhookReceiver,
+        ];
+
+        let mut serialized = serde_json::to_value(&extension).unwrap();
+        let object = serialized
+            .as_object_mut()
+            .expect("manifest should serialize to an object");
+        object.remove("tool_output");
+        object.remove("hooks");
+        object.remove("webhooks");
+
+        let legacy_manifest: ExtensionManifest = serde_json::from_value(serialized).unwrap();
+
+        assert!(legacy_manifest.tool_output.is_empty());
+        assert!(legacy_manifest.hooks.is_empty());
+        assert!(legacy_manifest.webhooks.is_empty());
+
+        let mut registry = ExtensionRegistry::in_memory();
+        let record = registry
+            .install(legacy_manifest.clone(), InstallOptions::default())
+            .unwrap();
+
+        assert_eq!(record.id, legacy_manifest.id);
+        assert_eq!(record.version, legacy_manifest.version);
+        assert_eq!(
+            registry
+                .active_record(&legacy_manifest.id)
+                .expect("installed extension should be active")
+                .version,
+            legacy_manifest.version
+        );
     }
 
     #[test]
