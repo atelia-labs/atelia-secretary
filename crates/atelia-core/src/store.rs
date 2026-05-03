@@ -253,7 +253,7 @@ impl InMemoryStore {
                     reason: format!("sequence index references missing event {}", id_debug(id)),
                 })?;
 
-            if event.refs.repository_id.as_ref() == Some(repository_id) {
+            if event_repository_id(&inner, event)?.as_ref() == Some(repository_id) {
                 return Ok(Some(event.clone()));
             }
         }
@@ -3576,6 +3576,58 @@ mod tests {
         assert_eq!(first.refs.repository_id, Some(other_repository.id.clone()));
         assert_eq!(second.refs.repository_id, Some(repository.id.clone()));
         assert_eq!(third.refs.repository_id, Some(other_repository.id));
+    }
+
+    #[test]
+    fn latest_job_event_for_repository_matches_subject_repository_without_ref() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let other_repository = repository_record();
+
+        store.create_repository(repository.clone()).unwrap();
+        store.create_repository(other_repository.clone()).unwrap();
+
+        store
+            .append_job_event(job_event(other_repository.id.clone()))
+            .unwrap();
+        let mut event = job_event(repository.id.clone());
+        event.refs.repository_id = None;
+        let latest = store.append_job_event(event).unwrap();
+
+        assert_eq!(
+            store
+                .latest_job_event_for_repository(&repository.id)
+                .unwrap(),
+            Some(latest)
+        );
+    }
+
+    #[test]
+    fn latest_job_event_for_repository_matches_repository_from_linked_refs() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let other_repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        store.create_repository(other_repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+
+        store
+            .append_job_event(job_event(other_repository.id.clone()))
+            .unwrap();
+        let mut event = job_event(other_repository.id.clone());
+        event.subject = EventSubject::job(&job.id);
+        event.refs.repository_id = None;
+        event.refs.job_id = Some(job.id.clone());
+        let latest = store.append_job_event(event).unwrap();
+
+        assert_eq!(
+            store
+                .latest_job_event_for_repository(&repository.id)
+                .unwrap(),
+            Some(latest)
+        );
     }
 
     #[test]
