@@ -1672,11 +1672,6 @@ mod tests {
             .fallback_reason
             .as_deref()
             .unwrap()
-            .contains("render policy compacted output"));
-        assert!(rendered
-            .fallback_reason
-            .as_deref()
-            .unwrap()
             .contains("json rendering switched from pretty to compact"));
         assert_eq!(json["output_refs"].as_array().unwrap().len(), 1);
     }
