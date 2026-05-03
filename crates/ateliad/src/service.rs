@@ -8,10 +8,11 @@ use atelia_core::{
     DefaultPolicyEngine, InMemoryStore, LedgerTimestamp, RepositoryId, RepositoryRecord,
     RepositoryTrustState, SecretaryRuntime, SecretaryStore,
 };
+use std::path::PathBuf;
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
-const PROTOCOL_VERSION: &str = "v1";
-const STORAGE_VERSION: &str = "in-memory-v1";
+const PROTOCOL_VERSION: &str = "1.0.0";
+const STORAGE_VERSION: &str = "0.1.0";
 
 // ---------------------------------------------------------------------------
 // Health types
@@ -116,6 +117,7 @@ impl SecretaryService {
     }
 
     /// Transition the daemon into [`DaemonStatus::Ready`].
+    #[allow(dead_code)]
     pub fn set_ready(&mut self) {
         self.daemon_status = DaemonStatus::Ready;
     }
@@ -141,12 +143,7 @@ impl SecretaryService {
             daemon_version: DAEMON_VERSION.to_string(),
             protocol_version: PROTOCOL_VERSION.to_string(),
             storage_version: STORAGE_VERSION.to_string(),
-            capabilities: vec![
-                "health".to_string(),
-                "register_repository".to_string(),
-                "list_repositories".to_string(),
-                "get_repository".to_string(),
-            ],
+            capabilities: vec!["health.v1".to_string(), "repositories.v1".to_string()],
             repository_count,
             started_at: self.started_at,
         }
@@ -168,10 +165,22 @@ impl SecretaryService {
                 reason: "root_path must not be empty".to_string(),
             });
         }
+        let root_path = canonical_repository_root(&request.root_path)?;
+        if self
+            .runtime
+            .store()
+            .list_repositories()?
+            .iter()
+            .any(|repository| repository.root_path == root_path)
+        {
+            return Err(ServiceError::InvalidArgument {
+                reason: "root_path is already registered".to_string(),
+            });
+        }
 
         let record = RepositoryRecord::new(
             request.display_name,
-            request.root_path,
+            root_path,
             request.trust_state,
             LedgerTimestamp::now(),
         );
@@ -192,6 +201,27 @@ impl SecretaryService {
     }
 }
 
+fn canonical_repository_root(root_path: &str) -> ServiceResult<String> {
+    let path = PathBuf::from(root_path.trim());
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| ServiceError::InvalidArgument {
+            reason: "root_path must identify an existing repository directory".to_string(),
+        })?;
+    if !canonical.is_dir() {
+        return Err(ServiceError::InvalidArgument {
+            reason: "root_path must identify an existing repository directory".to_string(),
+        });
+    }
+    if !canonical.join(".git").exists() {
+        return Err(ServiceError::InvalidArgument {
+            reason: "root_path must identify a repository root with .git metadata".to_string(),
+        });
+    }
+
+    Ok(canonical.to_string_lossy().to_string())
+}
+
 impl Default for SecretaryService {
     fn default() -> Self {
         Self::new()
@@ -206,11 +236,40 @@ impl Default for SecretaryService {
 mod tests {
     use super::*;
     use atelia_core::RepositoryTrustState;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn ready_service() -> SecretaryService {
         let mut svc = SecretaryService::new();
         svc.set_ready();
         svc
+    }
+
+    fn test_repo_dir(name: &str) -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "atelia-service-test-{}-{}-{name}",
+            std::process::id(),
+            id
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        dir
+    }
+
+    fn plain_test_dir(name: &str) -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "atelia-service-plain-test-{}-{}-{name}",
+            std::process::id(),
+            id
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     // -- health tests -------------------------------------------------------
@@ -242,14 +301,8 @@ mod tests {
     #[test]
     fn health_reports_capabilities() {
         let health = ready_service().health();
-        assert!(health.capabilities.contains(&"health".to_string()));
-        assert!(health
-            .capabilities
-            .contains(&"register_repository".to_string()));
-        assert!(health
-            .capabilities
-            .contains(&"list_repositories".to_string()));
-        assert!(health.capabilities.contains(&"get_repository".to_string()));
+        assert!(health.capabilities.contains(&"health.v1".to_string()));
+        assert!(health.capabilities.contains(&"repositories.v1".to_string()));
     }
 
     #[test]
@@ -269,18 +322,23 @@ mod tests {
     #[test]
     fn register_repository_returns_record() {
         let svc = ready_service();
+        let root = test_repo_dir("register");
         let record = svc
             .register_repository(RegisterRepositoryRequest {
                 display_name: "test-repo".to_string(),
-                root_path: "/tmp/test".to_string(),
+                root_path: root.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::Trusted,
             })
             .expect("register should succeed");
 
         assert_eq!(record.display_name, "test-repo");
-        assert_eq!(record.root_path, "/tmp/test");
+        assert_eq!(
+            record.root_path,
+            root.canonicalize().unwrap().to_string_lossy()
+        );
         assert_eq!(record.trust_state, RepositoryTrustState::Trusted);
         assert!(record.id.has_valid_prefix());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -310,20 +368,63 @@ mod tests {
     }
 
     #[test]
+    fn register_rejects_existing_directory_without_git_metadata() {
+        let svc = ready_service();
+        let root = plain_test_dir("not-repo");
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "not-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_rejects_duplicate_canonical_root() {
+        let svc = ready_service();
+        let root = test_repo_dir("duplicate");
+
+        svc.register_repository(RegisterRepositoryRequest {
+            display_name: "repo-a".to_string(),
+            root_path: root.to_string_lossy().to_string(),
+            trust_state: RepositoryTrustState::Trusted,
+        })
+        .expect("first register should succeed");
+
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "repo-b".to_string(),
+                root_path: root.join(".").to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::ReadOnly,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert_eq!(svc.health().repository_count, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn register_list_round_trip() {
         let svc = ready_service();
+        let root_a = test_repo_dir("round-a");
+        let root_b = test_repo_dir("round-b");
 
         let r1 = svc
             .register_repository(RegisterRepositoryRequest {
                 display_name: "repo-a".to_string(),
-                root_path: "/a".to_string(),
+                root_path: root_a.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::Trusted,
             })
             .expect("register a");
         let r2 = svc
             .register_repository(RegisterRepositoryRequest {
                 display_name: "repo-b".to_string(),
-                root_path: "/b".to_string(),
+                root_path: root_b.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::ReadOnly,
             })
             .expect("register b");
@@ -334,17 +435,21 @@ mod tests {
         let ids: Vec<_> = repos.iter().map(|r| r.id.clone()).collect();
         assert!(ids.contains(&r1.id));
         assert!(ids.contains(&r2.id));
+        let _ = fs::remove_dir_all(root_a);
+        let _ = fs::remove_dir_all(root_b);
     }
 
     #[test]
     fn health_updates_repository_count() {
         let svc = ready_service();
+        let root_a = test_repo_dir("health-a");
+        let root_b = test_repo_dir("health-b");
 
         assert_eq!(svc.health().repository_count, 0);
 
         svc.register_repository(RegisterRepositoryRequest {
             display_name: "repo-a".to_string(),
-            root_path: "/a".to_string(),
+            root_path: root_a.to_string_lossy().to_string(),
             trust_state: RepositoryTrustState::Trusted,
         })
         .expect("register a");
@@ -353,21 +458,24 @@ mod tests {
 
         svc.register_repository(RegisterRepositoryRequest {
             display_name: "repo-b".to_string(),
-            root_path: "/b".to_string(),
+            root_path: root_b.to_string_lossy().to_string(),
             trust_state: RepositoryTrustState::Trusted,
         })
         .expect("register b");
 
         assert_eq!(svc.health().repository_count, 2);
+        let _ = fs::remove_dir_all(root_a);
+        let _ = fs::remove_dir_all(root_b);
     }
 
     #[test]
     fn get_repository_after_register() {
         let svc = ready_service();
+        let root = test_repo_dir("lookup");
         let record = svc
             .register_repository(RegisterRepositoryRequest {
                 display_name: "lookup-repo".to_string(),
-                root_path: "/lookup".to_string(),
+                root_path: root.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::Trusted,
             })
             .expect("register");
@@ -375,6 +483,7 @@ mod tests {
         let fetched = svc.get_repository(&record.id).expect("get should succeed");
         assert_eq!(fetched.id, record.id);
         assert_eq!(fetched.display_name, "lookup-repo");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

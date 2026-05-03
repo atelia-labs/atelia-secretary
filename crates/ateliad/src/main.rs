@@ -12,14 +12,13 @@ async fn main() -> Result<()> {
     let mut service = service::SecretaryService::new();
     info!("Atelia Secretary daemon starting");
 
-    service.set_ready();
     let health = service.health();
     info!(
         version = %health.daemon_version,
         protocol = %health.protocol_version,
         storage = %health.storage_version,
         status = ?health.daemon_status,
-        "Daemon ready"
+        "Daemon service initialized; RPC listener not wired yet"
     );
 
     tokio::signal::ctrl_c().await?;
