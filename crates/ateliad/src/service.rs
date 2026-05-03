@@ -5,10 +5,14 @@
 //! registration/listing, and the first supported job lifecycle calls.
 
 use atelia_core::{
-    Actor, CancelJobReceipt, DefaultPolicyEngine, InMemoryStore, InMemoryToolOutputSettingsService,
-    JobId, JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
-    PathScope, PolicyEngine, PolicyInput, RepositoryId, RepositoryRecord, RepositoryTrustState,
-    ResourceScope, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
+    Actor, ApplyBlocklistRequest, ApplyBlocklistResponse, CancelJobReceipt, DefaultPolicyEngine,
+    ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, InMemoryStore,
+    InMemoryToolOutputSettingsService, InstallExtensionRequest, InstallExtensionResponse, JobId,
+    JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
+    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
+    PathScope, PolicyEngine, PolicyInput, RegistryError, RepositoryId, RepositoryRecord,
+    RepositoryTrustState, ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse,
+    RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
     ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
     ToolOutputSettingsScope,
 };
@@ -24,6 +28,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "repositories.v1",
     "jobs.v1",
     "policy.v1",
+    "extensions.registry.v1",
     "tool_output_settings.v1",
 ];
 const MAX_HISTORY_PAGE: usize = 1000;
@@ -88,6 +93,7 @@ pub enum ServiceError {
     Conflict { reason: String },
     Store(atelia_core::StoreError),
     Runtime(RuntimeError),
+    ExtensionRegistry(RegistryError),
     Settings(ToolOutputSettingsError),
     InvalidArgument { reason: String },
     Internal { reason: String },
@@ -99,6 +105,7 @@ impl std::fmt::Display for ServiceError {
             Self::Conflict { reason } => write!(f, "conflict: {reason}"),
             Self::Store(err) => write!(f, "{err}"),
             Self::Runtime(err) => write!(f, "{err}"),
+            Self::ExtensionRegistry(err) => write!(f, "{err}"),
             Self::Settings(err) => write!(f, "tool output settings: {err}"),
             Self::InvalidArgument { reason } => write!(f, "invalid argument: {reason}"),
             Self::Internal { reason } => write!(f, "internal error: {reason}"),
@@ -120,6 +127,12 @@ impl From<RuntimeError> for ServiceError {
             RuntimeError::Store(err) => Self::Store(err),
             err => Self::Runtime(err),
         }
+    }
+}
+
+impl From<RegistryError> for ServiceError {
+    fn from(err: RegistryError) -> Self {
+        Self::ExtensionRegistry(err)
     }
 }
 
@@ -214,6 +227,7 @@ pub struct SecretaryService {
     lifecycle: JobLifecycleService<InMemoryStore, DefaultPolicyEngine>,
     started_at: LedgerTimestamp,
     daemon_status: DaemonStatus,
+    extension_registry: Mutex<ExtensionRegistryService>,
     tool_output_settings: Mutex<InMemoryToolOutputSettingsService>,
     idempotent_submissions: Mutex<HashMap<String, IdempotentSubmitJob>>,
     cancellation_requesters: Mutex<HashMap<JobId, Actor>>,
@@ -226,6 +240,7 @@ impl SecretaryService {
             lifecycle: JobLifecycleService::in_memory(),
             started_at: LedgerTimestamp::now(),
             daemon_status: DaemonStatus::Starting,
+            extension_registry: Mutex::new(ExtensionRegistryService::new()),
             tool_output_settings: Mutex::new(InMemoryToolOutputSettingsService::new(
                 LedgerTimestamp::now(),
             )),
@@ -241,6 +256,16 @@ impl SecretaryService {
             .lock()
             .map_err(|err| ServiceError::Internal {
                 reason: format!("tool output settings lock poisoned: {err}"),
+            })
+    }
+
+    fn lock_extension_registry(
+        &self,
+    ) -> ServiceResult<std::sync::MutexGuard<'_, ExtensionRegistryService>> {
+        self.extension_registry
+            .lock()
+            .map_err(|err| ServiceError::Internal {
+                reason: format!("extension registry lock poisoned: {err}"),
             })
     }
 
@@ -303,6 +328,7 @@ impl SecretaryService {
                 reason: "display_name must not be empty".to_string(),
             });
         }
+
         if request.root_path.trim().is_empty() {
             return Err(ServiceError::InvalidArgument {
                 reason: "root_path must not be empty".to_string(),
@@ -634,6 +660,60 @@ impl SecretaryService {
         }
         Ok(receipt)
     }
+
+    pub fn install_extension(
+        &self,
+        request: InstallExtensionRequest,
+    ) -> ServiceResult<InstallExtensionResponse> {
+        self.lock_extension_registry()?
+            .install_extension(request)
+            .map_err(ServiceError::from)
+    }
+
+    pub fn extension_status(
+        &self,
+        request: ExtensionStatusRequest,
+    ) -> ServiceResult<ExtensionStatusResponse> {
+        self.lock_extension_registry()?
+            .extension_status(request)
+            .map_err(ServiceError::from)
+    }
+
+    pub fn list_extensions(
+        &self,
+        request: ListExtensionsRequest,
+    ) -> ServiceResult<ListExtensionsResponse> {
+        self.lock_extension_registry()?
+            .list_extensions(request)
+            .map_err(ServiceError::from)
+    }
+
+    pub fn rollback_extension(
+        &self,
+        request: RollbackExtensionRequest,
+    ) -> ServiceResult<RollbackExtensionResponse> {
+        self.lock_extension_registry()?
+            .rollback_extension(request)
+            .map_err(ServiceError::from)
+    }
+
+    pub fn apply_blocklist(
+        &self,
+        request: ApplyBlocklistRequest,
+    ) -> ServiceResult<ApplyBlocklistResponse> {
+        self.lock_extension_registry()?
+            .apply_blocklist(request)
+            .map_err(ServiceError::from)
+    }
+
+    pub fn list_blocklist(
+        &self,
+        request: ListBlocklistRequest,
+    ) -> ServiceResult<ListBlocklistResponse> {
+        self.lock_extension_registry()?
+            .list_blocklist(request)
+            .map_err(ServiceError::from)
+    }
 }
 
 fn parse_page_token(page_token: Option<&str>, collection: &'static str) -> ServiceResult<usize> {
@@ -782,7 +862,15 @@ impl Default for SecretaryService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atelia_core::RepositoryTrustState;
+    use atelia_core::{
+        ApplyBlocklistRequest, BlockKey, BlockReason, ExtensionCompatibility, ExtensionEntrypoints,
+        ExtensionFailure, ExtensionKind, ExtensionManifest, ExtensionPermission,
+        ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionServices,
+        InstallExtensionRequest, ListBlocklistRequest, ListExtensionsRequest, ProvenanceSource,
+        RepositoryTrustState, RetryPolicy, RollbackExtensionRequest, EXTENSION_MANIFEST_SCHEMA,
+        EXTENSION_RPC_PROTOCOL,
+    };
+    use std::collections::BTreeMap;
     use std::collections::HashSet;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -820,6 +908,65 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn extension_manifest(
+        id: &str,
+        version: &str,
+        artifact_digest: &str,
+        manifest_digest: &str,
+    ) -> ExtensionManifest {
+        let mut permissions = BTreeMap::new();
+        permissions.insert(
+            "service.review.comments".to_string(),
+            ExtensionPermission {
+                description: "allows review comment summaries".to_string(),
+                risk_tier: Some("R2".to_string()),
+            },
+        );
+
+        ExtensionManifest {
+            schema: EXTENSION_MANIFEST_SCHEMA.to_string(),
+            id: id.to_string(),
+            name: "Test Extension".to_string(),
+            version: version.to_string(),
+            publisher: ExtensionPublisher {
+                name: "Example Publisher".to_string(),
+                url: Some("https://example.com".to_string()),
+            },
+            description: "A focused test extension".to_string(),
+            types: vec![ExtensionKind::MemoryStrategy],
+            compatibility: ExtensionCompatibility {
+                atelia_protocol: ">=0.1 <0.3".to_string(),
+                atelia_secretary: ">=0.1 <0.2".to_string(),
+            },
+            entrypoints: ExtensionEntrypoints {
+                realm: ExtensionRealm::Backend,
+                runtime: ExtensionRuntime::WasmRust,
+                command: None,
+                image: None,
+                wasm: Some("extension.wasm".to_string()),
+                protocol: EXTENSION_RPC_PROTOCOL.to_string(),
+            },
+            permissions,
+            tools: Vec::new(),
+            services: ExtensionServices::default(),
+            failure: ExtensionFailure {
+                degrade: atelia_core::DegradeBehavior::ReturnUnavailable,
+                retry_policy: RetryPolicy::Bounded,
+            },
+            provenance: atelia_core::ExtensionProvenance {
+                source: ProvenanceSource::Registry,
+                repository: Some("https://github.com/example/extensions".to_string()),
+                commit: Some("deadbeef".to_string()),
+                registry_identity: Some("third-party-registry".to_string()),
+                artifact_digest: artifact_digest.to_string(),
+                manifest_digest: manifest_digest.to_string(),
+                signature: Some("signature".to_string()),
+                signer: Some("signer@example.com".to_string()),
+            },
+            bundle: None,
+        }
     }
 
     // -- health tests -------------------------------------------------------
@@ -864,7 +1011,175 @@ mod tests {
         assert!(health.capabilities.contains(&"policy.v1".to_string()));
         assert!(health
             .capabilities
+            .contains(&"extensions.registry.v1".to_string()));
+        assert!(health
+            .capabilities
             .contains(&"tool_output_settings.v1".to_string()));
+    }
+
+    #[test]
+    fn extension_registry_supports_install_status_list_blocklist_and_rollback() {
+        const ARTIFACT_V1: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const MANIFEST_V1: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const ARTIFACT_V2: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const MANIFEST_V2: &str =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let svc = ready_service();
+        let manifest_v1 = extension_manifest(
+            "com.example.review.extension",
+            "1.0.0",
+            ARTIFACT_V1,
+            MANIFEST_V1,
+        );
+        let manifest_v2 = extension_manifest(
+            "com.example.review.extension",
+            "2.0.0",
+            ARTIFACT_V2,
+            MANIFEST_V2,
+        );
+
+        let installed_v1 = svc
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest_v1.clone(),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .expect("first install should succeed");
+        assert_eq!(installed_v1.record.version, "1.0.0");
+
+        let installed_v2 = svc
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest_v2.clone(),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .expect("second install should succeed");
+        assert_eq!(installed_v2.record.version, "2.0.0");
+
+        let status = svc
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("status should succeed");
+        assert_eq!(status.record.as_ref().unwrap().version, "2.0.0");
+        assert!(status.block.is_none());
+
+        let list = svc
+            .list_extensions(ListExtensionsRequest {
+                include_blocked: true,
+            })
+            .expect("list should succeed");
+        assert_eq!(list.extensions.len(), 1);
+        assert_eq!(list.extensions[0].record.as_ref().unwrap().version, "2.0.0");
+
+        let rolled_back = svc
+            .rollback_extension(RollbackExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("rollback should succeed");
+        assert_eq!(rolled_back.record.version, "1.0.0");
+
+        let block = svc
+            .apply_blocklist(ApplyBlocklistRequest {
+                entry: atelia_core::BlocklistEntry {
+                    key: BlockKey::ExtensionId("com.example.review.extension".to_string()),
+                    reason: BlockReason::UserBlocked,
+                    note: Some("disabled for review".to_string()),
+                },
+            })
+            .expect("apply blocklist should succeed");
+        assert_eq!(block.entry.reason, BlockReason::UserBlocked);
+
+        let blocked_status = svc
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("blocked status should succeed");
+        assert!(blocked_status.block.is_some());
+        assert_eq!(
+            blocked_status.record.as_ref().unwrap().status,
+            atelia_core::ExtensionInstallStatus::Blocked
+        );
+
+        let blocked_list = svc
+            .list_extensions(ListExtensionsRequest {
+                include_blocked: false,
+            })
+            .expect("filtered list should succeed");
+        assert!(blocked_list.extensions.is_empty());
+
+        let blocklist = svc
+            .list_blocklist(ListBlocklistRequest {})
+            .expect("list blocklist should succeed");
+        assert_eq!(blocklist.entries.len(), 1);
+
+        let final_status = svc
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("final status should succeed");
+        assert_eq!(final_status.record.as_ref().unwrap().version, "1.0.0");
+    }
+
+    #[test]
+    fn extension_registry_lock_poisoning_returns_service_error() {
+        let svc = Arc::new(ready_service());
+        let poisoned = Arc::clone(&svc);
+
+        thread::spawn(move || {
+            let _guard = poisoned.extension_registry.lock().unwrap();
+            panic!("poison extension registry lock");
+        })
+        .join()
+        .expect_err("poisoning thread should panic");
+
+        let manifest = extension_manifest(
+            "com.example.review.extension",
+            "1.0.0",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+
+        for result in [
+            svc.install_extension(InstallExtensionRequest {
+                manifest: manifest.clone(),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .map(|_| "install_extension"),
+            svc.extension_status(atelia_core::ExtensionStatusRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .map(|_| "extension_status"),
+            svc.list_extensions(ListExtensionsRequest {
+                include_blocked: true,
+            })
+            .map(|_| "list_extensions"),
+            svc.rollback_extension(RollbackExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .map(|_| "rollback_extension"),
+            svc.apply_blocklist(ApplyBlocklistRequest {
+                entry: atelia_core::BlocklistEntry {
+                    key: BlockKey::ExtensionId("com.example.review.extension".to_string()),
+                    reason: BlockReason::UserBlocked,
+                    note: Some("poison check".to_string()),
+                },
+            })
+            .map(|_| "apply_blocklist"),
+            svc.list_blocklist(ListBlocklistRequest {})
+                .map(|_| "list_blocklist"),
+        ] {
+            let err = result.unwrap_err();
+            assert!(matches!(
+                err,
+                ServiceError::Internal { reason } if reason.contains("extension registry lock poisoned")
+            ));
+        }
     }
 
     #[test]
@@ -892,6 +1207,9 @@ mod tests {
             .contains(&"repositories.v1".to_string()));
         assert!(metadata.capabilities.contains(&"jobs.v1".to_string()));
         assert!(metadata.capabilities.contains(&"policy.v1".to_string()));
+        assert!(metadata
+            .capabilities
+            .contains(&"extensions.registry.v1".to_string()));
         assert!(metadata
             .capabilities
             .contains(&"tool_output_settings.v1".to_string()));

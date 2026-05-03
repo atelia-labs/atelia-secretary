@@ -60,6 +60,12 @@ Required RPC groups:
 | `WatchEvents` | Stream ordered events from a cursor |
 | `CheckPolicy` | Preview policy outcome for a requested action |
 | `RenderToolOutput` | Render canonical tool result as TOON, JSON, or text |
+| `InstallExtension` | Install or update an extension manifest |
+| `ExtensionStatus` | Inspect one extension installation and blocklist state |
+| `ListExtensions` | List installed extension statuses |
+| `RollbackExtension` | Restore the previous version of an extension |
+| `ApplyBlocklist` | Add a blocklist entry |
+| `ListBlocklist` | Inspect the current blocklist |
 
 ## Core Messages
 

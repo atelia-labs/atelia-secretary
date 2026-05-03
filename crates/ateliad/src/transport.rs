@@ -21,18 +21,54 @@ const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
 
 pub type RpcServerState = Arc<RwLock<rpc::SecretaryRpcServer>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Route {
     Health,
     ListRepositories,
+    InstallExtension,
+    ListExtensions,
+    ExtensionStatus { extension_id: String },
+    RollbackExtension { extension_id: String },
+    ApplyBlocklist,
+    ListBlocklist,
     Unsupported,
 }
 
 fn route_for_path(path: &str) -> Route {
+    if let Some(extension_id) = path
+        .strip_prefix("/v1/extensions/")
+        .and_then(|path| path.strip_suffix("/status"))
+        .and_then(valid_extension_id)
+    {
+        return Route::ExtensionStatus {
+            extension_id: extension_id.to_string(),
+        };
+    }
+    if let Some(extension_id) = path
+        .strip_prefix("/v1/extensions/")
+        .and_then(|path| path.strip_suffix("/rollback"))
+        .and_then(valid_extension_id)
+    {
+        return Route::RollbackExtension {
+            extension_id: extension_id.to_string(),
+        };
+    }
     match path {
         "/v1/health" => Route::Health,
         "/v1/repositories:list" => Route::ListRepositories,
+        "/v1/extensions/install" => Route::InstallExtension,
+        "/v1/extensions/list" => Route::ListExtensions,
+        "/v1/extensions/blocklist/apply" => Route::ApplyBlocklist,
+        "/v1/extensions/blocklist/list" => Route::ListBlocklist,
         _ => Route::Unsupported,
+    }
+}
+
+fn valid_extension_id(extension_id: &str) -> Option<&str> {
+    if extension_id.is_empty() || extension_id.contains('/') {
+        None
+    } else {
+        Some(extension_id)
     }
 }
 
@@ -203,6 +239,54 @@ fn serialize_list_repositories_response(
     })
 }
 
+fn serialize_install_extension_response(
+    response: rpc::InstallExtensionResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "record": response.record,
+    })
+}
+
+fn serialize_extension_status_response(
+    response: rpc::ExtensionStatusResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "extension": response.extension,
+    })
+}
+
+fn serialize_list_extensions_response(response: rpc::ListExtensionsResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "extensions": response.extensions,
+    })
+}
+
+fn serialize_rollback_extension_response(
+    response: rpc::RollbackExtensionResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "record": response.record,
+    })
+}
+
+fn serialize_apply_blocklist_response(response: rpc::ApplyBlocklistResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "entry": response.entry,
+    })
+}
+
+fn serialize_list_blocklist_response(response: rpc::ListBlocklistResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "entries": response.entries,
+    })
+}
+
 fn make_error_response(
     status_code: StatusCode,
     code: &'static str,
@@ -342,6 +426,168 @@ async fn dispatch_list_repositories(state: RpcServerState, request: Request<Body
     }
 }
 
+async fn dispatch_install_extension(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<atelia_core::InstallExtensionRequest>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.install_extension(payload) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_install_extension_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_list_extensions(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<atelia_core::ListExtensionsRequest>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.list_extensions(payload) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_list_extensions_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_extension_status(
+    state: RpcServerState,
+    extension_id: String,
+    request: Request<Body>,
+) -> Response {
+    if let Err(error) = body_or_empty_json::<serde_json::Value>(request).await {
+        let rpc_server = state.read().await;
+        let next_state = rpc_next_state(&rpc_server);
+        return error.into_response(next_state);
+    }
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.extension_status(atelia_core::ExtensionStatusRequest { extension_id }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_extension_status_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_rollback_extension(
+    state: RpcServerState,
+    extension_id: String,
+    request: Request<Body>,
+) -> Response {
+    if let Err(error) = body_or_empty_json::<serde_json::Value>(request).await {
+        let rpc_server = state.read().await;
+        let next_state = rpc_next_state(&rpc_server);
+        return error.into_response(next_state);
+    }
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.rollback_extension(atelia_core::RollbackExtensionRequest { extension_id }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_rollback_extension_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_apply_blocklist(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<atelia_core::ApplyBlocklistRequest>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.apply_blocklist(payload) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_apply_blocklist_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_list_blocklist(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<atelia_core::ListBlocklistRequest>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.list_blocklist(payload) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_list_blocklist_response(response))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
 async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Body>) -> Response {
     let method = request.method().clone();
     let path = request.uri().path();
@@ -387,6 +633,126 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                 dispatch_list_repositories(state, request).await
             }
         }
+        Route::InstallExtension => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_install_extension(state, request).await
+            }
+        }
+        Route::ListExtensions => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_list_extensions(state, request).await
+            }
+        }
+        Route::ExtensionStatus { extension_id } => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_extension_status(state, extension_id, request).await
+            }
+        }
+        Route::RollbackExtension { extension_id } => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_rollback_extension(state, extension_id, request).await
+            }
+        }
+        Route::ApplyBlocklist => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_apply_blocklist(state, request).await
+            }
+        }
+        Route::ListBlocklist => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_list_blocklist(state, request).await
+            }
+        }
         Route::Unsupported => make_error_response(
             StatusCode::NOT_FOUND,
             "unsupported_endpoint",
@@ -418,6 +784,11 @@ pub fn build_router(rpc_server: RpcServerState) -> Router {
     Router::new()
         .route("/v1/health", any(dispatch_route))
         .route("/v1/repositories:list", any(dispatch_route))
+        .route("/v1/extensions/install", any(dispatch_route))
+        .route("/v1/extensions/list", any(dispatch_route))
+        .route("/v1/extensions/blocklist/apply", any(dispatch_route))
+        .route("/v1/extensions/blocklist/list", any(dispatch_route))
+        .route("/v1/extensions/*path", any(dispatch_route))
         .fallback(fallback_route)
         .with_state(rpc_server)
 }
@@ -446,8 +817,15 @@ pub async fn run_listener(
 mod tests {
     use super::*;
     use crate::service;
+    use atelia_core::{
+        BlockKey, BlockReason, DegradeBehavior, ExtensionCompatibility, ExtensionEntrypoints,
+        ExtensionFailure, ExtensionKind, ExtensionManifest, ExtensionPermission,
+        ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionServices, ProvenanceSource,
+        RetryPolicy, EXTENSION_MANIFEST_SCHEMA, EXTENSION_RPC_PROTOCOL,
+    };
     use axum::http::StatusCode;
     use serde_json::Value;
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::io::ErrorKind;
     use std::sync::{Mutex, MutexGuard};
@@ -499,12 +877,128 @@ mod tests {
         .expect("request should succeed")
     }
 
+    async fn send_json_request(
+        state: &RpcServerState,
+        method: Method,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Response {
+        let app = build_router(state.clone());
+        app.oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).expect("json body")))
+                .expect("valid request"),
+        )
+        .await
+        .expect("request should succeed")
+    }
+
+    fn extension_manifest(
+        id: &str,
+        version: &str,
+        artifact_digest: &str,
+        manifest_digest: &str,
+    ) -> ExtensionManifest {
+        let mut permissions = BTreeMap::new();
+        permissions.insert(
+            "service.review.comments".to_string(),
+            ExtensionPermission {
+                description: "allows review comment summaries".to_string(),
+                risk_tier: Some("R2".to_string()),
+            },
+        );
+
+        ExtensionManifest {
+            schema: EXTENSION_MANIFEST_SCHEMA.to_string(),
+            id: id.to_string(),
+            name: "Test Extension".to_string(),
+            version: version.to_string(),
+            publisher: ExtensionPublisher {
+                name: "Example Publisher".to_string(),
+                url: Some("https://example.com".to_string()),
+            },
+            description: "A focused test extension".to_string(),
+            types: vec![ExtensionKind::MemoryStrategy],
+            compatibility: ExtensionCompatibility {
+                atelia_protocol: ">=0.1 <0.3".to_string(),
+                atelia_secretary: ">=0.1 <0.2".to_string(),
+            },
+            entrypoints: ExtensionEntrypoints {
+                realm: ExtensionRealm::Backend,
+                runtime: ExtensionRuntime::WasmRust,
+                command: None,
+                image: None,
+                wasm: Some("extension.wasm".to_string()),
+                protocol: EXTENSION_RPC_PROTOCOL.to_string(),
+            },
+            permissions,
+            tools: Vec::new(),
+            services: ExtensionServices::default(),
+            failure: ExtensionFailure {
+                degrade: DegradeBehavior::ReturnUnavailable,
+                retry_policy: RetryPolicy::Bounded,
+            },
+            provenance: atelia_core::ExtensionProvenance {
+                source: ProvenanceSource::Registry,
+                repository: Some("https://github.com/example/extensions".to_string()),
+                commit: Some("deadbeef".to_string()),
+                registry_identity: Some("third-party-registry".to_string()),
+                artifact_digest: artifact_digest.to_string(),
+                manifest_digest: manifest_digest.to_string(),
+                signature: Some("signature".to_string()),
+                signer: Some("signer@example.com".to_string()),
+            },
+            bundle: None,
+        }
+    }
+
     #[test]
     fn route_parser_distinguishes_supported_endpoints() {
         assert_eq!(route_for_path("/v1/health"), Route::Health);
         assert_eq!(
             route_for_path("/v1/repositories:list"),
             Route::ListRepositories
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/install"),
+            Route::InstallExtension
+        );
+        assert_eq!(route_for_path("/v1/extensions/list"), Route::ListExtensions);
+        assert_eq!(
+            route_for_path("/v1/extensions/blocklist/apply"),
+            Route::ApplyBlocklist
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/blocklist/list"),
+            Route::ListBlocklist
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/com.example.extension/status"),
+            Route::ExtensionStatus {
+                extension_id: "com.example.extension".to_string()
+            }
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/com.example.extension/rollback"),
+            Route::RollbackExtension {
+                extension_id: "com.example.extension".to_string()
+            }
+        );
+        assert_eq!(route_for_path("/v1/extensions//status"), Route::Unsupported);
+        assert_eq!(
+            route_for_path("/v1/extensions/a/b/status"),
+            Route::Unsupported
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions//rollback"),
+            Route::Unsupported
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/a/b/rollback"),
+            Route::Unsupported
         );
         assert_eq!(route_for_path("/unknown"), Route::Unsupported);
         assert_eq!(route_for_path("/v1/health/"), Route::Unsupported);
@@ -542,6 +1036,18 @@ mod tests {
         assert!(addr.ip().is_loopback());
     }
 
+    #[test]
+    fn rpc_error_status_maps_request_errors_to_client_responses() {
+        assert_eq!(
+            rpc_error_status(rpc::RpcErrorCode::InvalidArgument),
+            (StatusCode::BAD_REQUEST, false)
+        );
+        assert_eq!(
+            rpc_error_status(rpc::RpcErrorCode::NotFound),
+            (StatusCode::NOT_FOUND, false)
+        );
+    }
+
     #[tokio::test]
     async fn health_endpoint_is_reachable_inprocess() {
         let rpc_server = ready_rpc_server();
@@ -554,6 +1060,145 @@ mod tests {
         assert_eq!(payload["status"], "ok");
         assert!(payload["data"]["daemon_status"].is_string());
         assert!(payload["data"]["capabilities"].is_array());
+    }
+
+    #[tokio::test]
+    async fn extension_registry_endpoints_are_reachable_inprocess() {
+        const ARTIFACT_V1: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const MANIFEST_V1: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const ARTIFACT_V2: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const MANIFEST_V2: &str =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let rpc_server = ready_rpc_server();
+        let manifest_v1 = extension_manifest(
+            "com.example.review.extension",
+            "1.0.0",
+            ARTIFACT_V1,
+            MANIFEST_V1,
+        );
+        let manifest_v2 = extension_manifest(
+            "com.example.review.extension",
+            "2.0.0",
+            ARTIFACT_V2,
+            MANIFEST_V2,
+        );
+
+        let install_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/install",
+            serde_json::json!({
+                "manifest": manifest_v1,
+                "approve_local_unsigned": false,
+                "allow_local_process_runtime": false,
+            }),
+        )
+        .await;
+        assert_eq!(install_response.status(), StatusCode::OK);
+        let install_payload = to_bytes(install_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(install_payload["status"], "ok");
+        assert_eq!(install_payload["data"]["record"]["version"], "1.0.0");
+
+        let update_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/install",
+            serde_json::json!({
+                "manifest": manifest_v2,
+                "approve_local_unsigned": false,
+                "allow_local_process_runtime": false,
+            }),
+        )
+        .await;
+        assert_eq!(update_response.status(), StatusCode::OK);
+
+        let status_response = send_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/status",
+        )
+        .await;
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_payload = to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(
+            status_payload["data"]["extension"]["extension_id"],
+            "com.example.review.extension"
+        );
+        assert_eq!(
+            status_payload["data"]["extension"]["record"]["version"],
+            "2.0.0"
+        );
+
+        let rollback_response = send_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/rollback",
+        )
+        .await;
+        assert_eq!(rollback_response.status(), StatusCode::OK);
+        let rollback_payload = to_bytes(rollback_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(rollback_payload["data"]["record"]["version"], "1.0.0");
+
+        let block_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/blocklist/apply",
+            serde_json::json!({
+                "entry": {
+                    "key": serde_json::to_value(BlockKey::ExtensionId("com.example.review.extension".to_string())).expect("block key"),
+                    "reason": BlockReason::UserBlocked,
+                    "note": "policy review"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(block_response.status(), StatusCode::OK);
+
+        let blocked_status_response = send_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/status",
+        )
+        .await;
+        assert_eq!(blocked_status_response.status(), StatusCode::OK);
+        let blocked_status_payload = to_bytes(blocked_status_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(
+            blocked_status_payload["data"]["extension"]["record"]["status"],
+            "blocked"
+        );
+
+        let list_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/list",
+            serde_json::json!({ "include_blocked": false }),
+        )
+        .await;
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_payload = to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert!(list_payload["data"]["extensions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

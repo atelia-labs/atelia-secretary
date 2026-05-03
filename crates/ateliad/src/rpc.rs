@@ -16,11 +16,13 @@ use crate::service::{
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
 };
 use atelia_core::{
-    Actor, CancelJobReceipt, CancellationState, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
-    OutputFormat, OversizeOutputPolicy, PathScope, PolicyOutcome, ProjectId, RenderOptions,
-    RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier, StoreError,
-    ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides, ToolOutputSettingsChange,
-    ToolOutputSettingsScope, ToolOutputVerbosity,
+    Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState,
+    ExtensionInstallRecord, ExtensionStatusRequest, InstallExtensionRequest, JobEventKind, JobId,
+    JobKind, JobRecord, JobStatus, ListBlocklistRequest, ListExtensionsRequest, OutputFormat,
+    OversizeOutputPolicy, PathScope, PolicyOutcome, ProjectId, RenderOptions, RepositoryId,
+    RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier, RollbackExtensionRequest,
+    StoreError, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
+    ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity,
 };
 use std::convert::TryFrom;
 
@@ -152,6 +154,72 @@ impl SecretaryRpcServer {
         Ok(CheckPolicyResponse {
             metadata: self.metadata(),
             decision: policy_decision_to_rpc(policy_decision),
+        })
+    }
+
+    pub fn install_extension(
+        &self,
+        request: InstallExtensionRequest,
+    ) -> RpcResult<InstallExtensionResponse> {
+        let response = self.service.install_extension(request)?;
+        Ok(InstallExtensionResponse {
+            metadata: self.metadata(),
+            record: response.record,
+        })
+    }
+
+    pub fn extension_status(
+        &self,
+        request: ExtensionStatusRequest,
+    ) -> RpcResult<ExtensionStatusResponse> {
+        let extension = self.service.extension_status(request)?;
+        Ok(ExtensionStatusResponse {
+            metadata: self.metadata(),
+            extension,
+        })
+    }
+
+    pub fn list_extensions(
+        &self,
+        request: ListExtensionsRequest,
+    ) -> RpcResult<ListExtensionsResponse> {
+        let response = self.service.list_extensions(request)?;
+        Ok(ListExtensionsResponse {
+            metadata: self.metadata(),
+            extensions: response.extensions,
+        })
+    }
+
+    pub fn rollback_extension(
+        &self,
+        request: RollbackExtensionRequest,
+    ) -> RpcResult<RollbackExtensionResponse> {
+        let response = self.service.rollback_extension(request)?;
+        Ok(RollbackExtensionResponse {
+            metadata: self.metadata(),
+            record: response.record,
+        })
+    }
+
+    pub fn apply_blocklist(
+        &self,
+        request: ApplyBlocklistRequest,
+    ) -> RpcResult<ApplyBlocklistResponse> {
+        let response = self.service.apply_blocklist(request)?;
+        Ok(ApplyBlocklistResponse {
+            metadata: self.metadata(),
+            entry: response.entry,
+        })
+    }
+
+    pub fn list_blocklist(
+        &self,
+        request: ListBlocklistRequest,
+    ) -> RpcResult<ListBlocklistResponse> {
+        let response = self.service.list_blocklist(request)?;
+        Ok(ListBlocklistResponse {
+            metadata: self.metadata(),
+            entries: response.entries,
         })
     }
 
@@ -314,11 +382,43 @@ impl From<ServiceError> for RpcError {
                 code: RpcErrorCode::Internal,
                 reason: error.to_string(),
             },
+            ServiceError::ExtensionRegistry(error) => registry_error_to_rpc(error),
             ServiceError::Internal { reason } => Self {
                 code: RpcErrorCode::Internal,
                 reason,
             },
         }
+    }
+}
+
+fn registry_error_to_rpc(error: atelia_core::RegistryError) -> RpcError {
+    match error {
+        atelia_core::RegistryError::Validation(error) => RpcError {
+            code: RpcErrorCode::InvalidArgument,
+            reason: error.to_string(),
+        },
+        atelia_core::RegistryError::UnsupportedBlocklistKey { key } => RpcError {
+            code: RpcErrorCode::InvalidArgument,
+            reason: format!("unsupported blocklist key: {key:?}"),
+        },
+        atelia_core::RegistryError::Blocked { .. }
+        | atelia_core::RegistryError::DigestConflict { .. }
+        | atelia_core::RegistryError::RollbackUnavailable { .. } => RpcError {
+            code: RpcErrorCode::Conflict,
+            reason: error.to_string(),
+        },
+        atelia_core::RegistryError::ServiceDenied { .. } => RpcError {
+            code: RpcErrorCode::InvalidArgument,
+            reason: error.to_string(),
+        },
+        atelia_core::RegistryError::NotInstalled { .. } => RpcError {
+            code: RpcErrorCode::NotFound,
+            reason: error.to_string(),
+        },
+        atelia_core::RegistryError::ServiceUnavailable { .. } => RpcError {
+            code: RpcErrorCode::Internal,
+            reason: error.to_string(),
+        },
     }
 }
 
@@ -794,6 +894,42 @@ pub struct CheckPolicyRequest {
 pub struct CheckPolicyResponse {
     pub metadata: ProtocolMetadata,
     pub decision: PolicyDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallExtensionResponse {
+    pub metadata: ProtocolMetadata,
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionStatusResponse {
+    pub metadata: ProtocolMetadata,
+    pub extension: atelia_core::ExtensionStatusResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListExtensionsResponse {
+    pub metadata: ProtocolMetadata,
+    pub extensions: Vec<atelia_core::ExtensionStatusResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackExtensionResponse {
+    pub metadata: ProtocolMetadata,
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyBlocklistResponse {
+    pub metadata: ProtocolMetadata,
+    pub entry: BlocklistEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListBlocklistResponse {
+    pub metadata: ProtocolMetadata,
+    pub entries: Vec<BlocklistEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1476,6 +1612,13 @@ fn risk_tier_label(risk_tier: RiskTier) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atelia_core::{
+        BlockKey, BlockReason, DegradeBehavior, ExtensionCompatibility, ExtensionEntrypoints,
+        ExtensionFailure, ExtensionKind, ExtensionManifest, ExtensionPermission,
+        ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionServices, ProvenanceSource,
+        RetryPolicy, EXTENSION_MANIFEST_SCHEMA, EXTENSION_RPC_PROTOCOL,
+    };
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1517,6 +1660,65 @@ mod tests {
                 project_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
             },
             tool_id: None,
+        }
+    }
+
+    fn extension_manifest(
+        id: &str,
+        version: &str,
+        artifact_digest: &str,
+        manifest_digest: &str,
+    ) -> ExtensionManifest {
+        let mut permissions = BTreeMap::new();
+        permissions.insert(
+            "service.review.comments".to_string(),
+            ExtensionPermission {
+                description: "allows review comment summaries".to_string(),
+                risk_tier: Some("R2".to_string()),
+            },
+        );
+
+        ExtensionManifest {
+            schema: EXTENSION_MANIFEST_SCHEMA.to_string(),
+            id: id.to_string(),
+            name: "Test Extension".to_string(),
+            version: version.to_string(),
+            publisher: ExtensionPublisher {
+                name: "Example Publisher".to_string(),
+                url: Some("https://example.com".to_string()),
+            },
+            description: "A focused test extension".to_string(),
+            types: vec![ExtensionKind::MemoryStrategy],
+            compatibility: ExtensionCompatibility {
+                atelia_protocol: ">=0.1 <0.3".to_string(),
+                atelia_secretary: ">=0.1 <0.2".to_string(),
+            },
+            entrypoints: ExtensionEntrypoints {
+                realm: ExtensionRealm::Backend,
+                runtime: ExtensionRuntime::WasmRust,
+                command: None,
+                image: None,
+                wasm: Some("extension.wasm".to_string()),
+                protocol: EXTENSION_RPC_PROTOCOL.to_string(),
+            },
+            permissions,
+            tools: Vec::new(),
+            services: ExtensionServices::default(),
+            failure: ExtensionFailure {
+                degrade: DegradeBehavior::ReturnUnavailable,
+                retry_policy: RetryPolicy::Bounded,
+            },
+            provenance: atelia_core::ExtensionProvenance {
+                source: ProvenanceSource::Registry,
+                repository: Some("https://github.com/example/extensions".to_string()),
+                commit: Some("deadbeef".to_string()),
+                registry_identity: Some("third-party-registry".to_string()),
+                artifact_digest: artifact_digest.to_string(),
+                manifest_digest: manifest_digest.to_string(),
+                signature: Some("signature".to_string()),
+                signer: Some("signer@example.com".to_string()),
+            },
+            bundle: None,
         }
     }
 
@@ -2708,6 +2910,100 @@ mod tests {
     }
 
     #[test]
+    fn extension_registry_round_trip_through_rpc_surface() {
+        const ARTIFACT_V1: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const MANIFEST_V1: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const ARTIFACT_V2: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const MANIFEST_V2: &str =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let server = ready_server();
+        let manifest_v1 = extension_manifest(
+            "com.example.review.extension",
+            "1.0.0",
+            ARTIFACT_V1,
+            MANIFEST_V1,
+        );
+        let manifest_v2 = extension_manifest(
+            "com.example.review.extension",
+            "2.0.0",
+            ARTIFACT_V2,
+            MANIFEST_V2,
+        );
+
+        let install = server
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest_v1,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .expect("install should succeed");
+        assert_eq!(install.record.version, "1.0.0");
+
+        server
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest_v2,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .expect("update should succeed");
+
+        let status = server
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("status should succeed");
+        assert_eq!(
+            status.extension.extension_id,
+            "com.example.review.extension"
+        );
+        assert_eq!(status.extension.record.as_ref().unwrap().version, "2.0.0");
+
+        let list = server
+            .list_extensions(ListExtensionsRequest {
+                include_blocked: true,
+            })
+            .expect("list should succeed");
+        assert_eq!(list.extensions.len(), 1);
+
+        let rolled_back = server
+            .rollback_extension(RollbackExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("rollback should succeed");
+        assert_eq!(rolled_back.record.version, "1.0.0");
+
+        server
+            .apply_blocklist(ApplyBlocklistRequest {
+                entry: BlocklistEntry {
+                    key: BlockKey::ExtensionId("com.example.review.extension".to_string()),
+                    reason: BlockReason::UserBlocked,
+                    note: Some("policy review".to_string()),
+                },
+            })
+            .expect("apply blocklist should succeed");
+
+        let blocked_status = server
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("blocked status should succeed");
+        assert!(blocked_status.extension.block.is_some());
+        assert_eq!(
+            blocked_status.extension.record.as_ref().unwrap().status,
+            atelia_core::ExtensionInstallStatus::Blocked
+        );
+
+        let blocklist = server
+            .list_blocklist(ListBlocklistRequest {})
+            .expect("list blocklist should succeed");
+        assert_eq!(blocklist.entries.len(), 1);
+    }
+
+    #[test]
     fn missing_job_maps_to_not_found() {
         let server = ready_server();
         let missing = JobId::new();
@@ -2719,5 +3015,29 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, RpcErrorCode::NotFound);
+    }
+
+    #[test]
+    fn registry_service_denied_maps_to_invalid_argument() {
+        let error = RpcError::from(ServiceError::ExtensionRegistry(
+            atelia_core::RegistryError::ServiceDenied {
+                reason: "caller did not declare services.consumes".to_string(),
+            },
+        ));
+
+        assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+        assert!(error.reason.contains("services.consumes"));
+    }
+
+    #[test]
+    fn registry_service_unavailable_maps_to_internal() {
+        let error = RpcError::from(ServiceError::ExtensionRegistry(
+            atelia_core::RegistryError::ServiceUnavailable {
+                reason: "callee did not declare services.provides".to_string(),
+            },
+        ));
+
+        assert_eq!(error.code, RpcErrorCode::Internal);
+        assert!(error.reason.contains("services.provides"));
     }
 }
