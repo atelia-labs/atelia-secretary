@@ -169,6 +169,27 @@ impl From<serde_json::Error> for ArtifactError {
 
 pub type ArtifactResult<T> = Result<T, ArtifactError>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedArtifactRecord {
+    pub path: PathBuf,
+    pub repository_id: Option<String>,
+    pub project_id: Option<String>,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactLookupDenyReason {
+    ProjectOrJobContextRequired,
+    RepositoryScopeOrIdentityMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactLookupResult {
+    Found(ResolvedArtifactRecord),
+    Denied(ArtifactLookupDenyReason),
+    NotFound,
+}
+
 trait ArtifactWriter {
     fn write_artifact_bytes(
         &self,
@@ -343,6 +364,193 @@ impl LocalArtifactStore {
         });
 
         Ok(records)
+    }
+
+    pub fn resolve_output_path(
+        &self,
+        output_ref_id: &OutputRefId,
+    ) -> ArtifactResult<Option<PathBuf>> {
+        self.resolve_output_path_for_context(output_ref_id, None, None, None)
+    }
+
+    pub fn resolve_output_path_for_context(
+        &self,
+        output_ref_id: &OutputRefId,
+        repository_id: Option<&str>,
+        repository_scope: Option<&str>,
+        project_id: Option<&str>,
+    ) -> ArtifactResult<Option<PathBuf>> {
+        match self.resolve_output_record_for_context(
+            output_ref_id,
+            repository_id,
+            repository_scope,
+            project_id,
+        )? {
+            ArtifactLookupResult::Found(record) => Ok(Some(record.path)),
+            ArtifactLookupResult::Denied(_) | ArtifactLookupResult::NotFound => Ok(None),
+        }
+    }
+
+    pub fn resolve_output_record_for_context(
+        &self,
+        output_ref_id: &OutputRefId,
+        repository_id: Option<&str>,
+        repository_scope: Option<&str>,
+        project_id: Option<&str>,
+    ) -> ArtifactResult<ArtifactLookupResult> {
+        let mut matches = Vec::new();
+        let mut has_context_denied_match = false;
+
+        let repository_scope = repository_scope.map(sanitize_segment).transpose()?;
+        let repository_id = repository_id.map(sanitize_segment).transpose()?;
+
+        let mut candidate_scopes = Vec::new();
+        if let Some(repository_scope) = repository_scope.as_deref() {
+            candidate_scopes.push(repository_scope.to_string());
+        }
+        if let Some(repository_id) = repository_id.as_deref() {
+            if !candidate_scopes.iter().any(|scope| scope == repository_id) {
+                candidate_scopes.push(repository_id.to_string());
+            }
+        }
+
+        for repository_scope in &candidate_scopes {
+            let scope_dir = self.scope_dir(repository_scope)?;
+            if !scope_dir.exists() {
+                continue;
+            }
+            let scope_records = self.read_scope_records(&scope_dir)?;
+            for record in scope_records {
+                if &record.id != output_ref_id {
+                    continue;
+                }
+
+                if !record_matches_request_context(
+                    &record,
+                    repository_id.as_deref(),
+                    Some(repository_scope),
+                    project_id,
+                ) {
+                    if project_id.is_none() && record.project_id.is_some() {
+                        has_context_denied_match = true;
+                    }
+                    continue;
+                }
+
+                let sanitized_scope = sanitize_segment(&record.scope)?;
+                let candidate_path = validate_record_path(
+                    &self.config.root_dir,
+                    &sanitized_scope,
+                    &record.id,
+                    &record.path,
+                )
+                .ok_or_else(|| ArtifactError::InvalidIndex {
+                    path: record.path,
+                    reason: "artifact path failed scope validation".to_string(),
+                })?;
+
+                matches.push(ResolvedArtifactRecord {
+                    path: candidate_path,
+                    repository_id: record.repository_id.clone(),
+                    project_id: record.project_id.clone(),
+                    scope: sanitized_scope,
+                });
+            }
+        }
+
+        let needs_full_scan = repository_id.is_none() && repository_scope.is_none();
+        if matches.is_empty() && needs_full_scan {
+            let all_records = self.list_records(None)?;
+            for record in all_records {
+                if &record.id != output_ref_id {
+                    continue;
+                }
+                if !record_matches_request_context(
+                    &record,
+                    repository_id.as_deref(),
+                    repository_scope.as_deref(),
+                    project_id,
+                ) {
+                    if project_id.is_none() && record.project_id.is_some() {
+                        has_context_denied_match = true;
+                    }
+                    continue;
+                }
+
+                let sanitized_scope = sanitize_segment(&record.scope)?;
+                let candidate_path = validate_record_path(
+                    &self.config.root_dir,
+                    &sanitized_scope,
+                    &record.id,
+                    &record.path,
+                )
+                .ok_or_else(|| ArtifactError::InvalidIndex {
+                    path: record.path,
+                    reason: "artifact path failed scope validation".to_string(),
+                })?;
+
+                matches.push(ResolvedArtifactRecord {
+                    path: candidate_path,
+                    repository_id: record.repository_id.clone(),
+                    project_id: record.project_id.clone(),
+                    scope: sanitized_scope,
+                });
+            }
+        }
+
+        if matches.is_empty()
+            && !needs_full_scan
+            && self.has_output_record_id_in_other_repository_context(
+                output_ref_id,
+                repository_id.as_deref(),
+                repository_scope.as_deref(),
+            )?
+        {
+            return Ok(ArtifactLookupResult::Denied(
+                ArtifactLookupDenyReason::RepositoryScopeOrIdentityMismatch,
+            ));
+        }
+
+        match matches.as_slice() {
+            [] => {
+                if has_context_denied_match {
+                    Ok(ArtifactLookupResult::Denied(
+                        ArtifactLookupDenyReason::ProjectOrJobContextRequired,
+                    ))
+                } else {
+                    Ok(ArtifactLookupResult::NotFound)
+                }
+            }
+            [only] => Ok(ArtifactLookupResult::Found(only.clone())),
+            _ => Err(ArtifactError::InvalidIndex {
+                path: "artifact index".to_string(),
+                reason: format!("duplicate artifact id {} in index", output_ref_id.as_str()),
+            }),
+        }
+    }
+
+    fn has_output_record_id_in_other_repository_context(
+        &self,
+        output_ref_id: &OutputRefId,
+        repository_id: Option<&str>,
+        repository_scope: Option<&str>,
+    ) -> ArtifactResult<bool> {
+        for record in self.list_records(None)? {
+            if &record.id != output_ref_id {
+                continue;
+            }
+
+            if !record_matches_repository_context(
+                record.repository_id.as_deref(),
+                record.scope.as_str(),
+                repository_id,
+                repository_scope,
+            ) {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     pub fn find_expired_artifact_records(
@@ -1271,6 +1479,66 @@ fn sanitize_segment(value: &str) -> ArtifactResult<String> {
     Ok(sanitized)
 }
 
+fn record_matches_request_context(
+    record: &LocalArtifactRecord,
+    repository_id: Option<&str>,
+    repository_scope: Option<&str>,
+    project_id: Option<&str>,
+) -> bool {
+    if let Some(expected_repository_id) = repository_id {
+        if let Some(record_repository_id) = record.repository_id.as_deref() {
+            if record_repository_id != expected_repository_id {
+                return false;
+            }
+        }
+
+        if record.repository_id.is_none()
+            && repository_scope.is_some_and(|scope| record.scope != *scope)
+        {
+            return false;
+        }
+    }
+
+    if let Some(expected_project_id) = project_id {
+        if let Some(record_project_id) = record.project_id.as_deref() {
+            if record_project_id != expected_project_id {
+                return false;
+            }
+        }
+
+        if record.project_id.is_none() && repository_id.is_none() {
+            return false;
+        }
+    } else if record.project_id.is_some() {
+        // Artifact refs created in project/job context should not be readable until
+        // a request-level project/job identity is supplied.
+        return false;
+    }
+
+    true
+}
+
+fn record_matches_repository_context(
+    record_repository_id: Option<&str>,
+    record_scope: &str,
+    repository_id: Option<&str>,
+    repository_scope: Option<&str>,
+) -> bool {
+    match repository_id {
+        Some(expected_repository_id) => match record_repository_id {
+            Some(record_repository_id) => record_repository_id == expected_repository_id,
+            None => repository_scope
+                .map_or(record_scope == expected_repository_id, |expected_scope| {
+                    record_scope == expected_scope
+                }),
+        },
+        None => match repository_scope {
+            Some(expected_scope) => record_scope == expected_scope,
+            None => true,
+        },
+    }
+}
+
 fn sanitize_label(value: &str) -> String {
     value
         .chars()
@@ -1501,6 +1769,163 @@ mod tests {
         assert_eq!(Some(5), record.original_bytes);
         assert_eq!(Some(7), record.retained_bytes);
         assert_eq!(None, record.tombstone);
+    }
+
+    #[test]
+    fn resolves_output_path_within_matching_repository_context() {
+        let root = temp_root("resolve-output-path-context");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+
+        let output_ref = store
+            .write_bytes("repo-a", "search output", "text/plain", b"hello context")
+            .unwrap();
+
+        let context_path = store
+            .resolve_output_path_for_context(&output_ref.id, Some("repo-a"), Some("repo-a"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(PathBuf::from(&output_ref.uri), context_path);
+
+        let mismatched = store
+            .resolve_output_path_for_context(&output_ref.id, Some("repo-b"), Some("repo-b"), None)
+            .unwrap();
+        assert_eq!(None, mismatched);
+    }
+
+    #[test]
+    fn resolves_output_path_within_matching_repository_metadata() {
+        let root = temp_root("resolve-output-path-metadata");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+
+        let output_ref = store
+            .write_bytes_with_metadata(
+                "custom-scope",
+                "search output",
+                "text/plain",
+                b"hello context",
+                ArtifactWriteMetadata {
+                    repository_id: Some("repo-a".to_string()),
+                    project_id: None,
+                    original_bytes: None,
+                    retained_bytes: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            PathBuf::from(&output_ref.uri),
+            store
+                .resolve_output_path_for_context(
+                    &output_ref.id,
+                    Some("repo-a"),
+                    Some("custom-scope"),
+                    None
+                )
+                .unwrap()
+                .unwrap()
+        );
+
+        let mismatched = store
+            .resolve_output_path_for_context(
+                &output_ref.id,
+                Some("repo-b"),
+                Some("custom-scope"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(None, mismatched);
+    }
+
+    #[test]
+    fn resolves_output_path_prefers_scoped_records_before_full_scan() {
+        let root = temp_root("resolve-output-path-scoped");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+
+        let output_ref = store
+            .write_bytes("repo-a", "search output", "text/plain", b"scoped artifact")
+            .unwrap();
+
+        let invalid_scope_dir = root.join("other_scope");
+        create_scope_dir(&invalid_scope_dir).unwrap();
+        fs::write(invalid_scope_dir.join("index.json"), "{invalid json}").unwrap();
+
+        let context_path = store
+            .resolve_output_path_for_context(&output_ref.id, Some("repo-a"), Some("repo-a"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(PathBuf::from(&output_ref.uri), context_path);
+
+        let full_scan = store.list_records(None).unwrap_err();
+        assert!(matches!(full_scan, ArtifactError::InvalidIndex { .. }));
+    }
+
+    #[test]
+    fn resolve_output_record_requires_project_context() {
+        let root = temp_root("resolve-output-path-project-context");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+
+        let output_ref = store
+            .write_bytes_with_metadata(
+                "repo-a",
+                "project artifact",
+                "text/plain",
+                b"project context",
+                ArtifactWriteMetadata {
+                    project_id: Some("project-1".to_string()),
+                    repository_id: Some("repo-a".to_string()),
+                    original_bytes: None,
+                    retained_bytes: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            ArtifactLookupResult::Denied(ArtifactLookupDenyReason::ProjectOrJobContextRequired),
+            store
+                .resolve_output_record_for_context(
+                    &output_ref.id,
+                    Some("repo-a"),
+                    Some("repo-a"),
+                    None
+                )
+                .unwrap()
+        );
+
+        assert_eq!(
+            None,
+            store
+                .resolve_output_path_for_context(
+                    &output_ref.id,
+                    Some("repo-a"),
+                    Some("repo-a"),
+                    None
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_output_record_denies_other_repository_match() {
+        let root = temp_root("resolve-output-record-cross-repo");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+
+        let output_ref = store
+            .write_bytes("repo-a", "search output", "text/plain", b"hello context")
+            .unwrap();
+
+        assert_eq!(
+            ArtifactLookupResult::Denied(
+                ArtifactLookupDenyReason::RepositoryScopeOrIdentityMismatch
+            ),
+            store
+                .resolve_output_record_for_context(
+                    &output_ref.id,
+                    Some("repo-b"),
+                    Some("repo-b"),
+                    None
+                )
+                .unwrap()
+        );
     }
 
     #[test]
