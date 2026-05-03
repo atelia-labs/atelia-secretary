@@ -974,6 +974,28 @@ mod tests {
             }
             other => panic!("expected StringList, got {:?}", other),
         }
+
+        // Counts must sum to total entries.
+        let fc = result
+            .fields
+            .iter()
+            .find(|f| f.key == "file_count")
+            .unwrap();
+        let dc = result.fields.iter().find(|f| f.key == "dir_count").unwrap();
+        let uc = result
+            .fields
+            .iter()
+            .find(|f| f.key == "unknown_count")
+            .unwrap();
+        let total: i64 =
+            integer_value(&fc.value) + integer_value(&dc.value) + integer_value(&uc.value);
+        let entry_count = result
+            .fields
+            .iter()
+            .find(|f| f.key == "entry_count")
+            .unwrap();
+        assert_eq!(integer_value(&entry_count.value), total);
+        assert_eq!(0, integer_value(&uc.value));
         env.cleanup();
     }
 
