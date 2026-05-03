@@ -11,7 +11,7 @@ use crate::domain::{
     ToolResult, ToolResultField, ToolResultId, ToolResultStatus, TruncationMetadata,
 };
 use crate::runtime::RuntimeJobRequest;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -20,6 +20,11 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
@@ -1387,6 +1392,392 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
                     value: StructuredValue::Integer(files_skipped as i64),
                 },
             ],
+            truncation,
+            Vec::new(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProcExecTool
+// ---------------------------------------------------------------------------
+
+/// Executes a bounded explicit-argv process within the registered repository scope.
+#[derive(Debug, Clone)]
+pub struct ProcExecTool {
+    repository_root: PathBuf,
+    argv: Vec<String>,
+    env_allowlist: HashSet<String>,
+    env_overrides: HashMap<String, String>,
+    timeout: Duration,
+    max_output_bytes: usize,
+}
+
+impl ProcExecTool {
+    pub fn new(repository_root: impl Into<PathBuf>, argv: Vec<String>) -> Self {
+        Self {
+            repository_root: repository_root.into(),
+            argv,
+            env_allowlist: HashSet::new(),
+            env_overrides: HashMap::new(),
+            timeout: Duration::from_secs(30),
+            max_output_bytes: 64 * 1024,
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+        self.max_output_bytes = max_output_bytes;
+        self
+    }
+
+    pub fn with_env_allowlist<I, S>(mut self, allowlist: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.env_allowlist = allowlist.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_env_override(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env_overrides.insert(key.into(), value.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CapturedStream {
+    text: String,
+    original_bytes: usize,
+    retained_bytes: usize,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessExecutionOutcome {
+    status: ToolResultStatus,
+    summary: String,
+    exit_code: Option<i64>,
+    duration_ms: i64,
+    stdout: CapturedStream,
+    stderr: CapturedStream,
+    timed_out: bool,
+}
+
+fn capture_text_output(bytes: Vec<u8>, max_output_bytes: usize) -> CapturedStream {
+    let original_bytes = bytes.len();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let text_bytes = text.len();
+    if text_bytes <= max_output_bytes {
+        return CapturedStream {
+            text,
+            original_bytes,
+            retained_bytes: text_bytes,
+            truncated: false,
+        };
+    }
+
+    let retained = truncate_utf8_to_byte_boundary(&text, max_output_bytes).to_string();
+    CapturedStream {
+        retained_bytes: retained.len(),
+        text: retained,
+        original_bytes,
+        truncated: true,
+    }
+}
+
+fn read_child_stream(
+    handle: Option<impl Read + Send + 'static>,
+) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut reader) = handle {
+            reader.read_to_end(&mut bytes)?;
+        }
+        Ok(bytes)
+    })
+}
+
+fn wait_for_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> io::Result<(Option<std::process::ExitStatus>, bool)> {
+    let start = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok((Some(status), false));
+        }
+
+        if start.elapsed() >= timeout {
+            child.kill()?;
+            let status = child.wait()?;
+            return Ok((Some(status), true));
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn execute_explicit_argv_process(
+    repository_root: &Path,
+    cwd_request: &str,
+    argv: &[String],
+    env_allowlist: &HashSet<String>,
+    env_overrides: &HashMap<String, String>,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<ProcessExecutionOutcome, String> {
+    if argv.is_empty() {
+        return Err("argv must not be empty".to_string());
+    }
+
+    let canonical_cwd = canonicalize_within_scope(repository_root, Path::new(cwd_request))
+        .map_err(|error| format!("cwd rejected: {error}"))?;
+
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    command.current_dir(&canonical_cwd.canonical);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.env_clear();
+
+    let current_env: HashMap<String, String> = std::env::vars().collect();
+    for key in env_allowlist {
+        if let Some(value) = current_env.get(key) {
+            command.env(key, value);
+        }
+    }
+    for (key, value) in env_overrides {
+        command.env(key, value);
+    }
+
+    let start = Instant::now();
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn process: {error}"))?;
+    let stdout_handle = read_child_stream(child.stdout.take());
+    let stderr_handle = read_child_stream(child.stderr.take());
+    let (status, timed_out) = wait_for_child(&mut child, timeout)
+        .map_err(|error| format!("process wait failed: {error}"))?;
+    let stdout_bytes = stdout_handle
+        .join()
+        .map_err(|_| "stdout reader thread panicked".to_string())?
+        .map_err(|error| format!("stdout read failed: {error}"))?;
+    let stderr_bytes = stderr_handle
+        .join()
+        .map_err(|_| "stderr reader thread panicked".to_string())?
+        .map_err(|error| format!("stderr read failed: {error}"))?;
+
+    let stdout = capture_text_output(stdout_bytes, max_output_bytes);
+    let stderr = capture_text_output(stderr_bytes, max_output_bytes);
+    let duration_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    let exit_code = status.and_then(|exit_status| exit_status.code().map(i64::from));
+
+    let mut summary = match (timed_out, exit_code) {
+        (true, _) => format!("process timed out after {} ms", duration_ms),
+        (false, Some(0)) => format!("process exited successfully after {} ms", duration_ms),
+        (false, Some(code)) => {
+            format!("process exited with code {} after {} ms", code, duration_ms)
+        }
+        (false, None) => format!(
+            "process terminated without exit code after {} ms",
+            duration_ms
+        ),
+    };
+    summary.push_str(&format!(" in {}", canonical_cwd.display_path()));
+
+    let status = if timed_out {
+        ToolResultStatus::TimedOut
+    } else if exit_code == Some(0) {
+        ToolResultStatus::Succeeded
+    } else {
+        ToolResultStatus::Failed
+    };
+
+    Ok(ProcessExecutionOutcome {
+        status,
+        summary,
+        exit_code,
+        duration_ms,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+impl crate::runtime::RuntimeTool for ProcExecTool {
+    fn tool_id(&self) -> &'static str {
+        "proc.exec"
+    }
+
+    fn requested_capability(&self) -> &'static str {
+        "process.exec"
+    }
+
+    fn declared_effect(&self) -> &'static str {
+        "run an explicit argv process within the registered repository scope"
+    }
+
+    fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+        let mut parts = vec![
+            format!("cwd={}", request.resource_scope.value),
+            format!("argv={:?}", self.argv),
+            format!("timeout={}ms", self.timeout.as_millis()),
+            format!("max_output_bytes={}", self.max_output_bytes),
+        ];
+
+        let mut allowlist: Vec<_> = self.env_allowlist.iter().cloned().collect();
+        allowlist.sort();
+        if !allowlist.is_empty() {
+            parts.push(format!("env_allowlist=[{}]", allowlist.join(",")));
+        }
+
+        let mut overrides: Vec<_> = self.env_overrides.keys().cloned().collect();
+        overrides.sort();
+        if !overrides.is_empty() {
+            parts.push(format!("env_overrides=[{}]", overrides.join(",")));
+        }
+
+        parts.join(" ")
+    }
+
+    fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
+        resolved_path_for_request(&self.repository_root, request)
+    }
+
+    fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
+        let schema_ref = "tool_result.proc.exec.v1";
+        let outcome = match execute_explicit_argv_process(
+            &self.repository_root,
+            &request.resource_scope.value,
+            &self.argv,
+            &self.env_allowlist,
+            &self.env_overrides,
+            self.timeout,
+            self.max_output_bytes,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "process execution failed".to_string(),
+                    error,
+                );
+            }
+        };
+
+        let mut truncation_reasons = Vec::new();
+        if outcome.stdout.truncated {
+            truncation_reasons.push(format!(
+                "stdout truncated at {} bytes",
+                self.max_output_bytes
+            ));
+        }
+        if outcome.stderr.truncated {
+            truncation_reasons.push(format!(
+                "stderr truncated at {} bytes",
+                self.max_output_bytes
+            ));
+        }
+        let truncation = if truncation_reasons.is_empty() {
+            None
+        } else {
+            Some(TruncationMetadata {
+                original_bytes: (outcome.stdout.original_bytes + outcome.stderr.original_bytes)
+                    as u64,
+                retained_bytes: (outcome.stdout.retained_bytes + outcome.stderr.retained_bytes)
+                    as u64,
+                reason: truncation_reasons.join("; "),
+            })
+        };
+
+        let mut fields = vec![
+            ToolResultField {
+                key: "summary".to_string(),
+                value: StructuredValue::String(outcome.summary),
+            },
+            ToolResultField {
+                key: "cwd".to_string(),
+                value: StructuredValue::String(request.resource_scope.value.clone()),
+            },
+            ToolResultField {
+                key: "argv".to_string(),
+                value: StructuredValue::StringList(self.argv.clone()),
+            },
+            ToolResultField {
+                key: "status".to_string(),
+                value: StructuredValue::String(
+                    match outcome.status {
+                        ToolResultStatus::Succeeded => "succeeded",
+                        ToolResultStatus::Failed => "failed",
+                        ToolResultStatus::Canceled => "canceled",
+                        ToolResultStatus::TimedOut => "timed_out",
+                    }
+                    .to_string(),
+                ),
+            },
+            ToolResultField {
+                key: "duration_ms".to_string(),
+                value: StructuredValue::Integer(outcome.duration_ms),
+            },
+            ToolResultField {
+                key: "stdout".to_string(),
+                value: StructuredValue::String(outcome.stdout.text),
+            },
+            ToolResultField {
+                key: "stdout_bytes".to_string(),
+                value: StructuredValue::Integer(outcome.stdout.original_bytes as i64),
+            },
+            ToolResultField {
+                key: "stdout_retained_bytes".to_string(),
+                value: StructuredValue::Integer(outcome.stdout.retained_bytes as i64),
+            },
+            ToolResultField {
+                key: "stdout_truncated".to_string(),
+                value: StructuredValue::Bool(outcome.stdout.truncated),
+            },
+            ToolResultField {
+                key: "stderr".to_string(),
+                value: StructuredValue::String(outcome.stderr.text),
+            },
+            ToolResultField {
+                key: "stderr_bytes".to_string(),
+                value: StructuredValue::Integer(outcome.stderr.original_bytes as i64),
+            },
+            ToolResultField {
+                key: "stderr_retained_bytes".to_string(),
+                value: StructuredValue::Integer(outcome.stderr.retained_bytes as i64),
+            },
+            ToolResultField {
+                key: "stderr_truncated".to_string(),
+                value: StructuredValue::Bool(outcome.stderr.truncated),
+            },
+        ];
+
+        if let Some(exit_code) = outcome.exit_code {
+            fields.push(ToolResultField {
+                key: "exit_code".to_string(),
+                value: StructuredValue::Integer(exit_code),
+            });
+        }
+        fields.push(ToolResultField {
+            key: "timed_out".to_string(),
+            value: StructuredValue::Bool(outcome.timed_out),
+        });
+
+        make_tool_result(
+            invocation,
+            outcome.status,
+            schema_ref,
+            fields,
             truncation,
             Vec::new(),
         )
@@ -4216,6 +4607,121 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    // -- ProcExecTool tests --
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_runs_successfully_with_repo_scoped_cwd() {
+        let env = TestEnv::new("proc-success");
+        env.create_dir("subdir");
+
+        let tool = ProcExecTool::new(&env.root, vec!["pwd".to_string()]);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("subdir");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            Some("tool_result.proc.exec.v1".to_string()),
+            result.schema_ref
+        );
+        let stdout = result.fields.iter().find(|f| f.key == "stdout").unwrap();
+        let stdout_value = string_value(&stdout.value).trim_end_matches('\n');
+        assert_eq!(env.root.join("subdir").to_string_lossy(), stdout_value);
+        let exit_code = result.fields.iter().find(|f| f.key == "exit_code").unwrap();
+        assert_eq!(0, integer_value(&exit_code.value));
+        let cwd = result.fields.iter().find(|f| f.key == "cwd").unwrap();
+        assert_eq!("subdir", string_value(&cwd.value));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_reports_nonzero_exit() {
+        let env = TestEnv::new("proc-nonzero");
+
+        let tool = ProcExecTool::new(&env.root, vec!["false".to_string()]);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let exit_code = result.fields.iter().find(|f| f.key == "exit_code").unwrap();
+        assert_eq!(1, integer_value(&exit_code.value));
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        assert!(string_value(&summary.value).contains("exited with code 1"));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_times_out() {
+        let env = TestEnv::new("proc-timeout");
+
+        let tool = ProcExecTool::new(&env.root, vec!["sleep".to_string(), "2".to_string()])
+            .with_timeout(Duration::from_millis(50));
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::TimedOut, result.status);
+        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
+        assert_eq!(StructuredValue::Bool(true), timed_out.value);
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        assert!(string_value(&summary.value).contains("timed out"));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_rejects_cwd_escape() {
+        let env = TestEnv::new("proc-cwd-escape");
+
+        let tool = ProcExecTool::new(&env.root, vec!["pwd".to_string()]);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("../../etc");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("cwd rejected"));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_truncates_output_at_max_bytes() {
+        let env = TestEnv::new("proc-output-bounds");
+
+        let tool = ProcExecTool::new(
+            &env.root,
+            vec![
+                "printf".to_string(),
+                "%s".to_string(),
+                "abcdefghij".to_string(),
+            ],
+        )
+        .with_max_output_bytes(4);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let stdout = result.fields.iter().find(|f| f.key == "stdout").unwrap();
+        assert_eq!("abcd", string_value(&stdout.value));
+        let stdout_truncated = result
+            .fields
+            .iter()
+            .find(|f| f.key == "stdout_truncated")
+            .unwrap();
+        assert_eq!(StructuredValue::Bool(true), stdout_truncated.value);
+        let trunc = result.truncation.unwrap();
+        assert!(trunc.reason.contains("stdout truncated at 4 bytes"));
+        assert_eq!(10, trunc.original_bytes);
+        assert_eq!(4, trunc.retained_bytes);
+        env.cleanup();
+    }
+
     // -- FsPatchTool tests --
 
     #[test]
@@ -4378,8 +4884,6 @@ mod tests {
         assert_eq!(io::ErrorKind::FileTooLarge, err.kind());
         env.cleanup();
     }
-
-    // -- Rendering compatibility --
 
     #[test]
     fn read_tool_results_render_in_all_formats() {
