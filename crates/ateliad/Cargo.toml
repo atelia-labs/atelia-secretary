@@ -8,6 +8,13 @@ repository.workspace = true
 [dependencies]
 anyhow = "1"
 atelia-core = { path = "../atelia-core" }
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tower = { version = "0.5", features = ["util"] }
