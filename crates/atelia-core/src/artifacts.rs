@@ -418,16 +418,20 @@ impl LocalArtifactStore {
                         });
                     }
 
-                    if validate_record_path(&self.config.root_dir, &scope, &record.id, &record.path)
-                    {
+                    if let Some(candidate_path) = validate_record_path(
+                        &self.config.root_dir,
+                        &scope,
+                        &record.id,
+                        &record.path,
+                    ) {
                         let output_ref = OutputRef {
                             id: record.id.clone(),
-                            uri: record.path.clone(),
+                            uri: candidate_path.to_string_lossy().into_owned(),
                             media_type: record.media_type.clone(),
                             label: record.label.clone(),
                             digest: None,
                         };
-                        deletions.push((output_ref, Path::new(&record.path).to_path_buf()));
+                        deletions.push((output_ref, candidate_path));
                     }
                 }
 
@@ -648,7 +652,7 @@ impl ScopeIndexGuard {
                 .truncate(false)
                 .open(&lock_path)?;
             let fd = file.as_raw_fd();
-            let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            let result = unsafe { libc::flock(fd, libc::LOCK_EX) };
             if result != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -663,20 +667,43 @@ impl ScopeIndexGuard {
 
         #[cfg(not(unix))]
         {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(_) => Ok(Self { lock_path }),
-                Err(e) => Err(io::Error::new(
-                    e.kind(),
-                    format!(
-                        "failed to acquire scope index lock at {}: {e}",
-                        lock_path.display()
-                    ),
-                )),
+            const LOCK_RETRY_ATTEMPTS: usize = 8;
+            let mut backoff = Duration::from_millis(5);
+
+            for attempt in 0..LOCK_RETRY_ATTEMPTS {
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_path)
+                {
+                    Ok(_) => return Ok(Self { lock_path }),
+                    Err(e)
+                        if e.kind() == ErrorKind::AlreadyExists
+                            && attempt + 1 < LOCK_RETRY_ATTEMPTS =>
+                    {
+                        std::thread::sleep(backoff);
+                        let next_backoff_ms = (backoff.as_millis() as u64).saturating_mul(2);
+                        backoff = Duration::from_millis(next_backoff_ms);
+                    }
+                    Err(e) => {
+                        return Err(io::Error::new(
+                            e.kind(),
+                            format!(
+                                "failed to acquire scope index lock at {}: {e}",
+                                lock_path.display()
+                            ),
+                        ));
+                    }
+                }
             }
+
+            Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                format!(
+                    "failed to acquire scope index lock at {}: lock is held",
+                    lock_path.display()
+                ),
+            ))
         }
     }
 }
@@ -1031,33 +1058,47 @@ fn validate_record_path(
     sanitized_scope: &str,
     record_id: &OutputRefId,
     record_path: &str,
-) -> bool {
+) -> Option<PathBuf> {
     let path = Path::new(record_path);
-
-    let file_name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(name) => name,
-        None => return false,
-    };
-
-    if file_name == DEFAULT_ARTIFACT_INDEX_FILE {
-        return false;
-    }
-
-    if !file_name.starts_with(record_id.as_str()) {
-        return false;
-    }
 
     let expected_scope_dir = root_dir.join(sanitized_scope);
     let canonical_scope_dir = match expected_scope_dir.canonicalize() {
         Ok(dir) => dir,
-        Err(_) => return false,
-    };
-    let canonical_path = match path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
-    canonical_path.starts_with(&canonical_scope_dir)
+    let scope_relative_path = match path.strip_prefix(&canonical_scope_dir) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => match path.file_name() {
+            Some(file_name) => PathBuf::from(file_name),
+            None => return None,
+        },
+    };
+
+    let candidate_path = canonical_scope_dir.join(scope_relative_path);
+    let candidate_file_name = candidate_path.file_name().and_then(|name| name.to_str())?;
+
+    if candidate_file_name == DEFAULT_ARTIFACT_INDEX_FILE {
+        return None;
+    }
+
+    if !candidate_file_name.starts_with(record_id.as_str()) {
+        return None;
+    }
+
+    let canonical_parent = match path.parent() {
+        Some(parent) => match parent.canonicalize() {
+            Ok(dir) => dir,
+            Err(_) => return None,
+        },
+        None => canonical_scope_dir.clone(),
+    };
+
+    if !canonical_parent.starts_with(&canonical_scope_dir) {
+        return None;
+    }
+
+    Some(candidate_path)
 }
 
 fn sanitize_segment(value: &str) -> ArtifactResult<String> {
@@ -1095,6 +1136,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(name: &str) -> PathBuf {
@@ -1103,6 +1146,13 @@ mod tests {
             .unwrap()
             .as_nanos();
         env::temp_dir().join(format!("atelia-artifacts-{name}-{unique}"))
+    }
+
+    #[cfg(unix)]
+    fn make_scope_dir_read_only(scope_dir: &Path) {
+        let mut permissions = fs::metadata(scope_dir).unwrap().permissions();
+        permissions.set_mode(0o500);
+        fs::set_permissions(scope_dir, permissions).unwrap();
     }
 
     #[cfg(unix)]
@@ -1327,6 +1377,55 @@ mod tests {
         );
         assert_eq!(reference.id, records[0].id);
         assert!(!Path::new(&reference.uri).exists());
+    }
+
+    #[test]
+    fn safe_expire_artifact_records_counts_missing_files() {
+        let root = temp_root("expire-missing");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let record_id = OutputRefId::new();
+        let missing_path = scope_dir.join(format!("{}.artifact", record_id.as_str()));
+        let record = LocalArtifactRecord {
+            id: record_id.clone(),
+            scope: "repo_example".to_string(),
+            project_id: None,
+            repository_id: None,
+            path: missing_path.to_string_lossy().into_owned(),
+            uri: missing_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("missing".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+        store.write_scope_records(&scope_dir, vec![record]).unwrap();
+
+        let report = store
+            .safe_expire_artifact_records(
+                None,
+                std::slice::from_ref(&record_id),
+                LedgerTimestamp::now(),
+                "retention policy",
+            )
+            .unwrap();
+
+        assert_eq!(1, report.requested);
+        assert_eq!(1, report.matched);
+        assert_eq!(1, report.tombstoned);
+        assert_eq!(0, report.deleted_files);
+        assert_eq!(1, report.missing_files);
+
+        let records = store.list_records(None).unwrap();
+        assert_eq!(1, records.len());
+        assert_eq!(
+            Some("retention policy"),
+            records[0].tombstone.as_ref().map(|t| t.reason.as_str())
+        );
+        assert!(!missing_path.exists());
     }
 
     #[test]
@@ -1754,6 +1853,35 @@ mod tests {
         assert!(Path::new(&forged_artifact).exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn safe_expire_artifact_records_tombstones_before_delete_on_index_failure() {
+        let root = temp_root("expire-rollback");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let reference = store
+            .write_bytes("repo_example", "search output", "text/plain", b"hello")
+            .unwrap();
+
+        let scope_dir = root.join("repo_example");
+        fs::write(scope_dir.join(".index.lock"), b"").unwrap();
+        make_scope_dir_read_only(&scope_dir);
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let error = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ArtifactError::Io(_)));
+        assert!(Path::new(&reference.uri).exists());
+        assert_eq!(None, store.list_records(None).unwrap()[0].tombstone);
+    }
+
+    #[cfg(not(unix))]
     #[test]
     fn safe_expire_artifact_records_tombstones_before_delete_on_index_failure() {
         let root = temp_root("expire-rollback");
@@ -1852,6 +1980,54 @@ mod tests {
         assert!(!retry_path.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_bytes_with_metadata_blocks_until_scope_lock_is_released() {
+        let root = temp_root("write-lock-held");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+        let held_lock = hold_index_lock(&scope_dir);
+
+        let started = Arc::new(Barrier::new(2));
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_started = Arc::clone(&started);
+        let worker_finished = Arc::clone(&finished);
+        let worker_store = store.clone();
+
+        let handle = std::thread::spawn(move || {
+            worker_started.wait();
+            let reference = worker_store
+                .write_bytes_with_metadata(
+                    "repo_example",
+                    "search output",
+                    "text/plain",
+                    b"hello",
+                    ArtifactWriteMetadata::default(),
+                )
+                .unwrap();
+            worker_finished.store(true, AtomicOrdering::SeqCst);
+            reference
+        });
+
+        started.wait();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!finished.load(AtomicOrdering::SeqCst));
+
+        drop(held_lock);
+        let reference = handle.join().unwrap();
+        assert!(Path::new(&reference.uri).exists());
+
+        let remaining_entries: Vec<_> = fs::read_dir(&scope_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(remaining_entries
+            .iter()
+            .any(|entry| entry.to_string_lossy() == ".index.lock"));
+    }
+
+    #[cfg(not(unix))]
     #[test]
     fn write_bytes_with_metadata_cleans_up_when_scope_lock_is_held() {
         let root = temp_root("write-lock-held");
@@ -1880,6 +2056,43 @@ mod tests {
             .collect();
         assert_eq!(1, remaining_entries.len());
         assert_eq!(".index.lock", remaining_entries[0].to_string_lossy());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn write_bytes_with_metadata_retries_until_scope_lock_is_released() {
+        let root = temp_root("write-lock-retry");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let lock_path = scope_dir.join(".index.lock");
+        fs::write(&lock_path, b"").unwrap();
+
+        let remover = {
+            let lock_path = lock_path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(25));
+                let _ = fs::remove_file(lock_path);
+            })
+        };
+
+        let reference = store
+            .write_bytes_with_metadata(
+                "repo_example",
+                "search output",
+                "text/plain",
+                b"hello",
+                ArtifactWriteMetadata::default(),
+            )
+            .unwrap();
+
+        remover.join().unwrap();
+        assert!(Path::new(&reference.uri).exists());
+        assert!(
+            !lock_path.exists(),
+            "lock file should be removed after the guard drops"
+        );
     }
 
     #[test]
@@ -1959,6 +2172,58 @@ mod tests {
         assert!(!retry_path.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn safe_expire_artifact_records_tombstones_for_earlier_scopes_are_not_orphaned_on_later_failure(
+    ) {
+        let root = temp_root("expire-multi-scope-rollback");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let retained_ref = store
+            .write_bytes("scope_a", "search output", "text/plain", b"retained")
+            .unwrap();
+        let failed_ref = store
+            .write_bytes("scope_z", "search output", "text/plain", b"failed")
+            .unwrap();
+
+        let failing_scope_dir = root.join("scope_z");
+        fs::write(failing_scope_dir.join(".index.lock"), b"").unwrap();
+        make_scope_dir_read_only(&failing_scope_dir);
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let error = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ArtifactError::Io(_)));
+        assert!(!Path::new(&retained_ref.uri).exists());
+        assert!(Path::new(&failed_ref.uri).exists());
+
+        let records = store.list_records(None).unwrap();
+        let retained_record = records
+            .iter()
+            .find(|record| record.id == retained_ref.id)
+            .expect("retained scope record should remain indexed");
+        let failed_record = records
+            .iter()
+            .find(|record| record.id == failed_ref.id)
+            .expect("failed scope record should remain indexed");
+
+        assert_eq!(
+            Some("retention policy"),
+            retained_record
+                .tombstone
+                .as_ref()
+                .map(|t| t.reason.as_str())
+        );
+        assert_eq!(None, failed_record.tombstone);
+    }
+
+    #[cfg(not(unix))]
     #[test]
     fn safe_expire_artifact_records_tombstones_for_earlier_scopes_are_not_orphaned_on_later_failure(
     ) {
