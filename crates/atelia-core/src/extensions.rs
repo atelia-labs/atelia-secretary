@@ -903,6 +903,46 @@ impl ExtensionRegistry {
         self.records.get(extension_id)?.get(version).cloned()
     }
 
+    pub fn extension_status(&self, extension_id: &str) -> RegistryResult<ExtensionStatusSnapshot> {
+        let manifest =
+            self.active_manifest(extension_id)
+                .ok_or_else(|| RegistryError::NotInstalled {
+                    extension_id: extension_id.to_string(),
+                })?;
+        let mut record =
+            self.active_record(extension_id)
+                .ok_or_else(|| RegistryError::NotInstalled {
+                    extension_id: extension_id.to_string(),
+                })?;
+        let block = self
+            .find_blocklist_hit(manifest)
+            .map(|entry| ExtensionBlocklistMatch {
+                reason: entry.reason,
+                key: entry.key.clone(),
+            });
+
+        if block.is_some() {
+            record.status = ExtensionInstallStatus::Blocked;
+        }
+
+        Ok(ExtensionStatusSnapshot {
+            extension_id: extension_id.to_string(),
+            record,
+            block,
+        })
+    }
+
+    pub fn list_extension_statuses(&self) -> RegistryResult<Vec<ExtensionStatusSnapshot>> {
+        self.active_versions
+            .keys()
+            .map(|extension_id| self.extension_status(extension_id))
+            .collect()
+    }
+
+    pub fn blocklist_entries(&self) -> Vec<BlocklistEntry> {
+        self.blocklist.clone()
+    }
+
     pub fn authorize_service_call(
         &self,
         request: ServiceCallRequest,
@@ -1000,6 +1040,12 @@ impl ExtensionRegistry {
         self.manifests.get(extension_id)?.get(version)
     }
 
+    fn find_blocklist_hit(&self, manifest: &ExtensionManifest) -> Option<&BlocklistEntry> {
+        self.blocklist
+            .iter()
+            .find(|entry| entry.matches_manifest(manifest))
+    }
+
     fn ensure_same_version_digest_is_stable(
         &self,
         manifest: &ExtensionManifest,
@@ -1025,11 +1071,7 @@ impl ExtensionRegistry {
     }
 
     fn ensure_not_blocked(&self, manifest: &ExtensionManifest) -> RegistryResult<()> {
-        if let Some(entry) = self
-            .blocklist
-            .iter()
-            .find(|entry| entry.matches_manifest(manifest))
-        {
+        if let Some(entry) = self.find_blocklist_hit(manifest) {
             return Err(RegistryError::Blocked {
                 extension_id: manifest.id.clone(),
                 reason: entry.reason,
@@ -1038,6 +1080,227 @@ impl ExtensionRegistry {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionBlocklistMatch {
+    pub reason: BlockReason,
+    pub key: BlockKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionStatusSnapshot {
+    pub extension_id: String,
+    pub record: ExtensionInstallRecord,
+    pub block: Option<ExtensionBlocklistMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstallExtensionRequest {
+    pub manifest: ExtensionManifest,
+    #[serde(default)]
+    pub approve_local_unsigned: bool,
+    #[serde(default)]
+    pub allow_local_process_runtime: bool,
+}
+
+impl InstallExtensionRequest {
+    pub fn with_defaults(manifest: ExtensionManifest) -> Self {
+        Self {
+            manifest,
+            approve_local_unsigned: false,
+            allow_local_process_runtime: false,
+        }
+    }
+}
+
+impl From<InstallExtensionRequest> for InstallOptions {
+    fn from(request: InstallExtensionRequest) -> Self {
+        Self::from(&request)
+    }
+}
+
+impl From<&InstallExtensionRequest> for InstallOptions {
+    fn from(request: &InstallExtensionRequest) -> Self {
+        let mut options = InstallOptions::default();
+        if request.approve_local_unsigned {
+            options = options.approve_local_unsigned();
+        }
+        if request.allow_local_process_runtime {
+            options = options.allow_local_process_runtime();
+        }
+        options
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstallExtensionResponse {
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionStatusRequest {
+    pub extension_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionStatusResponse {
+    pub extension_id: String,
+    pub record: Option<ExtensionInstallRecord>,
+    pub block: Option<ExtensionBlocklistMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListExtensionsRequest {
+    #[serde(default = "ListExtensionsRequest::default_include_blocked")]
+    pub include_blocked: bool,
+}
+
+impl ListExtensionsRequest {
+    fn default_include_blocked() -> bool {
+        true
+    }
+}
+
+impl Default for ListExtensionsRequest {
+    fn default() -> Self {
+        Self {
+            include_blocked: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListExtensionsResponse {
+    pub extensions: Vec<ExtensionStatusResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RollbackExtensionRequest {
+    pub extension_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RollbackExtensionResponse {
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplyBlocklistRequest {
+    pub entry: BlocklistEntry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplyBlocklistResponse {
+    pub entry: BlocklistEntry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListBlocklistRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListBlocklistResponse {
+    pub entries: Vec<BlocklistEntry>,
+}
+
+pub struct ExtensionRegistryService {
+    registry: ExtensionRegistry,
+}
+
+impl ExtensionRegistryService {
+    pub fn new() -> Self {
+        Self {
+            registry: ExtensionRegistry::in_memory(),
+        }
+    }
+
+    pub fn with_registry(registry: ExtensionRegistry) -> Self {
+        Self { registry }
+    }
+
+    pub fn install_extension(
+        &mut self,
+        request: InstallExtensionRequest,
+    ) -> RegistryResult<InstallExtensionResponse> {
+        let options = InstallOptions::from(&request);
+        let record = self
+            .registry
+            .install(request.manifest, options)
+            .map(|record| InstallExtensionResponse { record })?;
+        Ok(record)
+    }
+
+    pub fn extension_status(
+        &self,
+        request: ExtensionStatusRequest,
+    ) -> RegistryResult<ExtensionStatusResponse> {
+        self.registry
+            .extension_status(&request.extension_id)
+            .map(|status| status.into())
+    }
+
+    pub fn list_extensions(
+        &self,
+        request: ListExtensionsRequest,
+    ) -> RegistryResult<ListExtensionsResponse> {
+        let mut extensions: Vec<ExtensionStatusResponse> = self
+            .registry
+            .list_extension_statuses()?
+            .into_iter()
+            .map(ExtensionStatusSnapshot::into)
+            .collect();
+
+        if !request.include_blocked {
+            extensions.retain(|snapshot| snapshot.block.is_none());
+        }
+
+        Ok(ListExtensionsResponse { extensions })
+    }
+
+    pub fn rollback_extension(
+        &mut self,
+        request: RollbackExtensionRequest,
+    ) -> RegistryResult<RollbackExtensionResponse> {
+        let record = self
+            .registry
+            .rollback(&request.extension_id)
+            .map(|record| RollbackExtensionResponse { record })?;
+        Ok(record)
+    }
+
+    pub fn apply_blocklist(
+        &mut self,
+        request: ApplyBlocklistRequest,
+    ) -> RegistryResult<ApplyBlocklistResponse> {
+        let entry = request.entry;
+        self.registry.add_blocklist_entry(entry.clone())?;
+        Ok(ApplyBlocklistResponse { entry })
+    }
+
+    pub fn list_blocklist(
+        &self,
+        _request: ListBlocklistRequest,
+    ) -> RegistryResult<ListBlocklistResponse> {
+        Ok(ListBlocklistResponse {
+            entries: self.registry.blocklist_entries(),
+        })
+    }
+}
+
+impl Default for ExtensionRegistryService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<ExtensionStatusSnapshot> for ExtensionStatusResponse {
+    fn from(snapshot: ExtensionStatusSnapshot) -> Self {
+        Self {
+            extension_id: snapshot.extension_id,
+            record: Some(snapshot.record),
+            block: snapshot.block,
+        }
     }
 }
 
@@ -1798,5 +2061,227 @@ mod tests {
                 .version,
             "1.0.0"
         );
+    }
+
+    #[test]
+    fn extension_service_install_status_and_list_returns_installed_extensions() {
+        let mut service = ExtensionRegistryService::new();
+        service
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest("com.example.extension"),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .unwrap();
+        service
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest("com.example.other"),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .unwrap();
+
+        let status = service
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.extension".to_string(),
+            })
+            .unwrap();
+        let status_record = status.record.expect("status should include a record");
+        assert_eq!(status_record.version, "1.0.0");
+        assert_eq!(status_record.status, ExtensionInstallStatus::Installed);
+
+        let list = service
+            .list_extensions(ListExtensionsRequest::default())
+            .unwrap();
+        assert_eq!(list.extensions.len(), 2);
+
+        let ids: std::collections::HashSet<_> = list
+            .extensions
+            .iter()
+            .map(|entry| entry.extension_id.as_str())
+            .collect();
+        assert!(ids.contains("com.example.extension"));
+        assert!(ids.contains("com.example.other"));
+    }
+
+    #[test]
+    fn extension_service_rollback_restores_previous_extension_version() {
+        let mut service = ExtensionRegistryService::new();
+        service
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest("com.example.extension"),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .unwrap();
+
+        let mut updated = manifest("com.example.extension");
+        updated.version = "1.1.0".to_string();
+        updated.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        updated.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        service
+            .install_extension(InstallExtensionRequest {
+                manifest: updated,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .unwrap();
+
+        let rolled_back = service
+            .rollback_extension(RollbackExtensionRequest {
+                extension_id: "com.example.extension".to_string(),
+            })
+            .unwrap();
+        assert_eq!(rolled_back.record.version, "1.0.0");
+
+        let status = service
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.extension".to_string(),
+            })
+            .unwrap();
+        let status_record = status.record.expect("status should include a record");
+        assert_eq!(status_record.version, "1.0.0");
+        assert_eq!(
+            status_record.status,
+            ExtensionInstallStatus::InstalledPreviousVersion
+        );
+    }
+
+    #[test]
+    fn extension_service_blocked_install_and_status_are_reported_explicitly() {
+        let mut service = ExtensionRegistryService::new();
+        service
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest("com.example.extension"),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .unwrap();
+
+        service
+            .apply_blocklist(ApplyBlocklistRequest {
+                entry: BlocklistEntry {
+                    key: BlockKey::ExtensionId("com.example.extension".to_string()),
+                    reason: BlockReason::ManifestMismatch,
+                    note: Some("policy update".to_string()),
+                },
+            })
+            .unwrap();
+
+        let err = service
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest("com.example.extension"),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::Blocked {
+                reason: BlockReason::ManifestMismatch,
+                ..
+            }
+        ));
+
+        let status = service
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.extension".to_string(),
+            })
+            .unwrap();
+        let status_record = status.record.expect("status should include a record");
+        let block = status.block.expect("status should expose block reason");
+
+        assert_eq!(status_record.status, ExtensionInstallStatus::Blocked);
+        assert_eq!(block.reason, BlockReason::ManifestMismatch);
+
+        let list = service
+            .list_extensions(ListExtensionsRequest::default())
+            .unwrap();
+        let listed_status = list
+            .extensions
+            .iter()
+            .find(|entry| entry.extension_id == "com.example.extension")
+            .and_then(|entry| entry.record.as_ref())
+            .expect("extension should still be listed");
+        assert_eq!(listed_status.status, ExtensionInstallStatus::Blocked);
+    }
+
+    #[test]
+    fn list_extensions_request_deserializes_missing_include_blocked_as_true() {
+        let request: ListExtensionsRequest = serde_json::from_str("{}").unwrap();
+
+        assert!(request.include_blocked);
+        assert_eq!(request, ListExtensionsRequest::default());
+    }
+
+    #[test]
+    fn list_extensions_request_deserializes_include_blocked_false() {
+        let request: ListExtensionsRequest =
+            serde_json::from_str("{\"include_blocked\":false}").unwrap();
+
+        assert!(!request.include_blocked);
+        assert_ne!(request, ListExtensionsRequest::default());
+
+        let mut service = ExtensionRegistryService::new();
+        service
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest("com.example.extension"),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .unwrap();
+        service
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest("com.example.other"),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+            })
+            .unwrap();
+
+        service
+            .apply_blocklist(ApplyBlocklistRequest {
+                entry: BlocklistEntry {
+                    key: BlockKey::ExtensionId("com.example.extension".to_string()),
+                    reason: BlockReason::PolicyViolation,
+                    note: None,
+                },
+            })
+            .unwrap();
+
+        let list = service.list_extensions(request).unwrap();
+        assert_eq!(list.extensions.len(), 1);
+        assert_eq!(list.extensions[0].extension_id, "com.example.other");
+    }
+
+    #[test]
+    fn install_extension_request_deserializes_manifest_only_with_false_defaults() {
+        let request: InstallExtensionRequest = serde_json::from_value(serde_json::json!({
+            "manifest": manifest("com.example.extension"),
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request,
+            InstallExtensionRequest::with_defaults(manifest("com.example.extension"))
+        );
+        assert_eq!(InstallOptions::from(request), InstallOptions::default());
+    }
+
+    #[test]
+    fn extension_service_blocklist_listing_works() {
+        let mut service = ExtensionRegistryService::new();
+        service
+            .apply_blocklist(ApplyBlocklistRequest {
+                entry: BlocklistEntry {
+                    key: BlockKey::PermissionPattern("test.*".to_string()),
+                    reason: BlockReason::PolicyViolation,
+                    note: None,
+                },
+            })
+            .unwrap();
+
+        let list = service.list_blocklist(ListBlocklistRequest {}).unwrap();
+        assert_eq!(list.entries.len(), 1);
+        assert_eq!(list.entries[0].reason, BlockReason::PolicyViolation);
     }
 }
