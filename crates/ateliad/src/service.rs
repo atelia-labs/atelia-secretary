@@ -7,7 +7,8 @@
 use atelia_core::{
     canonicalize_job_requested_capability, canonicalize_within_scope,
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
-    CancelJobReceipt, DefaultPolicyEngine, ExtensionRegistryService, ExtensionStatusRequest,
+    EventCursor, EventPage, EventQuery, ExtensionRegistryService, ExtensionStatusRequest,
+    CancelJobReceipt, DefaultPolicyEngine,
     ExtensionStatusResponse, InMemoryStore, InMemoryToolOutputSettingsService,
     InstallExtensionRequest, InstallExtensionResponse, JobId, JobKind, JobLifecycleService,
     JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest,
@@ -30,6 +31,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "health.v1",
     "repositories.v1",
     "jobs.v1",
+    "events.v1",
     "policy.v1",
     "extensions.registry.v1",
     "tool_output_settings.v1",
@@ -718,6 +720,26 @@ impl SecretaryService {
             .expect("cancellation requesters cache lock poisoned")
             .get(id)
             .cloned()
+    }
+
+    /// Query events with cursor, severity, and subject filters.
+    #[allow(dead_code)]
+    pub fn list_events_page(&self, query: EventQuery) -> ServiceResult<EventPage> {
+        Ok(self.lifecycle.runtime().store().query_job_events(query)?)
+    }
+
+    /// Replay events from a cursor for watch-style clients.
+    #[allow(dead_code)]
+    pub fn watch_events(
+        &self,
+        cursor: EventCursor,
+        limit: Option<usize>,
+    ) -> ServiceResult<Vec<atelia_core::JobEvent>> {
+        Ok(self
+            .lifecycle
+            .runtime()
+            .store()
+            .replay_job_events(cursor, limit)?)
     }
 
     /// Request cancellation for a queued/running job.

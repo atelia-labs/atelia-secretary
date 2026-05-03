@@ -3,6 +3,11 @@ use std::sync::Arc;
 
 use crate::rpc;
 use anyhow::{anyhow, Context, Result};
+use atelia_core::{
+    Actor, LedgerTimestamp, OutputFormat, OversizeOutputPolicy, ProjectId, RenderOptions,
+    RepositoryId, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
+    ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity,
+};
 use axum::{
     body::{to_bytes, Body},
     extract::{Request, State},
@@ -25,6 +30,11 @@ pub type RpcServerState = Arc<RwLock<rpc::SecretaryRpcServer>>;
 enum Route {
     Health,
     ListRepositories,
+    ListEvents,
+    ReplayEvents,
+    GetToolOutputDefaults,
+    UpdateToolOutputDefaults,
+    ListToolOutputSettingsHistory,
     InstallExtension,
     ListExtensions,
     ExtensionStatus { extension_id: String },
@@ -57,6 +67,11 @@ fn route_for_path(path: &str) -> Route {
     match path {
         "/v1/health" => Route::Health,
         "/v1/repositories:list" => Route::ListRepositories,
+        "/v1/events/list" => Route::ListEvents,
+        "/v1/events/replay" => Route::ReplayEvents,
+        "/v1/tool-output/settings/get" => Route::GetToolOutputDefaults,
+        "/v1/tool-output/settings/update" => Route::UpdateToolOutputDefaults,
+        "/v1/tool-output/settings/history:list" => Route::ListToolOutputSettingsHistory,
         "/v1/extensions/install" => Route::InstallExtension,
         "/v1/extensions/list" => Route::ListExtensions,
         "/v1/extensions/blocklist/apply" => Route::ApplyBlocklist,
@@ -131,6 +146,54 @@ struct ToolResultRefPayload {
 struct RenderToolOutputRequestPayload {
     tool_result: ToolResultRefPayload,
     format: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListEventsRequestPayload {
+    repository_id: Option<String>,
+    cursor: Option<EventCursorPayload>,
+    subject_ids: Option<Vec<String>>,
+    min_severity: Option<String>,
+    page_size: Option<usize>,
+    page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplayEventsRequestPayload {
+    repository_id: String,
+    cursor: Option<EventCursorPayload>,
+    subject_ids: Option<Vec<String>>,
+    min_severity: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetToolOutputDefaultsRequestPayload {
+    scope: ToolOutputSettingsScope,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateToolOutputDefaultsRequestPayload {
+    scope: ToolOutputSettingsScope,
+    actor: Actor,
+    reason: String,
+    overrides: ToolOutputOverrides,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListToolOutputSettingsHistoryRequestPayload {
+    scope: Option<ToolOutputSettingsScope>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum EventCursorPayload {
+    Beginning,
+    AfterSequence { sequence_number: u64 },
+    AfterEventId { event_id: String },
 }
 
 pub fn listen_addr() -> Result<(SocketAddr, bool)> {
@@ -210,6 +273,300 @@ fn parse_render_tool_output_payload(
     })
 }
 
+fn parse_event_cursor_payload(
+    payload: EventCursorPayload,
+) -> Result<rpc::EventCursorRequest, String> {
+    Ok(match payload {
+        EventCursorPayload::Beginning => rpc::EventCursorRequest::Beginning,
+        EventCursorPayload::AfterSequence { sequence_number } => {
+            rpc::EventCursorRequest::AfterSequence(sequence_number)
+        }
+        EventCursorPayload::AfterEventId { event_id } => {
+            rpc::EventCursorRequest::AfterEventId(event_id)
+        }
+    })
+}
+
+fn serialize_event_cursor_request(cursor: &rpc::EventCursorRequest) -> serde_json::Value {
+    match cursor {
+        rpc::EventCursorRequest::Beginning => serde_json::json!({
+            "kind": "beginning",
+        }),
+        rpc::EventCursorRequest::AfterSequence(sequence_number) => serde_json::json!({
+            "kind": "after_sequence",
+            "sequence_number": sequence_number,
+        }),
+        rpc::EventCursorRequest::AfterEventId(event_id) => serde_json::json!({
+            "kind": "after_event_id",
+            "event_id": event_id,
+        }),
+    }
+}
+
+fn parse_event_severity(value: Option<String>) -> Result<Option<rpc::RpcEventSeverity>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value.as_str() {
+        "debug" => Ok(Some(rpc::RpcEventSeverity::Debug)),
+        "info" => Ok(Some(rpc::RpcEventSeverity::Info)),
+        "warning" | "warn" => Ok(Some(rpc::RpcEventSeverity::Warning)),
+        "error" => Ok(Some(rpc::RpcEventSeverity::Error)),
+        unknown => Err(format!("unknown min_severity '{unknown}'")),
+    }
+}
+
+fn parse_list_events_payload(
+    payload: ListEventsRequestPayload,
+) -> Result<rpc::ListEventsRequest, String> {
+    Ok(rpc::ListEventsRequest {
+        repository_id: payload.repository_id,
+        cursor: match payload.cursor {
+            Some(cursor) => Some(parse_event_cursor_payload(cursor)?),
+            None => None,
+        },
+        subject_ids: payload.subject_ids.unwrap_or_default(),
+        min_severity: parse_event_severity(payload.min_severity)?,
+        page_size: payload.page_size,
+        page_token: payload.page_token,
+    })
+}
+
+fn parse_replay_events_payload(
+    payload: ReplayEventsRequestPayload,
+) -> Result<rpc::WatchEventsRequest, String> {
+    Ok(rpc::WatchEventsRequest {
+        repository_id: payload.repository_id,
+        cursor: match payload.cursor {
+            Some(cursor) => Some(parse_event_cursor_payload(cursor)?),
+            None => None,
+        },
+        subject_ids: payload.subject_ids.unwrap_or_default(),
+        min_severity: parse_event_severity(payload.min_severity)?,
+        limit: payload.limit,
+    })
+}
+
+fn core_tool_output_scope_to_rpc(scope: ToolOutputSettingsScope) -> rpc::RpcToolOutputScope {
+    let level = match scope.level {
+        atelia_core::ToolOutputSettingsLevel::Workspace => rpc::RpcToolOutputScopeLevel::Workspace,
+        atelia_core::ToolOutputSettingsLevel::Repository { repository_id } => {
+            rpc::RpcToolOutputScopeLevel::Repository {
+                repository_id: repository_id.as_str().to_string(),
+            }
+        }
+        atelia_core::ToolOutputSettingsLevel::Project { project_id } => {
+            rpc::RpcToolOutputScopeLevel::Project {
+                project_id: serde_json::to_string(&project_id)
+                    .unwrap_or_else(|_| "\"\"".to_string())
+                    .trim_matches('"')
+                    .to_string(),
+            }
+        }
+        atelia_core::ToolOutputSettingsLevel::Session { session_id } => {
+            rpc::RpcToolOutputScopeLevel::Session { session_id }
+        }
+        atelia_core::ToolOutputSettingsLevel::AgentProfile { agent_id } => {
+            rpc::RpcToolOutputScopeLevel::AgentProfile { agent_id }
+        }
+    };
+
+    rpc::RpcToolOutputScope {
+        level,
+        tool_id: scope.tool_id,
+    }
+}
+fn core_tool_output_overrides_to_rpc(
+    overrides: ToolOutputOverrides,
+) -> rpc::RpcToolOutputOverrides {
+    rpc::RpcToolOutputOverrides {
+        format: overrides.format.map(rpc::RpcOutputFormat::from),
+        include_policy: overrides.include_policy,
+        include_diagnostics: overrides.include_diagnostics,
+        include_cost: overrides.include_cost,
+        max_inline_bytes: overrides.max_inline_bytes,
+        max_inline_lines: overrides.max_inline_lines,
+        verbosity: overrides.verbosity.map(rpc::RpcToolOutputVerbosity::from),
+        granularity: overrides
+            .granularity
+            .map(rpc::RpcToolOutputGranularity::from),
+        oversize_policy: overrides
+            .oversize_policy
+            .map(rpc::RpcOversizeOutputPolicy::from),
+    }
+}
+
+fn rpc_tool_output_scope_to_core(scope: &rpc::RpcToolOutputScope) -> ToolOutputSettingsScope {
+    let level = match &scope.level {
+        rpc::RpcToolOutputScopeLevel::Workspace => atelia_core::ToolOutputSettingsLevel::Workspace,
+        rpc::RpcToolOutputScopeLevel::Repository { repository_id } => {
+            atelia_core::ToolOutputSettingsLevel::Repository {
+                repository_id: serde_json::from_str::<RepositoryId>(&format!(
+                    "\"{repository_id}\""
+                ))
+                .unwrap_or_else(|_| RepositoryId::new()),
+            }
+        }
+        rpc::RpcToolOutputScopeLevel::Project { project_id } => {
+            atelia_core::ToolOutputSettingsLevel::Project {
+                project_id: serde_json::from_str::<ProjectId>(&format!("\"{project_id}\""))
+                    .unwrap_or_else(|_| ProjectId::new()),
+            }
+        }
+        rpc::RpcToolOutputScopeLevel::Session { session_id } => {
+            atelia_core::ToolOutputSettingsLevel::Session {
+                session_id: session_id.clone(),
+            }
+        }
+        rpc::RpcToolOutputScopeLevel::AgentProfile { agent_id } => {
+            atelia_core::ToolOutputSettingsLevel::AgentProfile {
+                agent_id: agent_id.clone(),
+            }
+        }
+    };
+
+    ToolOutputSettingsScope {
+        level,
+        tool_id: scope.tool_id.clone(),
+    }
+}
+
+fn rpc_render_options_to_core(render_options: &rpc::RpcToolOutputRenderOptions) -> RenderOptions {
+    RenderOptions {
+        format: rpc_output_format_to_core(&render_options.format),
+        include_policy: render_options.include_policy,
+        include_diagnostics: render_options.include_diagnostics,
+        include_cost: render_options.include_cost,
+    }
+}
+
+fn rpc_defaults_to_core(defaults: &rpc::RpcToolOutputDefaults) -> ToolOutputDefaults {
+    ToolOutputDefaults {
+        render_options: rpc_render_options_to_core(&defaults.render_options),
+        max_inline_bytes: defaults.max_inline_bytes,
+        max_inline_lines: defaults.max_inline_lines,
+        verbosity: rpc_tool_output_verbosity_to_core(&defaults.verbosity),
+        granularity: rpc_tool_output_granularity_to_core(&defaults.granularity),
+        oversize_policy: rpc_oversize_policy_to_core(&defaults.oversize_policy),
+    }
+}
+
+fn rpc_change_to_core(change: &rpc::RpcToolOutputSettingsChange) -> ToolOutputSettingsChange {
+    ToolOutputSettingsChange {
+        schema_version: change.schema_version,
+        actor: rpc_actor_to_core(&change.actor),
+        scope: rpc_tool_output_scope_to_core(&change.scope),
+        old_defaults: rpc_defaults_to_core(&change.old_defaults),
+        new_defaults: rpc_defaults_to_core(&change.new_defaults),
+        reason: change.reason.clone(),
+        changed_at: LedgerTimestamp::from_unix_millis(change.changed_at_unix_ms),
+    }
+}
+
+fn rpc_actor_to_core(actor: &rpc::RpcActorDto) -> Actor {
+    match actor {
+        rpc::RpcActorDto::User { id, display_name } => Actor::User {
+            id: id.clone(),
+            display_name: display_name.clone(),
+        },
+        rpc::RpcActorDto::Agent { id, display_name } => Actor::Agent {
+            id: id.clone(),
+            display_name: display_name.clone(),
+        },
+        rpc::RpcActorDto::Extension { id } => Actor::Extension { id: id.clone() },
+        rpc::RpcActorDto::System { id } => Actor::System { id: id.clone() },
+    }
+}
+
+fn rpc_output_format_to_core(format: &rpc::RpcOutputFormat) -> OutputFormat {
+    match format {
+        rpc::RpcOutputFormat::Toon => OutputFormat::Toon,
+        rpc::RpcOutputFormat::Json => OutputFormat::Json,
+        rpc::RpcOutputFormat::Text => OutputFormat::Text,
+    }
+}
+
+fn rpc_tool_output_verbosity_to_core(
+    verbosity: &rpc::RpcToolOutputVerbosity,
+) -> ToolOutputVerbosity {
+    match verbosity {
+        rpc::RpcToolOutputVerbosity::Minimal => ToolOutputVerbosity::Minimal,
+        rpc::RpcToolOutputVerbosity::Normal => ToolOutputVerbosity::Normal,
+        rpc::RpcToolOutputVerbosity::Expanded => ToolOutputVerbosity::Expanded,
+        rpc::RpcToolOutputVerbosity::Debug => ToolOutputVerbosity::Debug,
+    }
+}
+
+fn rpc_tool_output_granularity_to_core(
+    granularity: &rpc::RpcToolOutputGranularity,
+) -> ToolOutputGranularity {
+    match granularity {
+        rpc::RpcToolOutputGranularity::Summary => ToolOutputGranularity::Summary,
+        rpc::RpcToolOutputGranularity::KeyFields => ToolOutputGranularity::KeyFields,
+        rpc::RpcToolOutputGranularity::Full => ToolOutputGranularity::Full,
+    }
+}
+
+fn rpc_oversize_policy_to_core(policy: &rpc::RpcOversizeOutputPolicy) -> OversizeOutputPolicy {
+    match policy {
+        rpc::RpcOversizeOutputPolicy::TruncateWithMetadata => {
+            OversizeOutputPolicy::TruncateWithMetadata
+        }
+        rpc::RpcOversizeOutputPolicy::SpillToArtifactRef => {
+            OversizeOutputPolicy::SpillToArtifactRef
+        }
+        rpc::RpcOversizeOutputPolicy::RejectOversize => OversizeOutputPolicy::RejectOversize,
+    }
+}
+
+fn serialize_tool_output_defaults_response(
+    response: rpc::GetToolOutputDefaultsResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "scope": serde_json::to_value(rpc_tool_output_scope_to_core(&response.scope)).expect("tool output scope serialization"),
+        "defaults": serde_json::to_value(rpc_defaults_to_core(&response.defaults)).expect("tool output defaults serialization"),
+    })
+}
+
+fn serialize_tool_output_update_response(
+    response: rpc::UpdateToolOutputDefaultsResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "change": serialize_tool_output_change(&response.change),
+    })
+}
+
+fn serialize_tool_output_history_response(
+    response: rpc::ListToolOutputSettingsHistoryResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "changes": response
+            .changes
+            .iter()
+            .map(serialize_tool_output_change)
+            .collect::<Vec<_>>(),
+        "next_page_token": response.next_page_token,
+    })
+}
+
+fn serialize_tool_output_change(change: &rpc::RpcToolOutputSettingsChange) -> serde_json::Value {
+    let mut value =
+        serde_json::to_value(rpc_change_to_core(change)).expect("tool output change serialization");
+
+    if let serde_json::Value::Object(ref mut map) = value {
+        if let Some(serde_json::Value::Object(changed_at)) = map.remove("changed_at") {
+            if let Some(unix_millis) = changed_at.get("unix_millis").cloned() {
+                map.insert("changed_at_unix_ms".to_string(), unix_millis);
+            }
+        }
+    }
+
+    value
+}
 fn serialize_protocol_metadata(metadata: &rpc::ProtocolMetadata) -> serde_json::Value {
     serde_json::json!({
         "protocol_version": metadata.protocol_version,
@@ -374,6 +731,85 @@ fn serialize_render_tool_output_response(
     })
 }
 
+fn serialize_list_events_response(response: rpc::ListEventsResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "events": response
+            .events
+            .iter()
+            .map(serialize_event)
+            .collect::<Vec<_>>(),
+        "next_page_token": response.next_page_token,
+    })
+}
+
+fn serialize_replay_events_response(response: rpc::WatchEventsReplayResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "events": response
+            .events
+            .iter()
+            .map(serialize_event)
+            .collect::<Vec<_>>(),
+        "cursor": response.cursor.as_ref().map(serialize_event_cursor_request),
+    })
+}
+
+fn serialize_event(event: &rpc::RpcEvent) -> serde_json::Value {
+    serde_json::json!({
+        "event_id": event.event_id,
+        "sequence": event.sequence,
+        "occurred_at_unix_ms": event.occurred_at_unix_ms,
+        "subject": serialize_event_subject(&event.subject),
+        "kind": event.kind,
+        "severity": serialize_event_severity(&event.severity),
+        "message": event.message,
+        "refs": serialize_event_refs(&event.refs),
+    })
+}
+
+fn serialize_event_subject(subject: &rpc::RpcEventSubject) -> serde_json::Value {
+    serde_json::json!({
+        "type": serialize_event_subject_type(&subject.subject_type),
+        "id": subject.id,
+    })
+}
+
+fn serialize_event_subject_type(subject_type: &rpc::RpcEventSubjectType) -> &'static str {
+    match subject_type {
+        rpc::RpcEventSubjectType::Unspecified => "unspecified",
+        rpc::RpcEventSubjectType::Daemon => "daemon",
+        rpc::RpcEventSubjectType::Repository => "repository",
+        rpc::RpcEventSubjectType::Job => "job",
+        rpc::RpcEventSubjectType::PolicyDecision => "policy_decision",
+        rpc::RpcEventSubjectType::LockDecision => "lock_decision",
+        rpc::RpcEventSubjectType::ToolInvocation => "tool_invocation",
+        rpc::RpcEventSubjectType::ToolResult => "tool_result",
+        rpc::RpcEventSubjectType::AuditRecord => "audit_record",
+    }
+}
+
+fn serialize_event_severity(severity: &rpc::RpcEventSeverity) -> &'static str {
+    match severity {
+        rpc::RpcEventSeverity::Debug => "debug",
+        rpc::RpcEventSeverity::Info => "info",
+        rpc::RpcEventSeverity::Warning => "warning",
+        rpc::RpcEventSeverity::Error => "error",
+    }
+}
+
+fn serialize_event_refs(refs: &rpc::RpcEventRefs) -> serde_json::Value {
+    serde_json::json!({
+        "repository_id": refs.repository_id,
+        "job_id": refs.job_id,
+        "policy_decision_id": refs.policy_decision_id,
+        "lock_decision_id": refs.lock_decision_id,
+        "tool_invocation_id": refs.tool_invocation_id,
+        "tool_result_id": refs.tool_result_id,
+        "audit_ref": refs.audit_ref,
+    })
+}
+
 fn make_error_response(
     status_code: StatusCode,
     code: &'static str,
@@ -502,6 +938,190 @@ async fn dispatch_list_repositories(state: RpcServerState, request: Request<Body
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_list_repositories_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_list_events(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<ListEventsRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let parsed = match parse_list_events_payload(payload) {
+        Ok(request) => request,
+        Err(reason) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                reason,
+                false,
+                next_state,
+            );
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.list_events(parsed) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_list_events_response(response))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_replay_events(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<ReplayEventsRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let parsed = match parse_replay_events_payload(payload) {
+        Ok(request) => request,
+        Err(reason) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                reason,
+                false,
+                next_state,
+            );
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.watch_events(parsed) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_replay_events_response(response))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_get_tool_output_defaults(
+    state: RpcServerState,
+    request: Request<Body>,
+) -> Response {
+    let payload = match body_or_empty_json::<GetToolOutputDefaultsRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.get_tool_output_defaults(rpc::GetToolOutputDefaultsRequest {
+        scope: core_tool_output_scope_to_rpc(payload.scope),
+    }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_tool_output_defaults_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_update_tool_output_defaults(
+    state: RpcServerState,
+    request: Request<Body>,
+) -> Response {
+    let payload = match body_or_empty_json::<UpdateToolOutputDefaultsRequestPayload>(request).await
+    {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.update_tool_output_defaults(rpc::UpdateToolOutputDefaultsRequest {
+        scope: core_tool_output_scope_to_rpc(payload.scope),
+        actor: rpc::RpcActorDto::from(payload.actor),
+        reason: payload.reason,
+        overrides: core_tool_output_overrides_to_rpc(payload.overrides),
+    }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_tool_output_update_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_list_tool_output_settings_history(
+    state: RpcServerState,
+    request: Request<Body>,
+) -> Response {
+    let payload =
+        match body_or_empty_json::<ListToolOutputSettingsHistoryRequestPayload>(request).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                let rpc_server = state.read().await;
+                let next_state = rpc_next_state(&rpc_server);
+                return error.into_response(next_state);
+            }
+        };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.list_tool_output_settings_history(rpc::ListToolOutputSettingsHistoryRequest {
+        scope: payload.scope.map(core_tool_output_scope_to_rpc),
+        limit: payload.limit,
+        offset: payload.offset,
+        cursor: payload.cursor,
+    }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_tool_output_history_response(
                 response,
             ))),
         )
@@ -761,6 +1381,106 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                 dispatch_list_repositories(state, request).await
             }
         }
+        Route::ListEvents => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_list_events(state, request).await
+            }
+        }
+        Route::ReplayEvents => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_replay_events(state, request).await
+            }
+        }
+        Route::GetToolOutputDefaults => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_get_tool_output_defaults(state, request).await
+            }
+        }
+        Route::UpdateToolOutputDefaults => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_update_tool_output_defaults(state, request).await
+            }
+        }
+        Route::ListToolOutputSettingsHistory => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_list_tool_output_settings_history(state, request).await
+            }
+        }
         Route::InstallExtension => {
             if method != Method::POST {
                 let mut response = make_error_response(
@@ -932,6 +1652,11 @@ pub fn build_router(rpc_server: RpcServerState) -> Router {
     Router::new()
         .route("/v1/health", any(dispatch_route))
         .route("/v1/repositories:list", any(dispatch_route))
+        .route("/v1/events/list", any(dispatch_route))
+        .route("/v1/events/replay", any(dispatch_route))
+        .route("/v1/tool-output/settings/get", any(dispatch_route))
+        .route("/v1/tool-output/settings/update", any(dispatch_route))
+        .route("/v1/tool-output/settings/history:list", any(dispatch_route))
         .route("/v1/extensions/install", any(dispatch_route))
         .route("/v1/extensions/list", any(dispatch_route))
         .route("/v1/extensions/blocklist/apply", any(dispatch_route))
@@ -978,10 +1703,8 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::io::ErrorKind;
-    use std::sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex, MutexGuard,
-    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
     use tower::util::ServiceExt;
 
     static LISTEN_ADDR_ENV_MUTEX: Mutex<()> = Mutex::new(());
@@ -1134,6 +1857,20 @@ mod tests {
             route_for_path("/v1/repositories:list"),
             Route::ListRepositories
         );
+        assert_eq!(route_for_path("/v1/events/list"), Route::ListEvents);
+        assert_eq!(route_for_path("/v1/events/replay"), Route::ReplayEvents);
+        assert_eq!(
+            route_for_path("/v1/tool-output/settings/get"),
+            Route::GetToolOutputDefaults
+        );
+        assert_eq!(
+            route_for_path("/v1/tool-output/settings/update"),
+            Route::UpdateToolOutputDefaults
+        );
+        assert_eq!(
+            route_for_path("/v1/tool-output/settings/history:list"),
+            Route::ListToolOutputSettingsHistory
+        );
         assert_eq!(
             route_for_path("/v1/extensions/install"),
             Route::InstallExtension
@@ -1236,6 +1973,273 @@ mod tests {
         assert_eq!(payload["status"], "ok");
         assert!(payload["data"]["daemon_status"].is_string());
         assert!(payload["data"]["capabilities"].is_array());
+    }
+
+    #[tokio::test]
+    async fn event_routes_are_reachable_inprocess() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("events-route");
+        let other_root = test_repo_dir("events-route-other");
+
+        let repository = {
+            let server = rpc_server.read().await;
+            server
+                .register_repository(rpc::RegisterRepositoryRequest {
+                    display_name: "event-route-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed")
+                .repository
+        };
+        let repository_id = repository.repository_id.clone();
+        let other_repository = {
+            let server = rpc_server.read().await;
+            server
+                .register_repository(rpc::RegisterRepositoryRequest {
+                    display_name: "event-route-other-repo".to_string(),
+                    root_path: other_root.to_string_lossy().to_string(),
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("other register should succeed")
+                .repository
+        };
+        let other_repository_id = other_repository.repository_id.clone();
+
+        {
+            let server = rpc_server.read().await;
+            server
+                .submit_job(rpc::SubmitJobRequest {
+                    repository_id: repository_id.clone(),
+                    requester: rpc::RpcActorDto::Agent {
+                        id: "agent:event-route".to_string(),
+                        display_name: Some("Event Route Agent".to_string()),
+                    },
+                    kind: "read".to_string(),
+                    goal: "first".to_string(),
+                    path_scope: None,
+                    requested_capabilities: Vec::new(),
+                    idempotency_key: None,
+                })
+                .expect("first submit should succeed");
+            server
+                .submit_job(rpc::SubmitJobRequest {
+                    repository_id: other_repository_id.clone(),
+                    requester: rpc::RpcActorDto::Agent {
+                        id: "agent:event-route".to_string(),
+                        display_name: Some("Event Route Agent".to_string()),
+                    },
+                    kind: "read".to_string(),
+                    goal: "between".to_string(),
+                    path_scope: None,
+                    requested_capabilities: Vec::new(),
+                    idempotency_key: None,
+                })
+                .expect("other repo submit should succeed");
+            server
+                .submit_job(rpc::SubmitJobRequest {
+                    repository_id: repository_id.clone(),
+                    requester: rpc::RpcActorDto::Agent {
+                        id: "agent:event-route".to_string(),
+                        display_name: Some("Event Route Agent".to_string()),
+                    },
+                    kind: "read".to_string(),
+                    goal: "second".to_string(),
+                    path_scope: None,
+                    requested_capabilities: Vec::new(),
+                    idempotency_key: None,
+                })
+                .expect("second submit should succeed");
+        }
+
+        let list_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/events/list",
+            serde_json::json!({
+                "repository_id": repository_id.clone(),
+                "cursor": { "kind": "beginning" },
+                "subject_ids": [],
+                "page_size": 1,
+            }),
+        )
+        .await;
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_payload = to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(list_payload["status"], "ok");
+        assert_eq!(list_payload["data"]["events"].as_array().unwrap().len(), 1);
+        let first_event = &list_payload["data"]["events"][0];
+        assert_eq!(
+            first_event["subject"]["type"],
+            Value::String("job".to_string())
+        );
+        assert!(!first_event["kind"].as_str().unwrap().is_empty());
+        assert!(first_event["occurred_at_unix_ms"].is_i64());
+        let first_event_id = first_event["event_id"]
+            .as_str()
+            .expect("event id")
+            .to_string();
+
+        let watch_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/events/replay",
+            serde_json::json!({
+                "repository_id": repository_id.clone(),
+                "cursor": {
+                    "kind": "after_event_id",
+                    "event_id": first_event_id,
+                },
+                "subject_ids": [],
+                "min_severity": "info",
+                "limit": 1,
+            }),
+        )
+        .await;
+        assert_eq!(watch_response.status(), StatusCode::OK);
+        let watch_payload = to_bytes(watch_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(watch_payload["status"], "ok");
+        assert_eq!(watch_payload["data"]["events"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            watch_payload["data"]["events"][0]["refs"]["repository_id"],
+            Value::String(repository_id)
+        );
+        assert!(!watch_payload["data"]["events"][0]["kind"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            watch_payload["data"]["cursor"]["kind"],
+            Value::String("after_event_id".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(other_root);
+    }
+
+    #[tokio::test]
+    async fn tool_output_settings_routes_are_reachable_inprocess() {
+        let rpc_server = ready_rpc_server();
+
+        let get_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/tool-output/settings/get",
+            serde_json::json!({
+                "scope": serde_json::to_value(ToolOutputSettingsScope::workspace())
+                    .expect("scope json"),
+            }),
+        )
+        .await;
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_payload = to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(get_payload["status"], "ok");
+        assert_eq!(
+            get_payload["data"]["defaults"]["max_inline_lines"],
+            Value::from(200)
+        );
+
+        let update_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/tool-output/settings/update",
+            serde_json::json!({
+                "scope": serde_json::to_value(ToolOutputSettingsScope::workspace())
+                    .expect("scope json"),
+                "actor": serde_json::to_value(Actor::User {
+                    id: "user:tool-output".to_string(),
+                    display_name: Some("Tool Output User".to_string()),
+                })
+                .expect("actor json"),
+                "reason": "tighten workspace defaults",
+                "overrides": serde_json::to_value(ToolOutputOverrides {
+                    format: Some(OutputFormat::Json),
+                    include_policy: Some(true),
+                    include_diagnostics: None,
+                    include_cost: None,
+                    max_inline_bytes: None,
+                    max_inline_lines: Some(42),
+                    verbosity: Some(ToolOutputVerbosity::Expanded),
+                    granularity: Some(ToolOutputGranularity::Full),
+                    oversize_policy: Some(OversizeOutputPolicy::RejectOversize),
+                })
+                .expect("overrides json"),
+            }),
+        )
+        .await;
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let update_payload = to_bytes(update_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(update_payload["status"], "ok");
+        assert_eq!(
+            update_payload["data"]["change"]["new_defaults"]["max_inline_lines"],
+            Value::from(42)
+        );
+        assert!(update_payload["data"]["change"]["changed_at_unix_ms"].is_i64());
+        assert_eq!(
+            update_payload["data"]["change"]["actor"]["user"]["id"],
+            Value::String("user:tool-output".to_string())
+        );
+
+        let history_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/tool-output/settings/history:list",
+            serde_json::json!({
+                "scope": serde_json::to_value(ToolOutputSettingsScope::workspace())
+                    .expect("scope json"),
+                "limit": 10,
+            }),
+        )
+        .await;
+        assert_eq!(history_response.status(), StatusCode::OK);
+        let history_payload = to_bytes(history_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(history_payload["status"], "ok");
+        assert_eq!(
+            history_payload["data"]["changes"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            history_payload["data"]["changes"][0]["new_defaults"]["max_inline_lines"],
+            Value::from(42)
+        );
+        assert!(history_payload["data"]["changes"][0]["changed_at_unix_ms"].is_i64());
+
+        let defaults_again = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/tool-output/settings/get",
+            serde_json::json!({
+                "scope": serde_json::to_value(ToolOutputSettingsScope::workspace())
+                    .expect("scope json"),
+            }),
+        )
+        .await;
+        assert_eq!(defaults_again.status(), StatusCode::OK);
+        let defaults_again_payload = to_bytes(defaults_again.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(
+            defaults_again_payload["data"]["defaults"]["max_inline_lines"],
+            Value::from(42)
+        );
     }
 
     #[tokio::test]
