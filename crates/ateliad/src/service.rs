@@ -2034,6 +2034,7 @@ mod tests {
             actor(),
             ToolOutputSettingsScope::workspace().for_tool(tool_result.tool_id.clone()),
             ToolOutputOverrides {
+                max_inline_bytes: Some(256),
                 granularity: Some(atelia_core::ToolOutputGranularity::Summary),
                 ..ToolOutputOverrides::default()
             },
@@ -2069,7 +2070,13 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("render policy compacted output"));
-        assert_eq!(rendered.truncation, tool_result.truncation.clone());
+        assert!(rendered
+            .truncation
+            .as_ref()
+            .unwrap()
+            .reason
+            .contains("max_inline_bytes=256"));
+        assert_eq!(rendered.truncation, rendered.rendered_output.truncation);
         let _ = fs::remove_dir_all(root);
     }
 

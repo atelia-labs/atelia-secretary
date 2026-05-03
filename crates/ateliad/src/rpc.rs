@@ -2340,6 +2340,7 @@ mod tests {
                 actor_record(),
                 ToolOutputSettingsScope::workspace().for_tool(tool_result.tool_id.clone()),
                 ToolOutputOverrides {
+                    max_inline_bytes: Some(256),
                     verbosity: Some(ToolOutputVerbosity::Debug),
                     include_policy: Some(true),
                     ..ToolOutputOverrides::default()
@@ -2381,7 +2382,7 @@ mod tests {
             .unwrap()
             .reason
             .contains("max_inline_bytes=256"));
-        assert!(response.rendered_output_metadata.degraded);
+        assert_eq!(response.rendered_output_metadata.degraded, true);
         assert!(response
             .rendered_output_metadata
             .fallback_reason
