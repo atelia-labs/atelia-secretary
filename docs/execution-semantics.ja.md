@@ -109,7 +109,8 @@ large output は metadata 付きで truncation します。truncation は agent 
 
 ## Target Architecture AX Check
 
-この section は persisted runtime record の target architecture を説明します。現在の daemon skeleton は、ここに出てくる具体的な Rust schema をまだ実装していない場合があります。client や agent がこの answer に依存する前に、implementation slice で追加します。
+この section は current な persisted runtime record model を説明します。具体的な Rust schema と store contract は
+`crates/atelia-core/src/domain.rs` と `crates/atelia-core/src/store.rs` に既にあります。repo 内で動いている実装は in-memory store なので、durable な on-disk backend はまだ separate な follow-up です。
 
 execution model により、agent は次に答えられるべきです。
 
