@@ -1,0 +1,1597 @@
+//! Backend extension manifest contract and in-memory registry.
+//!
+//! This module implements the first enforceable slice from
+//! `docs/extensions-runtime.md`: manifest validation, provenance boundaries,
+//! blocklist checks, install records with rollback pointers, and explicit
+//! service provide / consume declarations. It intentionally does not execute
+//! extension code yet.
+
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
+
+pub const EXTENSION_MANIFEST_SCHEMA: &str = "atelia.extension.v1";
+pub const EXTENSION_RPC_PROTOCOL: &str = "atelia-extension-rpc.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionManifest {
+    pub schema: String,
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub publisher: ExtensionPublisher,
+    pub description: String,
+    pub types: Vec<ExtensionKind>,
+    pub compatibility: ExtensionCompatibility,
+    pub entrypoints: ExtensionEntrypoints,
+    pub permissions: BTreeMap<String, ExtensionPermission>,
+    pub services: ExtensionServices,
+    pub failure: ExtensionFailure,
+    pub provenance: ExtensionProvenance,
+    pub bundle: Option<ExtensionBundleMembership>,
+}
+
+impl ExtensionManifest {
+    pub fn validate(
+        &self,
+        policy: &ManifestValidationPolicy,
+    ) -> ExtensionValidationResult<ValidatedExtensionManifest> {
+        validate_manifest(self, policy)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionPublisher {
+    pub name: String,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionKind {
+    Tool,
+    Service,
+    HookProvider,
+    ToolOutputCustomizer,
+    ApprovalAgent,
+    DelegatedAgentProvider,
+    MemoryProvider,
+    MemoryStrategy,
+    ClientSurface,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionCompatibility {
+    pub atelia_protocol: String,
+    pub atelia_secretary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionEntrypoints {
+    pub realm: ExtensionRealm,
+    pub runtime: ExtensionRuntime,
+    pub command: Option<String>,
+    pub image: Option<String>,
+    pub wasm: Option<String>,
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExtensionRealm {
+    Backend,
+    Client,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExtensionRuntime {
+    WasmRust,
+    Wasm,
+    Docker,
+    Process,
+    Remote,
+    SwiftClient,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionPermission {
+    pub description: String,
+    pub risk_tier: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionServices {
+    pub provides: Vec<ExtensionServiceDefinition>,
+    pub consumes: Vec<ExtensionServiceDependency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionServiceDefinition {
+    pub service: String,
+    pub method: String,
+    pub schema_version: String,
+    pub required_permission: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionServiceDependency {
+    pub extension_id: String,
+    pub service: String,
+    pub method: String,
+    pub schema_version: String,
+    pub required_permission: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionFailure {
+    pub degrade: DegradeBehavior,
+    pub retry_policy: RetryPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradeBehavior {
+    DisableExtension,
+    DisableFeature,
+    ReturnUnavailable,
+    RequireHuman,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryPolicy {
+    None,
+    Bounded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionProvenance {
+    pub source: ProvenanceSource,
+    pub repository: Option<String>,
+    pub commit: Option<String>,
+    pub registry_identity: Option<String>,
+    pub artifact_digest: String,
+    pub manifest_digest: String,
+    pub signature: Option<String>,
+    pub signer: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceSource {
+    Github,
+    Registry,
+    Local,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionBundleMembership {
+    pub id: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionBoundary {
+    Official,
+    ThirdParty,
+    LocalDevelopment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedExtensionManifest {
+    pub manifest: ExtensionManifest,
+    pub boundary: ExtensionBoundary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestValidationPolicy {
+    pub allow_local_unsigned: bool,
+    pub allow_local_process_runtime: bool,
+    pub official_id_prefix: String,
+    pub local_id_prefix: String,
+    pub official_registry_identity: String,
+}
+
+impl ManifestValidationPolicy {
+    pub fn with_local_unsigned(mut self) -> Self {
+        self.allow_local_unsigned = true;
+        self
+    }
+
+    pub fn with_local_process_runtime(mut self) -> Self {
+        self.allow_local_process_runtime = true;
+        self
+    }
+}
+
+impl Default for ManifestValidationPolicy {
+    fn default() -> Self {
+        Self {
+            allow_local_unsigned: false,
+            allow_local_process_runtime: false,
+            official_id_prefix: "ai.atelia.".to_string(),
+            local_id_prefix: "local.".to_string(),
+            official_registry_identity: "atelia-official".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionValidationError {
+    InvalidSchema {
+        expected: &'static str,
+        found: String,
+    },
+    MissingField {
+        field: &'static str,
+    },
+    InvalidField {
+        field: &'static str,
+        reason: String,
+    },
+    UnsupportedRuntime {
+        runtime: ExtensionRuntime,
+        reason: String,
+    },
+    ProvenanceRequired {
+        field: &'static str,
+        reason: String,
+    },
+    BoundaryViolation {
+        reason: String,
+    },
+    DuplicateServiceDeclaration {
+        service: String,
+        method: String,
+        schema_version: String,
+    },
+    MissingServicePermission {
+        service: String,
+        method: String,
+        permission: String,
+    },
+}
+
+impl fmt::Display for ExtensionValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSchema { expected, found } => {
+                write!(
+                    f,
+                    "extension manifest schema must be {expected}, found {found}"
+                )
+            }
+            Self::MissingField { field } => {
+                write!(f, "extension manifest field {field} is required")
+            }
+            Self::InvalidField { field, reason } => {
+                write!(f, "extension manifest field {field} is invalid: {reason}")
+            }
+            Self::UnsupportedRuntime { runtime, reason } => {
+                write!(
+                    f,
+                    "extension runtime {runtime:?} is not supported: {reason}"
+                )
+            }
+            Self::ProvenanceRequired { field, reason } => {
+                write!(
+                    f,
+                    "extension provenance field {field} is required: {reason}"
+                )
+            }
+            Self::BoundaryViolation { reason } => {
+                write!(f, "extension boundary violation: {reason}")
+            }
+            Self::DuplicateServiceDeclaration {
+                service,
+                method,
+                schema_version,
+            } => write!(
+                f,
+                "duplicate service declaration {service}.{method} schema {schema_version}"
+            ),
+            Self::MissingServicePermission {
+                service,
+                method,
+                permission,
+            } => write!(
+                f,
+                "service {service}.{method} requires undeclared permission {permission}"
+            ),
+        }
+    }
+}
+
+impl Error for ExtensionValidationError {}
+
+pub type ExtensionValidationResult<T> = Result<T, ExtensionValidationError>;
+
+fn validate_manifest(
+    manifest: &ExtensionManifest,
+    policy: &ManifestValidationPolicy,
+) -> ExtensionValidationResult<ValidatedExtensionManifest> {
+    if manifest.schema != EXTENSION_MANIFEST_SCHEMA {
+        return Err(ExtensionValidationError::InvalidSchema {
+            expected: EXTENSION_MANIFEST_SCHEMA,
+            found: manifest.schema.clone(),
+        });
+    }
+
+    require_non_empty("id", &manifest.id)?;
+    require_reverse_dns_id("id", &manifest.id)?;
+    require_non_empty("name", &manifest.name)?;
+    require_non_empty("version", &manifest.version)?;
+    require_semver("version", &manifest.version)?;
+    require_non_empty("publisher.name", &manifest.publisher.name)?;
+    require_non_empty("description", &manifest.description)?;
+    require_non_empty(
+        "compatibility.atelia_protocol",
+        &manifest.compatibility.atelia_protocol,
+    )?;
+    require_non_empty(
+        "compatibility.atelia_secretary",
+        &manifest.compatibility.atelia_secretary,
+    )?;
+
+    if manifest.types.is_empty() {
+        return Err(ExtensionValidationError::MissingField { field: "types" });
+    }
+
+    let boundary = classify_boundary(manifest, policy)?;
+    validate_entrypoint(manifest, boundary, policy)?;
+    validate_provenance(manifest, boundary, policy)?;
+    validate_permissions(&manifest.permissions)?;
+    validate_services(manifest)?;
+
+    Ok(ValidatedExtensionManifest {
+        manifest: manifest.clone(),
+        boundary,
+    })
+}
+
+fn classify_boundary(
+    manifest: &ExtensionManifest,
+    policy: &ManifestValidationPolicy,
+) -> ExtensionValidationResult<ExtensionBoundary> {
+    let is_official_id = manifest.id.starts_with(&policy.official_id_prefix);
+    let is_local_id = manifest.id.starts_with(&policy.local_id_prefix);
+
+    match manifest.provenance.source {
+        ProvenanceSource::Local => {
+            if !is_local_id {
+                return Err(ExtensionValidationError::BoundaryViolation {
+                    reason: format!(
+                        "local extensions must use the {} id namespace",
+                        policy.local_id_prefix
+                    ),
+                });
+            }
+            Ok(ExtensionBoundary::LocalDevelopment)
+        }
+        ProvenanceSource::Registry | ProvenanceSource::Github if is_official_id => {
+            if manifest.provenance.registry_identity.as_deref()
+                != Some(policy.official_registry_identity.as_str())
+            {
+                return Err(ExtensionValidationError::BoundaryViolation {
+                    reason: "official extensions must be issued by the official registry identity"
+                        .to_string(),
+                });
+            }
+            Ok(ExtensionBoundary::Official)
+        }
+        ProvenanceSource::Registry | ProvenanceSource::Github => {
+            if is_local_id {
+                return Err(ExtensionValidationError::BoundaryViolation {
+                    reason: "non-local extensions cannot use the local id namespace".to_string(),
+                });
+            }
+            Ok(ExtensionBoundary::ThirdParty)
+        }
+    }
+}
+
+fn validate_entrypoint(
+    manifest: &ExtensionManifest,
+    boundary: ExtensionBoundary,
+    policy: &ManifestValidationPolicy,
+) -> ExtensionValidationResult<()> {
+    if manifest.entrypoints.realm != ExtensionRealm::Backend {
+        return Err(ExtensionValidationError::UnsupportedRuntime {
+            runtime: manifest.entrypoints.runtime,
+            reason: "this registry slice only accepts backend extensions".to_string(),
+        });
+    }
+
+    if manifest.entrypoints.protocol != EXTENSION_RPC_PROTOCOL {
+        return Err(ExtensionValidationError::InvalidField {
+            field: "entrypoints.protocol",
+            reason: format!("expected {EXTENSION_RPC_PROTOCOL}"),
+        });
+    }
+
+    match manifest.entrypoints.runtime {
+        ExtensionRuntime::WasmRust | ExtensionRuntime::Wasm => {
+            if manifest
+                .entrypoints
+                .wasm
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                return Err(ExtensionValidationError::MissingField {
+                    field: "entrypoints.wasm",
+                });
+            }
+        }
+        ExtensionRuntime::Process => {
+            if boundary != ExtensionBoundary::LocalDevelopment
+                || !policy.allow_local_process_runtime
+            {
+                return Err(ExtensionValidationError::UnsupportedRuntime {
+                    runtime: ExtensionRuntime::Process,
+                    reason:
+                        "process runtime is local-development only and must be explicitly enabled"
+                            .to_string(),
+                });
+            }
+
+            if manifest
+                .entrypoints
+                .command
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                return Err(ExtensionValidationError::MissingField {
+                    field: "entrypoints.command",
+                });
+            }
+        }
+        ExtensionRuntime::Docker | ExtensionRuntime::Remote | ExtensionRuntime::SwiftClient => {
+            return Err(ExtensionValidationError::UnsupportedRuntime {
+                runtime: manifest.entrypoints.runtime,
+                reason: "first backend slice supports wasm-rust, wasm, and explicit local process development only"
+                    .to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_provenance(
+    manifest: &ExtensionManifest,
+    boundary: ExtensionBoundary,
+    policy: &ManifestValidationPolicy,
+) -> ExtensionValidationResult<()> {
+    require_digest(
+        "provenance.artifact_digest",
+        &manifest.provenance.artifact_digest,
+    )?;
+    require_digest(
+        "provenance.manifest_digest",
+        &manifest.provenance.manifest_digest,
+    )?;
+
+    match boundary {
+        ExtensionBoundary::LocalDevelopment => {
+            if (manifest.provenance.signature.is_none() || manifest.provenance.signer.is_none())
+                && !policy.allow_local_unsigned
+            {
+                return Err(ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.signature",
+                    reason: "local unsigned extensions require explicit dev-mode approval"
+                        .to_string(),
+                });
+            }
+        }
+        ExtensionBoundary::Official | ExtensionBoundary::ThirdParty => {
+            if manifest
+                .provenance
+                .signature
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return Err(ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.signature",
+                    reason: "non-local extensions must be signed".to_string(),
+                });
+            }
+            if manifest
+                .provenance
+                .signer
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return Err(ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.signer",
+                    reason: "non-local extensions must identify a signer".to_string(),
+                });
+            }
+        }
+    }
+
+    match manifest.provenance.source {
+        ProvenanceSource::Github => {
+            if manifest
+                .provenance
+                .repository
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return Err(ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.repository",
+                    reason: "github-sourced extensions must declare a repository".to_string(),
+                });
+            }
+            if manifest
+                .provenance
+                .commit
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return Err(ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.commit",
+                    reason: "github-sourced extensions must declare a commit".to_string(),
+                });
+            }
+        }
+        ProvenanceSource::Registry => {
+            if manifest
+                .provenance
+                .registry_identity
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return Err(ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.registry_identity",
+                    reason: "registry-sourced extensions must declare registry identity"
+                        .to_string(),
+                });
+            }
+        }
+        ProvenanceSource::Local => {}
+    }
+
+    Ok(())
+}
+
+fn validate_permissions(
+    permissions: &BTreeMap<String, ExtensionPermission>,
+) -> ExtensionValidationResult<()> {
+    for (permission, metadata) in permissions {
+        require_permission_name(permission)?;
+        require_non_empty("permissions.description", &metadata.description)?;
+
+        if let Some(risk_tier) = &metadata.risk_tier {
+            if !matches!(risk_tier.as_str(), "R0" | "R1" | "R2" | "R3" | "R4") {
+                return Err(ExtensionValidationError::InvalidField {
+                    field: "permissions.risk_tier",
+                    reason: format!("unsupported risk tier {risk_tier}"),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_services(manifest: &ExtensionManifest) -> ExtensionValidationResult<()> {
+    let has_service_kind = manifest.types.contains(&ExtensionKind::Service);
+    let declares_services =
+        !manifest.services.provides.is_empty() || !manifest.services.consumes.is_empty();
+
+    if declares_services && !has_service_kind {
+        return Err(ExtensionValidationError::InvalidField {
+            field: "types",
+            reason: "service declarations require type service".to_string(),
+        });
+    }
+
+    if has_service_kind && !declares_services {
+        return Err(ExtensionValidationError::MissingField { field: "services" });
+    }
+
+    let mut provided = BTreeSet::new();
+    for service in &manifest.services.provides {
+        validate_service_parts(&service.service, &service.method, &service.schema_version)?;
+        require_permission_name(&service.required_permission)?;
+        require_declared_service_permission(
+            &manifest.permissions,
+            &service.service,
+            &service.method,
+            &service.required_permission,
+        )?;
+
+        let key = service_key(&service.service, &service.method, &service.schema_version);
+        if !provided.insert(key) {
+            return Err(ExtensionValidationError::DuplicateServiceDeclaration {
+                service: service.service.clone(),
+                method: service.method.clone(),
+                schema_version: service.schema_version.clone(),
+            });
+        }
+    }
+
+    let mut consumed = BTreeSet::new();
+    for dependency in &manifest.services.consumes {
+        require_reverse_dns_id("services.consumes.extension_id", &dependency.extension_id)?;
+        validate_service_parts(
+            &dependency.service,
+            &dependency.method,
+            &dependency.schema_version,
+        )?;
+        require_permission_name(&dependency.required_permission)?;
+        require_declared_service_permission(
+            &manifest.permissions,
+            &dependency.service,
+            &dependency.method,
+            &dependency.required_permission,
+        )?;
+
+        let key = format!(
+            "{}:{}",
+            dependency.extension_id,
+            service_key(
+                &dependency.service,
+                &dependency.method,
+                &dependency.schema_version
+            )
+        );
+        if !consumed.insert(key) {
+            return Err(ExtensionValidationError::DuplicateServiceDeclaration {
+                service: dependency.service.clone(),
+                method: dependency.method.clone(),
+                schema_version: dependency.schema_version.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn require_declared_service_permission(
+    permissions: &BTreeMap<String, ExtensionPermission>,
+    service: &str,
+    method: &str,
+    permission: &str,
+) -> ExtensionValidationResult<()> {
+    if permissions.contains_key(permission) {
+        Ok(())
+    } else {
+        Err(ExtensionValidationError::MissingServicePermission {
+            service: service.to_string(),
+            method: method.to_string(),
+            permission: permission.to_string(),
+        })
+    }
+}
+
+fn validate_service_parts(
+    service: &str,
+    method: &str,
+    schema_version: &str,
+) -> ExtensionValidationResult<()> {
+    require_non_empty("services.service", service)?;
+    require_non_empty("services.method", method)?;
+    require_non_empty("services.schema_version", schema_version)?;
+
+    for (field, value) in [
+        ("services.service", service),
+        ("services.method", method),
+        ("services.schema_version", schema_version),
+    ] {
+        if value.chars().any(char::is_whitespace) {
+            return Err(ExtensionValidationError::InvalidField {
+                field,
+                reason: "must not contain whitespace".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn service_key(service: &str, method: &str, schema_version: &str) -> String {
+    format!("{service}:{method}:{schema_version}")
+}
+
+fn require_non_empty(field: &'static str, value: &str) -> ExtensionValidationResult<()> {
+    if value.trim().is_empty() {
+        Err(ExtensionValidationError::MissingField { field })
+    } else {
+        Ok(())
+    }
+}
+
+fn require_reverse_dns_id(field: &'static str, value: &str) -> ExtensionValidationResult<()> {
+    if value.starts_with('.') || value.ends_with('.') || !value.contains('.') {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must use a reverse-DNS-like dotted namespace".to_string(),
+        });
+    }
+
+    for segment in value.split('.') {
+        if segment.is_empty()
+            || !segment
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+            || !segment
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_lowercase())
+        {
+            return Err(ExtensionValidationError::InvalidField {
+                field,
+                reason:
+                    "segments must start with a lowercase ascii letter and contain lowercase ascii, digits, or hyphen"
+                        .to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn require_semver(field: &'static str, value: &str) -> ExtensionValidationResult<()> {
+    let parts = value.split('.').collect::<Vec<_>>();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || part.chars().any(|ch| !ch.is_ascii_digit()))
+    {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must be major.minor.patch numeric semver".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn require_digest(field: &'static str, value: &str) -> ExtensionValidationResult<()> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must start with sha256:".to_string(),
+        });
+    };
+
+    if hex.len() != 64 || hex.chars().any(|ch| !ch.is_ascii_hexdigit()) {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must contain 64 hex characters after sha256:".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn require_permission_name(value: &str) -> ExtensionValidationResult<()> {
+    require_non_empty("permission", value)?;
+
+    if value.chars().any(char::is_whitespace) {
+        return Err(ExtensionValidationError::InvalidField {
+            field: "permission",
+            reason: "must not contain whitespace".to_string(),
+        });
+    }
+
+    if !value.contains('.') && !value.contains(':') {
+        return Err(ExtensionValidationError::InvalidField {
+            field: "permission",
+            reason: "must include a namespace separator".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionRegistry {
+    manifests: BTreeMap<String, BTreeMap<String, ExtensionManifest>>,
+    records: BTreeMap<String, BTreeMap<String, ExtensionInstallRecord>>,
+    active_versions: BTreeMap<String, String>,
+    blocklist: Vec<BlocklistEntry>,
+    validation_policy: ManifestValidationPolicy,
+}
+
+impl ExtensionRegistry {
+    pub fn new(validation_policy: ManifestValidationPolicy) -> Self {
+        Self {
+            manifests: BTreeMap::new(),
+            records: BTreeMap::new(),
+            active_versions: BTreeMap::new(),
+            blocklist: Vec::new(),
+            validation_policy,
+        }
+    }
+
+    pub fn in_memory() -> Self {
+        Self::new(ManifestValidationPolicy::default())
+    }
+
+    pub fn add_blocklist_entry(&mut self, entry: BlocklistEntry) {
+        self.blocklist.push(entry);
+    }
+
+    pub fn install(
+        &mut self,
+        manifest: ExtensionManifest,
+        options: InstallOptions,
+    ) -> RegistryResult<ExtensionInstallRecord> {
+        let mut validation_policy = self.validation_policy.clone();
+        validation_policy.allow_local_unsigned = options.approve_local_unsigned;
+        validation_policy.allow_local_process_runtime = options.allow_local_process_runtime;
+
+        let validated = manifest.validate(&validation_policy)?;
+        self.ensure_not_blocked(&validated.manifest)?;
+        self.ensure_same_version_digest_is_stable(&validated.manifest)?;
+
+        let previous_version = self.active_versions.get(&validated.manifest.id).cloned();
+        let approved_permissions = validated
+            .manifest
+            .permissions
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let record = ExtensionInstallRecord {
+            id: validated.manifest.id.clone(),
+            version: validated.manifest.version.clone(),
+            manifest_digest: validated.manifest.provenance.manifest_digest.clone(),
+            artifact_digest: validated.manifest.provenance.artifact_digest.clone(),
+            boundary: validated.boundary,
+            status: ExtensionInstallStatus::Installed,
+            previous_version,
+            approved_permissions,
+            rollback_snapshot: Some(RollbackSnapshot {
+                manifest_digest: validated.manifest.provenance.manifest_digest.clone(),
+                artifact_digest: validated.manifest.provenance.artifact_digest.clone(),
+            }),
+        };
+
+        self.manifests
+            .entry(record.id.clone())
+            .or_default()
+            .insert(record.version.clone(), validated.manifest);
+        self.records
+            .entry(record.id.clone())
+            .or_default()
+            .insert(record.version.clone(), record.clone());
+        self.active_versions
+            .insert(record.id.clone(), record.version.clone());
+
+        Ok(record)
+    }
+
+    pub fn rollback(&mut self, extension_id: &str) -> RegistryResult<ExtensionInstallRecord> {
+        let current =
+            self.active_record(extension_id)
+                .ok_or_else(|| RegistryError::NotInstalled {
+                    extension_id: extension_id.to_string(),
+                })?;
+        let previous_version =
+            current
+                .previous_version
+                .clone()
+                .ok_or_else(|| RegistryError::RollbackUnavailable {
+                    extension_id: extension_id.to_string(),
+                })?;
+
+        self.active_versions
+            .insert(extension_id.to_string(), previous_version.clone());
+
+        let previous_record = self
+            .records
+            .get_mut(extension_id)
+            .and_then(|records| records.get_mut(&previous_version))
+            .ok_or_else(|| RegistryError::RollbackUnavailable {
+                extension_id: extension_id.to_string(),
+            })?;
+        previous_record.status = ExtensionInstallStatus::InstalledPreviousVersion;
+
+        Ok(previous_record.clone())
+    }
+
+    pub fn active_record(&self, extension_id: &str) -> Option<ExtensionInstallRecord> {
+        let version = self.active_versions.get(extension_id)?;
+        self.records.get(extension_id)?.get(version).cloned()
+    }
+
+    pub fn authorize_service_call(
+        &self,
+        request: ServiceCallRequest,
+    ) -> RegistryResult<ServiceCallGrant> {
+        let caller_manifest = self
+            .active_manifest(&request.caller_extension_id)
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: request.caller_extension_id.clone(),
+            })?;
+        let callee_manifest = self
+            .active_manifest(&request.callee_extension_id)
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: request.callee_extension_id.clone(),
+            })?;
+
+        self.ensure_not_blocked(caller_manifest)?;
+        self.ensure_not_blocked(callee_manifest)?;
+
+        let consume = caller_manifest
+            .services
+            .consumes
+            .iter()
+            .find(|dependency| {
+                dependency.extension_id == request.callee_extension_id
+                    && dependency.service == request.service
+                    && dependency.method == request.method
+                    && dependency.schema_version == request.schema_version
+            })
+            .ok_or_else(|| RegistryError::ServiceDenied {
+                reason: "caller did not declare services.consumes for this callee service"
+                    .to_string(),
+            })?;
+
+        let provide = callee_manifest
+            .services
+            .provides
+            .iter()
+            .find(|definition| {
+                definition.service == request.service
+                    && definition.method == request.method
+                    && definition.schema_version == request.schema_version
+            })
+            .ok_or_else(|| RegistryError::ServiceUnavailable {
+                reason: "callee did not declare services.provides for this service".to_string(),
+            })?;
+
+        let required_permission = request
+            .required_permission
+            .as_deref()
+            .unwrap_or(&provide.required_permission);
+
+        if consume.required_permission != required_permission
+            || provide.required_permission != required_permission
+        {
+            return Err(RegistryError::ServiceDenied {
+                reason: "caller consume permission, callee provide permission, and request permission must match"
+                    .to_string(),
+            });
+        }
+
+        if !caller_manifest
+            .permissions
+            .contains_key(required_permission)
+        {
+            return Err(RegistryError::ServiceDenied {
+                reason: format!("caller does not have approved permission {required_permission}"),
+            });
+        }
+
+        let caller_version = self
+            .active_versions
+            .get(&request.caller_extension_id)
+            .cloned()
+            .unwrap_or_default();
+        let callee_version = self
+            .active_versions
+            .get(&request.callee_extension_id)
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(ServiceCallGrant {
+            caller_extension_id: request.caller_extension_id,
+            caller_version,
+            callee_extension_id: request.callee_extension_id,
+            callee_version,
+            service: request.service,
+            method: request.method,
+            schema_version: request.schema_version,
+            required_permission: required_permission.to_string(),
+        })
+    }
+
+    fn active_manifest(&self, extension_id: &str) -> Option<&ExtensionManifest> {
+        let version = self.active_versions.get(extension_id)?;
+        self.manifests.get(extension_id)?.get(version)
+    }
+
+    fn ensure_same_version_digest_is_stable(
+        &self,
+        manifest: &ExtensionManifest,
+    ) -> RegistryResult<()> {
+        let Some(existing) = self
+            .records
+            .get(&manifest.id)
+            .and_then(|records| records.get(&manifest.version))
+        else {
+            return Ok(());
+        };
+
+        if existing.manifest_digest != manifest.provenance.manifest_digest
+            || existing.artifact_digest != manifest.provenance.artifact_digest
+        {
+            return Err(RegistryError::DigestConflict {
+                extension_id: manifest.id.clone(),
+                version: manifest.version.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn ensure_not_blocked(&self, manifest: &ExtensionManifest) -> RegistryResult<()> {
+        if let Some(entry) = self
+            .blocklist
+            .iter()
+            .find(|entry| entry.matches_manifest(manifest))
+        {
+            return Err(RegistryError::Blocked {
+                extension_id: manifest.id.clone(),
+                reason: entry.reason,
+                key: entry.key.clone(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InstallOptions {
+    pub approve_local_unsigned: bool,
+    pub allow_local_process_runtime: bool,
+}
+
+impl InstallOptions {
+    pub fn approve_local_unsigned(mut self) -> Self {
+        self.approve_local_unsigned = true;
+        self
+    }
+
+    pub fn allow_local_process_runtime(mut self) -> Self {
+        self.allow_local_process_runtime = true;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionInstallRecord {
+    pub id: String,
+    pub version: String,
+    pub manifest_digest: String,
+    pub artifact_digest: String,
+    pub boundary: ExtensionBoundary,
+    pub status: ExtensionInstallStatus,
+    pub previous_version: Option<String>,
+    pub approved_permissions: Vec<String>,
+    pub rollback_snapshot: Option<RollbackSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionInstallStatus {
+    Installed,
+    Disabled,
+    Blocked,
+    Updating,
+    RollbackInProgress,
+    InstalledPreviousVersion,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RollbackSnapshot {
+    pub manifest_digest: String,
+    pub artifact_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceCallRequest {
+    pub caller_extension_id: String,
+    pub callee_extension_id: String,
+    pub service: String,
+    pub method: String,
+    pub schema_version: String,
+    pub required_permission: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceCallGrant {
+    pub caller_extension_id: String,
+    pub caller_version: String,
+    pub callee_extension_id: String,
+    pub callee_version: String,
+    pub service: String,
+    pub method: String,
+    pub schema_version: String,
+    pub required_permission: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlocklistEntry {
+    pub key: BlockKey,
+    pub reason: BlockReason,
+    pub note: Option<String>,
+}
+
+impl BlocklistEntry {
+    fn matches_manifest(&self, manifest: &ExtensionManifest) -> bool {
+        match &self.key {
+            BlockKey::ExtensionId(id) => manifest.id == *id,
+            BlockKey::Version { id, version } => manifest.id == *id && manifest.version == *version,
+            BlockKey::ArtifactDigest(digest) => manifest.provenance.artifact_digest == *digest,
+            BlockKey::Signer(signer) => manifest.provenance.signer.as_deref() == Some(signer),
+            BlockKey::Publisher(publisher) => manifest.publisher.name == *publisher,
+            BlockKey::SourceRepository(repository) => {
+                manifest.provenance.repository.as_deref() == Some(repository)
+            }
+            BlockKey::PermissionPattern(pattern) => manifest
+                .permissions
+                .keys()
+                .any(|permission| permission_matches(pattern, permission)),
+            BlockKey::VulnerabilityId(_) => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockKey {
+    ExtensionId(String),
+    Version { id: String, version: String },
+    ArtifactDigest(String),
+    Signer(String),
+    Publisher(String),
+    SourceRepository(String),
+    PermissionPattern(String),
+    VulnerabilityId(String),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockReason {
+    Malware,
+    ManifestMismatch,
+    OverPermissioned,
+    VulnerableVersion,
+    CompromisedSigner,
+    PolicyViolation,
+    UserBlocked,
+    RegistryRemoved,
+}
+
+fn permission_matches(pattern: &str, permission: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        permission.starts_with(prefix)
+    } else {
+        pattern == permission
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryError {
+    Validation(ExtensionValidationError),
+    Blocked {
+        extension_id: String,
+        reason: BlockReason,
+        key: BlockKey,
+    },
+    DigestConflict {
+        extension_id: String,
+        version: String,
+    },
+    NotInstalled {
+        extension_id: String,
+    },
+    RollbackUnavailable {
+        extension_id: String,
+    },
+    ServiceDenied {
+        reason: String,
+    },
+    ServiceUnavailable {
+        reason: String,
+    },
+}
+
+impl fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Validation(error) => write!(f, "{error}"),
+            Self::Blocked {
+                extension_id,
+                reason,
+                key,
+            } => write!(
+                f,
+                "extension {extension_id} is blocklisted by {reason:?}: {key:?}"
+            ),
+            Self::DigestConflict {
+                extension_id,
+                version,
+            } => write!(
+                f,
+                "extension {extension_id} version {version} changed digest"
+            ),
+            Self::NotInstalled { extension_id } => {
+                write!(f, "extension {extension_id} is not installed")
+            }
+            Self::RollbackUnavailable { extension_id } => {
+                write!(f, "extension {extension_id} has no rollback target")
+            }
+            Self::ServiceDenied { reason } => write!(f, "service call denied: {reason}"),
+            Self::ServiceUnavailable { reason } => write!(f, "service unavailable: {reason}"),
+        }
+    }
+}
+
+impl Error for RegistryError {}
+
+impl From<ExtensionValidationError> for RegistryError {
+    fn from(error: ExtensionValidationError) -> Self {
+        Self::Validation(error)
+    }
+}
+
+pub type RegistryResult<T> = Result<T, RegistryError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ARTIFACT_DIGEST: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const MANIFEST_DIGEST: &str =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const OTHER_ARTIFACT_DIGEST: &str =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const OTHER_MANIFEST_DIGEST: &str =
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    fn permission(description: &str) -> ExtensionPermission {
+        ExtensionPermission {
+            description: description.to_string(),
+            risk_tier: Some("R2".to_string()),
+        }
+    }
+
+    fn manifest(id: &str) -> ExtensionManifest {
+        ExtensionManifest {
+            schema: EXTENSION_MANIFEST_SCHEMA.to_string(),
+            id: id.to_string(),
+            name: "Test Extension".to_string(),
+            version: "1.0.0".to_string(),
+            publisher: ExtensionPublisher {
+                name: "Example Publisher".to_string(),
+                url: Some("https://example.com".to_string()),
+            },
+            description: "A focused test extension".to_string(),
+            types: vec![ExtensionKind::Tool],
+            compatibility: ExtensionCompatibility {
+                atelia_protocol: ">=0.1 <0.3".to_string(),
+                atelia_secretary: ">=0.1 <0.2".to_string(),
+            },
+            entrypoints: ExtensionEntrypoints {
+                realm: ExtensionRealm::Backend,
+                runtime: ExtensionRuntime::WasmRust,
+                command: None,
+                image: None,
+                wasm: Some("extension.wasm".to_string()),
+                protocol: EXTENSION_RPC_PROTOCOL.to_string(),
+            },
+            permissions: BTreeMap::new(),
+            services: ExtensionServices::default(),
+            failure: ExtensionFailure {
+                degrade: DegradeBehavior::ReturnUnavailable,
+                retry_policy: RetryPolicy::Bounded,
+            },
+            provenance: ExtensionProvenance {
+                source: ProvenanceSource::Registry,
+                repository: None,
+                commit: None,
+                registry_identity: Some("third-party-registry".to_string()),
+                artifact_digest: ARTIFACT_DIGEST.to_string(),
+                manifest_digest: MANIFEST_DIGEST.to_string(),
+                signature: Some("signature".to_string()),
+                signer: Some("signer@example.com".to_string()),
+            },
+            bundle: None,
+        }
+    }
+
+    fn service_provider(id: &str, permission_name: &str) -> ExtensionManifest {
+        let mut manifest = manifest(id);
+        manifest.types = vec![ExtensionKind::Service];
+        manifest
+            .permissions
+            .insert(permission_name.to_string(), permission("provide service"));
+        manifest.services.provides.push(ExtensionServiceDefinition {
+            service: "review.comments".to_string(),
+            method: "summarize".to_string(),
+            schema_version: "v1".to_string(),
+            required_permission: permission_name.to_string(),
+        });
+        manifest
+    }
+
+    fn service_consumer(id: &str, callee_id: &str, permission_name: &str) -> ExtensionManifest {
+        let mut manifest = manifest(id);
+        manifest.types = vec![ExtensionKind::Service];
+        manifest.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        manifest.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        manifest
+            .permissions
+            .insert(permission_name.to_string(), permission("consume service"));
+        manifest.services.consumes.push(ExtensionServiceDependency {
+            extension_id: callee_id.to_string(),
+            service: "review.comments".to_string(),
+            method: "summarize".to_string(),
+            schema_version: "v1".to_string(),
+            required_permission: permission_name.to_string(),
+        });
+        manifest
+    }
+
+    fn service_call(caller_id: &str, callee_id: &str) -> ServiceCallRequest {
+        ServiceCallRequest {
+            caller_extension_id: caller_id.to_string(),
+            callee_extension_id: callee_id.to_string(),
+            service: "review.comments".to_string(),
+            method: "summarize".to_string(),
+            schema_version: "v1".to_string(),
+            required_permission: Some("service.review.comments".to_string()),
+        }
+    }
+
+    #[test]
+    fn validates_backend_wasm_rust_manifest() {
+        let validated = manifest("com.example.extension")
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap();
+
+        assert_eq!(validated.boundary, ExtensionBoundary::ThirdParty);
+    }
+
+    #[test]
+    fn rejects_official_namespace_without_official_registry_identity() {
+        let err = manifest("ai.atelia.git")
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ExtensionValidationError::BoundaryViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn local_unsigned_requires_dev_mode_approval() {
+        let mut local = manifest("local.test.extension");
+        local.provenance.source = ProvenanceSource::Local;
+        local.provenance.registry_identity = None;
+        local.provenance.signature = None;
+        local.provenance.signer = None;
+
+        let err = local
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::ProvenanceRequired {
+                field: "provenance.signature",
+                ..
+            }
+        ));
+
+        let validated = local
+            .validate(&ManifestValidationPolicy::default().with_local_unsigned())
+            .unwrap();
+        assert_eq!(validated.boundary, ExtensionBoundary::LocalDevelopment);
+    }
+
+    #[test]
+    fn backend_process_runtime_is_local_development_only() {
+        let mut process = manifest("local.test.process");
+        process.provenance.source = ProvenanceSource::Local;
+        process.provenance.registry_identity = None;
+        process.entrypoints.runtime = ExtensionRuntime::Process;
+        process.entrypoints.wasm = None;
+        process.entrypoints.command = Some("cargo run".to_string());
+
+        let err = process
+            .validate(&ManifestValidationPolicy::default().with_local_unsigned())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::UnsupportedRuntime {
+                runtime: ExtensionRuntime::Process,
+                ..
+            }
+        ));
+
+        process
+            .validate(
+                &ManifestValidationPolicy::default()
+                    .with_local_unsigned()
+                    .with_local_process_runtime(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn service_dependencies_must_declare_permissions() {
+        let mut consumer = service_consumer(
+            "com.example.consumer",
+            "com.example.provider",
+            "service.review.comments",
+        );
+        consumer.permissions.clear();
+
+        let err = consumer
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::MissingServicePermission { .. }
+        ));
+    }
+
+    #[test]
+    fn registry_blocks_install_before_local_enablement() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry.add_blocklist_entry(BlocklistEntry {
+            key: BlockKey::ExtensionId("com.example.extension".to_string()),
+            reason: BlockReason::UserBlocked,
+            note: None,
+        });
+
+        let err = registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RegistryError::Blocked {
+                reason: BlockReason::UserBlocked,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn same_version_different_digest_is_rejected() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let mut changed = manifest("com.example.extension");
+        changed.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+
+        let err = registry
+            .install(changed, InstallOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RegistryError::DigestConflict {
+                extension_id,
+                version
+            } if extension_id == "com.example.extension" && version == "1.0.0"
+        ));
+    }
+
+    #[test]
+    fn same_bundle_service_call_requires_explicit_consume_declaration() {
+        let permission_name = "service.review.comments";
+        let provider_id = "com.example.provider";
+        let consumer_id = "com.example.consumer";
+        let mut provider = service_provider(provider_id, permission_name);
+        let mut consumer = manifest(consumer_id);
+
+        provider.bundle = Some(ExtensionBundleMembership {
+            id: "com.example.bundle".to_string(),
+            required: true,
+        });
+        consumer.bundle = Some(ExtensionBundleMembership {
+            id: "com.example.bundle".to_string(),
+            required: true,
+        });
+
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(provider, InstallOptions::default())
+            .unwrap();
+        registry
+            .install(consumer, InstallOptions::default())
+            .unwrap();
+
+        let err = registry
+            .authorize_service_call(service_call(consumer_id, provider_id))
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::ServiceDenied { .. }));
+
+        let mut registry = ExtensionRegistry::in_memory();
+        let mut provider = service_provider(provider_id, permission_name);
+        let mut consumer = service_consumer(consumer_id, provider_id, permission_name);
+        provider.bundle = Some(ExtensionBundleMembership {
+            id: "com.example.bundle".to_string(),
+            required: true,
+        });
+        consumer.bundle = provider.bundle.clone();
+
+        registry
+            .install(provider, InstallOptions::default())
+            .unwrap();
+        registry
+            .install(consumer, InstallOptions::default())
+            .unwrap();
+
+        let grant = registry
+            .authorize_service_call(service_call(consumer_id, provider_id))
+            .unwrap();
+        assert_eq!(grant.required_permission, permission_name);
+    }
+
+    #[test]
+    fn service_call_permission_mismatch_is_denied() {
+        let provider_id = "com.example.provider";
+        let consumer_id = "com.example.consumer";
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(
+                service_provider(provider_id, "service.review.comments"),
+                InstallOptions::default(),
+            )
+            .unwrap();
+        registry
+            .install(
+                service_consumer(consumer_id, provider_id, "service.review.other"),
+                InstallOptions::default(),
+            )
+            .unwrap();
+
+        let err = registry
+            .authorize_service_call(service_call(consumer_id, provider_id))
+            .unwrap_err();
+
+        assert!(matches!(err, RegistryError::ServiceDenied { .. }));
+    }
+
+    #[test]
+    fn rollback_restores_previous_active_version() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let mut next = manifest("com.example.extension");
+        next.version = "1.1.0".to_string();
+        next.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        next.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        let installed = registry.install(next, InstallOptions::default()).unwrap();
+        assert_eq!(installed.previous_version.as_deref(), Some("1.0.0"));
+
+        let rolled_back = registry.rollback("com.example.extension").unwrap();
+        assert_eq!(rolled_back.version, "1.0.0");
+        assert_eq!(
+            registry
+                .active_record("com.example.extension")
+                .unwrap()
+                .version,
+            "1.0.0"
+        );
+    }
+}

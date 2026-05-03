@@ -73,7 +73,9 @@ provenance:
   source: github | registry | local
   repository: null
   commit: null
+  registry_identity: null
   artifact_digest: sha256:...
+  manifest_digest: sha256:...
   signature: null
   signer: null
 migration:
@@ -82,6 +84,21 @@ migration:
 ```
 
 manifest は enforceable contract です。runtime behavior が manifest を超える場合、Secretary は実行を block します。
+
+初期の backend enforcement は `atelia-core::extensions` の
+`ExtensionManifest` validation と in-memory `ExtensionRegistry` として実装します。
+この first slice は backend `wasm-rust` / `wasm` manifest、明示的な
+local-development process manifest、version ごとの provenance digest、
+blocklist check、rollback pointer、brokered service-call authorization を扱います。
+WASM execution はまだ実装しません。
+
+初期実装では具体的な id boundary も予約します。
+
+- official backend extension は `ai.atelia.*` namespace と `atelia-official`
+  registry identity を使う
+- local development extension は `local.*` namespace を使い、unsigned の場合は
+  明示的な unsigned dev-mode approval を必要とする
+- third-party extension は official / local namespace を使えない
 
 ## Permission And Capability
 
