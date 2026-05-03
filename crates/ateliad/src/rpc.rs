@@ -10,14 +10,17 @@
 use crate::service::{
     CheckPolicyRequest as ServiceCheckPolicyRequest, DaemonHealth, DaemonStatus,
     ListRepositoriesRequest as ServiceListRepositoriesRequest,
+    ListToolOutputSettingsHistoryRequest as ServiceListToolOutputSettingsHistoryRequest,
     ProtocolMetadata as ServiceProtocolMetadata,
     RegisterRepositoryRequest as ServiceRegisterRepositoryRequest, SecretaryService, ServiceError,
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
 };
 use atelia_core::{
     Actor, CancelJobReceipt, CancellationState, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
-    PathScope, PolicyOutcome, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
-    RiskTier, StoreError,
+    OutputFormat, OversizeOutputPolicy, PathScope, PolicyOutcome, ProjectId, RenderOptions,
+    RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier, StoreError,
+    ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides, ToolOutputSettingsChange,
+    ToolOutputSettingsScope, ToolOutputVerbosity,
 };
 use std::convert::TryFrom;
 
@@ -212,6 +215,63 @@ impl SecretaryRpcServer {
         })
     }
 
+    pub fn get_tool_output_defaults(
+        &self,
+        request: GetToolOutputDefaultsRequest,
+    ) -> RpcResult<GetToolOutputDefaultsResponse> {
+        let scope = parse_tool_output_scope(request.scope.clone())?;
+        let defaults = self.service.get_tool_output_defaults(scope.clone())?;
+
+        Ok(GetToolOutputDefaultsResponse {
+            metadata: self.metadata(),
+            scope: RpcToolOutputScope::from(scope),
+            defaults: RpcToolOutputDefaults::from(defaults),
+        })
+    }
+
+    pub fn update_tool_output_defaults(
+        &self,
+        request: UpdateToolOutputDefaultsRequest,
+    ) -> RpcResult<UpdateToolOutputDefaultsResponse> {
+        let scope = parse_tool_output_scope(request.scope)?;
+        let actor = Actor::try_from(request.actor)?;
+        let overrides = parse_tool_output_overrides(request.overrides)?;
+        let change =
+            self.service
+                .update_tool_output_defaults(actor, scope, overrides, request.reason)?;
+
+        Ok(UpdateToolOutputDefaultsResponse {
+            metadata: self.metadata(),
+            change: RpcToolOutputSettingsChange::from(change),
+        })
+    }
+
+    pub fn list_tool_output_settings_history(
+        &self,
+        request: ListToolOutputSettingsHistoryRequest,
+    ) -> RpcResult<ListToolOutputSettingsHistoryResponse> {
+        let scope = request.scope.map(parse_tool_output_scope).transpose()?;
+        let page = self.service.list_tool_output_settings_history_page(
+            ServiceListToolOutputSettingsHistoryRequest {
+                scope,
+                limit: request.limit,
+                offset: request.offset,
+                cursor: request.cursor,
+            },
+        )?;
+        let changes = page
+            .changes
+            .into_iter()
+            .map(RpcToolOutputSettingsChange::from)
+            .collect();
+
+        Ok(ListToolOutputSettingsHistoryResponse {
+            metadata: self.metadata(),
+            changes,
+            next_page_token: page.next_page_token,
+        })
+    }
+
     fn metadata(&self) -> ProtocolMetadata {
         ProtocolMetadata::from(self.service.protocol_metadata())
     }
@@ -245,10 +305,18 @@ impl From<ServiceError> for RpcError {
                 code: RpcErrorCode::Conflict,
                 reason,
             },
+            ServiceError::Settings(err) => Self {
+                code: RpcErrorCode::InvalidArgument,
+                reason: err.to_string(),
+            },
             ServiceError::Store(error) => store_error_to_rpc(error),
             ServiceError::Runtime(error) => Self {
                 code: RpcErrorCode::Internal,
                 reason: error.to_string(),
+            },
+            ServiceError::Internal { reason } => Self {
+                code: RpcErrorCode::Internal,
+                reason,
             },
         }
     }
@@ -339,6 +407,290 @@ pub struct ListRepositoriesResponse {
     pub metadata: ProtocolMetadata,
     pub repositories: Vec<Repository>,
     pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetToolOutputDefaultsRequest {
+    pub scope: RpcToolOutputScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetToolOutputDefaultsResponse {
+    pub metadata: ProtocolMetadata,
+    pub scope: RpcToolOutputScope,
+    pub defaults: RpcToolOutputDefaults,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateToolOutputDefaultsRequest {
+    pub scope: RpcToolOutputScope,
+    pub actor: RpcActorDto,
+    pub reason: String,
+    pub overrides: RpcToolOutputOverrides,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateToolOutputDefaultsResponse {
+    pub metadata: ProtocolMetadata,
+    pub change: RpcToolOutputSettingsChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListToolOutputSettingsHistoryRequest {
+    pub scope: Option<RpcToolOutputScope>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListToolOutputSettingsHistoryResponse {
+    pub metadata: ProtocolMetadata,
+    pub changes: Vec<RpcToolOutputSettingsChange>,
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcToolOutputScope {
+    pub level: RpcToolOutputScopeLevel,
+    pub tool_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcToolOutputScopeLevel {
+    Workspace,
+    Repository { repository_id: String },
+    Project { project_id: String },
+    Session { session_id: String },
+    AgentProfile { agent_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcToolOutputDefaults {
+    pub render_options: RpcToolOutputRenderOptions,
+    pub max_inline_bytes: u64,
+    pub max_inline_lines: u32,
+    pub verbosity: RpcToolOutputVerbosity,
+    pub granularity: RpcToolOutputGranularity,
+    pub oversize_policy: RpcOversizeOutputPolicy,
+}
+
+impl From<ToolOutputDefaults> for RpcToolOutputDefaults {
+    fn from(defaults: ToolOutputDefaults) -> Self {
+        Self {
+            render_options: RpcToolOutputRenderOptions::from(defaults.render_options),
+            max_inline_bytes: defaults.max_inline_bytes,
+            max_inline_lines: defaults.max_inline_lines,
+            verbosity: RpcToolOutputVerbosity::from(defaults.verbosity),
+            granularity: RpcToolOutputGranularity::from(defaults.granularity),
+            oversize_policy: RpcOversizeOutputPolicy::from(defaults.oversize_policy),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcToolOutputRenderOptions {
+    pub format: RpcOutputFormat,
+    pub include_policy: bool,
+    pub include_diagnostics: bool,
+    pub include_cost: bool,
+}
+
+impl From<RenderOptions> for RpcToolOutputRenderOptions {
+    fn from(options: RenderOptions) -> Self {
+        Self {
+            format: RpcOutputFormat::from(options.format),
+            include_policy: options.include_policy,
+            include_diagnostics: options.include_diagnostics,
+            include_cost: options.include_cost,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RpcToolOutputOverrides {
+    pub format: Option<RpcOutputFormat>,
+    pub include_policy: Option<bool>,
+    pub include_diagnostics: Option<bool>,
+    pub include_cost: Option<bool>,
+    pub max_inline_bytes: Option<u64>,
+    pub max_inline_lines: Option<u32>,
+    pub verbosity: Option<RpcToolOutputVerbosity>,
+    pub granularity: Option<RpcToolOutputGranularity>,
+    pub oversize_policy: Option<RpcOversizeOutputPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcToolOutputSettingsChange {
+    pub schema_version: u32,
+    pub actor: RpcActorDto,
+    pub scope: RpcToolOutputScope,
+    pub old_defaults: RpcToolOutputDefaults,
+    pub new_defaults: RpcToolOutputDefaults,
+    pub reason: String,
+    pub changed_at_unix_ms: i64,
+}
+
+impl From<ToolOutputSettingsChange> for RpcToolOutputSettingsChange {
+    fn from(change: ToolOutputSettingsChange) -> Self {
+        Self {
+            schema_version: change.schema_version,
+            actor: RpcActorDto::from(change.actor),
+            scope: RpcToolOutputScope::from(change.scope),
+            old_defaults: RpcToolOutputDefaults::from(change.old_defaults),
+            new_defaults: RpcToolOutputDefaults::from(change.new_defaults),
+            reason: change.reason,
+            changed_at_unix_ms: change.changed_at.unix_millis,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcOutputFormat {
+    Toon,
+    Json,
+    Text,
+}
+
+impl From<OutputFormat> for RpcOutputFormat {
+    fn from(format: OutputFormat) -> Self {
+        match format {
+            OutputFormat::Toon => Self::Toon,
+            OutputFormat::Json => Self::Json,
+            OutputFormat::Text => Self::Text,
+        }
+    }
+}
+
+impl TryFrom<RpcOutputFormat> for OutputFormat {
+    type Error = RpcError;
+
+    fn try_from(value: RpcOutputFormat) -> Result<Self, Self::Error> {
+        Ok(match value {
+            RpcOutputFormat::Toon => Self::Toon,
+            RpcOutputFormat::Json => Self::Json,
+            RpcOutputFormat::Text => Self::Text,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcToolOutputVerbosity {
+    Minimal,
+    Normal,
+    Expanded,
+    Debug,
+}
+
+impl From<ToolOutputVerbosity> for RpcToolOutputVerbosity {
+    fn from(verbosity: ToolOutputVerbosity) -> Self {
+        match verbosity {
+            ToolOutputVerbosity::Minimal => Self::Minimal,
+            ToolOutputVerbosity::Normal => Self::Normal,
+            ToolOutputVerbosity::Expanded => Self::Expanded,
+            ToolOutputVerbosity::Debug => Self::Debug,
+        }
+    }
+}
+
+impl TryFrom<RpcToolOutputVerbosity> for ToolOutputVerbosity {
+    type Error = RpcError;
+
+    fn try_from(value: RpcToolOutputVerbosity) -> Result<Self, Self::Error> {
+        Ok(match value {
+            RpcToolOutputVerbosity::Minimal => Self::Minimal,
+            RpcToolOutputVerbosity::Normal => Self::Normal,
+            RpcToolOutputVerbosity::Expanded => Self::Expanded,
+            RpcToolOutputVerbosity::Debug => Self::Debug,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcToolOutputGranularity {
+    Summary,
+    KeyFields,
+    Full,
+}
+
+impl From<ToolOutputGranularity> for RpcToolOutputGranularity {
+    fn from(granularity: ToolOutputGranularity) -> Self {
+        match granularity {
+            ToolOutputGranularity::Summary => Self::Summary,
+            ToolOutputGranularity::KeyFields => Self::KeyFields,
+            ToolOutputGranularity::Full => Self::Full,
+        }
+    }
+}
+
+impl TryFrom<RpcToolOutputGranularity> for ToolOutputGranularity {
+    type Error = RpcError;
+
+    fn try_from(value: RpcToolOutputGranularity) -> Result<Self, Self::Error> {
+        Ok(match value {
+            RpcToolOutputGranularity::Summary => Self::Summary,
+            RpcToolOutputGranularity::KeyFields => Self::KeyFields,
+            RpcToolOutputGranularity::Full => Self::Full,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcOversizeOutputPolicy {
+    TruncateWithMetadata,
+    SpillToArtifactRef,
+    RejectOversize,
+}
+
+impl From<OversizeOutputPolicy> for RpcOversizeOutputPolicy {
+    fn from(policy: OversizeOutputPolicy) -> Self {
+        match policy {
+            OversizeOutputPolicy::TruncateWithMetadata => Self::TruncateWithMetadata,
+            OversizeOutputPolicy::SpillToArtifactRef => Self::SpillToArtifactRef,
+            OversizeOutputPolicy::RejectOversize => Self::RejectOversize,
+        }
+    }
+}
+
+impl TryFrom<RpcOversizeOutputPolicy> for OversizeOutputPolicy {
+    type Error = RpcError;
+
+    fn try_from(value: RpcOversizeOutputPolicy) -> Result<Self, Self::Error> {
+        Ok(match value {
+            RpcOversizeOutputPolicy::TruncateWithMetadata => Self::TruncateWithMetadata,
+            RpcOversizeOutputPolicy::SpillToArtifactRef => Self::SpillToArtifactRef,
+            RpcOversizeOutputPolicy::RejectOversize => Self::RejectOversize,
+        })
+    }
+}
+
+impl From<ToolOutputSettingsScope> for RpcToolOutputScope {
+    fn from(scope: ToolOutputSettingsScope) -> Self {
+        Self {
+            level: match scope.level {
+                atelia_core::ToolOutputSettingsLevel::Workspace => {
+                    RpcToolOutputScopeLevel::Workspace
+                }
+                atelia_core::ToolOutputSettingsLevel::Repository { repository_id } => {
+                    RpcToolOutputScopeLevel::Repository {
+                        repository_id: repository_id.as_str().to_string(),
+                    }
+                }
+                atelia_core::ToolOutputSettingsLevel::Project { project_id } => {
+                    RpcToolOutputScopeLevel::Project {
+                        project_id: project_id_to_string(&project_id),
+                    }
+                }
+                atelia_core::ToolOutputSettingsLevel::Session { session_id } => {
+                    RpcToolOutputScopeLevel::Session { session_id }
+                }
+                atelia_core::ToolOutputSettingsLevel::AgentProfile { agent_id } => {
+                    RpcToolOutputScopeLevel::AgentProfile { agent_id }
+                }
+            },
+            tool_id: scope.tool_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -598,6 +950,101 @@ fn parse_list_repositories_request(
         page_size: request.page_size,
         page_token: request.page_token,
     })
+}
+
+fn parse_tool_output_scope(request: RpcToolOutputScope) -> RpcResult<ToolOutputSettingsScope> {
+    let tool_id = request.tool_id.map(|id| {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            return Err(RpcError::invalid_argument(
+                "tool_output scope.tool_id must not be empty when provided",
+            ));
+        }
+
+        Ok(trimmed.to_string())
+    });
+    let level = match request.level {
+        RpcToolOutputScopeLevel::Workspace => ToolOutputSettingsScope::workspace(),
+        RpcToolOutputScopeLevel::Repository { repository_id } => {
+            let repository_id = parse_repository_id(repository_id.trim())?;
+            ToolOutputSettingsScope::repository(repository_id)
+        }
+        RpcToolOutputScopeLevel::Project { project_id } => {
+            let project_id = parse_project_id(project_id)?;
+            ToolOutputSettingsScope::project(project_id)
+        }
+        RpcToolOutputScopeLevel::Session { session_id } => {
+            let session_id = session_id.trim();
+            if session_id.is_empty() {
+                return Err(RpcError::invalid_argument(
+                    "tool_output session scope requires a non-empty session_id",
+                ));
+            }
+
+            ToolOutputSettingsScope::session(session_id.to_string())
+        }
+        RpcToolOutputScopeLevel::AgentProfile { agent_id } => {
+            let agent_id = agent_id.trim();
+            if agent_id.is_empty() {
+                return Err(RpcError::invalid_argument(
+                    "tool_output agent_profile scope requires a non-empty agent_id",
+                ));
+            }
+
+            ToolOutputSettingsScope::agent_profile(agent_id.to_string())
+        }
+    };
+
+    let mut scope = level;
+    if let Some(tool_id) = tool_id.transpose()? {
+        scope = scope.for_tool(tool_id);
+    }
+    Ok(scope)
+}
+
+fn parse_tool_output_overrides(request: RpcToolOutputOverrides) -> RpcResult<ToolOutputOverrides> {
+    Ok(ToolOutputOverrides {
+        format: request.format.map(OutputFormat::try_from).transpose()?,
+        include_policy: request.include_policy,
+        include_diagnostics: request.include_diagnostics,
+        include_cost: request.include_cost,
+        max_inline_bytes: request.max_inline_bytes,
+        max_inline_lines: request.max_inline_lines,
+        verbosity: request
+            .verbosity
+            .map(ToolOutputVerbosity::try_from)
+            .transpose()?,
+        granularity: request
+            .granularity
+            .map(ToolOutputGranularity::try_from)
+            .transpose()?,
+        oversize_policy: request
+            .oversize_policy
+            .map(OversizeOutputPolicy::try_from)
+            .transpose()?,
+    })
+}
+
+fn parse_project_id(value: String) -> RpcResult<ProjectId> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(RpcError::invalid_argument(
+            "tool_output project scope requires a non-empty project_id",
+        ));
+    }
+
+    let project_id_json = format!("\"{trimmed}\"");
+    let project_id: ProjectId = serde_json::from_str(&project_id_json)
+        .map_err(|_| RpcError::invalid_argument("tool_output project_id must be a valid UUID"))?;
+
+    Ok(project_id)
+}
+
+fn project_id_to_string(project_id: &ProjectId) -> String {
+    serde_json::to_string(project_id)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .trim_matches('"')
+        .to_string()
 }
 
 fn parse_repository_allowed_scope(
@@ -1048,6 +1495,31 @@ mod tests {
         }
     }
 
+    fn tool_output_scope_workspace() -> RpcToolOutputScope {
+        RpcToolOutputScope {
+            level: RpcToolOutputScopeLevel::Workspace,
+            tool_id: None,
+        }
+    }
+
+    fn tool_output_scope_repository() -> RpcToolOutputScope {
+        RpcToolOutputScope {
+            level: RpcToolOutputScopeLevel::Repository {
+                repository_id: RepositoryId::new().as_str().to_string(),
+            },
+            tool_id: None,
+        }
+    }
+
+    fn tool_output_scope_project() -> RpcToolOutputScope {
+        RpcToolOutputScope {
+            level: RpcToolOutputScopeLevel::Project {
+                project_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            },
+            tool_id: None,
+        }
+    }
+
     fn actor_record() -> Actor {
         Actor::Agent {
             id: "agent:test".to_string(),
@@ -1137,6 +1609,251 @@ mod tests {
             started_at: atelia_core::LedgerTimestamp::from_unix_millis(0),
         });
         assert_eq!(read_only.status, "degraded");
+    }
+
+    #[test]
+    fn health_includes_tool_output_settings_capability() {
+        let server = ready_server();
+        let response = server.health(HealthRequest);
+        assert!(response
+            .capabilities
+            .contains(&"tool_output_settings.v1".to_string()));
+    }
+
+    #[test]
+    fn tool_output_defaults_exposed_via_scope_round_trip() {
+        let server = ready_server();
+        let response = server
+            .get_tool_output_defaults(GetToolOutputDefaultsRequest {
+                scope: tool_output_scope_workspace(),
+            })
+            .expect("workspace defaults lookup should succeed");
+        let baseline = atelia_core::ToolOutputDefaults::default();
+
+        assert_eq!(
+            response.scope,
+            RpcToolOutputScope {
+                level: RpcToolOutputScopeLevel::Workspace,
+                tool_id: None
+            }
+        );
+        assert_eq!(
+            response.defaults.max_inline_lines,
+            baseline.max_inline_lines
+        );
+        assert_eq!(
+            response.defaults.max_inline_bytes,
+            baseline.max_inline_bytes
+        );
+    }
+
+    #[test]
+    fn tool_output_defaults_return_canonical_scope() {
+        let server = ready_server();
+        let response = server
+            .get_tool_output_defaults(GetToolOutputDefaultsRequest {
+                scope: RpcToolOutputScope {
+                    level: RpcToolOutputScopeLevel::Workspace,
+                    tool_id: Some("  tool.fs-read  ".to_string()),
+                },
+            })
+            .expect("tool output defaults lookup should succeed");
+
+        assert_eq!(
+            response.scope,
+            RpcToolOutputScope {
+                level: RpcToolOutputScopeLevel::Workspace,
+                tool_id: Some("tool.fs-read".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn tool_output_project_scope_round_trips_and_preserved_in_history() {
+        let server = ready_server();
+        let scope = tool_output_scope_project();
+        let change = server
+            .update_tool_output_defaults(UpdateToolOutputDefaultsRequest {
+                scope: scope.clone(),
+                actor: actor(),
+                reason: "Project-level override for tests".to_string(),
+                overrides: RpcToolOutputOverrides {
+                    max_inline_lines: Some(222),
+                    ..Default::default()
+                },
+            })
+            .expect("project update should succeed");
+
+        let defaults = server
+            .get_tool_output_defaults(GetToolOutputDefaultsRequest { scope })
+            .expect("project defaults lookup should succeed");
+
+        let history = server
+            .list_tool_output_settings_history(ListToolOutputSettingsHistoryRequest {
+                scope: Some(RpcToolOutputScope {
+                    level: RpcToolOutputScopeLevel::Project {
+                        project_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+                    },
+                    tool_id: None,
+                }),
+                limit: None,
+                offset: None,
+                cursor: None,
+            })
+            .expect("history should return project-scoped entries");
+
+        let expected_scope = RpcToolOutputScope {
+            level: RpcToolOutputScopeLevel::Project {
+                project_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            },
+            tool_id: None,
+        };
+
+        assert_eq!(change.change.scope, expected_scope);
+        assert_eq!(defaults.scope, expected_scope);
+        assert_eq!(history.changes.len(), 1);
+        assert_eq!(history.changes[0].scope, expected_scope);
+        assert_eq!(defaults.defaults.max_inline_lines, 222);
+    }
+
+    #[test]
+    fn update_tool_output_defaults_records_audit_and_updates_lookup() {
+        let server = ready_server();
+        let change = server
+            .update_tool_output_defaults(UpdateToolOutputDefaultsRequest {
+                scope: RpcToolOutputScope {
+                    level: RpcToolOutputScopeLevel::Session {
+                        session_id: "session-1".to_string(),
+                    },
+                    tool_id: Some("tool.fs-read".to_string()),
+                },
+                actor: actor(),
+                reason: "Long output trim for inspection mode".to_string(),
+                overrides: RpcToolOutputOverrides {
+                    max_inline_lines: Some(120),
+                    format: Some(RpcOutputFormat::Json),
+                    ..Default::default()
+                },
+            })
+            .expect("tool output defaults update should succeed");
+
+        let defaults = server
+            .get_tool_output_defaults(GetToolOutputDefaultsRequest {
+                scope: RpcToolOutputScope {
+                    level: RpcToolOutputScopeLevel::Session {
+                        session_id: "session-1".to_string(),
+                    },
+                    tool_id: Some("tool.fs-read".to_string()),
+                },
+            })
+            .expect("tool output defaults lookup should succeed");
+
+        let history = server
+            .list_tool_output_settings_history(ListToolOutputSettingsHistoryRequest {
+                scope: Some(RpcToolOutputScope {
+                    level: RpcToolOutputScopeLevel::Session {
+                        session_id: "session-1".to_string(),
+                    },
+                    tool_id: Some("tool.fs-read".to_string()),
+                }),
+                limit: None,
+                offset: None,
+                cursor: None,
+            })
+            .expect("settings history should return filterable list");
+
+        assert_eq!(change.change.new_defaults.max_inline_lines, 120);
+        assert_eq!(
+            change.change.new_defaults.render_options.format,
+            RpcOutputFormat::Json
+        );
+        assert_eq!(change.change.actor, actor());
+        assert_eq!(
+            defaults.scope,
+            RpcToolOutputScope {
+                level: RpcToolOutputScopeLevel::Session {
+                    session_id: "session-1".to_string(),
+                },
+                tool_id: Some("tool.fs-read".to_string()),
+            }
+        );
+        assert_eq!(defaults.defaults.max_inline_lines, 120);
+        assert_eq!(history.changes.len(), 1);
+        assert_eq!(history.changes[0].actor, actor());
+    }
+
+    #[test]
+    fn list_tool_output_settings_history_forwards_pagination_and_token() {
+        let server = ready_server();
+        for i in 0..3 {
+            server
+                .update_tool_output_defaults(UpdateToolOutputDefaultsRequest {
+                    scope: RpcToolOutputScope {
+                        level: RpcToolOutputScopeLevel::Workspace,
+                        tool_id: None,
+                    },
+                    actor: actor(),
+                    reason: format!("history-page {i}"),
+                    overrides: RpcToolOutputOverrides {
+                        max_inline_lines: Some(300 + i),
+                        ..Default::default()
+                    },
+                })
+                .expect("tool output defaults update should succeed");
+        }
+
+        let first = server
+            .list_tool_output_settings_history(ListToolOutputSettingsHistoryRequest {
+                scope: None,
+                limit: Some(2),
+                offset: None,
+                cursor: None,
+            })
+            .expect("first history page should succeed");
+        assert_eq!(first.changes.len(), 2);
+        assert_eq!(first.next_page_token, Some("2".to_string()));
+
+        let second = server
+            .list_tool_output_settings_history(ListToolOutputSettingsHistoryRequest {
+                scope: None,
+                limit: Some(2),
+                offset: None,
+                cursor: first.next_page_token,
+            })
+            .expect("second history page should succeed");
+        assert_eq!(second.changes.len(), 1);
+        assert_eq!(second.next_page_token, None);
+    }
+
+    #[test]
+    fn update_tool_output_defaults_rejects_missing_reason_or_invalid_scope() {
+        let server = ready_server();
+
+        let empty_reason = server
+            .update_tool_output_defaults(UpdateToolOutputDefaultsRequest {
+                scope: tool_output_scope_workspace(),
+                actor: actor(),
+                reason: "  ".to_string(),
+                overrides: RpcToolOutputOverrides {
+                    max_inline_lines: Some(220),
+                    ..Default::default()
+                },
+            })
+            .unwrap_err();
+
+        assert_eq!(empty_reason.code, RpcErrorCode::InvalidArgument);
+
+        let invalid_scope = server
+            .get_tool_output_defaults(GetToolOutputDefaultsRequest {
+                scope: RpcToolOutputScope {
+                    level: RpcToolOutputScopeLevel::Repository {
+                        repository_id: "not-a-repo-id".to_string(),
+                    },
+                    tool_id: None,
+                },
+            })
+            .unwrap_err();
+        assert_eq!(invalid_scope.code, RpcErrorCode::InvalidArgument);
     }
 
     #[test]

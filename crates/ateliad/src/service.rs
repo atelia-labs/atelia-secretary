@@ -5,10 +5,12 @@
 //! registration/listing, and the first supported job lifecycle calls.
 
 use atelia_core::{
-    Actor, CancelJobReceipt, DefaultPolicyEngine, InMemoryStore, JobId, JobKind,
-    JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, PathScope,
-    PolicyEngine, PolicyInput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
-    RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
+    Actor, CancelJobReceipt, DefaultPolicyEngine, InMemoryStore, InMemoryToolOutputSettingsService,
+    JobId, JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
+    PathScope, PolicyEngine, PolicyInput, RepositoryId, RepositoryRecord, RepositoryTrustState,
+    ResourceScope, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
+    ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
+    ToolOutputSettingsScope,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,6 +19,21 @@ use std::sync::Mutex;
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "1.0.0";
 const STORAGE_VERSION: &str = "0.1.0";
+const DAEMON_CAPABILITIES: &[&str] = &[
+    "health.v1",
+    "repositories.v1",
+    "jobs.v1",
+    "policy.v1",
+    "tool_output_settings.v1",
+];
+const MAX_HISTORY_PAGE: usize = 1000;
+
+fn daemon_capabilities() -> Vec<String> {
+    DAEMON_CAPABILITIES
+        .iter()
+        .map(|capability| capability.to_string())
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Health types
@@ -71,7 +88,9 @@ pub enum ServiceError {
     Conflict { reason: String },
     Store(atelia_core::StoreError),
     Runtime(RuntimeError),
+    Settings(ToolOutputSettingsError),
     InvalidArgument { reason: String },
+    Internal { reason: String },
 }
 
 impl std::fmt::Display for ServiceError {
@@ -80,7 +99,9 @@ impl std::fmt::Display for ServiceError {
             Self::Conflict { reason } => write!(f, "conflict: {reason}"),
             Self::Store(err) => write!(f, "{err}"),
             Self::Runtime(err) => write!(f, "{err}"),
+            Self::Settings(err) => write!(f, "tool output settings: {err}"),
             Self::InvalidArgument { reason } => write!(f, "invalid argument: {reason}"),
+            Self::Internal { reason } => write!(f, "internal error: {reason}"),
         }
     }
 }
@@ -99,6 +120,12 @@ impl From<RuntimeError> for ServiceError {
             RuntimeError::Store(err) => Self::Store(err),
             err => Self::Runtime(err),
         }
+    }
+}
+
+impl From<ToolOutputSettingsError> for ServiceError {
+    fn from(err: ToolOutputSettingsError) -> Self {
+        Self::Settings(err)
     }
 }
 
@@ -154,6 +181,20 @@ pub struct ListRepositoriesPage {
     pub next_page_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ListToolOutputSettingsHistoryRequest {
+    pub scope: Option<ToolOutputSettingsScope>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListToolOutputSettingsHistoryPage {
+    pub changes: Vec<ToolOutputSettingsChange>,
+    pub next_page_token: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct IdempotentSubmitJob {
     signature: String,
@@ -173,6 +214,7 @@ pub struct SecretaryService {
     lifecycle: JobLifecycleService<InMemoryStore, DefaultPolicyEngine>,
     started_at: LedgerTimestamp,
     daemon_status: DaemonStatus,
+    tool_output_settings: Mutex<InMemoryToolOutputSettingsService>,
     idempotent_submissions: Mutex<HashMap<String, IdempotentSubmitJob>>,
     cancellation_requesters: Mutex<HashMap<JobId, Actor>>,
 }
@@ -184,9 +226,22 @@ impl SecretaryService {
             lifecycle: JobLifecycleService::in_memory(),
             started_at: LedgerTimestamp::now(),
             daemon_status: DaemonStatus::Starting,
+            tool_output_settings: Mutex::new(InMemoryToolOutputSettingsService::new(
+                LedgerTimestamp::now(),
+            )),
             idempotent_submissions: HashMap::new().into(),
             cancellation_requesters: HashMap::new().into(),
         }
+    }
+
+    fn lock_tool_output_settings(
+        &self,
+    ) -> ServiceResult<std::sync::MutexGuard<'_, InMemoryToolOutputSettingsService>> {
+        self.tool_output_settings
+            .lock()
+            .map_err(|err| ServiceError::Internal {
+                reason: format!("tool output settings lock poisoned: {err}"),
+            })
     }
 
     /// Transition the daemon into [`DaemonStatus::Running`].
@@ -222,12 +277,7 @@ impl SecretaryService {
             daemon_version: DAEMON_VERSION.to_string(),
             protocol_version: PROTOCOL_VERSION.to_string(),
             storage_version: STORAGE_VERSION.to_string(),
-            capabilities: vec![
-                "health.v1".to_string(),
-                "repositories.v1".to_string(),
-                "jobs.v1".to_string(),
-                "policy.v1".to_string(),
-            ],
+            capabilities: daemon_capabilities(),
             repository_count,
             started_at: self.started_at,
         }
@@ -238,12 +288,7 @@ impl SecretaryService {
             protocol_version: PROTOCOL_VERSION.to_string(),
             daemon_version: DAEMON_VERSION.to_string(),
             storage_version: STORAGE_VERSION.to_string(),
-            capabilities: vec![
-                "health.v1".to_string(),
-                "repositories.v1".to_string(),
-                "jobs.v1".to_string(),
-                "policy.v1".to_string(),
-            ],
+            capabilities: daemon_capabilities(),
         }
     }
 
@@ -340,6 +385,90 @@ impl SecretaryService {
     #[allow(dead_code)]
     pub fn get_repository(&self, id: &RepositoryId) -> ServiceResult<RepositoryRecord> {
         Ok(self.lifecycle.runtime().store().get_repository(id)?)
+    }
+
+    /// Resolve effective tool output defaults for an explicit scope.
+    pub fn get_tool_output_defaults(
+        &self,
+        scope: ToolOutputSettingsScope,
+    ) -> ServiceResult<ToolOutputDefaults> {
+        Ok(self.lock_tool_output_settings()?.resolve_defaults(&scope))
+    }
+
+    /// Update tool output defaults for a specific scope and record an audit change.
+    pub fn update_tool_output_defaults(
+        &self,
+        actor: Actor,
+        scope: ToolOutputSettingsScope,
+        update: ToolOutputOverrides,
+        reason: String,
+    ) -> ServiceResult<ToolOutputSettingsChange> {
+        let mut tool_output_settings = self.lock_tool_output_settings()?;
+        Ok(tool_output_settings.apply_update(
+            actor,
+            scope,
+            update,
+            reason,
+            LedgerTimestamp::now(),
+        )?)
+    }
+
+    /// Return a snapshot of tool output settings changes, optionally filtered by scope.
+    #[allow(dead_code)]
+    pub fn list_tool_output_settings_history(
+        &self,
+        scope: Option<ToolOutputSettingsScope>,
+    ) -> ServiceResult<ListToolOutputSettingsHistoryPage> {
+        self.list_tool_output_settings_history_page(ListToolOutputSettingsHistoryRequest {
+            scope,
+            ..Default::default()
+        })
+    }
+
+    /// Return a bounded page of tool output settings change records.
+    pub fn list_tool_output_settings_history_page(
+        &self,
+        request: ListToolOutputSettingsHistoryRequest,
+    ) -> ServiceResult<ListToolOutputSettingsHistoryPage> {
+        let ListToolOutputSettingsHistoryRequest {
+            scope,
+            limit: requested_limit,
+            offset,
+            cursor,
+        } = request;
+        let requested_limit = requested_limit.unwrap_or(MAX_HISTORY_PAGE);
+        let limit = requested_limit.min(MAX_HISTORY_PAGE);
+        let start = list_history_page_start(offset, cursor)?;
+        if limit == 0 {
+            return Ok(ListToolOutputSettingsHistoryPage {
+                changes: Vec::new(),
+                next_page_token: None,
+            });
+        }
+        let changes = self
+            .lock_tool_output_settings()?
+            .changes()
+            .iter()
+            .filter(|change| scope.as_ref().is_none_or(|scope| change.scope == *scope))
+            .skip(start)
+            .take(limit.saturating_add(1))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if changes.len() <= limit {
+            return Ok(ListToolOutputSettingsHistoryPage {
+                changes,
+                next_page_token: None,
+            });
+        }
+
+        let next_page_token = (start + limit).to_string();
+        let mut changes = changes;
+        changes.truncate(limit);
+        Ok(ListToolOutputSettingsHistoryPage {
+            changes,
+            next_page_token: Some(next_page_token),
+        })
     }
 
     /// Submit the first supported daemon job, backed by the core echo tool.
@@ -518,6 +647,28 @@ fn parse_page_token(page_token: Option<&str>, collection: &'static str) -> Servi
         }
         _ => Ok(0),
     }
+}
+
+fn list_history_page_start(offset: Option<usize>, cursor: Option<String>) -> ServiceResult<usize> {
+    let has_offset = offset.is_some();
+    let has_cursor = cursor.is_some();
+    let cursors_specified = usize::from(has_offset) + usize::from(has_cursor);
+
+    if cursors_specified > 1 {
+        return Err(ServiceError::InvalidArgument {
+            reason: "only one of offset or cursor may be set".to_string(),
+        });
+    }
+
+    if let Some(cursor) = cursor {
+        return parse_page_token(Some(cursor.as_str()), "tool output settings history");
+    }
+
+    if let Some(offset) = offset {
+        return Ok(offset);
+    }
+
+    Ok(0)
 }
 
 fn paginate_records<T>(
@@ -711,6 +862,9 @@ mod tests {
         assert!(health.capabilities.contains(&"repositories.v1".to_string()));
         assert!(health.capabilities.contains(&"jobs.v1".to_string()));
         assert!(health.capabilities.contains(&"policy.v1".to_string()));
+        assert!(health
+            .capabilities
+            .contains(&"tool_output_settings.v1".to_string()));
     }
 
     #[test]
@@ -738,6 +892,9 @@ mod tests {
             .contains(&"repositories.v1".to_string()));
         assert!(metadata.capabilities.contains(&"jobs.v1".to_string()));
         assert!(metadata.capabilities.contains(&"policy.v1".to_string()));
+        assert!(metadata
+            .capabilities
+            .contains(&"tool_output_settings.v1".to_string()));
     }
 
     // -- register / list round trip -----------------------------------------
@@ -1015,6 +1172,8 @@ mod tests {
         assert!(matches!(err, ServiceError::Store(_)));
     }
 
+    // -- policy checks API -------------------------------------------------
+
     #[test]
     fn check_policy_runs_preview_for_allowed_capability() {
         let svc = ready_service();
@@ -1201,6 +1360,319 @@ mod tests {
 
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
         let _ = fs::remove_dir_all(root);
+    }
+
+    // -- tool output settings API -------------------------------------------
+
+    #[test]
+    fn tool_output_defaults_initially_resolve_from_workspace_baseline() {
+        let svc = ready_service();
+        let defaults = svc
+            .get_tool_output_defaults(ToolOutputSettingsScope::workspace())
+            .expect("defaults lookup should succeed");
+        let baseline = ToolOutputDefaults::default();
+
+        assert_eq!(defaults.max_inline_bytes, baseline.max_inline_bytes);
+        assert_eq!(defaults.max_inline_lines, baseline.max_inline_lines);
+        assert_eq!(defaults.verbosity, baseline.verbosity);
+        assert_eq!(defaults.granularity, baseline.granularity);
+        assert_eq!(defaults.oversize_policy, baseline.oversize_policy);
+        assert_eq!(defaults.render_options, baseline.render_options);
+    }
+
+    #[test]
+    fn tool_output_update_updates_workspace_defaults_and_records_change() {
+        let svc = ready_service();
+        let change = svc
+            .update_tool_output_defaults(
+                actor(),
+                ToolOutputSettingsScope::workspace(),
+                ToolOutputOverrides {
+                    max_inline_lines: Some(120),
+                    ..ToolOutputOverrides::default()
+                },
+                "Adjust workspace defaults for concise responses".to_string(),
+            )
+            .expect("workspace output update should succeed");
+
+        let defaults = svc
+            .get_tool_output_defaults(ToolOutputSettingsScope::workspace())
+            .expect("defaults lookup should succeed");
+
+        assert_eq!(defaults.max_inline_lines, 120);
+        assert_eq!(
+            change.scope.level,
+            ToolOutputSettingsScope::workspace().level
+        );
+        assert_eq!(change.new_defaults.max_inline_lines, 120);
+        assert_eq!(
+            change.reason,
+            "Adjust workspace defaults for concise responses"
+        );
+        assert_eq!(change.actor, actor());
+        let history = svc
+            .list_tool_output_settings_history(None)
+            .expect("history should be available");
+        assert_eq!(history.changes.len(), 1);
+        assert_eq!(
+            history.changes[0].scope.level,
+            ToolOutputSettingsScope::workspace().level
+        );
+    }
+
+    #[test]
+    fn tool_output_update_rejects_empty_update() {
+        let svc = ready_service();
+        let err = svc
+            .update_tool_output_defaults(
+                actor(),
+                ToolOutputSettingsScope::workspace(),
+                ToolOutputOverrides::default(),
+                "Empty update should fail".to_string(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ServiceError::Settings(ToolOutputSettingsError::EmptyUpdate)
+        ));
+    }
+
+    #[test]
+    fn tool_output_update_rejects_missing_reason() {
+        let svc = ready_service();
+        let err = svc
+            .update_tool_output_defaults(
+                actor(),
+                ToolOutputSettingsScope::workspace(),
+                ToolOutputOverrides {
+                    max_inline_lines: Some(250),
+                    ..ToolOutputOverrides::default()
+                },
+                "   ".to_string(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ServiceError::Settings(ToolOutputSettingsError::MissingReason)
+        ));
+    }
+
+    #[test]
+    fn tool_output_settings_lock_poisoning_returns_service_error() {
+        let svc = Arc::new(ready_service());
+        let poisoned = Arc::clone(&svc);
+
+        thread::spawn(move || {
+            let _guard = poisoned.tool_output_settings.lock().unwrap();
+            panic!("poison tool output settings lock");
+        })
+        .join()
+        .expect_err("poisoning thread should panic");
+
+        let defaults_err = svc
+            .get_tool_output_defaults(ToolOutputSettingsScope::workspace())
+            .unwrap_err();
+        assert!(matches!(
+            defaults_err,
+            ServiceError::Internal { reason } if reason.contains("tool output settings lock poisoned")
+        ));
+
+        let update_err = svc
+            .update_tool_output_defaults(
+                actor(),
+                ToolOutputSettingsScope::workspace(),
+                ToolOutputOverrides {
+                    max_inline_lines: Some(32),
+                    ..ToolOutputOverrides::default()
+                },
+                "attempt after poison".to_string(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            update_err,
+            ServiceError::Internal { reason } if reason.contains("tool output settings lock poisoned")
+        ));
+
+        let history_err = svc
+            .list_tool_output_settings_history_page(ListToolOutputSettingsHistoryRequest {
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(
+            history_err,
+            ServiceError::Internal { reason } if reason.contains("tool output settings lock poisoned")
+        ));
+    }
+
+    #[test]
+    fn tool_output_history_can_filter_by_scope() {
+        let svc = ready_service();
+        svc.update_tool_output_defaults(
+            actor(),
+            ToolOutputSettingsScope::workspace(),
+            ToolOutputOverrides {
+                max_inline_bytes: Some(16_384),
+                ..ToolOutputOverrides::default()
+            },
+            "workspace baseline".to_string(),
+        )
+        .expect("workspace output update should succeed");
+
+        let repository_scope = ToolOutputSettingsScope::repository(RepositoryId::new());
+        svc.update_tool_output_defaults(
+            actor(),
+            repository_scope.clone(),
+            ToolOutputOverrides {
+                max_inline_lines: Some(80),
+                ..ToolOutputOverrides::default()
+            },
+            "repository override".to_string(),
+        )
+        .expect("repository output update should succeed");
+
+        let all = svc
+            .list_tool_output_settings_history(None)
+            .expect("history should be available");
+        let workspace = svc
+            .list_tool_output_settings_history(Some(ToolOutputSettingsScope::workspace()))
+            .expect("workspace history should be available");
+        let repository = svc
+            .list_tool_output_settings_history(Some(repository_scope.clone()))
+            .expect("repository history should be available");
+
+        assert_eq!(all.changes.len(), 2);
+        assert_eq!(workspace.changes.len(), 1);
+        assert_eq!(repository.changes.len(), 1);
+        assert_eq!(
+            workspace.changes[0].scope.level,
+            ToolOutputSettingsScope::workspace().level
+        );
+        assert_eq!(repository.changes[0].scope.level, repository_scope.level);
+    }
+
+    #[test]
+    fn tool_output_history_pages_are_hard_capped() {
+        let svc = ready_service();
+        for i in 0..(MAX_HISTORY_PAGE + 25) {
+            svc.update_tool_output_defaults(
+                actor(),
+                ToolOutputSettingsScope::workspace(),
+                ToolOutputOverrides {
+                    max_inline_lines: Some(200 + (i % 20) as u32),
+                    ..ToolOutputOverrides::default()
+                },
+                format!("cap limit test {i}"),
+            )
+            .expect("workspace output update should succeed");
+        }
+
+        let first = svc
+            .list_tool_output_settings_history_page(ListToolOutputSettingsHistoryRequest {
+                limit: Some(MAX_HISTORY_PAGE + 1),
+                ..Default::default()
+            })
+            .expect("history should be paginated");
+        assert_eq!(first.changes.len(), MAX_HISTORY_PAGE);
+        assert_eq!(first.next_page_token, Some(MAX_HISTORY_PAGE.to_string()));
+
+        let second = svc
+            .list_tool_output_settings_history_page(ListToolOutputSettingsHistoryRequest {
+                cursor: first.next_page_token,
+                ..Default::default()
+            })
+            .expect("second history page should succeed");
+        assert_eq!(second.changes.len(), 25);
+        assert_eq!(second.next_page_token, None);
+    }
+
+    #[test]
+    fn tool_output_history_limit_zero_rejects_malformed_cursor() {
+        let svc = ready_service();
+        let err = svc
+            .list_tool_output_settings_history_page(ListToolOutputSettingsHistoryRequest {
+                limit: Some(0),
+                cursor: Some("not-a-cursor".to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn tool_output_history_limit_zero_rejects_offset_and_cursor() {
+        let svc = ready_service();
+        let err = svc
+            .list_tool_output_settings_history_page(ListToolOutputSettingsHistoryRequest {
+                limit: Some(0),
+                offset: Some(0),
+                cursor: Some("0".to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn tool_output_history_filters_scope_before_paging() {
+        let svc = ready_service();
+        for i in 0..3 {
+            svc.update_tool_output_defaults(
+                actor(),
+                ToolOutputSettingsScope::workspace(),
+                ToolOutputOverrides {
+                    max_inline_bytes: Some(300 + (i as u64)),
+                    ..ToolOutputOverrides::default()
+                },
+                format!("global {i}"),
+            )
+            .expect("workspace output update should succeed");
+        }
+
+        let repository_scope = ToolOutputSettingsScope::repository(RepositoryId::new());
+        for i in 0..5 {
+            svc.update_tool_output_defaults(
+                actor(),
+                repository_scope.clone(),
+                ToolOutputOverrides {
+                    max_inline_lines: Some(100 + i),
+                    ..ToolOutputOverrides::default()
+                },
+                format!("repository {i}"),
+            )
+            .expect("repository output update should succeed");
+        }
+
+        let first = svc
+            .list_tool_output_settings_history_page(ListToolOutputSettingsHistoryRequest {
+                scope: Some(repository_scope.clone()),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .expect("history should be available");
+        assert_eq!(first.changes.len(), 2);
+        assert_eq!(first.next_page_token, Some("2".to_string()));
+        assert!(first
+            .changes
+            .iter()
+            .all(|change| change.scope == repository_scope));
+
+        let second = svc
+            .list_tool_output_settings_history_page(ListToolOutputSettingsHistoryRequest {
+                scope: Some(repository_scope.clone()),
+                cursor: first.next_page_token,
+                ..Default::default()
+            })
+            .expect("next history page should be available");
+        assert_eq!(second.changes.len(), 3);
+        assert_eq!(second.next_page_token, None);
+        assert!(second
+            .changes
+            .iter()
+            .all(|change| change.scope == repository_scope));
     }
 
     // -- job lifecycle API --------------------------------------------------
