@@ -343,6 +343,7 @@ pub struct CancelJobResponse {
 pub struct Job {
     pub job_id: String,
     pub repository_id: String,
+    pub requester: RpcActorDto,
     pub kind: String,
     pub goal: String,
     pub status: String,
@@ -351,14 +352,25 @@ pub struct Job {
     pub started_at_unix_ms: Option<i64>,
     pub completed_at_unix_ms: Option<i64>,
     pub latest_event_id: Option<String>,
-    pub cancellation_state: String,
+    pub cancellation: JobCancellation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobCancellation {
+    pub state: String,
+    pub requested_by: Option<RpcActorDto>,
+    pub reason: Option<String>,
+    pub requested_at_unix_ms: Option<i64>,
+    pub completed_at_unix_ms: Option<i64>,
 }
 
 impl From<JobRecord> for Job {
     fn from(record: JobRecord) -> Self {
+        let cancellation = job_cancellation_from_record(&record);
         Self {
             job_id: record.id.as_str().to_string(),
             repository_id: record.repository_id.as_str().to_string(),
+            requester: RpcActorDto::from(record.requester),
             kind: job_kind_label(&record.kind).to_string(),
             goal: record.goal,
             status: job_status_label(record.status).to_string(),
@@ -367,7 +379,7 @@ impl From<JobRecord> for Job {
             started_at_unix_ms: record.started_at.map(|ts| ts.unix_millis),
             completed_at_unix_ms: record.completed_at.map(|ts| ts.unix_millis),
             latest_event_id: record.latest_event_id.map(|id| id.as_str().to_string()),
-            cancellation_state: cancellation_state_label(record.cancellation_state).to_string(),
+            cancellation,
         }
     }
 }
@@ -630,6 +642,19 @@ fn cancellation_state_label(state: CancellationState) -> &'static str {
         CancellationState::CooperativeStop => "cooperative_stop",
         CancellationState::ForceStop => "force_stop",
         CancellationState::Completed => "completed",
+    }
+}
+
+fn job_cancellation_from_record(record: &JobRecord) -> JobCancellation {
+    JobCancellation {
+        state: cancellation_state_label(record.cancellation_state).to_string(),
+        requested_by: None,
+        reason: None,
+        requested_at_unix_ms: None,
+        completed_at_unix_ms: match record.cancellation_state {
+            CancellationState::Completed => record.completed_at.map(|ts| ts.unix_millis),
+            _ => None,
+        },
     }
 }
 
@@ -950,9 +975,15 @@ mod tests {
 
         let dto = Job::from(record);
 
+        assert_eq!(dto.requester, actor());
         assert_eq!(dto.started_at_unix_ms, None);
         assert_eq!(dto.completed_at_unix_ms, None);
         assert_eq!(dto.latest_event_id, None);
+        assert_eq!(dto.cancellation.state, "not_requested");
+        assert_eq!(dto.cancellation.requested_by, None);
+        assert_eq!(dto.cancellation.reason, None);
+        assert_eq!(dto.cancellation.requested_at_unix_ms, None);
+        assert_eq!(dto.cancellation.completed_at_unix_ms, None);
     }
 
     #[test]
@@ -992,6 +1023,31 @@ mod tests {
                 .decision_id,
             Some(decision_id_str)
         );
+
+        assert_eq!(dto.requester, actor());
+        assert_eq!(dto.cancellation.state, "not_requested");
+        assert_eq!(dto.cancellation.requested_by, None);
+        assert_eq!(dto.cancellation.reason, None);
+        assert_eq!(dto.cancellation.requested_at_unix_ms, None);
+        assert_eq!(dto.cancellation.completed_at_unix_ms, None);
+    }
+
+    #[test]
+    fn job_dto_maps_cancellation_state_to_structured_cancellation() {
+        let mut record = JobRecord::new(
+            actor_record(),
+            RepositoryId::new(),
+            JobKind::Read,
+            "dry run".to_string(),
+            atelia_core::LedgerTimestamp::from_unix_millis(1_000),
+        );
+        record.cancellation_state = CancellationState::CooperativeStop;
+        let dto = Job::from(record);
+        assert_eq!(dto.cancellation.state, "cooperative_stop");
+        assert_eq!(dto.cancellation.requested_by, None);
+        assert_eq!(dto.cancellation.reason, None);
+        assert_eq!(dto.cancellation.requested_at_unix_ms, None);
+        assert_eq!(dto.cancellation.completed_at_unix_ms, None);
     }
 
     #[test]
