@@ -5,8 +5,9 @@
 //! surface.
 
 use crate::domain::{Actor, LedgerTimestamp, RepositoryId};
-use crate::tool_output::{OutputFormat, RenderOptions};
+use crate::tool_output::{OutputFormat, RenderOptions, ToolOutputRenderPolicy};
 use crate::ProjectId;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::error::Error;
@@ -104,7 +105,17 @@ impl InMemoryToolOutputSettingsService {
     pub fn new_with_settings(
         created_at: LedgerTimestamp,
         settings: Vec<ToolOutputSettings>,
-    ) -> Self {
+    ) -> Result<Self, ToolOutputSettingsError> {
+        let mut scopes = Vec::with_capacity(settings.len());
+        for setting in &settings {
+            if scopes.contains(&setting.scope) {
+                return Err(ToolOutputSettingsError::DuplicateScope {
+                    scope: setting.scope.clone(),
+                });
+            }
+            scopes.push(setting.scope.clone());
+        }
+
         let mut service = Self {
             settings,
             changes: Vec::new(),
@@ -122,7 +133,7 @@ impl InMemoryToolOutputSettingsService {
         }
 
         service.migrate_legacy_settings();
-        service
+        Ok(service)
     }
 
     pub fn new_with_defaults(
@@ -243,15 +254,15 @@ fn resolution_chain(scope: &ToolOutputSettingsScope) -> Vec<ToolOutputSettingsSc
 
     push_unique(&mut chain, ToolOutputSettingsScope::workspace());
 
-    if let Some(tool_id) = scope.tool_id.as_deref() {
-        push_unique(&mut chain, workspace_scope.for_tool(tool_id));
-    }
-
     let level_scope = ToolOutputSettingsScope {
         level: scope.level.clone(),
         tool_id: None,
     };
     push_unique(&mut chain, level_scope);
+
+    if let Some(tool_id) = scope.tool_id.as_deref() {
+        push_unique(&mut chain, workspace_scope.for_tool(tool_id));
+    }
 
     if scope.tool_id.as_deref().is_some() {
         push_unique(&mut chain, scope.clone());
@@ -330,6 +341,44 @@ impl ToolOutputDefaults {
         self.render_options.clone()
     }
 
+    pub fn render_policy(&self) -> ToolOutputRenderPolicy {
+        self.render_policy_with_render_options(None)
+    }
+
+    pub fn render_policy_with_render_options(
+        &self,
+        requested_render_options: Option<&RenderOptions>,
+    ) -> ToolOutputRenderPolicy {
+        let mut render_options = self.render_options();
+        if let Some(requested_render_options) = requested_render_options {
+            render_options.format = requested_render_options.format;
+            render_options.include_policy = requested_render_options.include_policy;
+            render_options.include_diagnostics = requested_render_options.include_diagnostics;
+            render_options.include_cost = requested_render_options.include_cost;
+        }
+
+        apply_verbosity_constraints(&mut render_options, self.verbosity);
+
+        let max_inline_lines = usize::try_from(self.max_inline_lines).unwrap_or(usize::MAX);
+        let field_limit = match self.granularity {
+            ToolOutputGranularity::Summary => Some(1),
+            ToolOutputGranularity::KeyFields => Some(3),
+            ToolOutputGranularity::Full => None,
+        }
+        .map(|limit| limit.min(max_inline_lines));
+
+        ToolOutputRenderPolicy {
+            render_options,
+            max_fields: field_limit,
+            max_inline_lines: Some(max_inline_lines),
+            max_inline_bytes: Some(self.max_inline_bytes),
+            oversize_policy: self.oversize_policy,
+            include_evidence_refs: !matches!(self.granularity, ToolOutputGranularity::Summary),
+            include_output_refs: !matches!(self.granularity, ToolOutputGranularity::Summary),
+            include_redactions: !matches!(self.granularity, ToolOutputGranularity::Summary),
+        }
+    }
+
     fn apply_overrides(&mut self, overrides: &ToolOutputOverrides) {
         overrides.apply_to(self);
     }
@@ -360,6 +409,29 @@ impl Default for ToolOutputDefaults {
             verbosity: ToolOutputVerbosity::Normal,
             granularity: ToolOutputGranularity::KeyFields,
             oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        }
+    }
+}
+
+fn apply_verbosity_constraints(render_options: &mut RenderOptions, verbosity: ToolOutputVerbosity) {
+    match verbosity {
+        ToolOutputVerbosity::Minimal => {
+            render_options.include_policy = false;
+            render_options.include_diagnostics = false;
+            render_options.include_cost = false;
+        }
+        ToolOutputVerbosity::Normal => {
+            render_options.include_policy = false;
+            render_options.include_diagnostics = false;
+            render_options.include_cost = false;
+        }
+        ToolOutputVerbosity::Expanded => {
+            render_options.include_cost = false;
+        }
+        ToolOutputVerbosity::Debug => {
+            render_options.include_policy = true;
+            render_options.include_diagnostics = true;
+            render_options.include_cost = true;
         }
     }
 }
@@ -540,14 +612,13 @@ impl ToolOutputOverrides {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutputSettings {
     pub schema_version: u32,
     pub scope: ToolOutputSettingsScope,
     pub overrides: ToolOutputOverrides,
     pub updated_at: LedgerTimestamp,
     pub updated_by: Option<Actor>,
-    #[serde(skip)]
     legacy_defaults: Option<ToolOutputDefaults>,
 }
 
@@ -592,6 +663,27 @@ impl<'de> Deserialize<'de> for ToolOutputSettings {
             updated_by: raw.updated_by,
             legacy_defaults,
         })
+    }
+}
+
+impl Serialize for ToolOutputSettings {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("ToolOutputSettings", 5)?;
+        state.serialize_field("schema_version", &self.schema_version)?;
+        state.serialize_field("scope", &self.scope)?;
+
+        if let Some(legacy_defaults) = &self.legacy_defaults {
+            state.serialize_field("defaults", legacy_defaults)?;
+        } else {
+            state.serialize_field("overrides", &self.overrides)?;
+        }
+
+        state.serialize_field("updated_at", &self.updated_at)?;
+        state.serialize_field("updated_by", &self.updated_by)?;
+        state.end()
     }
 }
 
@@ -678,6 +770,7 @@ pub struct ToolOutputSettingsChange {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolOutputSettingsError {
+    DuplicateScope { scope: ToolOutputSettingsScope },
     EmptyUpdate,
     MissingReason,
     MaxInlineBytesOutOfRange { value: u64, min: u64, max: u64 },
@@ -689,6 +782,9 @@ impl fmt::Display for ToolOutputSettingsError {
         match self {
             Self::EmptyUpdate => {
                 write!(f, "tool output settings update must set at least one field")
+            }
+            Self::DuplicateScope { scope } => {
+                write!(f, "duplicate tool output settings scope: {scope:?}")
             }
             Self::MissingReason => write!(f, "tool output settings update requires a reason"),
             Self::MaxInlineBytesOutOfRange { value, min, max } => write!(
@@ -991,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_deserialization_migrates_legacy_defaults_shape() {
+    fn settings_deserialization_keeps_legacy_defaults_for_roundtrip() {
         let defaults = ToolOutputDefaults {
             render_options: RenderOptions::new(OutputFormat::Json),
             max_inline_bytes: 32 * 1024,
@@ -1010,8 +1106,24 @@ mod tests {
 
         let settings = serde_json::from_value::<ToolOutputSettings>(legacy_json).unwrap();
 
-        assert_eq!(settings.overrides, ToolOutputOverrides::default());
-        assert_eq!(settings.legacy_defaults, Some(defaults));
+        assert_eq!(
+            settings.overrides,
+            ToolOutputOverrides {
+                ..ToolOutputOverrides::default()
+            }
+        );
+        assert_eq!(settings.legacy_defaults, Some(defaults.clone()));
+
+        let serialized = serde_json::to_value(&settings).unwrap();
+        assert!(serialized["defaults"].is_object());
+        assert!(serialized["overrides"].is_null());
+        assert_eq!(
+            serialized["defaults"],
+            serde_json::to_value(&defaults).unwrap()
+        );
+        let roundtrip = serde_json::from_value::<ToolOutputSettings>(serialized).unwrap();
+        assert_eq!(roundtrip.overrides, settings.overrides);
+        assert_eq!(roundtrip.legacy_defaults, Some(defaults));
     }
 
     #[test]
@@ -1050,6 +1162,27 @@ mod tests {
         let error = serde_json::from_value::<ToolOutputSettings>(invalid).unwrap_err();
 
         assert!(error.to_string().contains("max_inline_lines"));
+    }
+
+    #[test]
+    fn service_new_with_settings_rejects_duplicate_scopes() {
+        let created_at = LedgerTimestamp::from_unix_millis(1_700_000_000_000);
+        let duplicated_scope = ToolOutputSettingsScope::repository(RepositoryId::new());
+        let settings = vec![
+            ToolOutputSettings::new(ToolOutputSettingsScope::workspace(), created_at),
+            ToolOutputSettings::new(duplicated_scope.clone(), created_at),
+            ToolOutputSettings::new(duplicated_scope.clone(), created_at),
+        ];
+
+        let error =
+            InMemoryToolOutputSettingsService::new_with_settings(created_at, settings).unwrap_err();
+
+        assert_eq!(
+            error,
+            ToolOutputSettingsError::DuplicateScope {
+                scope: duplicated_scope
+            }
+        );
     }
 
     #[test]
@@ -1278,6 +1411,53 @@ mod tests {
     }
 
     #[test]
+    fn service_resolves_workspace_tool_after_non_tool_level_scope() {
+        let repo_id = RepositoryId::new();
+        let mut service = InMemoryToolOutputSettingsService::new(
+            LedgerTimestamp::from_unix_millis(1_700_000_000_200),
+        );
+        let repository_scope = ToolOutputSettingsScope::repository(repo_id);
+        let repository_tool_scope = repository_scope.clone().for_tool("tool.read");
+
+        service
+            .apply_update(
+                actor(),
+                ToolOutputSettingsScope::workspace().for_tool("tool.read"),
+                ToolOutputOverrides {
+                    format: Some(OutputFormat::Json),
+                    ..ToolOutputOverrides::default()
+                },
+                "tool-scoped workspace default",
+                LedgerTimestamp::from_unix_millis(1_700_000_000_201),
+            )
+            .unwrap();
+        service
+            .apply_update(
+                actor(),
+                repository_scope.clone(),
+                ToolOutputOverrides {
+                    format: Some(OutputFormat::Text),
+                    ..ToolOutputOverrides::default()
+                },
+                "repository-level default",
+                LedgerTimestamp::from_unix_millis(1_700_000_000_202),
+            )
+            .unwrap();
+
+        let resolved_repository_tool = service.resolve_defaults(&repository_tool_scope);
+        assert_eq!(
+            resolved_repository_tool.render_options.format,
+            OutputFormat::Json
+        );
+
+        let resolved_repository = service.resolve_defaults(&repository_scope);
+        assert_eq!(
+            resolved_repository.render_options.format,
+            OutputFormat::Text
+        );
+    }
+
+    #[test]
     fn service_call_overrides_do_not_mutate_stored_defaults() {
         let repo_id = RepositoryId::new();
         let mut service = InMemoryToolOutputSettingsService::new(
@@ -1417,7 +1597,8 @@ mod tests {
         let mut service = InMemoryToolOutputSettingsService::new_with_settings(
             LedgerTimestamp::from_unix_millis(1_700_000_000_100),
             loaded_settings,
-        );
+        )
+        .unwrap();
 
         let before = service.resolve_defaults(&repository_tool_scope);
         assert_eq!(before.render_options.format, OutputFormat::Json);
@@ -1446,6 +1627,19 @@ mod tests {
         assert_eq!(after.max_inline_lines, 123);
         assert_eq!(after.verbosity, ToolOutputVerbosity::Expanded);
         assert_eq!(after.granularity, ToolOutputGranularity::Full);
+
+        let repository_entry = service
+            .settings
+            .iter()
+            .find(|setting| setting.scope == repository_scope)
+            .unwrap();
+        assert_eq!(
+            repository_entry.overrides,
+            ToolOutputOverrides {
+                granularity: Some(ToolOutputGranularity::Full),
+                ..ToolOutputOverrides::default()
+            }
+        );
     }
 
     #[test]
