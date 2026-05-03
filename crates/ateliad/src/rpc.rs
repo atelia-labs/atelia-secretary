@@ -1996,6 +1996,7 @@ mod tests {
             response.rendered_output_metadata.truncation,
             tool_result.truncation.clone()
         );
+        std::fs::remove_dir_all(root).expect("temporary repository should be removed");
     }
 
     #[test]
