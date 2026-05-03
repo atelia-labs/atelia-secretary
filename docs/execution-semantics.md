@@ -152,10 +152,11 @@ Large output is truncated with metadata. Truncation must be visible to agents.
 
 ## Target Architecture AX Check
 
-This section describes the target architecture for persisted runtime records.
-The current daemon skeleton may not yet implement these concrete Rust schemas;
-implementation slices must add them before clients or agents rely on these
-answers.
+This section describes the current persisted runtime record model. The concrete
+Rust schemas and store contract already exist in
+`crates/atelia-core/src/domain.rs` and `crates/atelia-core/src/store.rs`. The
+implementation in this repo is the in-memory store, so a durable on-disk
+backend is still a separate follow-up.
 
 The execution model should let an agent answer:
 
