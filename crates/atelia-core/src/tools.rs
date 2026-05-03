@@ -5,14 +5,17 @@
 //! canonicalization with symlink escape rejection per
 //! `docs/execution-semantics.md`.
 
+use crate::artifacts::{ArtifactLookupDenyReason, ArtifactLookupResult, LocalArtifactStore};
 use crate::domain::{
-    LedgerTimestamp, RedactionMarker, ResolvedPath, StructuredValue, ToolInvocation, ToolResult,
-    ToolResultField, ToolResultId, ToolResultStatus, TruncationMetadata,
+    LedgerTimestamp, OutputRefId, RedactionMarker, ResolvedPath, StructuredValue, ToolInvocation,
+    ToolResult, ToolResultField, ToolResultId, ToolResultStatus, TruncationMetadata,
 };
 use crate::runtime::RuntimeJobRequest;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufRead, Read};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -219,6 +222,40 @@ fn open_canonical_file_within_scope(canonical: &CanonicalPath) -> io::Result<Fil
     Ok(file)
 }
 
+fn open_artifact_file_within_scope(path: &Path) -> io::Result<File> {
+    let expected_metadata = fs::metadata(path)?;
+    let expected_path = path.canonicalize()?;
+    #[cfg(unix)]
+    let (expected_dev, expected_ino) = (expected_metadata.dev(), expected_metadata.ino());
+
+    let file = open_file_no_follow(path)?;
+    let opened_metadata = file.metadata()?;
+
+    #[cfg(unix)]
+    {
+        if opened_metadata.dev() != expected_dev || opened_metadata.ino() != expected_ino {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "opened artifact file did not match resolved record",
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let opened_path = fs::canonicalize(fd_path)?;
+        if opened_path != expected_path {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "opened artifact file path changed after record resolution",
+            ));
+        }
+    }
+
+    Ok(file)
+}
+
 #[cfg(unix)]
 fn open_file_no_follow(path: &Path) -> io::Result<File> {
     fs::OpenOptions::new()
@@ -229,6 +266,14 @@ fn open_file_no_follow(path: &Path) -> io::Result<File> {
 
 #[cfg(not(unix))]
 fn open_file_no_follow(path: &Path) -> io::Result<File> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "artifact file reads are best-effort symlink-blocked on non-Unix platforms",
+        ));
+    }
+
     fs::File::open(path)
 }
 
@@ -511,9 +556,11 @@ impl crate::runtime::RuntimeTool for FsStatTool {
 #[derive(Debug, Clone)]
 pub struct FsReadTool {
     repository_root: PathBuf,
+    artifact_store: Option<LocalArtifactStore>,
     start_line: usize,
     max_lines: usize,
     max_chars: usize,
+    max_bytes: Option<usize>,
     max_scan_bytes: u64,
     max_file_bytes: Option<u64>,
     include_line_numbers: bool,
@@ -523,9 +570,11 @@ impl FsReadTool {
     pub fn new(repository_root: impl Into<PathBuf>) -> Self {
         Self {
             repository_root: repository_root.into(),
+            artifact_store: None,
             start_line: 1,
             max_lines: DEFAULT_READ_MAX_LINES,
             max_chars: DEFAULT_READ_MAX_CHARS,
+            max_bytes: None,
             max_scan_bytes: DEFAULT_READ_MAX_SCAN_BYTES,
             max_file_bytes: None,
             include_line_numbers: false,
@@ -543,6 +592,16 @@ impl FsReadTool {
         self
     }
 
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = Some(max_bytes);
+        self
+    }
+
+    pub fn with_artifact_store(mut self, artifact_store: LocalArtifactStore) -> Self {
+        self.artifact_store = Some(artifact_store);
+        self
+    }
+
     pub fn with_max_scan_bytes(mut self, max_scan_bytes: u64) -> Self {
         self.max_scan_bytes = max_scan_bytes;
         self
@@ -556,6 +615,147 @@ impl FsReadTool {
     pub fn with_line_numbers(mut self) -> Self {
         self.include_line_numbers = true;
         self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadTarget {
+    Repository(CanonicalPath),
+    Artifact(PathBuf),
+}
+
+impl ReadTarget {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Repository(canonical) => &canonical.canonical,
+            Self::Artifact(path) => path,
+        }
+    }
+
+    fn display_path(&self) -> String {
+        match self {
+            Self::Repository(canonical) => canonical.display_path(),
+            Self::Artifact(path) => path.to_string_lossy().to_string(),
+        }
+    }
+}
+
+impl FsReadTool {
+    fn resolve_target(&self, request: &RuntimeJobRequest) -> Result<ReadTarget, String> {
+        self.resolve_target_for_request(request, None)
+    }
+
+    fn resolve_artifact_target_from_store(
+        &self,
+        request: &RuntimeJobRequest,
+    ) -> Result<PathBuf, String> {
+        let output_ref_id = OutputRefId::try_from_string(&request.resource_scope.value)
+            .map_err(|error| error.to_string())?;
+        let store = self
+            .artifact_store
+            .as_ref()
+            .ok_or_else(|| "artifact store is not configured".to_string())?;
+        let repository_scope = Some(request.repository_id.as_str());
+
+        match store
+            .resolve_output_record_for_context(
+                &output_ref_id,
+                Some(request.repository_id.as_str()),
+                repository_scope,
+                None,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            ArtifactLookupResult::Found(record) => Ok(record.path),
+            ArtifactLookupResult::NotFound => Err("artifact not found".to_string()),
+            ArtifactLookupResult::Denied(ArtifactLookupDenyReason::ProjectOrJobContextRequired) => {
+                Err(
+                    "artifact requires project/job context, but this request does not include one"
+                        .to_string(),
+                )
+            }
+            ArtifactLookupResult::Denied(
+                ArtifactLookupDenyReason::RepositoryScopeOrIdentityMismatch,
+            ) => Err("artifact is not accessible from this repository context".to_string()),
+        }
+    }
+
+    fn resolve_target_for_request(
+        &self,
+        request: &RuntimeJobRequest,
+        invocation: Option<&ToolInvocation>,
+    ) -> Result<ReadTarget, String> {
+        if matches!(
+            request.resource_scope.kind.as_str(),
+            "artifact" | "artifact_ref"
+        ) {
+            if let Some(invocation) = invocation {
+                if let Some(resolved_path) = invocation
+                    .resolved_paths
+                    .iter()
+                    .find(|resolved_path| {
+                        resolved_path.requested_path == request.resource_scope.value
+                            && resolved_path.resolved_path != request.resource_scope.value
+                    })
+                    .map(|resolved_path| PathBuf::from(&resolved_path.resolved_path))
+                {
+                    if let Ok(store_path) = self.resolve_artifact_target_from_store(request) {
+                        if store_path == resolved_path {
+                            return Ok(ReadTarget::Artifact(resolved_path));
+                        }
+                    }
+                }
+            }
+
+            return Ok(ReadTarget::Artifact(
+                self.resolve_artifact_target_from_store(request)?,
+            ));
+        }
+
+        let relative = target_from_request(request);
+        canonicalize_within_scope(&self.repository_root, &relative)
+            .map(ReadTarget::Repository)
+            .map_err(|error| error.to_string())
+    }
+
+    fn resolve_target_for_request_path(
+        &self,
+        request: &RuntimeJobRequest,
+        invocation: Option<&ToolInvocation>,
+    ) -> Vec<ResolvedPath> {
+        if matches!(
+            request.resource_scope.kind.as_str(),
+            "artifact" | "artifact_ref"
+        ) {
+            return match self.resolve_artifact_target_from_store(request) {
+                Ok(path) => vec![ResolvedPath {
+                    requested_path: request.resource_scope.value.clone(),
+                    resolved_path: path.to_string_lossy().to_string(),
+                    display_path: path.display().to_string(),
+                }],
+                Err(_) => Vec::new(),
+            };
+        }
+
+        match self.resolve_target_for_request(request, invocation) {
+            Ok(target) => vec![ResolvedPath {
+                requested_path: request.resource_scope.value.clone(),
+                resolved_path: target.path().to_string_lossy().to_string(),
+                display_path: target.display_path(),
+            }],
+            Err(_) => resolved_path_for_request(&self.repository_root, request),
+        }
+    }
+
+    fn open_read_target(&self, target: &ReadTarget) -> io::Result<File> {
+        match target {
+            ReadTarget::Repository(canonical) => open_canonical_file_within_scope(canonical),
+            ReadTarget::Artifact(path) => open_artifact_file_within_scope(path),
+        }
+    }
+
+    fn display_target_path(&self, target: &ReadTarget) -> String {
+        target.display_path()
     }
 }
 
@@ -580,6 +780,9 @@ impl crate::runtime::RuntimeTool for FsReadTool {
         if self.max_chars != DEFAULT_READ_MAX_CHARS {
             parts.push(format!("chars={}", self.max_chars));
         }
+        if let Some(max_bytes) = self.max_bytes {
+            parts.push(format!("bytes={}", max_bytes));
+        }
         if self.max_scan_bytes != DEFAULT_READ_MAX_SCAN_BYTES {
             parts.push(format!("scan={}", self.max_scan_bytes));
         }
@@ -593,33 +796,45 @@ impl crate::runtime::RuntimeTool for FsReadTool {
     }
 
     fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
-        resolved_path_for_request(&self.repository_root, request)
+        if matches!(
+            request.resource_scope.kind.as_str(),
+            "artifact" | "artifact_ref"
+        ) {
+            return self.resolve_target_for_request_path(request, None);
+        }
+
+        match self.resolve_target(request) {
+            Ok(target) => vec![ResolvedPath {
+                requested_path: request.resource_scope.value.clone(),
+                resolved_path: target.path().to_string_lossy().to_string(),
+                display_path: target.display_path(),
+            }],
+            Err(_) => resolved_path_for_request(&self.repository_root, request),
+        }
     }
 
     fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
         let schema_ref = "tool_result.fs.read.v1";
-        let relative = target_from_request(request);
-
-        let canonical = match canonicalize_within_scope(&self.repository_root, &relative) {
-            Ok(c) => c,
+        let target = match self.resolve_target_for_request(request, Some(invocation)) {
+            Ok(target) => target,
             Err(err) => {
                 return failed_result(
                     invocation,
                     schema_ref,
-                    "read failed: path rejected".to_string(),
-                    err.to_string(),
+                    "read failed: invalid read target".to_string(),
+                    err,
                 );
             }
         };
 
-        let file = match open_canonical_file_within_scope(&canonical) {
+        let file = match self.open_read_target(&target) {
             Ok(file) => file,
             Err(err) => {
                 return failed_result(
                     invocation,
                     schema_ref,
                     "read failed: cannot open scoped file".to_string(),
-                    format!("{}: {}", canonical.display_path(), err),
+                    format!("{}: {}", self.display_target_path(&target), err),
                 );
             }
         };
@@ -631,7 +846,7 @@ impl crate::runtime::RuntimeTool for FsReadTool {
                     invocation,
                     schema_ref,
                     "read failed: cannot read file metadata".to_string(),
-                    format!("{}: {}", canonical.display_path(), err),
+                    format!("{}: {}", self.display_target_path(&target), err),
                 );
             }
         };
@@ -641,7 +856,7 @@ impl crate::runtime::RuntimeTool for FsReadTool {
                 invocation,
                 schema_ref,
                 "read failed: target is not a file".to_string(),
-                canonical.display_path(),
+                self.display_target_path(&target),
             );
         }
 
@@ -653,7 +868,7 @@ impl crate::runtime::RuntimeTool for FsReadTool {
                     "read failed: file exceeds configured byte limit".to_string(),
                     format!(
                         "{} is {} bytes; limit is {} bytes",
-                        canonical.display_path(),
+                        self.display_target_path(&target),
                         metadata.len(),
                         max_file_bytes
                     ),
@@ -666,6 +881,7 @@ impl crate::runtime::RuntimeTool for FsReadTool {
             self.start_line,
             self.max_lines,
             self.max_chars,
+            self.max_bytes,
             self.max_scan_bytes,
             self.include_line_numbers,
         ) {
@@ -675,7 +891,7 @@ impl crate::runtime::RuntimeTool for FsReadTool {
                     invocation,
                     schema_ref,
                     "read failed: cannot read UTF-8 text".to_string(),
-                    format!("{}: {}", canonical.display_path(), err),
+                    format!("{}: {}", self.display_target_path(&target), err),
                 );
             }
         };
@@ -689,6 +905,9 @@ impl crate::runtime::RuntimeTool for FsReadTool {
         }
         if window.truncated_by_chars {
             truncation_reasons.push(format!("character limit {}", self.max_chars));
+        }
+        if window.truncated_by_bytes {
+            truncation_reasons.push(format!("byte limit {}", self.max_bytes.unwrap_or_default()));
         }
         if window.truncated_by_scan {
             truncation_reasons.push(format!("scan byte limit {}", self.max_scan_bytes));
@@ -706,9 +925,8 @@ impl crate::runtime::RuntimeTool for FsReadTool {
         let summary = format!(
             "read {} line(s) from {}",
             window.line_count,
-            canonical.display_path()
+            self.display_target_path(&target)
         );
-
         make_tool_result(
             invocation,
             ToolResultStatus::Succeeded,
@@ -720,7 +938,7 @@ impl crate::runtime::RuntimeTool for FsReadTool {
                 },
                 ToolResultField {
                     key: "path".to_string(),
-                    value: StructuredValue::String(canonical.display_path()),
+                    value: StructuredValue::String(self.display_target_path(&target)),
                 },
                 ToolResultField {
                     key: "content".to_string(),
@@ -748,7 +966,6 @@ impl crate::runtime::RuntimeTool for FsReadTool {
         )
     }
 }
-
 // ---------------------------------------------------------------------------
 // FsSearchTool
 // ---------------------------------------------------------------------------
@@ -1036,6 +1253,7 @@ struct ReadWindow {
     retained_source_bytes: u64,
     truncated_by_lines: bool,
     truncated_by_chars: bool,
+    truncated_by_bytes: bool,
     truncated_by_scan: bool,
 }
 
@@ -1044,6 +1262,7 @@ fn read_text_window(
     start_line: usize,
     max_lines: usize,
     max_chars: usize,
+    max_bytes: Option<usize>,
     max_scan_bytes: u64,
     include_line_numbers: bool,
 ) -> io::Result<ReadWindow> {
@@ -1054,11 +1273,13 @@ fn read_text_window(
     let mut end_line = 0;
     let mut line_count = 0;
     let mut used_chars = 0;
+    let mut used_bytes = 0;
     let mut retained_source_bytes = 0;
     let mut scanned_bytes = 0;
     let mut previous_retained_newline_bytes = 0;
     let mut truncated_by_lines = false;
     let mut truncated_by_chars = false;
+    let mut truncated_by_bytes = false;
     let mut truncated_by_scan = false;
     let mut current_line = 0;
     let mut line_bytes = Vec::new();
@@ -1072,6 +1293,12 @@ fn read_text_window(
             if used_chars >= max_chars {
                 truncated_by_chars = !reader.fill_buf()?.is_empty();
                 break;
+            }
+            if let Some(max_bytes_limit) = max_bytes {
+                if used_bytes >= max_bytes_limit {
+                    truncated_by_bytes = !reader.fill_buf()?.is_empty();
+                    break;
+                }
             }
         }
 
@@ -1112,6 +1339,13 @@ fn read_text_window(
             continue;
         }
 
+        if line_bytes.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "binary file rejected (contains NUL byte)",
+            ));
+        }
+
         let line = match std::str::from_utf8(&line_bytes) {
             Ok(line) => line.to_string(),
             Err(error) if truncated_by_scan && error.error_len().is_none() => {
@@ -1133,10 +1367,18 @@ fn read_text_window(
             truncated_by_chars = true;
             break;
         }
+        let separator_bytes = separator_chars;
+        if let Some(max_bytes_limit) = max_bytes {
+            if used_bytes + separator_bytes > max_bytes_limit {
+                truncated_by_bytes = true;
+                break;
+            }
+        }
 
         if separator_chars == 1 {
             content.push('\n');
             used_chars += 1;
+            used_bytes += 1;
             retained_source_bytes += previous_retained_newline_bytes;
         }
 
@@ -1156,8 +1398,31 @@ fn read_text_window(
             break;
         }
 
+        let rendered_bytes = rendered.len();
+        if let Some(max_bytes_limit) = max_bytes {
+            if used_bytes + rendered_bytes > max_bytes_limit {
+                let available_bytes = max_bytes_limit.saturating_sub(used_bytes);
+                let rendered = truncate_utf8_to_byte_boundary(&rendered, available_bytes);
+                let rendered_bytes = rendered.len();
+                if rendered_bytes > 0 {
+                    content.push_str(rendered);
+                    retained_source_bytes += retained_source_bytes_for_rendered_bytes(
+                        &line,
+                        current_line,
+                        include_line_numbers,
+                        rendered_bytes,
+                    );
+                    line_count += 1;
+                    end_line = current_line;
+                }
+                truncated_by_bytes = true;
+                break;
+            }
+        }
+
         content.push_str(&rendered);
         used_chars += rendered_chars;
+        used_bytes += rendered_bytes;
         retained_source_bytes += line.len() as u64;
         line_count += 1;
         end_line = current_line;
@@ -1175,6 +1440,7 @@ fn read_text_window(
         retained_source_bytes,
         truncated_by_lines,
         truncated_by_chars,
+        truncated_by_bytes,
         truncated_by_scan,
     })
 }
@@ -1196,6 +1462,40 @@ fn retained_source_bytes_for_rendered_chars(
         .take(source_char_count)
         .map(|character| character.len_utf8() as u64)
         .sum()
+}
+
+fn truncate_utf8_to_byte_boundary(input: &str, byte_limit: usize) -> &str {
+    if byte_limit >= input.len() {
+        return input;
+    }
+
+    let mut cut = byte_limit;
+    while !input.is_char_boundary(cut) {
+        cut = cut.saturating_sub(1);
+    }
+    &input[..cut]
+}
+
+fn retained_source_bytes_for_rendered_bytes(
+    line: &str,
+    current_line: usize,
+    include_line_numbers: bool,
+    rendered_byte_count: usize,
+) -> u64 {
+    if rendered_byte_count == 0 {
+        return 0;
+    }
+
+    let prefix_bytes = if include_line_numbers {
+        format!("{current_line}: ").len()
+    } else {
+        0
+    };
+
+    let source_bytes = rendered_byte_count
+        .saturating_sub(prefix_bytes)
+        .min(line.len());
+    u64::try_from(source_bytes).unwrap_or(0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1237,8 +1537,10 @@ fn search_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::{ArtifactStoreConfig, ArtifactWriteMetadata, LocalArtifactStore};
     use crate::domain::{
-        Actor, JobKind, RepositoryId, RepositoryRecord, RepositoryTrustState, ToolInvocationId,
+        Actor, JobKind, OutputRefId, RepositoryId, RepositoryRecord, RepositoryTrustState,
+        ToolInvocationId,
     };
     use crate::runtime::{RuntimeTool, SecretaryRuntime, RUNTIME_SCHEMA_VERSION};
     use crate::store::SecretaryStore;
@@ -1283,6 +1585,14 @@ mod tests {
     fn request_with_path(path: &str) -> RuntimeJobRequest {
         RuntimeJobRequest::new(actor(), RepositoryId::new(), JobKind::Read, "test goal")
             .with_resource_scope("path", path)
+    }
+
+    fn request_with_artifact_ref_for_repository(
+        output_ref_id: &str,
+        repository_id: RepositoryId,
+    ) -> RuntimeJobRequest {
+        RuntimeJobRequest::new(actor(), repository_id, JobKind::Read, "test goal")
+            .with_resource_scope("artifact", output_ref_id)
     }
 
     fn string_value(value: &StructuredValue) -> &str {
@@ -1678,6 +1988,121 @@ mod tests {
     }
 
     #[test]
+    fn fs_read_applies_byte_limit() {
+        let env = TestEnv::new("read-bytes");
+        env.create_file("bytes.txt", "abcdefg");
+
+        let tool = FsReadTool::new(&env.root).with_max_bytes(4);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("bytes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("abcd", string_value(&content.value));
+
+        let trunc = result.truncation.unwrap();
+        assert!(trunc.reason.contains("byte limit 4"));
+        assert_eq!(4, trunc.retained_bytes);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_applies_byte_limit_with_multibyte_text() {
+        let env = TestEnv::new("read-bytes-multibyte");
+        env.create_file("bytes.txt", "ééé");
+
+        let tool = FsReadTool::new(&env.root).with_max_bytes(5);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("bytes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("éé", string_value(&content.value));
+
+        let trunc = result.truncation.unwrap();
+        assert!(trunc.reason.contains("byte limit 5"));
+        assert_eq!(4, trunc.retained_bytes);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_applies_byte_limit_with_line_numbers() {
+        let env = TestEnv::new("read-bytes-line-numbers");
+        env.create_file("bytes.txt", "abcdef");
+
+        let tool = FsReadTool::new(&env.root)
+            .with_max_bytes(8)
+            .with_line_numbers();
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("bytes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("1: abcde", string_value(&content.value));
+
+        let trunc = result.truncation.unwrap();
+        assert!(trunc.reason.contains("byte limit 8"));
+        assert_eq!(5, trunc.retained_bytes);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_rejects_missing_path() {
+        let env = TestEnv::new("read-missing");
+        let tool = FsReadTool::new(&env.root);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("missing.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("not found"));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_read_rejects_symlink_escape() {
+        let env = TestEnv::new("read-symlink");
+        let outside = unique_test_dir("read-symlink-outside");
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+        env.create_symlink("escape.txt", &outside.join("secret.txt"));
+
+        let tool = FsReadTool::new(&env.root);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("escape.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("outside repository root"));
+
+        env.cleanup();
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn fs_read_rejects_binary_file() {
+        let env = TestEnv::new("read-binary");
+        let path = env.root.join("binary.bin");
+        fs::write(&path, vec![0x61, 0x00, 0x62]).unwrap();
+
+        let tool = FsReadTool::new(&env.root);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("binary.bin");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("binary file rejected"));
+        env.cleanup();
+    }
+
+    #[test]
     fn fs_read_applies_scan_limit_before_allocating_unbounded_lines() {
         let env = TestEnv::new("read-scan");
         env.create_file("long-line.txt", &"x".repeat(1024));
@@ -1773,7 +2198,7 @@ mod tests {
         env.create_file("crlf.txt", "a\r\nb");
 
         let file = File::open(env.root.join("crlf.txt")).unwrap();
-        let window = read_text_window(file, 1, 2, 100, 1024, true).unwrap();
+        let window = read_text_window(file, 1, 2, 100, None, 1024, true).unwrap();
 
         assert_eq!("1: a\n2: b", window.content);
         assert_eq!(4, window.retained_source_bytes);
@@ -1822,6 +2247,236 @@ mod tests {
 
         assert_eq!(ToolResultStatus::Failed, result.status);
         env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_reads_repository_scoped_artifact() {
+        let env = TestEnv::new("read-artifact");
+        let repository_id = RepositoryId::new();
+        let artifact_store_root = unique_test_dir("read-artifact-store");
+        let artifact_store =
+            LocalArtifactStore::new(ArtifactStoreConfig::new(artifact_store_root.clone()));
+        let output_ref = artifact_store
+            .write_bytes(
+                repository_id.as_str(),
+                "artifact-read",
+                "text/plain; charset=utf-8",
+                b"artifact content\nline 2",
+            )
+            .unwrap();
+
+        let tool = FsReadTool::new(&env.root).with_artifact_store(artifact_store);
+        let invocation = fake_invocation(tool.tool_id());
+        let request =
+            request_with_artifact_ref_for_repository(output_ref.id.as_str(), repository_id);
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert!(result
+            .fields
+            .iter()
+            .find(|f| f.key == "content")
+            .map(|field| string_value(&field.value))
+            .unwrap()
+            .starts_with("artifact content"));
+        env.cleanup();
+        let _ = fs::remove_dir_all(&artifact_store_root);
+    }
+
+    #[test]
+    fn fs_read_rejects_project_scoped_artifact_without_context() {
+        let env = TestEnv::new("read-artifact-project-scoped");
+        let repository_id = RepositoryId::new();
+        let artifact_store_root = unique_test_dir("read-artifact-store-project-scoped");
+        let artifact_store =
+            LocalArtifactStore::new(ArtifactStoreConfig::new(artifact_store_root.clone()));
+        let output_ref = artifact_store
+            .write_bytes_with_metadata(
+                repository_id.as_str(),
+                "artifact-read",
+                "text/plain; charset=utf-8",
+                b"artifact content\nline 2",
+                ArtifactWriteMetadata {
+                    project_id: Some("project-1".to_string()),
+                    repository_id: Some(repository_id.as_str().to_string()),
+                    original_bytes: None,
+                    retained_bytes: None,
+                },
+            )
+            .unwrap();
+
+        let tool = FsReadTool::new(&env.root).with_artifact_store(artifact_store);
+        let invocation = fake_invocation(tool.tool_id());
+        let request =
+            request_with_artifact_ref_for_repository(output_ref.id.as_str(), repository_id);
+        let denied = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, denied.status);
+        let error = denied.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(
+            string_value(&error.value).contains("project/job context"),
+            "unexpected error: {error:?}"
+        );
+        env.cleanup();
+        let _ = fs::remove_dir_all(&artifact_store_root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fs_read_rejects_symlink_artifact_on_windows() {
+        let env = TestEnv::new("read-artifact-symlink");
+        let repository_id = RepositoryId::new();
+        let artifact_store_root = unique_test_dir("read-artifact-store-symlink");
+        let artifact_store =
+            LocalArtifactStore::new(ArtifactStoreConfig::new(artifact_store_root.clone()));
+        let output_ref = artifact_store
+            .write_bytes(
+                repository_id.as_str(),
+                "artifact-read",
+                "text/plain; charset=utf-8",
+                b"artifact content\nline 2",
+            )
+            .unwrap();
+
+        let link_path = PathBuf::from(&output_ref.uri);
+        let target_path = env.root.join("replacement.txt");
+        fs::write(&target_path, b"replacement").unwrap();
+        fs::remove_file(&link_path).unwrap();
+
+        if let Err(error) = std::os::windows::fs::symlink_file(&target_path, &link_path) {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("failed to create symlink for test: {error}");
+        }
+
+        let tool = FsReadTool::new(&env.root).with_artifact_store(artifact_store);
+        let invocation = fake_invocation(tool.tool_id());
+        let request =
+            request_with_artifact_ref_for_repository(output_ref.id.as_str(), repository_id);
+        let denied = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, denied.status);
+        let error = denied.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("best-effort symlink-blocked"));
+        env.cleanup();
+        let _ = fs::remove_dir_all(&artifact_store_root);
+    }
+
+    #[test]
+    fn fs_read_denies_artifact_ref_from_other_repository() {
+        let env = TestEnv::new("read-artifact-cross-repo-denial");
+        let repository_id = RepositoryId::new();
+        let other_repository_id = RepositoryId::new();
+        let artifact_store_root = unique_test_dir("read-artifact-store-cross-repo");
+        let artifact_store =
+            LocalArtifactStore::new(ArtifactStoreConfig::new(artifact_store_root.clone()));
+        let output_ref = artifact_store
+            .write_bytes(
+                repository_id.as_str(),
+                "artifact-read",
+                "text/plain; charset=utf-8",
+                b"artifact content\nline 2",
+            )
+            .unwrap();
+
+        let tool = FsReadTool::new(&env.root).with_artifact_store(artifact_store);
+        let invocation = fake_invocation(tool.tool_id());
+        let request =
+            request_with_artifact_ref_for_repository(output_ref.id.as_str(), repository_id.clone());
+        let allowed = tool.execute(&invocation, &request);
+        assert_eq!(ToolResultStatus::Succeeded, allowed.status);
+
+        let request =
+            request_with_artifact_ref_for_repository(output_ref.id.as_str(), other_repository_id);
+        let denied = tool.execute(&invocation, &request);
+        assert_eq!(ToolResultStatus::Failed, denied.status);
+        let error = denied.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value)
+            .contains("artifact is not accessible from this repository context"));
+
+        env.cleanup();
+        let _ = fs::remove_dir_all(&artifact_store_root);
+    }
+
+    #[test]
+    fn fs_read_artifact_ref_denied_does_not_read_repository_file() {
+        let env = TestEnv::new("read-artifact-ref-denied-repo-fallback");
+        let repository_id = RepositoryId::new();
+        let artifact_store_root = unique_test_dir("read-artifact-store-denied-fallback");
+        let artifact_store =
+            LocalArtifactStore::new(ArtifactStoreConfig::new(artifact_store_root.clone()));
+        let output_ref = artifact_store
+            .write_bytes_with_metadata(
+                repository_id.as_str(),
+                "artifact-read",
+                "text/plain; charset=utf-8",
+                b"artifact content\nline 2",
+                ArtifactWriteMetadata {
+                    project_id: Some("project-1".to_string()),
+                    repository_id: Some(repository_id.as_str().to_string()),
+                    original_bytes: None,
+                    retained_bytes: None,
+                },
+            )
+            .unwrap();
+        env.create_file(
+            output_ref.id.as_str(),
+            "repository artifact fallback content",
+        );
+
+        let tool = FsReadTool::new(&env.root).with_artifact_store(artifact_store);
+        let request = RuntimeJobRequest::new(actor(), repository_id, JobKind::Read, "test goal")
+            .with_resource_scope("artifact_ref", output_ref.id.as_str());
+        let invocation = ToolInvocation {
+            resolved_paths: tool.resolved_paths(&request),
+            ..fake_invocation(tool.tool_id())
+        };
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        assert!(invocation.resolved_paths.is_empty());
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(
+            string_value(&error.value).contains("project/job context"),
+            "unexpected error: {error:?}"
+        );
+        env.cleanup();
+        let _ = fs::remove_dir_all(&artifact_store_root);
+    }
+
+    #[test]
+    fn fs_read_artifact_ref_missing_does_not_read_repository_file() {
+        let env = TestEnv::new("read-artifact-ref-missing-repo-fallback");
+        let repository_id = RepositoryId::new();
+        let artifact_store_root = unique_test_dir("read-artifact-store-missing-fallback");
+        let artifact_store =
+            LocalArtifactStore::new(ArtifactStoreConfig::new(artifact_store_root.clone()));
+
+        let output_ref_id = OutputRefId::new();
+        env.create_file(
+            output_ref_id.as_str(),
+            "repository artifact fallback content",
+        );
+
+        let tool = FsReadTool::new(&env.root).with_artifact_store(artifact_store);
+        let request = RuntimeJobRequest::new(actor(), repository_id, JobKind::Read, "test goal")
+            .with_resource_scope("artifact_ref", output_ref_id.as_str());
+        let invocation = ToolInvocation {
+            resolved_paths: tool.resolved_paths(&request),
+            ..fake_invocation(tool.tool_id())
+        };
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        assert!(invocation.resolved_paths.is_empty());
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(
+            string_value(&error.value).contains("artifact not found"),
+            "unexpected error: {error:?}"
+        );
+        env.cleanup();
+        let _ = fs::remove_dir_all(&artifact_store_root);
     }
 
     // -- FsSearchTool tests --
