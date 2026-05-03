@@ -289,14 +289,15 @@ fn append_artifact_refs(lines: &mut Vec<String>, label: &str, refs: &[ArtifactRe
     }
 
     lines.push(format!(
-        "{label}[{}]{{id,media_type,label,digest}}",
+        "{label}[{}]{{id,uri,media_type,label,digest}}",
         refs.len()
     ));
 
     for reference in refs {
         lines.push(format!(
-            "  {},{},{},{}",
+            "  {},{},{},{},{}",
             reference.id.as_str(),
+            render_toon_value(&reference.uri),
             render_toon_value(&reference.media_type),
             render_optional_string(reference.label.as_deref()),
             render_optional_string(reference.digest.as_deref())
@@ -310,14 +311,15 @@ fn append_output_refs(lines: &mut Vec<String>, refs: &[OutputRef]) {
     }
 
     lines.push(format!(
-        "output_refs[{}]{{id,media_type,label,digest}}",
+        "output_refs[{}]{{id,uri,media_type,label,digest}}",
         refs.len()
     ));
 
     for reference in refs {
         lines.push(format!(
-            "  {},{},{},{}",
+            "  {},{},{},{},{}",
             reference.id.as_str(),
+            render_toon_value(&reference.uri),
             render_toon_value(&reference.media_type),
             render_optional_string(reference.label.as_deref()),
             render_optional_string(reference.digest.as_deref())
@@ -489,12 +491,14 @@ mod tests {
             ],
             evidence_refs: vec![ArtifactRef {
                 id: ArtifactRefId::new(),
+                uri: "/tmp/evidence.txt".to_string(),
                 media_type: "text/plain".to_string(),
                 label: Some("status evidence".to_string()),
                 digest: Some("sha256:abc123".to_string()),
             }],
             output_refs: vec![OutputRef {
                 id: OutputRefId::new(),
+                uri: "/tmp/stdout.txt".to_string(),
                 media_type: "text/plain".to_string(),
                 label: Some("stdout".to_string()),
                 digest: None,
@@ -552,10 +556,10 @@ mod tests {
         assert!(rendered.body.contains("  summary,\"2 modified files\""));
         assert!(rendered
             .body
-            .contains("evidence_refs[1]{id,media_type,label,digest}"));
+            .contains("evidence_refs[1]{id,uri,media_type,label,digest}"));
         assert!(rendered
             .body
-            .contains("output_refs[1]{id,media_type,label,digest}"));
+            .contains("output_refs[1]{id,uri,media_type,label,digest}"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod artifacts;
 pub mod domain;
 pub mod extensions;
 pub mod policy;
@@ -10,6 +11,7 @@ pub mod store;
 pub mod tool_output;
 pub mod tools;
 
+pub use artifacts::*;
 pub use domain::*;
 pub use extensions::*;
 pub use policy::*;
