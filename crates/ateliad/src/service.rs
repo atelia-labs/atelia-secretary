@@ -5,17 +5,18 @@
 //! registration/listing, and the first supported job lifecycle calls.
 
 use atelia_core::{
-    canonicalize_job_requested_capability, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
-    CancelJobReceipt, DefaultPolicyEngine, ExtensionRegistryService, ExtensionStatusRequest,
-    ExtensionStatusResponse, InMemoryStore, InMemoryToolOutputSettingsService,
-    InstallExtensionRequest, InstallExtensionResponse, JobId, JobKind, JobLifecycleService,
-    JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest,
-    ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse, PathScope, PolicyEngine,
-    PolicyInput, RegistryError, RepositoryId, RepositoryRecord, RepositoryTrustState,
-    ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse, RuntimeError,
-    RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError, ToolOutputDefaults,
-    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
-    ToolOutputSettingsScope,
+    canonicalize_job_requested_capability, render_tool_result, Actor, ApplyBlocklistRequest,
+    ApplyBlocklistResponse, CancelJobReceipt, DefaultPolicyEngine, ExtensionRegistryService,
+    ExtensionStatusRequest, ExtensionStatusResponse, InMemoryStore,
+    InMemoryToolOutputSettingsService, InstallExtensionRequest, InstallExtensionResponse, JobId,
+    JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
+    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
+    OutputFormat, PathScope, PolicyEngine, PolicyInput, RegistryError, RenderedToolOutput,
+    RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RollbackExtensionRequest,
+    RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore,
+    StoreError, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
+    ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
+    TruncationMetadata,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,6 +32,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "policy.v1",
     "extensions.registry.v1",
     "tool_output_settings.v1",
+    "tool_output_render.v1",
 ];
 const MAX_HISTORY_PAGE: usize = 1000;
 
@@ -180,6 +182,30 @@ pub struct CheckPolicyRequest {
     pub requested_capability: String,
     pub action: String,
     pub resource_scope: ResourceScope,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct RenderToolOutputRequest {
+    pub tool_result_id: ToolResultId,
+    pub repository_id: Option<RepositoryId>,
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderToolOutputResult {
+    pub tool_result: CanonicalToolResultRef,
+    pub rendered_output: RenderedToolOutput,
+    pub truncation: Option<TruncationMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalToolResultRef {
+    pub tool_result_id: ToolResultId,
+    pub tool_invocation_id: ToolInvocationId,
+    pub job_id: JobId,
+    pub repository_id: RepositoryId,
+    pub content_type: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -606,6 +632,49 @@ impl SecretaryService {
         let policy_engine = DefaultPolicyEngine::new();
 
         Ok(policy_engine.evaluate(policy_input))
+    }
+
+    /// Render a stored canonical tool result with the daemon's current settings.
+    pub fn render_tool_output(
+        &self,
+        request: RenderToolOutputRequest,
+    ) -> ServiceResult<RenderToolOutputResult> {
+        let tool_result = self
+            .lifecycle
+            .runtime()
+            .store()
+            .get_tool_result(&request.tool_result_id)?;
+        let tool_invocation = self
+            .lifecycle
+            .runtime()
+            .store()
+            .get_tool_invocation(&tool_result.invocation_id)?;
+        let repository = self.get_repository(&tool_invocation.repository_id)?;
+        let render_scope = ToolOutputSettingsScope::repository(repository.id.clone())
+            .for_tool(tool_result.tool_id.clone());
+        let mut render_options = self
+            .lock_tool_output_settings()?
+            .resolve_render_options(&render_scope);
+        render_options.format = request.format;
+
+        let rendered_output =
+            render_tool_result(&tool_result, &render_options).map_err(|error| {
+                ServiceError::Internal {
+                    reason: error.to_string(),
+                }
+            })?;
+
+        Ok(RenderToolOutputResult {
+            tool_result: CanonicalToolResultRef {
+                tool_result_id: tool_result.id,
+                tool_invocation_id: tool_invocation.id,
+                job_id: tool_invocation.job_id,
+                repository_id: repository.id,
+                content_type: "application/json".to_string(),
+            },
+            rendered_output,
+            truncation: tool_result.truncation.clone(),
+        })
     }
 
     /// List jobs with optional repository/status filtering.
@@ -1052,6 +1121,9 @@ mod tests {
         assert!(health
             .capabilities
             .contains(&"tool_output_settings.v1".to_string()));
+        assert!(health
+            .capabilities
+            .contains(&"tool_output_render.v1".to_string()));
     }
 
     #[test]
@@ -1250,6 +1322,9 @@ mod tests {
         assert!(metadata
             .capabilities
             .contains(&"tool_output_settings.v1".to_string()));
+        assert!(metadata
+            .capabilities
+            .contains(&"tool_output_render.v1".to_string()));
     }
 
     // -- register / list round trip -----------------------------------------
@@ -1733,6 +1808,144 @@ mod tests {
         assert_eq!(defaults.granularity, baseline.granularity);
         assert_eq!(defaults.oversize_policy, baseline.oversize_policy);
         assert_eq!(defaults.render_options, baseline.render_options);
+    }
+
+    #[test]
+    fn render_tool_output_uses_settings_and_rendered_result() {
+        let svc = ready_service();
+        let root = test_repo_dir("render-tool-output");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "render-tool-output".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("repository registration should succeed");
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "render tool output".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("job submission should succeed");
+        let tool_result = receipt.tool_result.expect("tool result should be recorded");
+
+        svc.update_tool_output_defaults(
+            actor(),
+            ToolOutputSettingsScope::workspace().for_tool(tool_result.tool_id.clone()),
+            ToolOutputOverrides {
+                include_policy: Some(true),
+                ..ToolOutputOverrides::default()
+            },
+            "Surface policy fields when rendering stored results".to_string(),
+        )
+        .expect("tool output settings update should succeed");
+
+        let tool_result_id = tool_result.id.clone();
+        let tool_invocation_id = tool_result.invocation_id.clone();
+        let job_id = receipt.job.id.clone();
+        let repository_id = repository.id.clone();
+        let rendered = svc
+            .render_tool_output(RenderToolOutputRequest {
+                tool_result_id: tool_result_id.clone(),
+                repository_id: Some(repository_id.clone()),
+                format: OutputFormat::Json,
+            })
+            .expect("rendering should succeed");
+
+        assert_eq!(rendered.rendered_output.format, OutputFormat::Json);
+        assert_eq!(rendered.tool_result.tool_result_id, tool_result_id);
+        assert_eq!(rendered.tool_result.tool_invocation_id, tool_invocation_id);
+        assert_eq!(rendered.tool_result.job_id, job_id);
+        assert_eq!(rendered.tool_result.repository_id, repository_id);
+        assert_eq!(rendered.tool_result.content_type, "application/json");
+        assert!(rendered.rendered_output.body.contains("policy.state"));
+        assert!(rendered.rendered_output.body.contains("render tool output"));
+        assert!(rendered.rendered_output.fallback_reason.is_none());
+        assert_eq!(rendered.truncation, tool_result.truncation.clone());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn render_tool_output_uses_canonical_repository_scope_for_settings() {
+        let svc = ready_service();
+        let root = test_repo_dir("render-tool-output-canonical-scope");
+        let wrong_root = test_repo_dir("render-tool-output-wrong-scope");
+        let canonical_repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "canonical-scope".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("repository registration should succeed");
+        let wrong_repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "wrong-scope".to_string(),
+                root_path: wrong_root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("second repository registration should succeed");
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: canonical_repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "render tool output".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("job submission should succeed");
+        let tool_result = receipt.tool_result.expect("tool result should be recorded");
+
+        svc.update_tool_output_defaults(
+            actor(),
+            ToolOutputSettingsScope::repository(canonical_repository.id.clone())
+                .for_tool(tool_result.tool_id.clone()),
+            ToolOutputOverrides {
+                include_policy: Some(true),
+                ..ToolOutputOverrides::default()
+            },
+            "Canonical repository override".to_string(),
+        )
+        .expect("canonical repository settings should update");
+        svc.update_tool_output_defaults(
+            actor(),
+            ToolOutputSettingsScope::repository(wrong_repository.id.clone())
+                .for_tool(tool_result.tool_id.clone()),
+            ToolOutputOverrides {
+                include_policy: Some(false),
+                ..ToolOutputOverrides::default()
+            },
+            "Wrong repository override".to_string(),
+        )
+        .expect("wrong repository settings should update");
+
+        let tool_result_id = tool_result.id.clone();
+        let wrong_repository_id = wrong_repository.id.clone();
+        let rendered = svc
+            .render_tool_output(RenderToolOutputRequest {
+                tool_result_id: tool_result_id.clone(),
+                repository_id: Some(wrong_repository_id),
+                format: OutputFormat::Json,
+            })
+            .expect("rendering should succeed");
+
+        assert!(rendered.rendered_output.body.contains("policy.state"));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(wrong_root);
     }
 
     #[test]
