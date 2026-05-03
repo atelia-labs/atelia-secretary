@@ -71,15 +71,7 @@ impl SecretaryRpcServer {
         Ok(RegisterRepositoryResponse {
             metadata: self.metadata(),
             repository: Repository::from(repository),
-            policy: PolicyDecision {
-                decision_id: "n/a".to_string(),
-                outcome: "allowed".to_string(),
-                risk_tier: "r0".to_string(),
-                requested_capability: "repository.register".to_string(),
-                reason_code: "not_evaluated".to_string(),
-                reason: "register repository policy is not yet evaluated by this daemon surface"
-                    .to_string(),
-            },
+            policy: None,
         })
     }
 
@@ -185,11 +177,11 @@ impl SecretaryRpcServer {
         let receipt = self
             .service
             .cancel_job(&job_id, request.reason, Some(requester.clone()))?;
-        let cancellation = job_cancellation_from_receipt(&receipt, Some(&requester));
+        let (job, cancellation) = job_from_cancel_receipt(receipt, Some(&requester));
 
         Ok(CancelJobResponse {
             metadata: self.metadata(),
-            job: Job::from(receipt.job),
+            job,
             cancellation,
         })
     }
@@ -303,7 +295,7 @@ pub struct RegisterRepositoryRequest {
 pub struct RegisterRepositoryResponse {
     pub metadata: ProtocolMetadata,
     pub repository: Repository,
-    pub policy: PolicyDecision,
+    pub policy: Option<PolicyDecision>,
 }
 
 // Mirrors proto's `ListRepositoriesRequest` contract.
@@ -340,7 +332,10 @@ impl From<RepositoryRecord> for Repository {
             repository_id: record.id.as_str().to_string(),
             display_name: record.display_name,
             root_path: record.root_path,
-            allowed_scope: rpc_path_scope_from_record(&record.allowed_path_scope),
+            allowed_scope: rpc_path_scope_from_record(
+                &record.allowed_path_scope,
+                record.trust_state.clone(),
+            ),
             trust_state: record.trust_state.into(),
             created_at_unix_ms: record.created_at.unix_millis,
             updated_at_unix_ms: record.updated_at.unix_millis,
@@ -553,9 +548,12 @@ fn parse_repository_allowed_scope(
     })
 }
 
-fn rpc_path_scope_from_record(allowed_scope: &PathScope) -> RpcPathScope {
+fn rpc_path_scope_from_record(
+    allowed_scope: &PathScope,
+    trust_state: RepositoryTrustState,
+) -> RpcPathScope {
     RpcPathScope {
-        kind: RpcPathScopeKind::Repository,
+        kind: rpc_path_scope_kind(allowed_scope, trust_state),
         roots: if allowed_scope.allowed_paths.is_empty() {
             vec![allowed_scope.root_path.clone()]
         } else {
@@ -564,6 +562,37 @@ fn rpc_path_scope_from_record(allowed_scope: &PathScope) -> RpcPathScope {
         include_patterns: Vec::new(),
         exclude_patterns: Vec::new(),
     }
+}
+
+fn rpc_path_scope_kind(
+    allowed_scope: &PathScope,
+    trust_state: RepositoryTrustState,
+) -> RpcPathScopeKind {
+    if matches!(trust_state, RepositoryTrustState::ReadOnly) {
+        return RpcPathScopeKind::ReadOnly;
+    }
+
+    if allowed_scope.allowed_paths.is_empty() {
+        return RpcPathScopeKind::Repository;
+    }
+
+    if let [path] = &allowed_scope.allowed_paths[..] {
+        if path == "." || path == &allowed_scope.root_path {
+            return RpcPathScopeKind::Repository;
+        }
+    }
+
+    RpcPathScopeKind::ExplicitPaths
+}
+
+fn job_from_cancel_receipt(
+    receipt: CancelJobReceipt,
+    cancellation_requester: Option<&Actor>,
+) -> (Job, JobCancellation) {
+    let cancellation = job_cancellation_from_receipt(&receipt, cancellation_requester);
+    let mut job = Job::from_with_cancellation_requester(receipt.job, cancellation_requester);
+    job.cancellation = cancellation.clone();
+    (job, cancellation)
 }
 
 fn parse_path_scope(value: RpcPathScope) -> RpcResult<Option<ResourceScope>> {
@@ -923,6 +952,29 @@ mod tests {
         }
     }
 
+    fn repository_record(
+        root_path: &str,
+        trust_state: RepositoryTrustState,
+        allowed_paths: Vec<&str>,
+    ) -> RepositoryRecord {
+        let record = RepositoryRecord::new(
+            "repo-scope-test",
+            root_path,
+            trust_state,
+            atelia_core::LedgerTimestamp::from_unix_millis(1_000),
+        );
+        RepositoryRecord {
+            allowed_path_scope: PathScope {
+                root_path: root_path.to_string(),
+                allowed_paths: allowed_paths
+                    .into_iter()
+                    .map(std::string::ToString::to_string)
+                    .collect(),
+            },
+            ..record
+        }
+    }
+
     fn test_repo_dir(name: &str) -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
@@ -1063,6 +1115,25 @@ mod tests {
     }
 
     #[test]
+    fn register_repository_response_policy_is_not_an_authz_result() {
+        let server = ready_server();
+        let root = test_repo_dir("register-policy-null");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "rpc-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        assert!(registered.policy.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn register_repository_defaults_to_trusted_without_allowed_scope() {
         let server = ready_server();
         let root = test_repo_dir("trusted-default");
@@ -1106,6 +1177,54 @@ mod tests {
         assert_eq!(
             registered.repository.trust_state,
             RpcRepositoryTrustState::ReadOnly
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rpc_path_scope_from_record_maps_read_only_from_repository_trust_state() {
+        let root = test_repo_dir("scope-kind-readonly");
+        let record = repository_record(
+            root.to_string_lossy().as_ref(),
+            RepositoryTrustState::ReadOnly,
+            vec!["."],
+        );
+        let repository = Repository::from(record);
+
+        assert_eq!(repository.allowed_scope.kind, RpcPathScopeKind::ReadOnly);
+        assert_eq!(repository.allowed_scope.roots, vec![".".to_string()]);
+        assert!(repository.allowed_scope.include_patterns.is_empty());
+        assert!(repository.allowed_scope.exclude_patterns.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rpc_path_scope_from_record_preserves_roots_and_infers_kind() {
+        let root = test_repo_dir("scope-kind-explicit");
+        let repository_root = root.to_string_lossy();
+
+        let repository = Repository::from(repository_record(
+            repository_root.as_ref(),
+            RepositoryTrustState::Trusted,
+            vec![repository_root.as_ref()],
+        ));
+        assert_eq!(repository.allowed_scope.kind, RpcPathScopeKind::Repository);
+        assert_eq!(
+            repository.allowed_scope.roots,
+            vec![repository_root.as_ref().to_string()]
+        );
+
+        let explicit = Repository::from(repository_record(
+            repository_root.as_ref(),
+            RepositoryTrustState::Trusted,
+            vec!["subdir", "other"],
+        ));
+        assert_eq!(explicit.allowed_scope.kind, RpcPathScopeKind::ExplicitPaths);
+        assert_eq!(
+            explicit.allowed_scope.roots,
+            vec!["subdir".to_string(), "other".to_string()]
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1608,6 +1727,61 @@ mod tests {
         assert_eq!(
             cancellation.requested_by,
             Some(RpcActorDto::from(requested_by))
+        );
+    }
+
+    #[test]
+    fn cancel_job_response_payload_matches_receipt_cancellation() {
+        let requested_by = actor_record();
+        let requested_at = atelia_core::LedgerTimestamp::from_unix_millis(9_000);
+        let completed_at = atelia_core::LedgerTimestamp::from_unix_millis(9_500);
+        let receipt = CancelJobReceipt {
+            job: JobRecord {
+                cancellation_state: CancellationState::Requested,
+                completed_at: Some(completed_at),
+                ..JobRecord::new(
+                    requested_by.clone(),
+                    RepositoryId::new(),
+                    JobKind::Read,
+                    "cleanup".to_string(),
+                    atelia_core::LedgerTimestamp::from_unix_millis(8_500),
+                )
+            },
+            events: vec![atelia_core::JobEvent {
+                id: atelia_core::JobEventId::new(),
+                schema_version: 1,
+                sequence_number: 1,
+                created_at: requested_at,
+                subject: atelia_core::EventSubject::job(&JobId::new()),
+                kind: JobEventKind::CancellationRequested,
+                severity: atelia_core::EventSeverity::Warning,
+                public_message: "operator requested cancellation".to_string(),
+                refs: atelia_core::EventRefs::default(),
+                redactions: Vec::new(),
+            }],
+        };
+
+        let expected = job_cancellation_from_receipt(&receipt, Some(&requested_by));
+        let (job, cancellation) = job_from_cancel_receipt(receipt, Some(&requested_by));
+
+        assert_eq!(job.cancellation, cancellation);
+        assert_eq!(job.cancellation, expected);
+        assert_eq!(cancellation.state, "requested");
+        assert_eq!(
+            cancellation.requested_by,
+            Some(RpcActorDto::from(requested_by))
+        );
+        assert_eq!(
+            cancellation.reason,
+            Some("operator requested cancellation".to_string())
+        );
+        assert_eq!(
+            cancellation.requested_at_unix_ms,
+            Some(requested_at.unix_millis)
+        );
+        assert_eq!(
+            cancellation.completed_at_unix_ms,
+            Some(completed_at.unix_millis)
         );
     }
 
