@@ -157,6 +157,7 @@ pub struct TruncationMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OutputRef {
     pub id: OutputRefId,
+    pub uri: String,
     pub media_type: String,
     pub label: Option<String>,
     pub digest: Option<String>,
@@ -165,6 +166,7 @@ pub struct OutputRef {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactRef {
     pub id: ArtifactRefId,
+    pub uri: String,
     pub media_type: String,
     pub label: Option<String>,
     pub digest: Option<String>,

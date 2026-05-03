@@ -1,5 +1,9 @@
 //! Synchronous Secretary runtime loop for bounded tool jobs.
 
+use crate::artifacts::{
+    spill_large_tool_result_fields, ArtifactError, ArtifactStoreConfig, LocalArtifactStore,
+    ToolResultSpilloverOptions,
+};
 use crate::domain::{
     Actor, AuditRecord, AuditRecordId, CancellationState, EventRefs, EventSeverity, EventSubject,
     JobEvent, JobEventId, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
@@ -26,6 +30,7 @@ pub struct RuntimeJobRequest {
     pub resource_scope: ResourceScope,
     pub approval_available: bool,
     pub render_options: RenderOptions,
+    pub artifact_spillover: Option<RuntimeArtifactSpillover>,
 }
 
 impl RuntimeJobRequest {
@@ -46,6 +51,7 @@ impl RuntimeJobRequest {
             },
             approval_available: true,
             render_options: RenderOptions::new(OutputFormat::Toon),
+            artifact_spillover: None,
         }
     }
 
@@ -70,6 +76,33 @@ impl RuntimeJobRequest {
         self.render_options = render_options;
         self
     }
+
+    pub fn with_artifact_spillover(mut self, spillover: RuntimeArtifactSpillover) -> Self {
+        self.artifact_spillover = Some(spillover);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeArtifactSpillover {
+    pub store_config: ArtifactStoreConfig,
+    pub options: ToolResultSpilloverOptions,
+}
+
+impl RuntimeArtifactSpillover {
+    pub fn new(store_config: ArtifactStoreConfig, options: ToolResultSpilloverOptions) -> Self {
+        Self {
+            store_config,
+            options,
+        }
+    }
+
+    pub fn local_default(max_inline_bytes: usize) -> Self {
+        Self {
+            store_config: ArtifactStoreConfig::default_local(),
+            options: ToolResultSpilloverOptions::new(max_inline_bytes),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,11 +116,12 @@ pub struct RuntimeJobReceipt {
     pub events: Vec<JobEvent>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum RuntimeError {
     Store(StoreError),
     JobStatusTransition(JobStatusTransitionError),
     ToolOutputRender(ToolOutputRenderError),
+    Artifact(ArtifactError),
     InvalidToolResult { reason: String },
 }
 
@@ -99,6 +133,7 @@ impl fmt::Display for RuntimeError {
                 write!(f, "job status transition failed: {error:?}")
             }
             Self::ToolOutputRender(error) => write!(f, "{error}"),
+            Self::Artifact(error) => write!(f, "{error}"),
             Self::InvalidToolResult { reason } => write!(f, "invalid tool result: {reason}"),
         }
     }
@@ -121,6 +156,12 @@ impl From<JobStatusTransitionError> for RuntimeError {
 impl From<ToolOutputRenderError> for RuntimeError {
     fn from(error: ToolOutputRenderError) -> Self {
         Self::ToolOutputRender(error)
+    }
+}
+
+impl From<ArtifactError> for RuntimeError {
+    fn from(error: ArtifactError) -> Self {
+        Self::Artifact(error)
     }
 }
 
@@ -358,23 +399,36 @@ where
         );
         job.latest_event_id = events.last().map(|event| event.id.clone());
 
-        let result = tool.execute(&invocation, &request);
+        let mut result = tool.execute(&invocation, &request);
         if let Err(error) = validate_runtime_tool_result(&invocation, &result) {
-            let previous = job.status;
-            job.transition_status(JobStatus::Failed, LedgerTimestamp::now())?;
-            let failure_event = job_event(
-                EventSubject::job(&job.id),
-                JobEventKind::JobStatusChanged {
-                    from: previous,
-                    to: JobStatus::Failed,
-                },
-                EventSeverity::Error,
+            let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
+            append_failed_job_event(
+                &self.store,
+                &mut job,
+                &mut events,
                 "tool result rejected",
-                refs_for_invocation(&job, &policy_decision, &invocation),
-            );
-            self.store
-                .append_job_event_and_update_job(job.clone(), failure_event)?;
+                failure_refs,
+            )?;
             return Err(error);
+        }
+        if let Some(spillover) = &request.artifact_spillover {
+            let artifact_store = LocalArtifactStore::new(spillover.store_config.clone());
+            if let Err(error) = spill_large_tool_result_fields(
+                &mut result,
+                &artifact_store,
+                repository.id.as_str(),
+                &spillover.options,
+            ) {
+                let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
+                append_failed_job_event(
+                    &self.store,
+                    &mut job,
+                    &mut events,
+                    "artifact spillover failed",
+                    failure_refs,
+                )?;
+                return Err(error.into());
+            }
         }
         let result_event = job_event(
             EventSubject::tool_result(&result.id),
@@ -603,6 +657,34 @@ fn validate_runtime_tool_result(
     Ok(())
 }
 
+fn append_failed_job_event<S>(
+    store: &S,
+    job: &mut JobRecord,
+    events: &mut Vec<JobEvent>,
+    public_message: &'static str,
+    refs: EventRefs,
+) -> RuntimeResult<()>
+where
+    S: SecretaryStore,
+{
+    let previous = job.status;
+    job.transition_status(JobStatus::Failed, LedgerTimestamp::now())?;
+    let failure_event = job_event(
+        EventSubject::job(&job.id),
+        JobEventKind::JobStatusChanged {
+            from: previous,
+            to: JobStatus::Failed,
+        },
+        EventSeverity::Error,
+        public_message,
+        refs,
+    );
+    let failure_event = store.append_job_event_and_update_job(job.clone(), failure_event)?;
+    job.latest_event_id = Some(failure_event.id.clone());
+    events.push(failure_event);
+    Ok(())
+}
+
 fn job_event(
     subject: EventSubject,
     kind: JobEventKind,
@@ -790,6 +872,92 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct WrongInvocationLargeOutputTool {
+        content: String,
+    }
+
+    impl RuntimeTool for WrongInvocationLargeOutputTool {
+        fn tool_id(&self) -> &'static str {
+            "secretary.bad_large_fixture"
+        }
+
+        fn requested_capability(&self) -> &'static str {
+            "capability.discovery"
+        }
+
+        fn declared_effect(&self) -> &'static str {
+            "return a malformed large result"
+        }
+
+        fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+            format!("goal={}", request.goal)
+        }
+
+        fn execute(&self, invocation: &ToolInvocation, _request: &RuntimeJobRequest) -> ToolResult {
+            ToolResult {
+                id: ToolResultId::new(),
+                schema_version: RUNTIME_SCHEMA_VERSION,
+                created_at: LedgerTimestamp::now(),
+                invocation_id: ToolInvocationId::new(),
+                tool_id: invocation.tool_id.clone(),
+                status: ToolResultStatus::Succeeded,
+                schema_ref: None,
+                fields: vec![ToolResultField {
+                    key: "content".to_string(),
+                    value: StructuredValue::String(self.content.clone()),
+                }],
+                evidence_refs: Vec::new(),
+                output_refs: Vec::new(),
+                truncation: None,
+                redactions: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct LargeOutputTool {
+        content: String,
+    }
+
+    impl RuntimeTool for LargeOutputTool {
+        fn tool_id(&self) -> &'static str {
+            "secretary.large_output_fixture"
+        }
+
+        fn requested_capability(&self) -> &'static str {
+            "capability.discovery"
+        }
+
+        fn declared_effect(&self) -> &'static str {
+            "return a large text field"
+        }
+
+        fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+            format!("goal={}", request.goal)
+        }
+
+        fn execute(&self, invocation: &ToolInvocation, _request: &RuntimeJobRequest) -> ToolResult {
+            ToolResult {
+                id: ToolResultId::new(),
+                schema_version: RUNTIME_SCHEMA_VERSION,
+                created_at: LedgerTimestamp::now(),
+                invocation_id: invocation.id.clone(),
+                tool_id: invocation.tool_id.clone(),
+                status: ToolResultStatus::Succeeded,
+                schema_ref: Some("tool_result.large_output_fixture.v1".to_string()),
+                fields: vec![ToolResultField {
+                    key: "content".to_string(),
+                    value: StructuredValue::String(self.content.clone()),
+                }],
+                evidence_refs: Vec::new(),
+                output_refs: Vec::new(),
+                truncation: None,
+                redactions: Vec::new(),
+            }
+        }
+    }
+
     #[test]
     fn echo_tool_job_records_policy_execution_result_audit_and_rendered_output() {
         let runtime = SecretaryRuntime::in_memory();
@@ -859,6 +1027,123 @@ mod tests {
         assert!(receipt.rendered_output.is_none());
         assert!(runtime.store().list_tool_invocations().unwrap().is_empty());
         assert_eq!(3, receipt.events.len());
+    }
+
+    #[test]
+    fn runtime_spills_large_tool_output_before_persisting_result_and_audit() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+        let artifact_root = std::env::temp_dir().join(format!(
+            "atelia-runtime-artifacts-{}",
+            LedgerTimestamp::now().unix_millis
+        ));
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "large output",
+        )
+        .with_artifact_spillover(RuntimeArtifactSpillover::new(
+            ArtifactStoreConfig::new(&artifact_root),
+            ToolResultSpilloverOptions::new(8),
+        ));
+        let tool = LargeOutputTool {
+            content: "0123456789abcdef".to_string(),
+        };
+
+        let receipt = runtime.run_tool_job(request, &tool).unwrap();
+
+        let result = receipt.tool_result.unwrap();
+        assert_eq!(1, result.output_refs.len());
+        assert_eq!(
+            result.output_refs,
+            receipt.audit_record.as_ref().unwrap().output_refs
+        );
+        assert_eq!(
+            "0123456789abcdef",
+            std::fs::read_to_string(&result.output_refs[0].uri).unwrap()
+        );
+        let rendered = receipt.rendered_output.unwrap().body;
+        assert!(rendered.contains("output_refs[1]"));
+        assert!(rendered.contains("artifact_ref "));
+        std::fs::remove_dir_all(artifact_root).ok();
+    }
+
+    #[test]
+    fn runtime_marks_job_failed_when_artifact_spillover_fails() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+        let artifact_root = std::env::temp_dir().join(format!(
+            "atelia-runtime-artifacts-file-{}",
+            LedgerTimestamp::now().unix_millis
+        ));
+        std::fs::write(&artifact_root, "not a directory").unwrap();
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "large output",
+        )
+        .with_artifact_spillover(RuntimeArtifactSpillover::new(
+            ArtifactStoreConfig::new(&artifact_root),
+            ToolResultSpilloverOptions::new(8),
+        ));
+        let tool = LargeOutputTool {
+            content: "0123456789abcdef".to_string(),
+        };
+
+        let error = runtime.run_tool_job(request, &tool).unwrap_err();
+
+        assert!(matches!(error, RuntimeError::Artifact(_)));
+        let jobs = runtime.store().list_jobs().unwrap();
+        assert_eq!(1, jobs.len());
+        assert_eq!(JobStatus::Failed, jobs[0].status);
+        assert!(jobs[0].completed_at.is_some());
+        assert!(runtime.store().list_tool_results().unwrap().is_empty());
+        std::fs::remove_file(artifact_root).ok();
+    }
+
+    #[test]
+    fn runtime_validates_tool_result_before_artifact_spillover_side_effects() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+        let artifact_root = std::env::temp_dir().join(format!(
+            "atelia-runtime-artifacts-invalid-{}",
+            LedgerTimestamp::now().unix_millis
+        ));
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "malformed large output",
+        )
+        .with_artifact_spillover(RuntimeArtifactSpillover::new(
+            ArtifactStoreConfig::new(&artifact_root),
+            ToolResultSpilloverOptions::new(8),
+        ));
+        let tool = WrongInvocationLargeOutputTool {
+            content: "0123456789abcdef".to_string(),
+        };
+
+        let error = runtime.run_tool_job(request, &tool).unwrap_err();
+
+        assert!(matches!(error, RuntimeError::InvalidToolResult { .. }));
+        assert!(!artifact_root.exists());
+        let jobs = runtime.store().list_jobs().unwrap();
+        assert_eq!(1, jobs.len());
+        assert_eq!(JobStatus::Failed, jobs[0].status);
     }
 
     #[test]
