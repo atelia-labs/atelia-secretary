@@ -5,10 +5,11 @@
 //! escape rejection per `docs/execution-semantics.md`.
 
 use crate::domain::{
-    LedgerTimestamp, RedactionMarker, StructuredValue, ToolInvocation, ToolResult, ToolResultField,
-    ToolResultId, ToolResultStatus, TruncationMetadata,
+    LedgerTimestamp, RedactionMarker, ResolvedPath, StructuredValue, ToolInvocation, ToolResult,
+    ToolResultField, ToolResultId, ToolResultStatus, TruncationMetadata,
 };
 use crate::runtime::RuntimeJobRequest;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
@@ -128,6 +129,20 @@ fn target_from_request(request: &RuntimeJobRequest) -> PathBuf {
     PathBuf::from(&request.resource_scope.value)
 }
 
+fn resolved_path_for_request(
+    repository_root: &Path,
+    request: &RuntimeJobRequest,
+) -> Vec<ResolvedPath> {
+    match canonicalize_within_scope(repository_root, &target_from_request(request)) {
+        Ok(canonical) => vec![ResolvedPath {
+            requested_path: request.resource_scope.value.clone(),
+            resolved_path: canonical.canonical.to_string_lossy().to_string(),
+            display_path: canonical.display_path(),
+        }],
+        Err(_) => Vec::new(),
+    }
+}
+
 fn make_tool_result(
     invocation: &ToolInvocation,
     status: ToolResultStatus,
@@ -212,6 +227,10 @@ impl crate::runtime::RuntimeTool for FsListTool {
         format!("path={}", request.resource_scope.value)
     }
 
+    fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
+        resolved_path_for_request(&self.repository_root, request)
+    }
+
     fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
         let schema_ref = "tool_result.fs.list.v1";
         let relative = target_from_request(request);
@@ -243,15 +262,19 @@ impl crate::runtime::RuntimeTool for FsListTool {
         let mut names: Vec<String> = Vec::new();
         let mut file_count: u64 = 0;
         let mut dir_count: u64 = 0;
+        let mut unknown_count: u64 = 0;
 
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_dir() {
-                    dir_count += 1;
-                } else {
-                    file_count += 1;
-                }
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => dir_count += 1,
+                Ok(ft) if ft.is_file() => file_count += 1,
+                Ok(_) => unknown_count += 1,
+                Err(_) => match entry.metadata() {
+                    Ok(meta) if meta.is_dir() => dir_count += 1,
+                    Ok(meta) if meta.is_file() => file_count += 1,
+                    _ => unknown_count += 1,
+                },
             }
             names.push(name);
         }
@@ -259,11 +282,16 @@ impl crate::runtime::RuntimeTool for FsListTool {
         names.sort();
 
         let summary = format!(
-            "{} entries in {} ({} files, {} dirs)",
+            "{} entries in {} ({} files, {} dirs{})",
             names.len(),
             canonical.display_path(),
             file_count,
             dir_count,
+            if unknown_count > 0 {
+                format!(", {} other", unknown_count)
+            } else {
+                String::new()
+            },
         );
 
         make_tool_result(
@@ -294,6 +322,10 @@ impl crate::runtime::RuntimeTool for FsListTool {
                 ToolResultField {
                     key: "dir_count".to_string(),
                     value: StructuredValue::Integer(dir_count as i64),
+                },
+                ToolResultField {
+                    key: "unknown_count".to_string(),
+                    value: StructuredValue::Integer(unknown_count as i64),
                 },
             ],
             None,
@@ -335,6 +367,10 @@ impl crate::runtime::RuntimeTool for FsStatTool {
 
     fn args_summary(&self, request: &RuntimeJobRequest) -> String {
         format!("path={}", request.resource_scope.value)
+    }
+
+    fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
+        resolved_path_for_request(&self.repository_root, request)
     }
 
     fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
@@ -481,6 +517,10 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
         )
     }
 
+    fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
+        resolved_path_for_request(&self.repository_root, request)
+    }
+
     fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
         let schema_ref = "tool_result.fs.search.v1";
         let relative = target_from_request(request);
@@ -499,13 +539,26 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
 
         let mut matches: Vec<String> = Vec::new();
         let mut files_searched: u64 = 0;
+        let mut files_skipped: u64 = 0;
         let mut truncated = false;
         let mut total_bytes: u64 = 0;
         let mut retained_bytes: u64 = 0;
 
         if canonical.canonical.is_file() {
-            files_searched = 1;
-            let _ = search_file(
+            let metadata = match fs::metadata(&canonical.canonical) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    return failed_result(
+                        invocation,
+                        schema_ref,
+                        "search failed: cannot read file metadata".to_string(),
+                        format!("{}: {}", canonical.display_path(), err),
+                    );
+                }
+            };
+            if metadata.len() > self.max_file_bytes {
+                files_skipped = 1;
+            } else if let Err(err) = search_file(
                 &canonical.canonical,
                 &canonical.root,
                 &self.pattern,
@@ -514,9 +567,19 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
                 &mut truncated,
                 &mut total_bytes,
                 &mut retained_bytes,
-            );
+            ) {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "search failed: cannot read file".to_string(),
+                    format!("{}: {}", canonical.display_path(), err),
+                );
+            } else {
+                files_searched = 1;
+            }
         } else if canonical.canonical.is_dir() {
-            let _ = search_recursive(
+            let mut visited_dirs = HashSet::from([canonical.canonical.clone()]);
+            if let Err(err) = search_recursive(
                 &canonical.canonical,
                 &canonical.root,
                 &self.pattern,
@@ -524,10 +587,19 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
                 self.max_file_bytes,
                 &mut matches,
                 &mut files_searched,
+                &mut files_skipped,
                 &mut truncated,
                 &mut total_bytes,
                 &mut retained_bytes,
-            );
+                &mut visited_dirs,
+            ) {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "search failed: cannot traverse directory".to_string(),
+                    format!("{}: {}", canonical.display_path(), err),
+                );
+            }
         }
 
         let truncation = if truncated {
@@ -577,6 +649,10 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
                     key: "files_searched".to_string(),
                     value: StructuredValue::Integer(files_searched as i64),
                 },
+                ToolResultField {
+                    key: "files_skipped".to_string(),
+                    value: StructuredValue::Integer(files_skipped as i64),
+                },
             ],
             truncation,
             Vec::new(),
@@ -593,15 +669,14 @@ fn search_recursive(
     max_file_bytes: u64,
     matches: &mut Vec<String>,
     files_searched: &mut u64,
+    files_skipped: &mut u64,
     truncated: &mut bool,
     total_bytes: &mut u64,
     retained_bytes: &mut u64,
+    visited_dirs: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
     let entries = fs::read_dir(dir)?;
     for entry in entries {
-        if *truncated {
-            return Ok(());
-        }
         let entry = entry?;
         let path = entry.path();
 
@@ -614,8 +689,11 @@ fn search_recursive(
             continue;
         }
 
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
+        let metadata = fs::metadata(&canonical)?;
+        if metadata.is_dir() {
+            if !visited_dirs.insert(canonical.clone()) {
+                continue;
+            }
             search_recursive(
                 &canonical,
                 root,
@@ -624,17 +702,23 @@ fn search_recursive(
                 max_file_bytes,
                 matches,
                 files_searched,
+                files_skipped,
                 truncated,
                 total_bytes,
                 retained_bytes,
+                visited_dirs,
             )?;
-        } else if file_type.is_file() {
-            let metadata = fs::metadata(&canonical)?;
+        } else if metadata.is_file() {
             if metadata.len() > max_file_bytes {
+                *files_skipped += 1;
                 continue;
             }
             *files_searched += 1;
-            let _ = search_file(
+            let snapshot_len = matches.len();
+            let snapshot_total = *total_bytes;
+            let snapshot_retained = *retained_bytes;
+            let snapshot_truncated = *truncated;
+            if search_file(
                 &canonical,
                 root,
                 pattern,
@@ -643,7 +727,16 @@ fn search_recursive(
                 truncated,
                 total_bytes,
                 retained_bytes,
-            );
+            )
+            .is_err()
+            {
+                matches.truncate(snapshot_len);
+                *total_bytes = snapshot_total;
+                *retained_bytes = snapshot_retained;
+                *truncated = snapshot_truncated;
+                *files_searched -= 1;
+                *files_skipped += 1;
+            }
         }
     }
     Ok(())
@@ -661,24 +754,21 @@ fn search_file(
     retained_bytes: &mut u64,
 ) -> io::Result<()> {
     let file = fs::File::open(path)?;
-    *total_bytes += file.metadata()?.len();
 
     let reader = io::BufReader::new(file);
     let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
 
     for (line_num, line_result) in reader.lines().enumerate() {
-        if matches.len() >= max_results {
-            *truncated = true;
-            return Ok(());
-        }
-        let line = match line_result {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+        let line = line_result?;
         if line.contains(pattern) {
             let match_ref = format!("{}:{}", relative, line_num + 1);
-            *retained_bytes += match_ref.len() as u64;
-            matches.push(match_ref);
+            *total_bytes += match_ref.len() as u64;
+            if matches.len() < max_results {
+                *retained_bytes += match_ref.len() as u64;
+                matches.push(match_ref);
+            } else {
+                *truncated = true;
+            }
         }
     }
     Ok(())
@@ -743,6 +833,13 @@ mod tests {
         match value {
             StructuredValue::String(value) => value,
             other => panic!("expected String, got {:?}", other),
+        }
+    }
+
+    fn integer_value(value: &StructuredValue) -> i64 {
+        match value {
+            StructuredValue::Integer(value) => *value,
+            other => panic!("expected Integer, got {:?}", other),
         }
     }
 
@@ -1090,6 +1187,88 @@ mod tests {
         env.cleanup();
     }
 
+    #[test]
+    fn fs_search_single_file_respects_max_file_bytes() {
+        let env = TestEnv::new("search-large-file");
+        env.create_file(
+            "large.txt",
+            "MATCH in a file that is intentionally too large",
+        );
+
+        let tool = FsSearchTool::new(&env.root, "MATCH").with_max_file_bytes(4);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("large.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let count = result
+            .fields
+            .iter()
+            .find(|f| f.key == "match_count")
+            .unwrap();
+        assert_eq!(0, integer_value(&count.value));
+        let skipped = result
+            .fields
+            .iter()
+            .find(|f| f.key == "files_skipped")
+            .unwrap();
+        assert_eq!(1, integer_value(&skipped.value));
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_search_skips_binary_files_during_directory_search() {
+        let env = TestEnv::new("search-binary");
+        env.create_file("good.txt", "needle in text");
+        fs::write(
+            env.root.join("binary.bin"),
+            [0xff, 0xfe, b'n', b'e', b'e', b'd'],
+        )
+        .unwrap();
+
+        let tool = FsSearchTool::new(&env.root, "needle");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let count = result
+            .fields
+            .iter()
+            .find(|f| f.key == "match_count")
+            .unwrap();
+        assert_eq!(1, integer_value(&count.value));
+        let skipped = result
+            .fields
+            .iter()
+            .find(|f| f.key == "files_skipped")
+            .unwrap();
+        assert_eq!(1, integer_value(&skipped.value));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_search_follows_safe_in_scope_symlink() {
+        let env = TestEnv::new("search-safe-symlink");
+        env.create_file("real/target.txt", "hello through link");
+        env.create_symlink("linked", &env.root.join("real"));
+
+        let tool = FsSearchTool::new(&env.root, "hello");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("linked");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let count = result
+            .fields
+            .iter()
+            .find(|f| f.key == "match_count")
+            .unwrap();
+        assert_eq!(1, integer_value(&count.value));
+        env.cleanup();
+    }
+
     // -- Rendering compatibility --
 
     #[test]
@@ -1171,6 +1350,12 @@ mod tests {
             receipt.policy_decision.outcome
         );
         assert!(receipt.tool_invocation.is_some());
+        assert!(!receipt
+            .tool_invocation
+            .as_ref()
+            .unwrap()
+            .resolved_paths
+            .is_empty());
         assert!(receipt.tool_result.is_some());
         assert!(receipt.audit_record.is_some());
         assert!(receipt.rendered_output.is_some());
