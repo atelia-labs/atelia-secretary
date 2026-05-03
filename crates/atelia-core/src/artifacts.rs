@@ -275,12 +275,13 @@ impl LocalArtifactStore {
         let id = OutputRefId::new();
         let file_name = format!("{}-{safe_label}.artifact", id.as_str());
         let dir = self.config.root_dir.join(&scope_dir_name);
-        let path = dir.join(file_name);
 
         create_scope_dir(&dir)?;
+        let dir = dir.canonicalize()?;
+        let path = dir.join(file_name);
         write_file_bytes(&path, bytes)?;
 
-        let uri = path.to_string_lossy().into_owned();
+        let uri = path.canonicalize()?.to_string_lossy().into_owned();
         let media_type = media_type.into();
         let created_at = LedgerTimestamp::now();
         let index_record = LocalArtifactRecord {
@@ -370,9 +371,30 @@ impl LocalArtifactStore {
         let records = self.list_records(scope)?;
         let expected_scope = scope.map(sanitize_segment).transpose()?;
         let tombstone_reason = tombstone_reason.into();
-        let mut target_ids: HashSet<OutputRefId> = HashSet::new();
-        for record_id in record_ids {
-            target_ids.insert(record_id.clone());
+        let target_ids: HashSet<OutputRefId> = record_ids.iter().cloned().collect();
+        let mut seen_ids: HashSet<OutputRefId> = HashSet::new();
+        for record in &records {
+            let sanitized_scope = sanitize_segment(&record.scope)?;
+            if expected_scope
+                .as_ref()
+                .is_some_and(|expected| sanitized_scope != *expected)
+            {
+                return Err(ArtifactError::InvalidScope {
+                    scope: record.scope.clone(),
+                });
+            }
+            if sanitized_scope != record.scope {
+                return Err(ArtifactError::InvalidScope {
+                    scope: record.scope.clone(),
+                });
+            }
+            if !seen_ids.insert(record.id.clone()) {
+                return Err(duplicate_index_error(
+                    &self.config.root_dir,
+                    &sanitized_scope,
+                    &record.id,
+                ));
+            }
         }
 
         let mut report = ArtifactExpirationReport::new(target_ids.len());
@@ -383,20 +405,6 @@ impl LocalArtifactStore {
         let mut scope_targets: BTreeMap<String, HashSet<OutputRefId>> = BTreeMap::new();
         for record in records {
             let sanitized_scope = sanitize_segment(&record.scope)?;
-            if expected_scope
-                .as_ref()
-                .is_some_and(|expected| sanitized_scope != *expected)
-            {
-                return Err(ArtifactError::InvalidScope {
-                    scope: record.scope,
-                });
-            }
-            if sanitized_scope != record.scope {
-                return Err(ArtifactError::InvalidScope {
-                    scope: record.scope,
-                });
-            }
-
             if target_ids.contains(&record.id) {
                 report.matched += 1;
                 scope_targets
@@ -1097,6 +1105,17 @@ fn missing_scope_record_error(scope_dir: &Path, id: &OutputRefId) -> ArtifactErr
     }
 }
 
+fn duplicate_index_error(root_dir: &Path, scope: &str, id: &OutputRefId) -> ArtifactError {
+    ArtifactError::InvalidIndex {
+        path: root_dir
+            .join(scope)
+            .join(DEFAULT_ARTIFACT_INDEX_FILE)
+            .to_string_lossy()
+            .into_owned(),
+        reason: format!("duplicate artifact id {} in index", id.as_str()),
+    }
+}
+
 fn update_record_bytes(
     store: &LocalArtifactStore,
     scope: &str,
@@ -1485,6 +1504,36 @@ mod tests {
     }
 
     #[test]
+    fn writes_artifact_with_normalized_absolute_paths_from_relative_root() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let relative_root = PathBuf::from(format!("atelia-relative-artifacts-{unique}"));
+        let absolute_root = env::current_dir().unwrap().join(&relative_root);
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&relative_root));
+
+        let reference = store
+            .write_bytes_with_metadata(
+                "repo_example",
+                "search output",
+                "text/plain",
+                b"hello",
+                ArtifactWriteMetadata::default(),
+            )
+            .unwrap();
+
+        let records = store.list_records(None).unwrap();
+        assert_eq!(1, records.len());
+        assert!(Path::new(&reference.uri).is_absolute());
+        assert!(Path::new(&reference.uri).starts_with(&absolute_root));
+        assert_eq!(reference.uri, records[0].path);
+        assert_eq!(reference.uri, records[0].uri);
+
+        let _ = fs::remove_dir_all(&absolute_root);
+    }
+
+    #[test]
     fn spills_large_string_field_to_output_ref() {
         let root = temp_root("spill");
         let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
@@ -1619,6 +1668,77 @@ mod tests {
             records[0].tombstone.as_ref().map(|t| t.reason.as_str())
         );
         assert!(!missing_path.exists());
+    }
+
+    #[test]
+    fn safe_expire_artifact_records_rejects_duplicate_ids_before_mutating() {
+        let root = temp_root("expire-duplicate-ids");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let record_id = OutputRefId::new();
+        let first_path = scope_dir.join(format!("{}-first.artifact", record_id.as_str()));
+        let second_path = scope_dir.join(format!("{}-second.artifact", record_id.as_str()));
+        fs::write(&first_path, b"first").unwrap();
+        fs::write(&second_path, b"second").unwrap();
+
+        let first_record = LocalArtifactRecord {
+            id: record_id.clone(),
+            scope: "repo_example".to_string(),
+            project_id: None,
+            repository_id: None,
+            path: first_path.to_string_lossy().into_owned(),
+            uri: first_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("first".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+        let second_record = LocalArtifactRecord {
+            id: record_id.clone(),
+            scope: "repo_example".to_string(),
+            project_id: None,
+            repository_id: None,
+            path: second_path.to_string_lossy().into_owned(),
+            uri: second_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("second".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+        store
+            .write_scope_records(&scope_dir, vec![first_record, second_record])
+            .unwrap();
+
+        let index_path = scope_dir.join(DEFAULT_ARTIFACT_INDEX_FILE);
+        let index_before = fs::read(&index_path).unwrap();
+
+        let error = store
+            .safe_expire_artifact_records(
+                None,
+                std::slice::from_ref(&record_id),
+                LedgerTimestamp::now(),
+                "retention policy",
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidIndex { path, reason }
+            if path == index_path.to_string_lossy() && reason.contains(record_id.as_str())
+        ));
+        assert_eq!(index_before, fs::read(&index_path).unwrap());
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+
+        let records = store.list_records(None).unwrap();
+        assert_eq!(2, records.len());
+        assert!(records.iter().all(|record| record.tombstone.is_none()));
     }
 
     #[test]
