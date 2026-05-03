@@ -42,6 +42,7 @@ enum Route {
     ApplyBlocklist,
     ListBlocklist,
     RenderToolOutput,
+    ProjectStatus,
     Unsupported,
 }
 
@@ -77,6 +78,7 @@ fn route_for_path(path: &str) -> Route {
         "/v1/extensions/blocklist/apply" => Route::ApplyBlocklist,
         "/v1/extensions/blocklist/list" => Route::ListBlocklist,
         "/v1/tool-results:render" => Route::RenderToolOutput,
+        "/v1/project-status:get" => Route::ProjectStatus,
         _ => Route::Unsupported,
     }
 }
@@ -194,6 +196,11 @@ enum EventCursorPayload {
     Beginning,
     AfterSequence { sequence_number: u64 },
     AfterEventId { event_id: String },
+}
+
+#[derive(Debug, Deserialize)]
+struct GetProjectStatusRequestPayload {
+    repository_id: String,
 }
 
 pub fn listen_addr() -> Result<(SocketAddr, bool)> {
@@ -577,6 +584,15 @@ fn serialize_tool_output_change(
 
     Ok(value)
 }
+
+fn parse_get_project_status_payload(
+    payload: GetProjectStatusRequestPayload,
+) -> rpc::GetProjectStatusRequest {
+    rpc::GetProjectStatusRequest {
+        repository_id: payload.repository_id,
+    }
+}
+
 fn serialize_protocol_metadata(metadata: &rpc::ProtocolMetadata) -> serde_json::Value {
     serde_json::json!({
         "protocol_version": metadata.protocol_version,
@@ -634,6 +650,85 @@ fn serialize_repository(repository: &rpc::Repository) -> serde_json::Value {
         "trust_state": serialize_trust_state(&repository.trust_state),
         "created_at_unix_ms": repository.created_at_unix_ms,
         "updated_at_unix_ms": repository.updated_at_unix_ms,
+    })
+}
+
+fn serialize_actor(actor: &rpc::RpcActorDto) -> serde_json::Value {
+    match actor {
+        rpc::RpcActorDto::User { id, display_name } => serde_json::json!({
+            "type": "user",
+            "id": id,
+            "display_name": display_name,
+        }),
+        rpc::RpcActorDto::Agent { id, display_name } => serde_json::json!({
+            "type": "agent",
+            "id": id,
+            "display_name": display_name,
+        }),
+        rpc::RpcActorDto::Extension { id } => serde_json::json!({
+            "type": "extension",
+            "id": id,
+        }),
+        rpc::RpcActorDto::System { id } => serde_json::json!({
+            "type": "system",
+            "id": id,
+        }),
+    }
+}
+
+fn serialize_policy_summary(summary: &rpc::PolicySummary) -> serde_json::Value {
+    serde_json::json!({
+        "decision_id": summary.decision_id,
+        "outcome": summary.outcome,
+        "risk_tier": summary.risk_tier,
+        "reason_code": summary.reason_code,
+    })
+}
+
+fn serialize_job_cancellation(cancellation: &rpc::JobCancellation) -> serde_json::Value {
+    serde_json::json!({
+        "state": cancellation.state,
+        "requested_by": cancellation.requested_by.as_ref().map(serialize_actor),
+        "reason": cancellation.reason,
+        "requested_at_unix_ms": cancellation.requested_at_unix_ms,
+        "completed_at_unix_ms": cancellation.completed_at_unix_ms,
+    })
+}
+
+fn serialize_job(job: &rpc::Job) -> serde_json::Value {
+    serde_json::json!({
+        "job_id": job.job_id,
+        "repository_id": job.repository_id,
+        "requester": serialize_actor(&job.requester),
+        "kind": job.kind,
+        "goal": job.goal,
+        "status": job.status,
+        "policy_summary": job.policy_summary.as_ref().map(serialize_policy_summary),
+        "created_at_unix_ms": job.created_at_unix_ms,
+        "started_at_unix_ms": job.started_at_unix_ms,
+        "completed_at_unix_ms": job.completed_at_unix_ms,
+        "latest_event_id": job.latest_event_id,
+        "cancellation": serialize_job_cancellation(&job.cancellation),
+    })
+}
+
+fn serialize_policy_decision(decision: &rpc::PolicyDecision) -> serde_json::Value {
+    serde_json::json!({
+        "decision_id": decision.decision_id,
+        "outcome": decision.outcome,
+        "risk_tier": decision.risk_tier,
+        "requested_capability": decision.requested_capability,
+        "reason_code": decision.reason_code,
+        "reason": decision.reason,
+        "approval_request_ref": decision.approval_request_ref,
+        "audit_ref": decision.audit_ref,
+    })
+}
+
+fn serialize_event_cursor(cursor: &rpc::EventCursor) -> serde_json::Value {
+    serde_json::json!({
+        "sequence": cursor.sequence,
+        "event_id": cursor.event_id,
     })
 }
 
@@ -817,6 +912,25 @@ fn serialize_event_refs(refs: &rpc::RpcEventRefs) -> serde_json::Value {
         "tool_invocation_id": refs.tool_invocation_id,
         "tool_result_id": refs.tool_result_id,
         "audit_ref": refs.audit_ref,
+    })
+}
+
+fn serialize_project_status_response(response: rpc::GetProjectStatusResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "repository": serialize_repository(&response.repository),
+        "recent_jobs": response.recent_jobs.iter().map(serialize_job).collect::<Vec<_>>(),
+        "recent_policy_decisions": response
+            .recent_policy_decisions
+            .iter()
+            .map(serialize_policy_decision)
+            .collect::<Vec<_>>(),
+        "latest_cursor": response
+            .latest_cursor
+            .as_ref()
+            .map(serialize_event_cursor),
+        "daemon_status": response.daemon_status,
+        "storage_status": response.storage_status,
     })
 }
 
@@ -1174,6 +1288,32 @@ async fn dispatch_install_extension(state: RpcServerState, request: Request<Body
             Json(ApiResponse::ok(serialize_install_extension_response(
                 response,
             ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_project_status(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<GetProjectStatusRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let parsed = parse_get_project_status_payload(payload);
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.get_project_status(parsed) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_project_status_response(response))),
         )
             .into_response(),
         Err(error) => {
@@ -1644,6 +1784,26 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                 dispatch_list_blocklist(state, request).await
             }
         }
+        Route::ProjectStatus => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_project_status(state, request).await
+            }
+        }
         Route::Unsupported => make_error_response(
             StatusCode::NOT_FOUND,
             "unsupported_endpoint",
@@ -1686,6 +1846,7 @@ pub fn build_router(rpc_server: RpcServerState) -> Router {
         .route("/v1/extensions/blocklist/list", any(dispatch_route))
         .route("/v1/extensions/*path", any(dispatch_route))
         .route("/v1/tool-results:render", any(dispatch_route))
+        .route("/v1/project-status:get", any(dispatch_route))
         .fallback(fallback_route)
         .with_state(rpc_server)
 }
@@ -1935,6 +2096,10 @@ mod tests {
         assert_eq!(
             route_for_path("/v1/tool-results:render"),
             Route::RenderToolOutput
+        );
+        assert_eq!(
+            route_for_path("/v1/project-status:get"),
+            Route::ProjectStatus
         );
         assert_eq!(route_for_path("/unknown"), Route::Unsupported);
         assert_eq!(route_for_path("/v1/health/"), Route::Unsupported);
@@ -2579,6 +2744,100 @@ mod tests {
                 .expect("rendered json");
         assert_eq!(rendered_output["fields"].as_array().unwrap().len(), 1);
         assert_eq!(rendered_output["fields"][0]["key"], "summary");
+    }
+
+    #[tokio::test]
+    async fn project_status_endpoint_is_reachable_inprocess() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("project-status");
+        let repository_id = {
+            let mut server = rpc_server.write().await;
+            let registered = server
+                .service_mut()
+                .register_repository(service::RegisterRepositoryRequest {
+                    display_name: "transport-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    trust_state: atelia_core::RepositoryTrustState::Trusted,
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed");
+
+        let repository_id = {
+            let mut server = rpc_server.write().await;
+            let registered = server
+                .service_mut()
+                .register_repository(service::RegisterRepositoryRequest {
+                    display_name: "transport-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    trust_state: atelia_core::RepositoryTrustState::Trusted,
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed");
+
+            let submitted = server
+                .service_mut()
+                .submit_job(service::SubmitJobRequest {
+                    requester: atelia_core::Actor::Agent {
+                        id: "agent:test".to_string(),
+                        display_name: Some("Test Agent".to_string()),
+                    },
+                    repository_id: registered.id.clone(),
+                    kind: atelia_core::JobKind::Read,
+                    goal: "inspect status".to_string(),
+                    resource_scope: None,
+                    requested_capabilities: Vec::new(),
+                    idempotency_key: None,
+                })
+                .expect("submit should succeed");
+
+            submitted.job.repository_id.as_str().to_string()
+        };
+
+        let app = build_router(rpc_server);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/project-status:get")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "repository_id": repository_id,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(
+            payload["data"]["recent_jobs"]
+                .as_array()
+                .map(|jobs| jobs.len()),
+            Some(1)
+        );
+        assert_eq!(
+            payload["data"]["recent_policy_decisions"]
+                .as_array()
+                .map(|decisions| decisions.len()),
+            Some(1)
+        );
+        assert!(payload["data"]["repository"]["repository_id"].is_string());
+        assert!(payload["data"]["latest_cursor"].is_object());
+        assert!(
+            payload["data"]["latest_cursor"]["sequence"]
+                .as_i64()
+                .is_some_and(|sequence| sequence > 0)
+        );
         let _ = fs::remove_dir_all(root);
     }
 

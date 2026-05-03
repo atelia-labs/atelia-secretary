@@ -9,6 +9,7 @@
 
 use crate::service::{
     CheckPolicyRequest as ServiceCheckPolicyRequest, DaemonHealth, DaemonStatus,
+    GetProjectStatusRequest as ServiceGetProjectStatusRequest,
     ListRepositoriesRequest as ServiceListRepositoriesRequest,
     ListToolOutputSettingsHistoryRequest as ServiceListToolOutputSettingsHistoryRequest,
     ProtocolMetadata as ServiceProtocolMetadata,
@@ -102,6 +103,32 @@ impl SecretaryRpcServer {
             metadata: self.metadata(),
             repositories,
             next_page_token: page.next_page_token,
+        })
+    }
+
+    pub fn get_project_status(
+        &self,
+        request: GetProjectStatusRequest,
+    ) -> RpcResult<GetProjectStatusResponse> {
+        let repository_id = parse_repository_id(&request.repository_id)?;
+        let snapshot = self
+            .service
+            .get_project_status(ServiceGetProjectStatusRequest {
+                repository_id: repository_id.clone(),
+            })?;
+
+        Ok(GetProjectStatusResponse {
+            metadata: self.metadata(),
+            repository: Repository::from(snapshot.repository),
+            recent_jobs: snapshot.recent_jobs.into_iter().map(Job::from).collect(),
+            recent_policy_decisions: snapshot
+                .recent_policy_decisions
+                .into_iter()
+                .map(policy_decision_to_rpc)
+                .collect(),
+            latest_cursor: snapshot.latest_event.as_ref().map(event_cursor_from_job_event),
+            daemon_status: daemon_status_label(snapshot.daemon_status).to_string(),
+            storage_status: storage_status_label(snapshot.storage_status).to_string(),
         })
     }
 
@@ -583,6 +610,28 @@ pub struct RegisterRepositoryResponse {
     pub metadata: ProtocolMetadata,
     pub repository: Repository,
     pub policy: Option<PolicyDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EventCursor {
+    pub sequence: u64,
+    pub event_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetProjectStatusRequest {
+    pub repository_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetProjectStatusResponse {
+    pub metadata: ProtocolMetadata,
+    pub repository: Repository,
+    pub recent_jobs: Vec<Job>,
+    pub recent_policy_decisions: Vec<PolicyDecision>,
+    pub latest_cursor: Option<EventCursor>,
+    pub daemon_status: String,
+    pub storage_status: String,
 }
 
 // Mirrors proto's `ListRepositoriesRequest` contract.
@@ -1681,6 +1730,13 @@ fn policy_decision_to_rpc(decision: atelia_core::PolicyDecision) -> PolicyDecisi
     }
 }
 
+fn event_cursor_from_job_event(event: &JobEvent) -> EventCursor {
+    EventCursor {
+        sequence: event.sequence_number,
+        event_id: event.id.as_str().to_string(),
+    }
+}
+
 fn parse_path_scope(value: RpcPathScope) -> RpcResult<Option<ResourceScope>> {
     if value.include_patterns.is_empty() && value.exclude_patterns.is_empty() {
         let scope_kind = match value.kind {
@@ -2196,6 +2252,13 @@ mod tests {
             .capabilities
             .contains(&"tool_output_render.v1".to_string()));
         assert!(response.capabilities.contains(&"events.v1".to_string()));
+        assert!(response
+            .capabilities
+            .contains(&"project_status.v1".to_string()));
+        assert!(response.capabilities.contains(&"events.v1".to_string()));
+        assert!(response
+            .capabilities
+            .contains(&"project_status.v1".to_string()));
     }
 
     #[test]
@@ -2701,7 +2764,7 @@ mod tests {
 
         let jobs = server
             .list_jobs(ListJobsRequest {
-                repository_id: Some(registered.repository.repository_id),
+                repository_id: Some(registered.repository.repository_id.clone()),
                 status: Some(RpcJobStatus::Succeeded),
                 requester: None,
                 page_size: None,
@@ -2710,6 +2773,27 @@ mod tests {
             .expect("list jobs should succeed");
         assert_eq!(jobs.jobs.len(), 1);
         assert_eq!(jobs.jobs[0].job_id, submitted.job.job_id);
+
+        let status = server
+            .get_project_status(GetProjectStatusRequest {
+                repository_id: submitted.job.repository_id.clone(),
+            })
+            .expect("project status should succeed");
+        assert_eq!(
+            status.repository.repository_id,
+            registered.repository.repository_id
+        );
+        assert_eq!(status.recent_jobs.len(), 1);
+        assert_eq!(status.recent_jobs[0].job_id, submitted.job.job_id);
+        assert_eq!(status.recent_policy_decisions.len(), 1);
+        assert!(
+            status
+                .latest_cursor
+                .as_ref()
+                .expect("latest cursor exists")
+                .sequence
+                > 0
+        );
 
         let _ = fs::remove_dir_all(root);
     }
