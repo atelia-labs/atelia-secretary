@@ -1119,6 +1119,12 @@ impl InstallExtensionRequest {
 
 impl From<InstallExtensionRequest> for InstallOptions {
     fn from(request: InstallExtensionRequest) -> Self {
+        Self::from(&request)
+    }
+}
+
+impl From<&InstallExtensionRequest> for InstallOptions {
+    fn from(request: &InstallExtensionRequest) -> Self {
         let mut options = InstallOptions::default();
         if request.approve_local_unsigned {
             options = options.approve_local_unsigned();
@@ -1149,8 +1155,14 @@ pub struct ExtensionStatusResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListExtensionsRequest {
-    #[serde(default)]
+    #[serde(default = "ListExtensionsRequest::default_include_blocked")]
     pub include_blocked: bool,
+}
+
+impl ListExtensionsRequest {
+    fn default_include_blocked() -> bool {
+        true
+    }
 }
 
 impl Default for ListExtensionsRequest {
@@ -1213,21 +1225,10 @@ impl ExtensionRegistryService {
         &mut self,
         request: InstallExtensionRequest,
     ) -> RegistryResult<InstallExtensionResponse> {
-        let InstallExtensionRequest {
-            manifest,
-            approve_local_unsigned,
-            allow_local_process_runtime,
-        } = request;
-        let mut options = InstallOptions::default();
-        if approve_local_unsigned {
-            options = options.approve_local_unsigned();
-        }
-        if allow_local_process_runtime {
-            options = options.allow_local_process_runtime();
-        }
+        let options = InstallOptions::from(&request);
         let record = self
             .registry
-            .install(manifest, options)
+            .install(request.manifest, options)
             .map(|record| InstallExtensionResponse { record })?;
         Ok(record)
     }
@@ -2210,6 +2211,14 @@ mod tests {
             .and_then(|entry| entry.record.as_ref())
             .expect("extension should still be listed");
         assert_eq!(listed_status.status, ExtensionInstallStatus::Blocked);
+    }
+
+    #[test]
+    fn list_extensions_request_deserializes_missing_include_blocked_as_true() {
+        let request: ListExtensionsRequest = serde_json::from_str("{}").unwrap();
+
+        assert!(request.include_blocked);
+        assert_eq!(request, ListExtensionsRequest::default());
     }
 
     #[test]
