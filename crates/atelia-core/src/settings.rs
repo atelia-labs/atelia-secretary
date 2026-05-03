@@ -8,6 +8,7 @@ use crate::domain::{Actor, LedgerTimestamp, RepositoryId};
 use crate::tool_output::{OutputFormat, RenderOptions};
 use crate::ProjectId;
 use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt;
 
@@ -81,14 +82,59 @@ pub enum ToolOutputSettingsLevel {
     AgentProfile { agent_id: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolOutputDefaults {
     pub render_options: RenderOptions,
+    /// Number of bytes kept in the "inlined" renderer path before truncation.
+    /// Validation runs on deserialize/update, but policy application is not yet
+    /// wired to runtime rendering (tracked in follow-ups #20 and #17).
     pub max_inline_bytes: u64,
     pub max_inline_lines: u32,
+    /// Reserved for future renderer policy rollout; currently persisted and
+    /// validated but not yet enforced by runtime output rendering.
     pub verbosity: ToolOutputVerbosity,
     pub granularity: ToolOutputGranularity,
+    /// Reserved for future runtime policy enforcement; currently persisted and
+    /// stored in settings, but not yet enforced in this PR.
     pub oversize_policy: OversizeOutputPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolOutputDefaultsUnvalidated {
+    render_options: RenderOptions,
+    max_inline_bytes: u64,
+    max_inline_lines: u32,
+    verbosity: ToolOutputVerbosity,
+    granularity: ToolOutputGranularity,
+    oversize_policy: OversizeOutputPolicy,
+}
+
+impl TryFrom<ToolOutputDefaultsUnvalidated> for ToolOutputDefaults {
+    type Error = ToolOutputSettingsError;
+
+    fn try_from(value: ToolOutputDefaultsUnvalidated) -> Result<Self, Self::Error> {
+        let defaults = Self {
+            render_options: value.render_options,
+            max_inline_bytes: value.max_inline_bytes,
+            max_inline_lines: value.max_inline_lines,
+            verbosity: value.verbosity,
+            granularity: value.granularity,
+            oversize_policy: value.oversize_policy,
+        };
+        defaults.validate()?;
+        Ok(defaults)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolOutputDefaults {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        ToolOutputDefaultsUnvalidated::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl ToolOutputDefaults {
@@ -339,6 +385,22 @@ mod tests {
         }
     }
 
+    fn valid_defaults_json() -> serde_json::Value {
+        serde_json::json!({
+            "render_options": {
+                "format": "toon",
+                "include_policy": false,
+                "include_diagnostics": false,
+                "include_cost": false,
+            },
+            "max_inline_bytes": DEFAULT_MAX_INLINE_BYTES,
+            "max_inline_lines": DEFAULT_MAX_INLINE_LINES,
+            "verbosity": "normal",
+            "granularity": "key_fields",
+            "oversize_policy": "truncate_with_metadata",
+        })
+    }
+
     #[test]
     fn defaults_are_token_efficient_and_map_to_render_options() {
         let defaults = ToolOutputDefaults::default();
@@ -453,6 +515,48 @@ mod tests {
         );
         assert_eq!(settings.defaults, old_defaults);
         assert_eq!(settings.updated_at, LedgerTimestamp::from_unix_millis(1));
+    }
+
+    #[test]
+    fn settings_deserialization_rejects_out_of_range_bytes() {
+        let mut invalid = valid_defaults_json();
+        invalid["max_inline_bytes"] = serde_json::json!(MAX_MAX_INLINE_BYTES + 1);
+
+        let error = serde_json::from_value::<ToolOutputDefaults>(invalid).unwrap_err();
+
+        assert!(error.to_string().contains("max_inline_bytes"));
+    }
+
+    #[test]
+    fn settings_deserialization_rejects_out_of_range_lines() {
+        let mut invalid = valid_defaults_json();
+        invalid["max_inline_lines"] = serde_json::json!(MIN_MAX_INLINE_LINES - 1);
+
+        let error = serde_json::from_value::<ToolOutputDefaults>(invalid).unwrap_err();
+
+        assert!(error.to_string().contains("max_inline_lines"));
+    }
+
+    #[test]
+    fn settings_knobs_for_follow_up_controls_are_stored_for_pr_20_17() {
+        let defaults = ToolOutputDefaults {
+            render_options: RenderOptions::new(OutputFormat::Text),
+            max_inline_bytes: 4096,
+            max_inline_lines: 80,
+            verbosity: ToolOutputVerbosity::Debug,
+            granularity: ToolOutputGranularity::Full,
+            oversize_policy: OversizeOutputPolicy::RejectOversize,
+        };
+
+        let json = serde_json::to_string(&defaults).unwrap();
+        let deserialized = serde_json::from_str::<ToolOutputDefaults>(&json).unwrap();
+
+        assert_eq!(deserialized.verbosity, ToolOutputVerbosity::Debug);
+        assert_eq!(deserialized.granularity, ToolOutputGranularity::Full);
+        assert_eq!(
+            deserialized.oversize_policy,
+            OversizeOutputPolicy::RejectOversize
+        );
     }
 
     #[test]
