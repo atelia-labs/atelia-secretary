@@ -1963,6 +1963,7 @@ mod tests {
                 actor_record(),
                 ToolOutputSettingsScope::workspace().for_tool(tool_result.tool_id.clone()),
                 ToolOutputOverrides {
+                    verbosity: Some(ToolOutputVerbosity::Debug),
                     include_policy: Some(true),
                     ..ToolOutputOverrides::default()
                 },
@@ -2041,6 +2042,7 @@ mod tests {
                 ToolOutputSettingsScope::repository(repository.id.clone())
                     .for_tool(tool_result.tool_id.clone()),
                 ToolOutputOverrides {
+                    verbosity: Some(ToolOutputVerbosity::Debug),
                     include_policy: Some(true),
                     ..ToolOutputOverrides::default()
                 },
