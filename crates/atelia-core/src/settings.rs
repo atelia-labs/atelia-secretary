@@ -90,11 +90,10 @@ pub struct InMemoryToolOutputSettingsService {
 
 impl InMemoryToolOutputSettingsService {
     pub fn new(created_at: LedgerTimestamp) -> Self {
-        let mut settings = Vec::new();
-        settings.push(ToolOutputSettings::new(
+        let settings = vec![ToolOutputSettings::new(
             ToolOutputSettingsScope::workspace(),
             created_at,
-        ));
+        )];
 
         Self {
             settings,
@@ -106,14 +105,13 @@ impl InMemoryToolOutputSettingsService {
         created_at: LedgerTimestamp,
         base_defaults: ToolOutputDefaults,
     ) -> Self {
-        let mut settings = Vec::new();
-        settings.push(ToolOutputSettings {
+        let settings = vec![ToolOutputSettings {
             schema_version: TOOL_OUTPUT_SETTINGS_SCHEMA_VERSION,
             scope: ToolOutputSettingsScope::workspace(),
             defaults: base_defaults,
             updated_at: created_at,
             updated_by: None,
-        });
+        }];
 
         Self {
             settings,
@@ -195,7 +193,7 @@ fn resolution_chain(scope: &ToolOutputSettingsScope) -> Vec<ToolOutputSettingsSc
     };
     push_unique(&mut chain, level_scope);
 
-    if let Some(_) = scope.tool_id.as_deref() {
+    if scope.tool_id.as_deref().is_some() {
         push_unique(&mut chain, scope.clone());
     }
 
@@ -848,13 +846,13 @@ mod tests {
             .unwrap();
         let current = service.resolve_defaults(&repository_tool_scope);
 
-        assert_eq!(resolved.render_options.include_diagnostics, true);
+        assert!(resolved.render_options.include_diagnostics);
         assert_eq!(resolved.max_inline_lines, 555);
         assert_eq!(resolved.render_options.format, OutputFormat::Text);
 
         assert_eq!(current.render_options.format, OutputFormat::Text);
         assert_eq!(current.max_inline_bytes, 32 * 1024);
-        assert_eq!(current.render_options.include_diagnostics, false);
+        assert!(!current.render_options.include_diagnostics);
         assert_eq!(current.max_inline_lines, DEFAULT_MAX_INLINE_LINES);
     }
 
