@@ -172,17 +172,6 @@ impl SecretaryService {
             });
         }
         let root_path = canonical_repository_root(&request.root_path)?;
-        if self
-            .runtime
-            .store()
-            .list_repositories()?
-            .iter()
-            .any(|repository| repository.root_path == root_path)
-        {
-            return Err(ServiceError::InvalidArgument {
-                reason: "root_path is already registered".to_string(),
-            });
-        }
 
         let record = RepositoryRecord::new(
             request.display_name,
@@ -190,7 +179,18 @@ impl SecretaryService {
             request.trust_state,
             LedgerTimestamp::now(),
         );
-        self.runtime.store().create_repository(record.clone())?;
+        self.runtime
+            .store()
+            .create_repository(record.clone())
+            .map_err(|err| match err {
+                atelia_core::StoreError::DuplicateId {
+                    collection: "repositories",
+                    ..
+                } => ServiceError::InvalidArgument {
+                    reason: "root_path is already registered".to_string(),
+                },
+                err => ServiceError::Store(err),
+            })?;
         Ok(record)
     }
 

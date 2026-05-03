@@ -230,6 +230,16 @@ impl InMemoryStore {
 impl SecretaryStore for InMemoryStore {
     fn create_repository(&self, record: RepositoryRecord) -> StoreResult<()> {
         let mut inner = self.lock()?;
+        if inner
+            .repositories
+            .values()
+            .any(|repository| repository.root_path == record.root_path)
+        {
+            return Err(StoreError::DuplicateId {
+                collection: "repositories",
+                id: format!("root_path {}", record.root_path),
+            });
+        }
         insert_record(
             &mut inner.repositories,
             record.id.clone(),
@@ -2187,6 +2197,9 @@ mod tests {
         PolicySummary, RepositoryTrustState, ResourceScope, RiskTier, StructuredValue,
         ToolResultField, ToolResultStatus,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static REPOSITORY_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn timestamp(value: i64) -> LedgerTimestamp {
         LedgerTimestamp::from_unix_millis(value)
@@ -2199,9 +2212,10 @@ mod tests {
     }
 
     fn repository_record() -> RepositoryRecord {
+        let counter = REPOSITORY_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
         RepositoryRecord::new(
             "store test repository",
-            "/tmp/atelia-store-test",
+            format!("/tmp/atelia-store-test-{counter}"),
             RepositoryTrustState::Trusted,
             timestamp(1),
         )
@@ -3525,6 +3539,26 @@ mod tests {
 
         assert!(matches!(
             store.create_repository(repository),
+            Err(StoreError::DuplicateId {
+                collection: "repositories",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn duplicate_repository_roots_are_rejected() {
+        let store = InMemoryStore::new();
+        let first = repository_record();
+        let mut second = repository_record();
+        second.id = RepositoryId::new();
+        second.root_path = first.root_path.clone();
+        second.allowed_path_scope = first.allowed_path_scope.clone();
+
+        store.create_repository(first).unwrap();
+
+        assert!(matches!(
+            store.create_repository(second),
             Err(StoreError::DuplicateId {
                 collection: "repositories",
                 ..
