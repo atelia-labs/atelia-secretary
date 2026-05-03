@@ -357,6 +357,8 @@ fn open_no_follow_in_parent_dir(
     let mut flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     if create_new {
         flags |= libc::O_CREAT | libc::O_EXCL;
+    } else {
+        flags |= libc::O_TRUNC;
     }
 
     // SAFETY: `parent` is a live directory file descriptor and the `cstring` is valid for
@@ -2957,7 +2959,6 @@ fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> 
             "path does not name a file in its parent",
         )
     })?;
-
     #[cfg(unix)]
     let expected_metadata = if create_new {
         None
@@ -3640,6 +3641,18 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
 
         let content = match read_entire_text_file(path, self.max_bytes) {
             Ok(content) => content,
+            Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: file exceeds configured byte limit".to_string(),
+                    format!(
+                        "{} is larger than {} bytes",
+                        target.display_path(),
+                        self.max_bytes
+                    ),
+                );
+            }
             Err(err) => {
                 return failed_result(
                     invocation,
@@ -6054,6 +6067,7 @@ exit 0
         assert_eq!(io::ErrorKind::FileTooLarge, err.kind());
         env.cleanup();
     }
+
     // -- Rendering compatibility --
 
     #[test]
