@@ -1,9 +1,9 @@
 //! Storage abstractions for Secretary runtime records.
 
 use crate::domain::{
-    Actor, AuditRecord, AuditRecordId, EventSeverity, EventSubjectType, JobEvent, JobEventId,
-    JobEventKind, JobId, JobRecord, JobStatus, LockDecision, LockDecisionId, LockOwner,
-    PolicyDecision, PolicyDecisionId, RepositoryId, RepositoryRecord, ToolInvocation,
+    Actor, AuditRecord, AuditRecordId, CancellationState, EventSeverity, EventSubjectType,
+    JobEvent, JobEventId, JobEventKind, JobId, JobRecord, JobStatus, LockDecision, LockDecisionId,
+    LockOwner, PolicyDecision, PolicyDecisionId, RepositoryId, RepositoryRecord, ToolInvocation,
     ToolInvocationId, ToolResult, ToolResultId,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -361,6 +361,12 @@ impl SecretaryStore for InMemoryStore {
         let mut inner = self.lock()?;
 
         validate_sibling_event_ids_are_unique(&first_event, &final_event)?;
+        validate_two_stage_job_update_identity(
+            &first_record,
+            &first_event,
+            &final_record,
+            &final_event,
+        )?;
         validate_job_update(&inner, &first_record, &first_event)?;
         validate_new_job_event(&inner, &first_event, None)?;
 
@@ -1155,6 +1161,7 @@ fn validate_job_update_against(
     ensure_immutable_job_field(&record.id, "kind", &existing.kind, &record.kind)?;
     ensure_immutable_job_field(&record.id, "goal", &existing.goal, &record.goal)?;
     validate_job_lifecycle_update(existing, record, event)?;
+    validate_job_cancellation_update(existing, record, event)?;
     validate_job_policy_summary_update(existing, record, event)?;
     if event.refs.job_id.as_ref() != Some(&record.id) {
         return Err(StoreError::InvalidReference {
@@ -1173,6 +1180,73 @@ fn validate_job_update_against(
                 id_debug(&record.repository_id)
             ),
         });
+    }
+
+    Ok(())
+}
+
+fn validate_job_cancellation_update(
+    existing: &JobRecord,
+    record: &JobRecord,
+    event: &JobEvent,
+) -> StoreResult<()> {
+    if record.cancellation_state == existing.cancellation_state {
+        if matches!(event.kind, JobEventKind::CancellationRequested) {
+            return job_update_conflict(
+                &record.id,
+                "CancellationRequested event did not change materialized cancellation state",
+            );
+        }
+        return Ok(());
+    }
+
+    match (
+        existing.cancellation_state,
+        record.cancellation_state,
+        &event.kind,
+    ) {
+        (
+            CancellationState::NotRequested,
+            CancellationState::Requested,
+            JobEventKind::CancellationRequested,
+        ) => Ok(()),
+        _ => job_update_conflict(
+            &record.id,
+            format!(
+                "cancellation_state changed from {:?} to {:?} without matching CancellationRequested event",
+                existing.cancellation_state, record.cancellation_state
+            ),
+        ),
+    }
+}
+
+fn validate_two_stage_job_update_identity(
+    first_record: &JobRecord,
+    first_event: &JobEvent,
+    final_record: &JobRecord,
+    final_event: &JobEvent,
+) -> StoreResult<()> {
+    if first_record.id != final_record.id {
+        return Err(StoreError::InvalidReference {
+            collection: "jobs",
+            reason: format!(
+                "two-stage job update first_record {} does not match final_record {}",
+                id_debug(&first_record.id),
+                id_debug(&final_record.id)
+            ),
+        });
+    }
+
+    for (context, event) in [
+        ("first_event.refs.job_id", first_event),
+        ("final_event.refs.job_id", final_event),
+    ] {
+        if event.refs.job_id.as_ref() != Some(&first_record.id) {
+            return Err(StoreError::InvalidReference {
+                collection: "job_events",
+                reason: format!("{context} must identify job {}", id_debug(&first_record.id)),
+            });
+        }
     }
 
     Ok(())
@@ -2108,10 +2182,10 @@ fn ensure_ref_absent<Id: fmt::Debug>(
 mod tests {
     use super::*;
     use crate::domain::{
-        Actor, EventRefs, EventSeverity, EventSubject, EventSubjectType, JobEventKind, JobKind,
-        LedgerTimestamp, LockOwner, LockedScope, PolicyOutcome, PolicySummary,
-        RepositoryTrustState, ResourceScope, RiskTier, StructuredValue, ToolResultField,
-        ToolResultStatus,
+        Actor, CancellationState, EventRefs, EventSeverity, EventSubject, EventSubjectType,
+        JobEventKind, JobKind, LedgerTimestamp, LockOwner, LockedScope, PolicyOutcome,
+        PolicySummary, RepositoryTrustState, ResourceScope, RiskTier, StructuredValue,
+        ToolResultField, ToolResultStatus,
     };
 
     fn timestamp(value: i64) -> LedgerTimestamp {
@@ -2392,6 +2466,55 @@ mod tests {
     }
 
     #[test]
+    fn append_job_events_and_update_job_rejects_mixed_job_identity_without_partial_update() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let first_job = job_record(repository.id.clone());
+        let second_job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let mut first_job = persist_job(&store, first_job);
+        let second_job = persist_job(&store, second_job);
+
+        first_job.cancellation_state = CancellationState::Requested;
+        let mut first_event = job_event(repository.id.clone());
+        first_event.subject = EventSubject::job(&first_job.id);
+        first_event.kind = JobEventKind::CancellationRequested;
+        first_event.refs.job_id = Some(first_job.id.clone());
+
+        let mut final_job = second_job.clone();
+        final_job.latest_event_id = Some(first_event.id.clone());
+        final_job
+            .transition_status(JobStatus::Canceled, timestamp(6))
+            .unwrap();
+        let mut final_event = job_event(repository.id);
+        final_event.subject = EventSubject::job(&second_job.id);
+        final_event.kind = JobEventKind::JobStatusChanged {
+            from: JobStatus::Queued,
+            to: JobStatus::Canceled,
+        };
+        final_event.refs.job_id = Some(second_job.id.clone());
+
+        assert!(matches!(
+            store.append_job_events_and_update_job(
+                first_job.clone(),
+                first_event,
+                final_job,
+                final_event
+            ),
+            Err(StoreError::InvalidReference { .. })
+        ));
+
+        let stored_first = store.get_job(&first_job.id).unwrap();
+        assert_eq!(JobStatus::Queued, stored_first.status);
+        assert_eq!(
+            CancellationState::NotRequested,
+            stored_first.cancellation_state
+        );
+        assert_eq!(first_job.latest_event_id, stored_first.latest_event_id);
+    }
+
+    #[test]
     fn append_job_event_and_update_job_rejects_immutable_job_field_changes() {
         fn assert_rejects_change(
             mutate: impl FnOnce(&mut JobRecord),
@@ -2476,6 +2599,48 @@ mod tests {
             job.status = JobStatus::Running;
             job.updated_at = timestamp(10);
         });
+    }
+
+    #[test]
+    fn append_job_event_and_update_job_rejects_invalid_cancellation_state_updates() {
+        fn assert_rejects_cancellation_update(
+            mutate_job: impl FnOnce(&mut JobRecord),
+            mutate_event: impl FnOnce(&mut JobEvent),
+        ) {
+            let store = InMemoryStore::new();
+            let repository = repository_record();
+            let job = job_record(repository.id.clone());
+
+            store.create_repository(repository.clone()).unwrap();
+            let mut job = persist_job(&store, job);
+            mutate_job(&mut job);
+
+            let mut event = job_event(repository.id);
+            event.subject = EventSubject::job(&job.id);
+            event.refs.job_id = Some(job.id.clone());
+            mutate_event(&mut event);
+
+            assert!(matches!(
+                store.append_job_event_and_update_job(job, event),
+                Err(StoreError::Conflict {
+                    collection: "jobs",
+                    ..
+                })
+            ));
+        }
+
+        assert_rejects_cancellation_update(
+            |job| job.cancellation_state = CancellationState::Requested,
+            |_| {},
+        );
+        assert_rejects_cancellation_update(
+            |_| {},
+            |event| event.kind = JobEventKind::CancellationRequested,
+        );
+        assert_rejects_cancellation_update(
+            |job| job.cancellation_state = CancellationState::ForceStop,
+            |event| event.kind = JobEventKind::CancellationRequested,
+        );
     }
 
     #[test]
