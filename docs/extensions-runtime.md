@@ -100,7 +100,10 @@ migration:
 ```
 
 These additive sections default to empty collections or null notes in the daemon
-manifest model, so older manifests can still deserialize cleanly.
+manifest model, so older manifests can still deserialize cleanly. Validation
+only requires them when a manifest actually declares the corresponding
+customized content, which keeps legacy installs working while still rejecting
+section/type mismatches for new manifests.
 
 The manifest is an enforceable contract. If runtime behavior exceeds the
 manifest, Secretary blocks execution.

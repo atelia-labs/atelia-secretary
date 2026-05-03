@@ -83,7 +83,7 @@ migration:
   notes: null
 ```
 
-これらの additive section は daemon の manifest model では空の collection か null の note として default されるため、古い manifest も問題なく deserialize できます。
+これらの additive section は daemon の manifest model では空の collection か null の note として default されるため、古い manifest も問題なく deserialize できます。validation は、manifest が実際に対応する content を宣言した場合にだけ section を要求し、legacy install を壊さずに new manifest の section/type mismatch だけを止めます。
 
 manifest は enforceable contract です。runtime behavior が manifest を超える場合、Secretary は実行を block します。
 

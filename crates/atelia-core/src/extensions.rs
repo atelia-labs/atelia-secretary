@@ -844,12 +844,6 @@ fn validate_tool_output(manifest: &ExtensionManifest) -> ExtensionValidationResu
         });
     }
 
-    if has_tool_output_kind && !declares_tool_output {
-        return Err(ExtensionValidationError::MissingField {
-            field: "tool_output",
-        });
-    }
-
     let declared_tools = manifest
         .tools
         .iter()
@@ -884,10 +878,6 @@ fn validate_hooks(manifest: &ExtensionManifest) -> ExtensionValidationResult<()>
         });
     }
 
-    if has_hook_provider_kind && !declares_hooks {
-        return Err(ExtensionValidationError::MissingField { field: "hooks" });
-    }
-
     for hook in &manifest.hooks {
         require_non_empty("hooks.hook_id", &hook.hook_id)?;
     }
@@ -904,10 +894,6 @@ fn validate_webhooks(manifest: &ExtensionManifest) -> ExtensionValidationResult<
             field: "types",
             reason: "webhook declarations require type webhook_receiver".to_string(),
         });
-    }
-
-    if has_webhook_receiver_kind && !declares_webhooks {
-        return Err(ExtensionValidationError::MissingField { field: "webhooks" });
     }
 
     for webhook in &manifest.webhooks {
@@ -2797,6 +2783,46 @@ mod tests {
             .validate(&ManifestValidationPolicy::default())
             .unwrap();
         assert_eq!(validated.boundary, ExtensionBoundary::ThirdParty);
+    }
+
+    #[test]
+    fn extended_taxonomy_manifest_installs_without_legacy_sections() {
+        let mut extension = manifest("com.example.legacy-taxonomy");
+        extension.types = vec![
+            ExtensionKind::Tool,
+            ExtensionKind::ToolOutputCustomizer,
+            ExtensionKind::HookProvider,
+            ExtensionKind::WebhookReceiver,
+        ];
+
+        let mut serialized = serde_json::to_value(&extension).unwrap();
+        let object = serialized
+            .as_object_mut()
+            .expect("manifest should serialize to an object");
+        object.remove("tool_output");
+        object.remove("hooks");
+        object.remove("webhooks");
+
+        let legacy_manifest: ExtensionManifest = serde_json::from_value(serialized).unwrap();
+
+        assert!(legacy_manifest.tool_output.is_empty());
+        assert!(legacy_manifest.hooks.is_empty());
+        assert!(legacy_manifest.webhooks.is_empty());
+
+        let mut registry = ExtensionRegistry::in_memory();
+        let record = registry
+            .install(legacy_manifest.clone(), InstallOptions::default())
+            .unwrap();
+
+        assert_eq!(record.id, legacy_manifest.id);
+        assert_eq!(record.version, legacy_manifest.version);
+        assert_eq!(
+            registry
+                .active_record(&legacy_manifest.id)
+                .expect("installed extension should be active")
+                .version,
+            legacy_manifest.version
+        );
     }
 
     #[test]
