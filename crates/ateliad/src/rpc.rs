@@ -202,7 +202,7 @@ impl SecretaryRpcServer {
             .collect::<Vec<_>>();
         let cursor = events
             .last()
-            .map(|event| EventCursorRequest::AfterEventId(event.event_id.clone()));
+            .map(|event| EventCursorRequest::AfterSequence(event.sequence));
 
         Ok(WatchEventsReplayResponse {
             metadata: self.metadata(),
@@ -2783,9 +2783,7 @@ mod tests {
         );
         assert_eq!(
             watch.cursor,
-            Some(EventCursorRequest::AfterEventId(
-                watch.events[0].event_id.clone()
-            ))
+            Some(EventCursorRequest::AfterSequence(watch.events[0].sequence))
         );
         assert!(watch
             .events

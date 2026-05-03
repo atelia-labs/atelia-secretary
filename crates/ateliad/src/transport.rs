@@ -397,7 +397,9 @@ fn core_tool_output_overrides_to_rpc(
     }
 }
 
-fn rpc_tool_output_scope_to_core(scope: &rpc::RpcToolOutputScope) -> ToolOutputSettingsScope {
+fn rpc_tool_output_scope_to_core(
+    scope: &rpc::RpcToolOutputScope,
+) -> Result<ToolOutputSettingsScope> {
     let level = match &scope.level {
         rpc::RpcToolOutputScopeLevel::Workspace => atelia_core::ToolOutputSettingsLevel::Workspace,
         rpc::RpcToolOutputScopeLevel::Repository { repository_id } => {
@@ -405,13 +407,17 @@ fn rpc_tool_output_scope_to_core(scope: &rpc::RpcToolOutputScope) -> ToolOutputS
                 repository_id: serde_json::from_str::<RepositoryId>(&format!(
                     "\"{repository_id}\""
                 ))
-                .unwrap_or_else(|_| RepositoryId::new()),
+                .with_context(|| {
+                    format!("invalid repository_id in tool output scope: {repository_id}")
+                })?,
             }
         }
         rpc::RpcToolOutputScopeLevel::Project { project_id } => {
             atelia_core::ToolOutputSettingsLevel::Project {
                 project_id: serde_json::from_str::<ProjectId>(&format!("\"{project_id}\""))
-                    .unwrap_or_else(|_| ProjectId::new()),
+                    .with_context(|| {
+                        format!("invalid project_id in tool output scope: {project_id}")
+                    })?,
             }
         }
         rpc::RpcToolOutputScopeLevel::Session { session_id } => {
@@ -426,10 +432,10 @@ fn rpc_tool_output_scope_to_core(scope: &rpc::RpcToolOutputScope) -> ToolOutputS
         }
     };
 
-    ToolOutputSettingsScope {
+    Ok(ToolOutputSettingsScope {
         level,
         tool_id: scope.tool_id.clone(),
-    }
+    })
 }
 
 fn rpc_render_options_to_core(render_options: &rpc::RpcToolOutputRenderOptions) -> RenderOptions {
@@ -452,16 +458,18 @@ fn rpc_defaults_to_core(defaults: &rpc::RpcToolOutputDefaults) -> ToolOutputDefa
     }
 }
 
-fn rpc_change_to_core(change: &rpc::RpcToolOutputSettingsChange) -> ToolOutputSettingsChange {
-    ToolOutputSettingsChange {
+fn rpc_change_to_core(
+    change: &rpc::RpcToolOutputSettingsChange,
+) -> Result<ToolOutputSettingsChange> {
+    Ok(ToolOutputSettingsChange {
         schema_version: change.schema_version,
         actor: rpc_actor_to_core(&change.actor),
-        scope: rpc_tool_output_scope_to_core(&change.scope),
+        scope: rpc_tool_output_scope_to_core(&change.scope)?,
         old_defaults: rpc_defaults_to_core(&change.old_defaults),
         new_defaults: rpc_defaults_to_core(&change.new_defaults),
         reason: change.reason.clone(),
         changed_at: LedgerTimestamp::from_unix_millis(change.changed_at_unix_ms),
-    }
+    })
 }
 
 fn rpc_actor_to_core(actor: &rpc::RpcActorDto) -> Actor {
@@ -522,40 +530,41 @@ fn rpc_oversize_policy_to_core(policy: &rpc::RpcOversizeOutputPolicy) -> Oversiz
 
 fn serialize_tool_output_defaults_response(
     response: rpc::GetToolOutputDefaultsResponse,
-) -> serde_json::Value {
-    serde_json::json!({
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
-        "scope": serde_json::to_value(rpc_tool_output_scope_to_core(&response.scope)).expect("tool output scope serialization"),
-        "defaults": serde_json::to_value(rpc_defaults_to_core(&response.defaults)).expect("tool output defaults serialization"),
-    })
+        "scope": serde_json::to_value(rpc_tool_output_scope_to_core(&response.scope)?)?,
+        "defaults": serde_json::to_value(rpc_defaults_to_core(&response.defaults))?,
+    }))
 }
 
 fn serialize_tool_output_update_response(
     response: rpc::UpdateToolOutputDefaultsResponse,
-) -> serde_json::Value {
-    serde_json::json!({
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
-        "change": serialize_tool_output_change(&response.change),
-    })
+        "change": serialize_tool_output_change(&response.change)?,
+    }))
 }
 
 fn serialize_tool_output_history_response(
     response: rpc::ListToolOutputSettingsHistoryResponse,
-) -> serde_json::Value {
-    serde_json::json!({
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "changes": response
             .changes
             .iter()
             .map(serialize_tool_output_change)
-            .collect::<Vec<_>>(),
+            .collect::<Result<Vec<_>>>()?,
         "next_page_token": response.next_page_token,
-    })
+    }))
 }
 
-fn serialize_tool_output_change(change: &rpc::RpcToolOutputSettingsChange) -> serde_json::Value {
-    let mut value =
-        serde_json::to_value(rpc_change_to_core(change)).expect("tool output change serialization");
+fn serialize_tool_output_change(
+    change: &rpc::RpcToolOutputSettingsChange,
+) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(rpc_change_to_core(change)?)?;
 
     if let serde_json::Value::Object(ref mut map) = value {
         if let Some(serde_json::Value::Object(changed_at)) = map.remove("changed_at") {
@@ -565,7 +574,7 @@ fn serialize_tool_output_change(change: &rpc::RpcToolOutputSettingsChange) -> se
         }
     }
 
-    value
+    Ok(value)
 }
 fn serialize_protocol_metadata(metadata: &rpc::ProtocolMetadata) -> serde_json::Value {
     serde_json::json!({
@@ -824,6 +833,16 @@ fn make_error_response(
         .into_response()
 }
 
+fn transport_error_response(next_state: String, reason: impl std::fmt::Display) -> Response {
+    make_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "transport_error",
+        reason.to_string(),
+        false,
+        next_state,
+    )
+}
+
 fn rpc_next_state(server: &rpc::SecretaryRpcServer) -> String {
     server.health(rpc::HealthRequest).daemon_status
 }
@@ -1047,13 +1066,10 @@ async fn dispatch_get_tool_output_defaults(
     match rpc_server.get_tool_output_defaults(rpc::GetToolOutputDefaultsRequest {
         scope: core_tool_output_scope_to_rpc(payload.scope),
     }) {
-        Ok(response) => (
-            StatusCode::OK,
-            Json(ApiResponse::ok(serialize_tool_output_defaults_response(
-                response,
-            ))),
-        )
-            .into_response(),
+        Ok(response) => match serialize_tool_output_defaults_response(response) {
+            Ok(body) => (StatusCode::OK, Json(ApiResponse::ok(body))).into_response(),
+            Err(error) => transport_error_response(next_state, error),
+        },
         Err(error) => {
             let (status, recoverable) = rpc_error_status(error.code);
             make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
@@ -1083,13 +1099,10 @@ async fn dispatch_update_tool_output_defaults(
         reason: payload.reason,
         overrides: core_tool_output_overrides_to_rpc(payload.overrides),
     }) {
-        Ok(response) => (
-            StatusCode::OK,
-            Json(ApiResponse::ok(serialize_tool_output_update_response(
-                response,
-            ))),
-        )
-            .into_response(),
+        Ok(response) => match serialize_tool_output_update_response(response) {
+            Ok(body) => (StatusCode::OK, Json(ApiResponse::ok(body))).into_response(),
+            Err(error) => transport_error_response(next_state, error),
+        },
         Err(error) => {
             let (status, recoverable) = rpc_error_status(error.code);
             make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
@@ -1119,13 +1132,10 @@ async fn dispatch_list_tool_output_settings_history(
         offset: payload.offset,
         cursor: payload.cursor,
     }) {
-        Ok(response) => (
-            StatusCode::OK,
-            Json(ApiResponse::ok(serialize_tool_output_history_response(
-                response,
-            ))),
-        )
-            .into_response(),
+        Ok(response) => match serialize_tool_output_history_response(response) {
+            Ok(body) => (StatusCode::OK, Json(ApiResponse::ok(body))).into_response(),
+            Err(error) => transport_error_response(next_state, error),
+        },
         Err(error) => {
             let (status, recoverable) = rpc_error_status(error.code);
             make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
@@ -1961,6 +1971,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rpc_tool_output_scope_to_core_rejects_invalid_deserialization() {
+        let repository_scope = rpc::RpcToolOutputScope {
+            level: rpc::RpcToolOutputScopeLevel::Repository {
+                repository_id: "not-a-valid-repository-id".to_string(),
+            },
+            tool_id: None,
+        };
+        let repository_error = rpc_tool_output_scope_to_core(&repository_scope)
+            .expect_err("repository id should fail");
+        assert!(repository_error
+            .to_string()
+            .contains("invalid repository_id in tool output scope"));
+
+        let project_scope = rpc::RpcToolOutputScope {
+            level: rpc::RpcToolOutputScopeLevel::Project {
+                project_id: "not-a-valid-project-id".to_string(),
+            },
+            tool_id: None,
+        };
+        let project_error =
+            rpc_tool_output_scope_to_core(&project_scope).expect_err("project id should fail");
+        assert!(project_error
+            .to_string()
+            .contains("invalid project_id in tool output scope"));
+    }
+
     #[tokio::test]
     async fn health_endpoint_is_reachable_inprocess() {
         let rpc_server = ready_rpc_server();
@@ -2118,7 +2155,11 @@ mod tests {
             .is_empty());
         assert_eq!(
             watch_payload["data"]["cursor"]["kind"],
-            Value::String("after_event_id".to_string())
+            Value::String("after_sequence".to_string())
+        );
+        assert_eq!(
+            watch_payload["data"]["cursor"]["sequence_number"],
+            watch_payload["data"]["events"][0]["sequence"]
         );
 
         let _ = std::fs::remove_dir_all(root);
