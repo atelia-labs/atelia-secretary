@@ -363,7 +363,7 @@ impl ToolOutputDefaults {
         let field_limit = match self.granularity {
             ToolOutputGranularity::Summary => Some(1),
             ToolOutputGranularity::KeyFields => Some(3),
-            ToolOutputGranularity::Full => Some(max_inline_lines),
+            ToolOutputGranularity::Full => None,
         }
         .map(|limit| limit.min(max_inline_lines));
 
@@ -898,6 +898,23 @@ mod tests {
         assert!(!policy.include_evidence_refs);
         assert!(!policy.include_output_refs);
         assert!(!policy.include_redactions);
+    }
+
+    #[test]
+    fn defaults_render_policy_keeps_full_unbounded_by_inline_line_limit() {
+        let defaults = ToolOutputDefaults {
+            render_options: RenderOptions::new(OutputFormat::Text),
+            max_inline_bytes: DEFAULT_MAX_INLINE_BYTES,
+            max_inline_lines: 2,
+            verbosity: ToolOutputVerbosity::Normal,
+            granularity: ToolOutputGranularity::Full,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        };
+
+        let policy = defaults.render_policy();
+
+        assert_eq!(policy.max_fields, None);
+        assert_eq!(policy.max_inline_lines, Some(2));
     }
 
     #[test]
