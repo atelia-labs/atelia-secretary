@@ -160,24 +160,11 @@ impl InMemoryToolOutputSettingsService {
             .position(|candidate| candidate.scope == scope);
         let change = if let Some(idx) = idx {
             let inherited = self.resolve_parent_defaults_for(&scope);
-            self.settings[idx].apply_legacy_migration(&inherited);
-            let resolved_defaults = self.resolve_defaults(&scope);
-            self.settings[idx].apply_update(
-                actor,
-                update,
-                reason,
-                &resolved_defaults,
-                updated_at,
-            )?
+            self.settings[idx].apply_update(actor, update, reason, &inherited, updated_at)?
         } else {
             let mut settings = ToolOutputSettings::new(scope.clone(), updated_at);
-            let change = settings.apply_update(
-                actor,
-                update,
-                reason,
-                &self.resolve_defaults(&scope),
-                updated_at,
-            )?;
+            let inherited = self.resolve_parent_defaults_for(&scope);
+            let change = settings.apply_update(actor, update, reason, &inherited, updated_at)?;
             self.settings.push(settings);
             change
         };
@@ -583,8 +570,13 @@ impl<'de> Deserialize<'de> for ToolOutputSettings {
     {
         let raw = ToolOutputSettingsUnvalidated::deserialize(deserializer)?;
         let (overrides, legacy_defaults) = match (raw.overrides, raw.defaults) {
-            (Some(overrides), _) => (overrides, None),
+            (Some(overrides), None) => (overrides, None),
             (None, Some(defaults)) => (ToolOutputOverrides::default(), Some(defaults)),
+            (Some(_), Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "settings payload must not provide both `overrides` and legacy `defaults`",
+                ));
+            }
             (None, None) => {
                 return Err(serde::de::Error::custom(
                     "missing required field `overrides` (or legacy `defaults`)",
@@ -633,7 +625,7 @@ impl ToolOutputSettings {
         actor: Actor,
         update: ToolOutputOverrides,
         reason: impl Into<String>,
-        base_defaults: &ToolOutputDefaults,
+        inherited_defaults: &ToolOutputDefaults,
         updated_at: LedgerTimestamp,
     ) -> Result<ToolOutputSettingsChange, ToolOutputSettingsError> {
         if update.is_empty() {
@@ -644,10 +636,19 @@ impl ToolOutputSettings {
         if reason.trim().is_empty() {
             return Err(ToolOutputSettingsError::MissingReason);
         }
-        let old_defaults = base_defaults.with_overrides(&self.overrides)?;
+
+        let resolved_overrides = if let Some(defaults) = self.legacy_defaults.as_ref() {
+            ToolOutputOverrides::from_defaults_with_parent(defaults, inherited_defaults)
+        } else {
+            self.overrides.clone()
+        };
+
+        let mut old_defaults = inherited_defaults.clone();
+        resolved_overrides.apply_to(&mut old_defaults);
         let new_defaults = old_defaults.with_overrides(&update)?;
 
-        self.overrides = self.overrides.merge(&update);
+        self.overrides = resolved_overrides.merge(&update);
+        self.legacy_defaults = None;
         self.updated_by = Some(actor.clone());
         self.updated_at = updated_at;
 
@@ -883,6 +884,71 @@ mod tests {
     }
 
     #[test]
+    fn settings_apply_update_rejects_invalid_legacy_migration_without_mutating() {
+        let inherited = ToolOutputDefaults {
+            render_options: RenderOptions {
+                format: OutputFormat::Toon,
+                include_policy: false,
+                include_diagnostics: false,
+                include_cost: false,
+            },
+            max_inline_bytes: 24 * 1024,
+            max_inline_lines: 111,
+            verbosity: ToolOutputVerbosity::Normal,
+            granularity: ToolOutputGranularity::KeyFields,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        };
+        let legacy_defaults = ToolOutputDefaults {
+            render_options: RenderOptions {
+                format: OutputFormat::Json,
+                include_policy: true,
+                include_diagnostics: true,
+                include_cost: false,
+            },
+            max_inline_bytes: 32 * 1024,
+            max_inline_lines: 333,
+            verbosity: ToolOutputVerbosity::Expanded,
+            granularity: ToolOutputGranularity::Full,
+            oversize_policy: OversizeOutputPolicy::SpillToArtifactRef,
+        };
+        let legacy_json = serde_json::json!({
+            "schema_version": TOOL_OUTPUT_SETTINGS_SCHEMA_VERSION,
+            "scope": serde_json::to_value(ToolOutputSettingsScope::workspace()).unwrap(),
+            "defaults": serde_json::to_value(&legacy_defaults).unwrap(),
+            "updated_at": serde_json::to_value(LedgerTimestamp::from_unix_millis(1)).unwrap(),
+            "updated_by": serde_json::Value::Null,
+        });
+        let mut settings = serde_json::from_value::<ToolOutputSettings>(legacy_json).unwrap();
+        let old_overrides = settings.overrides.clone();
+        let old_legacy_defaults = settings.legacy_defaults.clone();
+
+        let error = settings
+            .apply_update(
+                actor(),
+                ToolOutputOverrides {
+                    max_inline_bytes: Some(MAX_MAX_INLINE_BYTES + 1),
+                    ..ToolOutputOverrides::default()
+                },
+                "invalid legacy migration update",
+                &inherited,
+                LedgerTimestamp::from_unix_millis(2),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ToolOutputSettingsError::MaxInlineBytesOutOfRange {
+                value: MAX_MAX_INLINE_BYTES + 1,
+                min: MIN_MAX_INLINE_BYTES,
+                max: MAX_MAX_INLINE_BYTES,
+            }
+        );
+        assert_eq!(settings.overrides, old_overrides);
+        assert_eq!(settings.legacy_defaults, old_legacy_defaults);
+        assert_eq!(settings.updated_at, LedgerTimestamp::from_unix_millis(1));
+    }
+
+    #[test]
     fn settings_deserialization_rejects_out_of_range_bytes() {
         let mut invalid = valid_defaults_json();
         invalid["max_inline_bytes"] = serde_json::json!(MAX_MAX_INLINE_BYTES + 1);
@@ -949,6 +1015,27 @@ mod tests {
     }
 
     #[test]
+    fn settings_deserialization_rejects_mixed_overrides_and_defaults() {
+        let json = serde_json::json!({
+            "schema_version": TOOL_OUTPUT_SETTINGS_SCHEMA_VERSION,
+            "scope": serde_json::to_value(ToolOutputSettingsScope::workspace()).unwrap(),
+            "overrides": serde_json::json!({
+                "format": "json",
+                "include_cost": true,
+            }),
+            "defaults": serde_json::to_value(ToolOutputDefaults::default()).unwrap(),
+            "updated_at": serde_json::to_value(LedgerTimestamp::from_unix_millis(1)).unwrap(),
+            "updated_by": serde_json::Value::Null,
+        });
+
+        let error = serde_json::from_value::<ToolOutputSettings>(json).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("must not provide both `overrides` and legacy `defaults`"));
+    }
+
+    #[test]
     fn settings_deserialization_rejects_invalid_overrides() {
         let invalid = serde_json::json!({
             "schema_version": TOOL_OUTPUT_SETTINGS_SCHEMA_VERSION,
@@ -963,6 +1050,79 @@ mod tests {
         let error = serde_json::from_value::<ToolOutputSettings>(invalid).unwrap_err();
 
         assert!(error.to_string().contains("max_inline_lines"));
+    }
+
+    #[test]
+    fn settings_apply_update_migrates_legacy_defaults_before_audit() {
+        let inherited = ToolOutputDefaults {
+            render_options: RenderOptions {
+                format: OutputFormat::Toon,
+                include_policy: false,
+                include_diagnostics: false,
+                include_cost: false,
+            },
+            max_inline_bytes: 24 * 1024,
+            max_inline_lines: 111,
+            verbosity: ToolOutputVerbosity::Normal,
+            granularity: ToolOutputGranularity::KeyFields,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        };
+        let legacy_defaults = ToolOutputDefaults {
+            render_options: RenderOptions {
+                format: OutputFormat::Json,
+                include_policy: true,
+                include_diagnostics: true,
+                include_cost: false,
+            },
+            max_inline_bytes: 32 * 1024,
+            max_inline_lines: 333,
+            verbosity: ToolOutputVerbosity::Expanded,
+            granularity: ToolOutputGranularity::Full,
+            oversize_policy: OversizeOutputPolicy::SpillToArtifactRef,
+        };
+        let legacy_json = serde_json::json!({
+            "schema_version": TOOL_OUTPUT_SETTINGS_SCHEMA_VERSION,
+            "scope": serde_json::to_value(ToolOutputSettingsScope::workspace()).unwrap(),
+            "defaults": serde_json::to_value(&legacy_defaults).unwrap(),
+            "updated_at": serde_json::to_value(LedgerTimestamp::from_unix_millis(1)).unwrap(),
+            "updated_by": serde_json::Value::Null,
+        });
+        let mut settings = serde_json::from_value::<ToolOutputSettings>(legacy_json).unwrap();
+
+        let change = settings
+            .apply_update(
+                actor(),
+                ToolOutputOverrides {
+                    include_cost: Some(true),
+                    ..ToolOutputOverrides::default()
+                },
+                "migrate legacy defaults before comparing audit diff",
+                &inherited,
+                LedgerTimestamp::from_unix_millis(2),
+            )
+            .unwrap();
+
+        assert_eq!(settings.legacy_defaults, None);
+        assert_eq!(
+            change.old_defaults.render_options.format,
+            OutputFormat::Json
+        );
+        assert!(change.old_defaults.render_options.include_policy);
+        assert!(change.old_defaults.render_options.include_diagnostics);
+        assert_eq!(change.old_defaults.verbosity, ToolOutputVerbosity::Expanded);
+        assert_eq!(
+            change.old_defaults.oversize_policy,
+            OversizeOutputPolicy::SpillToArtifactRef
+        );
+
+        assert_eq!(
+            change.new_defaults.render_options.format,
+            OutputFormat::Json
+        );
+        assert!(change.new_defaults.render_options.include_cost);
+
+        assert_eq!(settings.overrides.format, Some(OutputFormat::Json));
+        assert_eq!(settings.overrides.include_cost, Some(true));
     }
 
     #[test]
