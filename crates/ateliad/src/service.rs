@@ -725,6 +725,11 @@ impl SecretaryService {
     /// Query events with cursor, severity, and subject filters.
     #[allow(dead_code)]
     pub fn list_events_page(&self, query: EventQuery) -> ServiceResult<EventPage> {
+        if query.page_size == Some(0) {
+            return Err(ServiceError::InvalidArgument {
+                reason: "page_size must be greater than 0".to_string(),
+            });
+        }
         Ok(self.lifecycle.runtime().store().query_job_events(query)?)
     }
 
@@ -1613,6 +1618,19 @@ mod tests {
                 trust_state: None,
                 page_size: None,
                 page_token: Some("not-a-number".to_string()),
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn list_events_page_rejects_zero_page_size() {
+        let svc = ready_service();
+        let err = svc
+            .list_events_page(EventQuery {
+                page_size: Some(0),
+                ..EventQuery::default()
             })
             .unwrap_err();
 

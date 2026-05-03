@@ -181,9 +181,13 @@ impl SecretaryRpcServer {
         &self,
         request: WatchEventsRequest,
     ) -> RpcResult<WatchEventsReplayResponse> {
+        let incoming_cursor = request
+            .cursor
+            .clone()
+            .unwrap_or(EventCursorRequest::Beginning);
         let query = EventQuery {
             repository_id: Some(parse_repository_id(&request.repository_id)?),
-            cursor: parse_event_cursor(request.cursor.unwrap_or(EventCursorRequest::Beginning))?,
+            cursor: parse_event_cursor(incoming_cursor.clone())?,
             subject_ids: request.subject_ids,
             min_severity: request.min_severity.map(parse_event_severity),
             page_size: Some(
@@ -200,9 +204,11 @@ impl SecretaryRpcServer {
             .into_iter()
             .map(RpcEvent::from)
             .collect::<Vec<_>>();
-        let cursor = events
-            .last()
-            .map(|event| EventCursorRequest::AfterSequence(event.sequence));
+        let cursor = if let Some(event) = events.last() {
+            Some(EventCursorRequest::AfterSequence(event.sequence))
+        } else {
+            Some(incoming_cursor)
+        };
 
         Ok(WatchEventsReplayResponse {
             metadata: self.metadata(),
@@ -2803,6 +2809,35 @@ mod tests {
             .first()
             .map(|event| event.sequence > page.events[0].sequence)
             .unwrap_or(false));
+        let all_events = server
+            .list_events(ListEventsRequest {
+                repository_id: Some(registered.repository.repository_id.clone()),
+                cursor: Some(EventCursorRequest::Beginning),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                page_size: None,
+                page_token: None,
+            })
+            .expect("list all events should succeed");
+        let latest_sequence = all_events
+            .events
+            .last()
+            .expect("list should include at least one event")
+            .sequence;
+        let watch_exhausted = server
+            .watch_events(WatchEventsRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::AfterSequence(latest_sequence)),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: Some(1),
+            })
+            .expect("watch events should succeed when cursor at latest");
+        assert!(watch_exhausted.events.is_empty());
+        assert_eq!(
+            watch_exhausted.cursor,
+            Some(EventCursorRequest::AfterSequence(latest_sequence))
+        );
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(other_root);
