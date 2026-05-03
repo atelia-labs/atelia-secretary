@@ -376,6 +376,7 @@ fn renderable_result(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> To
         .fields
         .retain(|field| should_render_field(&field.key, &policy.render_options));
     if let Some(max_fields) = policy.max_fields {
+        prioritize_renderable_fields(&mut result.fields);
         result.fields.truncate(max_fields);
     }
     if !policy.include_evidence_refs {
@@ -388,6 +389,10 @@ fn renderable_result(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> To
         result.redactions.clear();
     }
     result
+}
+
+fn prioritize_renderable_fields(fields: &mut [crate::domain::ToolResultField]) {
+    fields.sort_by_key(|field| field.key != "summary");
 }
 
 fn render_policy_fallback_reason(original: &ToolResult, rendered: &ToolResult) -> Option<String> {
@@ -1237,6 +1242,65 @@ mod tests {
         assert!(!rendered.body.contains("evidence_refs["));
         assert!(!rendered.body.contains("output_refs["));
         assert!(!rendered.body.contains("redactions["));
+    }
+
+    #[test]
+    fn render_policy_max_fields_prioritizes_summary_before_truncation() {
+        let mut result = sample_result();
+        result.fields = vec![
+            ToolResultField {
+                key: "policy.state".to_string(),
+                value: StructuredValue::String("allowed_with_audit".to_string()),
+            },
+            ToolResultField {
+                key: "changed_files".to_string(),
+                value: StructuredValue::StringList(vec![
+                    "crates/atelia-core/src/lib.rs".to_string(),
+                    "docs/tool-output-schema.md".to_string(),
+                ]),
+            },
+            ToolResultField {
+                key: "summary".to_string(),
+                value: StructuredValue::String("summary survives truncation".to_string()),
+            },
+            ToolResultField {
+                key: "diagnostics.parser_failure".to_string(),
+                value: StructuredValue::String("none".to_string()),
+            },
+        ];
+
+        let policy = ToolOutputRenderPolicy {
+            render_options: RenderOptions {
+                format: OutputFormat::Json,
+                include_policy: true,
+                include_diagnostics: true,
+                include_cost: false,
+            },
+            max_fields: Some(2),
+            max_inline_lines: None,
+            include_evidence_refs: false,
+            include_output_refs: false,
+            include_redactions: false,
+        };
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
+        let keys = json["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field["key"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(keys, vec!["summary", "policy.state"]);
+        assert_eq!(
+            json["fields"][0]["value"]["string"],
+            "summary survives truncation"
+        );
+        assert!(
+            rendered.body.find("\"key\": \"summary\"").unwrap()
+                < rendered.body.find("\"key\": \"policy.state\"").unwrap()
+        );
     }
 
     #[test]
