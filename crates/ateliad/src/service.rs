@@ -5,9 +5,9 @@
 //! registration/listing, and the first supported job lifecycle calls.
 
 use atelia_core::{
-    canonicalize_job_requested_capability, render_tool_result, Actor, ApplyBlocklistRequest,
-    ApplyBlocklistResponse, CancelJobReceipt, DefaultPolicyEngine, ExtensionRegistryService,
-    ExtensionStatusRequest, ExtensionStatusResponse, InMemoryStore,
+    canonicalize_job_requested_capability, canonicalize_within_scope, render_tool_result, Actor,
+    ApplyBlocklistRequest, ApplyBlocklistResponse, CancelJobReceipt, DefaultPolicyEngine,
+    ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, InMemoryStore,
     InMemoryToolOutputSettingsService, InstallExtensionRequest, InstallExtensionResponse, JobId,
     JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
     ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
@@ -19,6 +19,7 @@ use atelia_core::{
     TruncationMetadata,
 };
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -373,6 +374,7 @@ impl SecretaryService {
             if requested_scope.allowed_paths.is_empty() {
                 requested_scope.allowed_paths = vec![record.root_path.clone()];
             }
+            validate_repository_allowed_scope(&record.root_path, &requested_scope)?;
             requested_scope.root_path = record.root_path.clone();
             record.allowed_path_scope = requested_scope;
         }
@@ -875,6 +877,22 @@ fn canonical_repository_root(root_path: &str) -> ServiceResult<String> {
     }
 
     Ok(canonical.to_string_lossy().to_string())
+}
+
+fn validate_repository_allowed_scope(
+    root_path: &str,
+    allowed_scope: &PathScope,
+) -> ServiceResult<()> {
+    let root_path = Path::new(root_path);
+    for allowed_path in &allowed_scope.allowed_paths {
+        canonicalize_within_scope(root_path, Path::new(allowed_path)).map_err(|err| {
+            ServiceError::InvalidArgument {
+                reason: format!("allowed_scope path {allowed_path:?} is invalid: {err}"),
+            }
+        })?;
+    }
+
+    Ok(())
 }
 
 fn actor_signature(actor: &Actor) -> String {
@@ -1404,6 +1422,31 @@ mod tests {
 
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_rejects_allowed_scope_outside_repository_root() {
+        let svc = ready_service();
+        let root = test_repo_dir("scope-outside-root");
+        let sibling = root.parent().unwrap().join("scope-outside-sibling");
+        fs::create_dir_all(&sibling).unwrap();
+
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "scope-outside".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: Some(PathScope {
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_paths: vec!["../scope-outside-sibling".to_string()],
+                }),
+                requester: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(sibling);
     }
 
     #[test]

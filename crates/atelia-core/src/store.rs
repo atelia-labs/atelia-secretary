@@ -229,6 +229,7 @@ impl InMemoryStore {
 
 impl SecretaryStore for InMemoryStore {
     fn create_repository(&self, record: RepositoryRecord) -> StoreResult<()> {
+        validate_repository_record(&record)?;
         let mut inner = self.lock()?;
         if inner
             .repositories
@@ -729,6 +730,38 @@ where
     Record: Clone,
 {
     collection.values().cloned().collect()
+}
+
+fn validate_repository_record(record: &RepositoryRecord) -> StoreResult<()> {
+    if record.display_name.trim().is_empty() {
+        return Err(StoreError::InvalidRecord {
+            collection: "repositories",
+            reason: "display_name must not be empty".to_string(),
+        });
+    }
+
+    if record.root_path.trim().is_empty() {
+        return Err(StoreError::InvalidRecord {
+            collection: "repositories",
+            reason: "root_path must not be empty".to_string(),
+        });
+    }
+
+    if record.allowed_path_scope.root_path != record.root_path {
+        return Err(StoreError::InvalidRecord {
+            collection: "repositories",
+            reason: "allowed_path_scope.root_path must match repository root_path".to_string(),
+        });
+    }
+
+    if record.allowed_path_scope.allowed_paths.is_empty() {
+        return Err(StoreError::InvalidRecord {
+            collection: "repositories",
+            reason: "allowed_path_scope must include at least one path".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn page_start(page_token: Option<&str>, collection: &'static str) -> StoreResult<usize> {
@@ -3560,6 +3593,21 @@ mod tests {
         assert!(matches!(
             store.create_repository(second),
             Err(StoreError::DuplicateId {
+                collection: "repositories",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn repository_records_reject_mismatched_allowed_scope_root() {
+        let store = InMemoryStore::new();
+        let mut repository = repository_record();
+        repository.allowed_path_scope.root_path = format!("{}/scope", repository.root_path);
+
+        assert!(matches!(
+            store.create_repository(repository),
+            Err(StoreError::InvalidRecord {
                 collection: "repositories",
                 ..
             })
