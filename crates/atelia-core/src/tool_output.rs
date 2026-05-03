@@ -454,7 +454,10 @@ fn render_json(
 
     Ok((
         body,
-        combine_fallback_reasons(policy_fallback_reason, fallback_reason),
+        combine_fallback_reasons(
+            combine_fallback_reasons(policy_fallback_reason, compact_fallback_reason),
+            fallback_reason,
+        ),
     ))
 }
 
@@ -1259,6 +1262,63 @@ mod tests {
         assert_eq!(json["fields"][1]["key"], "changed_files");
         assert!(rendered.body.contains("debug_note"));
         assert!(rendered.body.contains("secondary evidence"));
+    }
+
+    #[test]
+    fn json_rendering_combines_compact_and_truncation_fallback_reasons() {
+        let mut result = sample_result();
+        result.fields.push(ToolResultField {
+            key: "debug_note".to_string(),
+            value: StructuredValue::String("keep me out".to_string()),
+        });
+        result.evidence_refs.push(ArtifactRef {
+            id: ArtifactRefId::new(),
+            uri: "/tmp/evidence-2.txt".to_string(),
+            media_type: "text/plain".to_string(),
+            label: Some("secondary evidence".to_string()),
+            digest: Some("sha256:def456".to_string()),
+        });
+        result.output_refs.push(OutputRef {
+            id: OutputRefId::new(),
+            uri: "/tmp/stdout-2.txt".to_string(),
+            media_type: "text/plain".to_string(),
+            label: Some("stdout-2".to_string()),
+            digest: Some("sha256:ghi789".to_string()),
+        });
+        result.redactions = vec![RedactionMarker {
+            field_path: "fields.debug_note".to_string(),
+            reason: "policy secret".to_string(),
+            redacted_at: LedgerTimestamp::from_unix_millis(1_700_000_000_123),
+        }];
+
+        let policy = ToolOutputRenderPolicy {
+            render_options: RenderOptions::new(OutputFormat::Json),
+            max_fields: None,
+            max_inline_lines: Some(0),
+            include_evidence_refs: true,
+            include_output_refs: true,
+            include_redactions: true,
+        };
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Json);
+        assert_eq!(rendered.body.lines().count(), 1);
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("json rendering switched from pretty to compact"));
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("json rendering truncated to max_inline_lines=0"));
+        assert_eq!(json["fields"].as_array().unwrap().len(), 0);
+        assert_eq!(json["evidence_refs"].as_array().unwrap().len(), 0);
+        assert_eq!(json["output_refs"].as_array().unwrap().len(), 0);
+        assert_eq!(json["redactions"].as_array().unwrap().len(), 0);
     }
 
     #[test]
