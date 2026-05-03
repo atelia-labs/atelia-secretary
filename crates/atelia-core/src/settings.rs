@@ -82,6 +82,132 @@ pub enum ToolOutputSettingsLevel {
     AgentProfile { agent_id: String },
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryToolOutputSettingsService {
+    settings: Vec<ToolOutputSettings>,
+    changes: Vec<ToolOutputSettingsChange>,
+}
+
+impl InMemoryToolOutputSettingsService {
+    pub fn new(created_at: LedgerTimestamp) -> Self {
+        let mut settings = Vec::new();
+        settings.push(ToolOutputSettings::new(
+            ToolOutputSettingsScope::workspace(),
+            created_at,
+        ));
+
+        Self {
+            settings,
+            changes: Vec::new(),
+        }
+    }
+
+    pub fn new_with_defaults(
+        created_at: LedgerTimestamp,
+        base_defaults: ToolOutputDefaults,
+    ) -> Self {
+        let mut settings = Vec::new();
+        settings.push(ToolOutputSettings {
+            schema_version: TOOL_OUTPUT_SETTINGS_SCHEMA_VERSION,
+            scope: ToolOutputSettingsScope::workspace(),
+            defaults: base_defaults,
+            updated_at: created_at,
+            updated_by: None,
+        });
+
+        Self {
+            settings,
+            changes: Vec::new(),
+        }
+    }
+
+    pub fn apply_update(
+        &mut self,
+        actor: Actor,
+        scope: ToolOutputSettingsScope,
+        update: ToolOutputOverrides,
+        reason: impl Into<String>,
+        updated_at: LedgerTimestamp,
+    ) -> Result<ToolOutputSettingsChange, ToolOutputSettingsError> {
+        let idx = self
+            .settings
+            .iter()
+            .position(|candidate| candidate.scope == scope);
+
+        let change = if let Some(idx) = idx {
+            self.settings[idx].apply_update(actor, update, reason, updated_at)?
+        } else {
+            let mut settings = ToolOutputSettings::new(scope.clone(), updated_at);
+            settings.defaults = self.resolve_defaults(&scope);
+            let change = settings.apply_update(actor, update, reason, updated_at)?;
+            self.settings.push(settings);
+            change
+        };
+
+        self.changes.push(change.clone());
+        Ok(change)
+    }
+
+    pub fn resolve_defaults(&self, scope: &ToolOutputSettingsScope) -> ToolOutputDefaults {
+        let mut defaults = ToolOutputDefaults::default();
+        for candidate_scope in resolution_chain(scope) {
+            if let Some(candidate) = self
+                .settings
+                .iter()
+                .find(|setting| setting.scope == candidate_scope)
+            {
+                defaults = candidate.defaults.clone();
+            }
+        }
+        defaults
+    }
+
+    pub fn resolve_render_options(&self, scope: &ToolOutputSettingsScope) -> RenderOptions {
+        self.resolve_defaults(scope).render_options()
+    }
+
+    pub fn resolve_defaults_with_overrides(
+        &self,
+        scope: &ToolOutputSettingsScope,
+        overrides: &ToolOutputOverrides,
+    ) -> Result<ToolOutputDefaults, ToolOutputSettingsError> {
+        self.resolve_defaults(scope).with_overrides(overrides)
+    }
+
+    pub fn changes(&self) -> &[ToolOutputSettingsChange] {
+        self.changes.as_slice()
+    }
+}
+
+fn resolution_chain(scope: &ToolOutputSettingsScope) -> Vec<ToolOutputSettingsScope> {
+    let mut chain = Vec::new();
+    let workspace_scope = ToolOutputSettingsScope::workspace();
+
+    push_unique(&mut chain, ToolOutputSettingsScope::workspace());
+
+    if let Some(tool_id) = scope.tool_id.as_deref() {
+        push_unique(&mut chain, workspace_scope.for_tool(tool_id));
+    }
+
+    let level_scope = ToolOutputSettingsScope {
+        level: scope.level.clone(),
+        tool_id: None,
+    };
+    push_unique(&mut chain, level_scope);
+
+    if let Some(_) = scope.tool_id.as_deref() {
+        push_unique(&mut chain, scope.clone());
+    }
+
+    chain
+}
+
+fn push_unique(chain: &mut Vec<ToolOutputSettingsScope>, scope: ToolOutputSettingsScope) {
+    if !chain.contains(&scope) {
+        chain.push(scope);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolOutputDefaults {
     pub render_options: RenderOptions,
@@ -610,5 +736,213 @@ mod tests {
         assert!(json.contains("\"verbosity\":\"debug\""));
         assert!(json.contains("\"granularity\":\"full\""));
         assert!(json.contains("\"oversize_policy\":\"reject_oversize\""));
+    }
+
+    #[test]
+    fn service_resolves_effective_defaults_by_precedence() {
+        let repo_id = RepositoryId::new();
+        let mut service = InMemoryToolOutputSettingsService::new(
+            LedgerTimestamp::from_unix_millis(1_700_000_000_000),
+        );
+        let repository_scope = ToolOutputSettingsScope::repository(repo_id);
+        let repository_tool_scope = repository_scope.clone().for_tool("tool.read");
+
+        service
+            .apply_update(
+                actor(),
+                ToolOutputSettingsScope::workspace(),
+                ToolOutputOverrides {
+                    format: Some(OutputFormat::Json),
+                    max_inline_lines: Some(77),
+                    ..ToolOutputOverrides::default()
+                },
+                "set workspace default format",
+                LedgerTimestamp::from_unix_millis(1_700_000_000_001),
+            )
+            .unwrap();
+        service
+            .apply_update(
+                actor(),
+                repository_scope.clone(),
+                ToolOutputOverrides {
+                    granularity: Some(ToolOutputGranularity::Full),
+                    ..ToolOutputOverrides::default()
+                },
+                "make repository output full",
+                LedgerTimestamp::from_unix_millis(1_700_000_000_003),
+            )
+            .unwrap();
+        service
+            .apply_update(
+                actor(),
+                repository_tool_scope.clone(),
+                ToolOutputOverrides {
+                    include_policy: Some(true),
+                    verbosity: Some(ToolOutputVerbosity::Expanded),
+                    ..ToolOutputOverrides::default()
+                },
+                "expand only read in repository",
+                LedgerTimestamp::from_unix_millis(1_700_000_000_004),
+            )
+            .unwrap();
+
+        let repository_tool_defaults = service.resolve_defaults(&repository_tool_scope);
+        assert_eq!(
+            repository_tool_defaults.render_options.format,
+            OutputFormat::Json
+        );
+        assert!(repository_tool_defaults.render_options.include_policy);
+        assert_eq!(
+            repository_tool_defaults.granularity,
+            ToolOutputGranularity::Full
+        );
+        assert_eq!(
+            repository_tool_defaults.verbosity,
+            ToolOutputVerbosity::Expanded
+        );
+        assert_eq!(repository_tool_defaults.max_inline_lines, 77);
+
+        let repository_defaults = service.resolve_defaults(&repository_scope);
+        assert_eq!(
+            repository_defaults.render_options.format,
+            OutputFormat::Json
+        );
+        assert!(!repository_defaults.render_options.include_policy);
+        assert_eq!(repository_defaults.granularity, ToolOutputGranularity::Full);
+        assert_eq!(repository_defaults.verbosity, ToolOutputVerbosity::Normal);
+        assert_eq!(repository_defaults.max_inline_lines, 77);
+    }
+
+    #[test]
+    fn service_call_overrides_do_not_mutate_stored_defaults() {
+        let repo_id = RepositoryId::new();
+        let mut service = InMemoryToolOutputSettingsService::new(
+            LedgerTimestamp::from_unix_millis(1_700_000_000_010),
+        );
+        let repository_tool_scope =
+            ToolOutputSettingsScope::repository(repo_id).for_tool("tool.read");
+
+        service
+            .apply_update(
+                actor(),
+                repository_tool_scope.clone(),
+                ToolOutputOverrides {
+                    format: Some(OutputFormat::Text),
+                    max_inline_bytes: Some(32 * 1024),
+                    ..ToolOutputOverrides::default()
+                },
+                "set baseline repository tool defaults",
+                LedgerTimestamp::from_unix_millis(1_700_000_000_011),
+            )
+            .unwrap();
+
+        let resolved = service
+            .resolve_defaults_with_overrides(
+                &repository_tool_scope,
+                &ToolOutputOverrides {
+                    include_diagnostics: Some(true),
+                    max_inline_lines: Some(555),
+                    ..ToolOutputOverrides::default()
+                },
+            )
+            .unwrap();
+        let current = service.resolve_defaults(&repository_tool_scope);
+
+        assert_eq!(resolved.render_options.include_diagnostics, true);
+        assert_eq!(resolved.max_inline_lines, 555);
+        assert_eq!(resolved.render_options.format, OutputFormat::Text);
+
+        assert_eq!(current.render_options.format, OutputFormat::Text);
+        assert_eq!(current.max_inline_bytes, 32 * 1024);
+        assert_eq!(current.render_options.include_diagnostics, false);
+        assert_eq!(current.max_inline_lines, DEFAULT_MAX_INLINE_LINES);
+    }
+
+    #[test]
+    fn service_rejects_invalid_updates_without_recording_audit() {
+        let mut service = InMemoryToolOutputSettingsService::new(
+            LedgerTimestamp::from_unix_millis(1_700_000_000_020),
+        );
+        let before = service.resolve_render_options(&ToolOutputSettingsScope::workspace());
+        assert!(service.changes().is_empty());
+
+        let err = service
+            .apply_update(
+                actor(),
+                ToolOutputSettingsScope::workspace(),
+                ToolOutputOverrides {
+                    max_inline_lines: Some(0),
+                    ..ToolOutputOverrides::default()
+                },
+                "reject invalid",
+                LedgerTimestamp::from_unix_millis(1_700_000_000_021),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            ToolOutputSettingsError::MaxInlineLinesOutOfRange {
+                value: 0,
+                min: MIN_MAX_INLINE_LINES,
+                max: MAX_MAX_INLINE_LINES,
+            }
+        );
+        assert!(service.changes().is_empty());
+        assert_eq!(
+            service.resolve_render_options(&ToolOutputSettingsScope::workspace()),
+            before
+        );
+    }
+
+    #[test]
+    fn service_audit_log_captures_update_history() {
+        let repository_id = RepositoryId::new();
+        let mut service = InMemoryToolOutputSettingsService::new(
+            LedgerTimestamp::from_unix_millis(1_700_000_000_030),
+        );
+        let repository_scope = ToolOutputSettingsScope::repository(repository_id);
+
+        let first_change = service
+            .apply_update(
+                actor(),
+                ToolOutputSettingsScope::workspace(),
+                ToolOutputOverrides {
+                    format: Some(OutputFormat::Text),
+                    ..ToolOutputOverrides::default()
+                },
+                "tooling default adjustment",
+                LedgerTimestamp::from_unix_millis(1_700_000_000_031),
+            )
+            .unwrap();
+
+        let second_change = service
+            .apply_update(
+                actor(),
+                repository_scope.clone(),
+                ToolOutputOverrides {
+                    granularity: Some(ToolOutputGranularity::Summary),
+                    ..ToolOutputOverrides::default()
+                },
+                "repo-level granularity tweak",
+                LedgerTimestamp::from_unix_millis(1_700_000_000_032),
+            )
+            .unwrap();
+
+        let log = service.changes();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0], first_change);
+        assert_eq!(log[1], second_change);
+        assert_eq!(log[0].scope, ToolOutputSettingsScope::workspace());
+        assert_eq!(log[1].scope, repository_scope);
+        assert_eq!(
+            log[0].new_defaults.render_options.format,
+            OutputFormat::Text
+        );
+        assert_eq!(
+            log[1].new_defaults.granularity,
+            ToolOutputGranularity::Summary
+        );
+        assert_eq!(log[0].reason, "tooling default adjustment");
+        assert_eq!(log[1].reason, "repo-level granularity tweak");
     }
 }
