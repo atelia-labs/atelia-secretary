@@ -7,8 +7,8 @@
 use atelia_core::{
     Actor, CancelJobReceipt, DefaultPolicyEngine, InMemoryStore, JobId, JobKind,
     JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, RepositoryId,
-    RepositoryRecord, RepositoryTrustState, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest,
-    SecretaryStore, StoreError,
+    RepositoryRecord, RepositoryTrustState, ResourceScope, RuntimeError, RuntimeJobReceipt,
+    RuntimeJobRequest, SecretaryStore, StoreError,
 };
 use std::path::PathBuf;
 
@@ -122,6 +122,32 @@ pub struct SubmitJobRequest {
     pub repository_id: RepositoryId,
     pub kind: JobKind,
     pub goal: String,
+    pub resource_scope: Option<ResourceScope>,
+    pub requested_capabilities: Vec<String>,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListRepositoriesRequest {
+    pub trust_state: Option<RepositoryTrustState>,
+    pub page_size: Option<usize>,
+    pub page_token: Option<String>,
+}
+
+impl Default for ListRepositoriesRequest {
+    fn default() -> Self {
+        Self {
+            trust_state: None,
+            page_size: None,
+            page_token: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ListRepositoriesPage {
+    pub repositories: Vec<RepositoryRecord>,
+    pub next_page_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +277,38 @@ impl SecretaryService {
     /// List all registered repositories.
     #[allow(dead_code)]
     pub fn list_repositories(&self) -> ServiceResult<Vec<RepositoryRecord>> {
+        Ok(self
+            .list_repositories_page(ListRepositoriesRequest::default())?
+            .repositories)
+    }
+
+    pub fn list_repositories_page(
+        &self,
+        request: ListRepositoriesRequest,
+    ) -> ServiceResult<ListRepositoriesPage> {
         Ok(self.lifecycle.runtime().store().list_repositories()?)
+            .and_then(|repos| {
+                let mut records = repos;
+                records.retain(|repository| {
+                    request
+                        .trust_state
+                        .as_ref()
+                        .map(|state| repository.trust_state == *state)
+                        .unwrap_or(true)
+                });
+
+                records.sort_by(|left, right| left.id.cmp(&right.id));
+
+                let page_size = request.page_size.unwrap_or(usize::MAX);
+                let start = parse_page_token(request.page_token.as_deref(), "repositories")?;
+                let page = paginate_records(records, start, page_size);
+
+                Ok(page)
+            })
+            .map(|(repositories, next_page_token)| ListRepositoriesPage {
+                repositories,
+                next_page_token,
+            })
     }
 
     /// Look up a single repository by id.
@@ -269,11 +326,40 @@ impl SecretaryService {
             });
         }
 
+        if !request.requested_capabilities.is_empty() {
+            return Err(ServiceError::InvalidArgument {
+                reason:
+                    "requested_capabilities is not yet supported; submit one capability via a future-capable transport".to_string(),
+            });
+        }
+
+        if request
+            .idempotency_key
+            .as_ref()
+            .is_some_and(|key| !key.trim().is_empty())
+        {
+            return Err(ServiceError::InvalidArgument {
+                reason: "idempotency_key is not yet supported by this daemon runtime".to_string(),
+            });
+        }
+
         let runtime_request = RuntimeJobRequest::new(
             request.requester,
             request.repository_id,
             request.kind,
             request.goal,
+        )
+        .with_resource_scope(
+            request
+                .resource_scope
+                .as_ref()
+                .map(|scope| scope.kind.clone())
+                .unwrap_or_else(|| "repository".to_string()),
+            request
+                .resource_scope
+                .as_ref()
+                .map(|scope| scope.value.clone())
+                .unwrap_or_else(|| ".".to_string()),
         );
 
         Ok(self.lifecycle.submit_echo_job(runtime_request)?)
@@ -309,9 +395,61 @@ impl SecretaryService {
         &self,
         id: &JobId,
         reason: impl Into<String>,
+        _requester: Option<Actor>,
     ) -> ServiceResult<CancelJobReceipt> {
         Ok(self.lifecycle.cancel_job(id, reason)?)
     }
+}
+
+fn parse_page_token(page_token: Option<&str>, collection: &'static str) -> ServiceResult<usize> {
+    match page_token {
+        Some(token) if !token.is_empty() => {
+            token
+                .parse::<usize>()
+                .map_err(|_| ServiceError::InvalidArgument {
+                    reason: format!("{collection} page token is not a numeric offset"),
+                })
+        }
+        _ => Ok(0),
+    }
+}
+
+fn paginate_records<T>(
+    records: Vec<T>,
+    start: usize,
+    page_size: usize,
+) -> (Vec<T>, Option<String>) {
+    let mut records = records.into_iter();
+    let mut skipped = 0usize;
+    let mut retained = Vec::new();
+    let mut has_next = false;
+
+    if page_size == 0 {
+        records.by_ref().take(start).for_each(|_| {});
+        return (retained, None);
+    }
+
+    for record in records {
+        if skipped < start {
+            skipped += 1;
+            continue;
+        }
+
+        if retained.len() == page_size {
+            has_next = true;
+            break;
+        }
+
+        retained.push(record);
+    }
+
+    let next_page_token = if has_next {
+        Some((start + retained.len()).to_string())
+    } else {
+        None
+    };
+
+    (retained, next_page_token)
 }
 
 fn canonical_repository_root(root_path: &str) -> ServiceResult<String> {
@@ -575,6 +713,76 @@ mod tests {
     }
 
     #[test]
+    fn list_repositories_page_filters_and_paginates() {
+        let svc = ready_service();
+        let root_a = test_repo_dir("list-page-a");
+        let root_b = test_repo_dir("list-page-b");
+        let root_c = test_repo_dir("list-page-c");
+
+        svc.register_repository(RegisterRepositoryRequest {
+            display_name: "repo-a".to_string(),
+            root_path: root_a.to_string_lossy().to_string(),
+            trust_state: RepositoryTrustState::Trusted,
+        })
+        .expect("register trusted should succeed");
+        svc.register_repository(RegisterRepositoryRequest {
+            display_name: "repo-b".to_string(),
+            root_path: root_b.to_string_lossy().to_string(),
+            trust_state: RepositoryTrustState::ReadOnly,
+        })
+        .expect("register read-only should succeed");
+        svc.register_repository(RegisterRepositoryRequest {
+            display_name: "repo-c".to_string(),
+            root_path: root_c.to_string_lossy().to_string(),
+            trust_state: RepositoryTrustState::Trusted,
+        })
+        .expect("register trusted should succeed");
+
+        let first = svc
+            .list_repositories_page(ListRepositoriesRequest {
+                trust_state: Some(RepositoryTrustState::Trusted),
+                page_size: Some(1),
+                page_token: None,
+            })
+            .expect("list repositories should succeed");
+        assert_eq!(first.repositories.len(), 1);
+        assert_eq!(
+            first.repositories[0].trust_state,
+            RepositoryTrustState::Trusted
+        );
+        assert_eq!(first.next_page_token, Some("1".to_string()));
+
+        let second = svc
+            .list_repositories_page(ListRepositoriesRequest {
+                trust_state: Some(RepositoryTrustState::Trusted),
+                page_size: Some(1),
+                page_token: first.next_page_token,
+            })
+            .expect("list repositories should succeed");
+        assert_eq!(second.repositories.len(), 1);
+        assert_ne!(second.repositories[0].id, first.repositories[0].id);
+        assert_eq!(second.next_page_token, None);
+
+        let _ = fs::remove_dir_all(root_a);
+        let _ = fs::remove_dir_all(root_b);
+        let _ = fs::remove_dir_all(root_c);
+    }
+
+    #[test]
+    fn list_repositories_request_rejects_invalid_page_token() {
+        let svc = ready_service();
+        let err = svc
+            .list_repositories_page(ListRepositoriesRequest {
+                trust_state: None,
+                page_size: None,
+                page_token: Some("not-a-number".to_string()),
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    #[test]
     fn health_updates_repository_count() {
         let svc = ready_service();
         let root_a = test_repo_dir("health-a");
@@ -656,6 +864,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: "summarize status".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
             })
             .expect("submit should succeed");
 
@@ -691,6 +902,9 @@ mod tests {
             repository_id: repository_id.clone(),
             kind: JobKind::Read,
             goal: "first".to_string(),
+            resource_scope: None,
+            requested_capabilities: Vec::new(),
+            idempotency_key: None,
         })
         .expect("submit should succeed");
         svc.submit_job(SubmitJobRequest {
@@ -698,6 +912,9 @@ mod tests {
             repository_id: repository_id.clone(),
             kind: JobKind::Read,
             goal: "second".to_string(),
+            resource_scope: None,
+            requested_capabilities: Vec::new(),
+            idempotency_key: None,
         })
         .expect("submit should succeed");
 
@@ -735,10 +952,69 @@ mod tests {
                 repository_id: RepositoryId::new(),
                 kind: JobKind::Read,
                 goal: " ".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
             })
             .unwrap_err();
 
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn submit_job_rejects_requested_capabilities() {
+        let svc = ready_service();
+        let root = test_repo_dir("unsupported-capabilities");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: vec!["capability.discovery".to_string()],
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_idempotency_key() {
+        let svc = ready_service();
+        let root = test_repo_dir("unsupported-idempotency");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("request-123".to_string()),
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
     }
 
     // -- whitespace-only validation tests ------------------------------------

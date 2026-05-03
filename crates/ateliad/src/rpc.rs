@@ -8,13 +8,15 @@
 #![allow(dead_code)]
 
 use crate::service::{
-    DaemonHealth, DaemonStatus, ProtocolMetadata as ServiceProtocolMetadata,
+    DaemonHealth, DaemonStatus, ListRepositoriesRequest as ServiceListRepositoriesRequest,
+    ProtocolMetadata as ServiceProtocolMetadata,
     RegisterRepositoryRequest as ServiceRegisterRepositoryRequest, SecretaryService, ServiceError,
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
 };
 use atelia_core::{
-    Actor, CancellationState, JobId, JobKind, JobRecord, JobStatus, PolicyOutcome, RepositoryId,
-    RepositoryRecord, RepositoryTrustState, RiskTier, StoreError,
+    Actor, CancelJobReceipt, CancellationState, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
+    PolicyOutcome, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier,
+    StoreError,
 };
 use std::convert::TryFrom;
 
@@ -63,11 +65,13 @@ impl SecretaryRpcServer {
 
     pub fn list_repositories(
         &self,
-        _request: ListRepositoriesRequest,
+        request: ListRepositoriesRequest,
     ) -> RpcResult<ListRepositoriesResponse> {
-        let repositories = self
-            .service
-            .list_repositories()?
+        let request = parse_list_repositories_request(request)?;
+        let page = self.service.list_repositories_page(request)?;
+
+        let repositories = page
+            .repositories
             .into_iter()
             .map(Repository::from)
             .collect();
@@ -75,16 +79,25 @@ impl SecretaryRpcServer {
         Ok(ListRepositoriesResponse {
             metadata: self.metadata(),
             repositories,
+            next_page_token: page.next_page_token,
         })
     }
 
     pub fn submit_job(&self, request: SubmitJobRequest) -> RpcResult<SubmitJobResponse> {
         let repository_id = parse_repository_id(&request.repository_id)?;
+        let path_scope = request
+            .path_scope
+            .map(parse_path_scope)
+            .transpose()?
+            .flatten();
         let receipt = self.service.submit_job(ServiceSubmitJobRequest {
             requester: Actor::try_from(request.requester)?,
             repository_id,
             kind: parse_job_kind(&request.kind)?,
             goal: request.goal,
+            resource_scope: path_scope,
+            requested_capabilities: request.requested_capabilities,
+            idempotency_key: request.idempotency_key,
         })?;
 
         Ok(SubmitJobResponse {
@@ -134,12 +147,16 @@ impl SecretaryRpcServer {
 
     pub fn cancel_job(&self, request: CancelJobRequest) -> RpcResult<CancelJobResponse> {
         let job_id = parse_job_id(&request.job_id)?;
-        let receipt = self.service.cancel_job(&job_id, request.reason)?;
+        let requester = Actor::try_from(request.requester)?;
+        let receipt = self
+            .service
+            .cancel_job(&job_id, request.reason, Some(requester))?;
+        let cancellation = job_cancellation_from_receipt(&receipt);
 
         Ok(CancelJobResponse {
             metadata: self.metadata(),
             job: Job::from(receipt.job),
-            event_count: receipt.events.len(),
+            cancellation,
         })
     }
 
@@ -253,13 +270,21 @@ pub struct RegisterRepositoryResponse {
     pub repository: Repository,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ListRepositoriesRequest;
+// Mirrors proto's `ListRepositoriesRequest` contract.
+// `trust_state` is optional so callers can omit it instead of sending
+// an explicit unspecified enum value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListRepositoriesRequest {
+    pub trust_state: Option<RpcRepositoryTrustState>,
+    pub page_size: Option<usize>,
+    pub page_token: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListRepositoriesResponse {
     pub metadata: ProtocolMetadata,
     pub repositories: Vec<Repository>,
+    pub next_page_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +316,9 @@ pub struct SubmitJobRequest {
     pub requester: RpcActorDto,
     pub kind: String,
     pub goal: String,
+    pub path_scope: Option<RpcPathScope>,
+    pub requested_capabilities: Vec<String>,
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +357,7 @@ pub struct ListJobsResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelJobRequest {
     pub job_id: String,
+    pub requester: RpcActorDto,
     pub reason: String,
 }
 
@@ -336,7 +365,23 @@ pub struct CancelJobRequest {
 pub struct CancelJobResponse {
     pub metadata: ProtocolMetadata,
     pub job: Job,
-    pub event_count: usize,
+    pub cancellation: JobCancellation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcPathScope {
+    pub kind: RpcPathScopeKind,
+    pub roots: Vec<String>,
+    pub include_patterns: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcPathScopeKind {
+    Unspecified,
+    Repository,
+    ExplicitPaths,
+    ReadOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,6 +461,59 @@ pub struct PolicyDecision {
 fn parse_repository_id(value: &str) -> RpcResult<RepositoryId> {
     RepositoryId::try_from_string(value.to_string())
         .map_err(|_| RpcError::invalid_argument("repository_id must be a valid repository id"))
+}
+
+fn parse_list_repositories_request(
+    request: ListRepositoriesRequest,
+) -> RpcResult<ServiceListRepositoriesRequest> {
+    let trust_state = match request.trust_state {
+        Some(RpcRepositoryTrustState::Unspecified) | None => None,
+        Some(state) => Some(state.try_into()?),
+    };
+
+    Ok(ServiceListRepositoriesRequest {
+        trust_state,
+        page_size: request.page_size,
+        page_token: request.page_token,
+    })
+}
+
+fn parse_path_scope(value: RpcPathScope) -> RpcResult<Option<ResourceScope>> {
+    if value.include_patterns.is_empty() && value.exclude_patterns.is_empty() {
+        let scope_kind = match value.kind {
+            RpcPathScopeKind::Unspecified => {
+                if value.roots.is_empty() {
+                    return Ok(None);
+                }
+
+                return Err(RpcError::invalid_argument(
+                    "path_scope kind is required when roots are provided",
+                ));
+            }
+            RpcPathScopeKind::Repository => "repository",
+            RpcPathScopeKind::ExplicitPaths => "explicit_paths",
+            RpcPathScopeKind::ReadOnly => "read_only",
+        };
+
+        if value.roots.len() > 1 {
+            return Err(RpcError::invalid_argument(
+                "path_scope currently supports only one root entry",
+            ));
+        }
+
+        Ok(Some(ResourceScope {
+            kind: scope_kind.to_string(),
+            value: value
+                .roots
+                .first()
+                .cloned()
+                .unwrap_or_else(|| ".".to_string()),
+        }))
+    } else {
+        Err(RpcError::invalid_argument(
+            "path_scope include_patterns and exclude_patterns are not supported yet",
+        ))
+    }
 }
 
 fn parse_job_id(value: &str) -> RpcResult<JobId> {
@@ -658,6 +756,21 @@ fn job_cancellation_from_record(record: &JobRecord) -> JobCancellation {
     }
 }
 
+fn job_cancellation_from_receipt(receipt: &CancelJobReceipt) -> JobCancellation {
+    let requested_event = receipt
+        .events
+        .iter()
+        .find(|event| matches!(event.kind, JobEventKind::CancellationRequested));
+
+    JobCancellation {
+        state: cancellation_state_label(receipt.job.cancellation_state).to_string(),
+        requested_by: None,
+        reason: requested_event.map(|event| event.public_message.clone()),
+        requested_at_unix_ms: requested_event.map(|event| event.created_at.unix_millis),
+        completed_at_unix_ms: receipt.job.completed_at.map(|ts| ts.unix_millis),
+    }
+}
+
 fn policy_outcome_label(outcome: PolicyOutcome) -> &'static str {
     match outcome {
         PolicyOutcome::Allowed => "allowed",
@@ -796,7 +909,11 @@ mod tests {
             .expect("register should succeed");
 
         let repositories = server
-            .list_repositories(ListRepositoriesRequest)
+            .list_repositories(ListRepositoriesRequest {
+                trust_state: None,
+                page_size: None,
+                page_token: None,
+            })
             .expect("list repositories should succeed");
         assert_eq!(repositories.repositories.len(), 1);
         assert_eq!(
@@ -810,6 +927,9 @@ mod tests {
                 requester: actor(),
                 kind: "read".to_string(),
                 goal: "summarize repository state".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
             })
             .expect("submit job should succeed");
         assert_eq!(submitted.job.status, "succeeded");
@@ -837,6 +957,86 @@ mod tests {
     }
 
     #[test]
+    fn list_repositories_request_forwards_filters_and_pagination() {
+        let server = ready_server();
+        let root_a = test_repo_dir("list-filter-a");
+        let root_b = test_repo_dir("list-filter-b");
+        let root_c = test_repo_dir("list-filter-c");
+
+        server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "repo-a".to_string(),
+                root_path: root_a.to_string_lossy().to_string(),
+                trust_state: RpcRepositoryTrustState::Trusted,
+            })
+            .expect("register trusted should succeed");
+        server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "repo-b".to_string(),
+                root_path: root_b.to_string_lossy().to_string(),
+                trust_state: RpcRepositoryTrustState::ReadOnly,
+            })
+            .expect("register read-only should succeed");
+        server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "repo-c".to_string(),
+                root_path: root_c.to_string_lossy().to_string(),
+                trust_state: RpcRepositoryTrustState::Trusted,
+            })
+            .expect("register trusted should succeed");
+
+        let first = server
+            .list_repositories(ListRepositoriesRequest {
+                trust_state: Some(RpcRepositoryTrustState::Trusted),
+                page_size: Some(1),
+                page_token: None,
+            })
+            .expect("list repositories should succeed");
+        assert_eq!(first.repositories.len(), 1);
+        assert_eq!(
+            first.repositories[0].trust_state,
+            RpcRepositoryTrustState::Trusted
+        );
+        assert_eq!(first.next_page_token, Some("1".to_string()));
+
+        let second = server
+            .list_repositories(ListRepositoriesRequest {
+                trust_state: Some(RpcRepositoryTrustState::Trusted),
+                page_size: Some(1),
+                page_token: first.next_page_token,
+            })
+            .expect("list repositories should succeed");
+        assert_eq!(second.repositories.len(), 1);
+        assert_eq!(
+            second.repositories[0].trust_state,
+            RpcRepositoryTrustState::Trusted
+        );
+        assert_ne!(
+            first.repositories[0].repository_id,
+            second.repositories[0].repository_id
+        );
+
+        let _ = fs::remove_dir_all(root_a);
+        let _ = fs::remove_dir_all(root_b);
+        let _ = fs::remove_dir_all(root_c);
+    }
+
+    #[test]
+    fn list_repositories_request_rejects_invalid_page_token() {
+        let server = ready_server();
+
+        let error = server
+            .list_repositories(ListRepositoriesRequest {
+                trust_state: None,
+                page_size: None,
+                page_token: Some("not-a-number".to_string()),
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+    }
+
+    #[test]
     fn list_jobs_request_forwards_pagination() {
         let server = ready_server();
         let root = test_repo_dir("pagination");
@@ -855,6 +1055,9 @@ mod tests {
                 requester: actor(),
                 kind: "read".to_string(),
                 goal: "one".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
             })
             .expect("submit job should succeed");
         server
@@ -863,6 +1066,9 @@ mod tests {
                 requester: actor(),
                 kind: "read".to_string(),
                 goal: "two".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
             })
             .expect("submit job should succeed");
 
@@ -908,12 +1114,16 @@ mod tests {
                 requester: actor(),
                 kind: "read".to_string(),
                 goal: "finish immediately".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
             })
             .expect("submit job should succeed");
 
         let error = server
             .cancel_job(CancelJobRequest {
                 job_id: submitted.job.job_id,
+                requester: actor(),
                 reason: "too late".to_string(),
             })
             .unwrap_err();
@@ -932,10 +1142,88 @@ mod tests {
                 requester: actor(),
                 kind: "read".to_string(),
                 goal: "test".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
             })
             .unwrap_err();
 
         assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn submit_job_rejects_unsupported_path_scope_patterns() {
+        let server = ready_server();
+        let root = test_repo_dir("unsupported-path-scope");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "scope-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RpcRepositoryTrustState::Trusted,
+            })
+            .expect("register should succeed");
+
+        let error = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id,
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "ignored".to_string(),
+                path_scope: Some(RpcPathScope {
+                    kind: RpcPathScopeKind::Repository,
+                    roots: vec![".".to_string()],
+                    include_patterns: vec!["src/**/*.rs".to_string()],
+                    exclude_patterns: Vec::new(),
+                }),
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_requested_capabilities_and_idempotency_key() {
+        let server = ready_server();
+        let root = test_repo_dir("unsupported-submission-fields");
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "feature-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RpcRepositoryTrustState::Trusted,
+            })
+            .expect("register should succeed");
+
+        let no_capabilities = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "first".to_string(),
+                path_scope: None,
+                requested_capabilities: vec!["capability.discovery".to_string()],
+                idempotency_key: None,
+            })
+            .unwrap_err();
+        assert_eq!(no_capabilities.code, RpcErrorCode::InvalidArgument);
+
+        let with_idempotency = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id,
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "second".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("request-key".to_string()),
+            })
+            .unwrap_err();
+        assert_eq!(with_idempotency.code, RpcErrorCode::InvalidArgument);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1048,6 +1336,55 @@ mod tests {
         assert_eq!(dto.cancellation.reason, None);
         assert_eq!(dto.cancellation.requested_at_unix_ms, None);
         assert_eq!(dto.cancellation.completed_at_unix_ms, None);
+    }
+
+    #[test]
+    fn cancellation_dto_from_receipt_maps_reason_and_requested_at() {
+        let timestamp = atelia_core::LedgerTimestamp::from_unix_millis(5_000);
+        let completion_timestamp = atelia_core::LedgerTimestamp::from_unix_millis(5_123);
+        let event = atelia_core::JobEvent {
+            id: atelia_core::JobEventId::new(),
+            schema_version: 1,
+            sequence_number: 1,
+            created_at: timestamp,
+            subject: atelia_core::EventSubject::job(&atelia_core::JobId::new()),
+            kind: JobEventKind::CancellationRequested,
+            severity: atelia_core::EventSeverity::Warning,
+            public_message: "operator requested cancellation".to_string(),
+            refs: atelia_core::EventRefs::default(),
+            redactions: Vec::new(),
+        };
+        let job = JobRecord::new(
+            actor_record(),
+            RepositoryId::new(),
+            JobKind::Read,
+            "dry run".to_string(),
+            atelia_core::LedgerTimestamp::from_unix_millis(4_900),
+        );
+        let receipt = CancelJobReceipt {
+            job: JobRecord {
+                completed_at: Some(completion_timestamp),
+                cancellation_state: CancellationState::Requested,
+                ..job
+            },
+            events: vec![event],
+        };
+
+        let cancellation = job_cancellation_from_receipt(&receipt);
+
+        assert_eq!(cancellation.state, "requested");
+        assert_eq!(
+            cancellation.reason,
+            Some("operator requested cancellation".to_string())
+        );
+        assert_eq!(
+            cancellation.requested_at_unix_ms,
+            Some(timestamp.unix_millis)
+        );
+        assert_eq!(
+            cancellation.completed_at_unix_ms,
+            Some(completion_timestamp.unix_millis)
+        );
     }
 
     #[test]
