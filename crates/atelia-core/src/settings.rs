@@ -371,6 +371,8 @@ impl ToolOutputDefaults {
             render_options,
             max_fields: field_limit,
             max_inline_lines: Some(max_inline_lines),
+            max_inline_bytes: Some(self.max_inline_bytes),
+            oversize_policy: self.oversize_policy,
             include_evidence_refs: !matches!(self.granularity, ToolOutputGranularity::Summary),
             include_output_refs: !matches!(self.granularity, ToolOutputGranularity::Summary),
             include_redactions: !matches!(self.granularity, ToolOutputGranularity::Summary),
@@ -913,6 +915,11 @@ mod tests {
 
         assert_eq!(policy.max_fields, None);
         assert_eq!(policy.max_inline_lines, Some(2));
+        assert_eq!(policy.max_inline_bytes, Some(DEFAULT_MAX_INLINE_BYTES));
+        assert_eq!(
+            policy.oversize_policy,
+            OversizeOutputPolicy::TruncateWithMetadata
+        );
     }
 
     #[test]
@@ -943,6 +950,11 @@ mod tests {
         assert!(!policy.render_options.include_diagnostics);
         assert!(!policy.render_options.include_cost);
         assert_eq!(policy.max_fields, Some(1));
+        assert_eq!(policy.max_inline_bytes, Some(DEFAULT_MAX_INLINE_BYTES));
+        assert_eq!(
+            policy.oversize_policy,
+            OversizeOutputPolicy::TruncateWithMetadata
+        );
         assert!(!policy.include_evidence_refs);
         assert!(!policy.include_output_refs);
         assert!(!policy.include_redactions);
@@ -1031,6 +1043,11 @@ mod tests {
         assert!(!policy.render_options.include_policy);
         assert!(!policy.render_options.include_diagnostics);
         assert!(!policy.render_options.include_cost);
+        assert_eq!(policy.max_inline_bytes, Some(DEFAULT_MAX_INLINE_BYTES));
+        assert_eq!(
+            policy.oversize_policy,
+            OversizeOutputPolicy::TruncateWithMetadata
+        );
     }
 
     #[test]
@@ -1060,6 +1077,11 @@ mod tests {
         assert!(!policy.render_options.include_policy);
         assert!(!policy.render_options.include_diagnostics);
         assert!(!policy.render_options.include_cost);
+        assert_eq!(policy.max_inline_bytes, Some(DEFAULT_MAX_INLINE_BYTES));
+        assert_eq!(
+            policy.oversize_policy,
+            OversizeOutputPolicy::TruncateWithMetadata
+        );
     }
 
     #[test]

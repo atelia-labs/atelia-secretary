@@ -4,6 +4,7 @@ use crate::domain::{
     ArtifactRef, OutputRef, RedactionMarker, StructuredValue, ToolResult, ToolResultStatus,
     TruncationMetadata,
 };
+use crate::settings::OversizeOutputPolicy;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
@@ -62,6 +63,8 @@ pub struct ToolOutputRenderPolicy {
     pub render_options: RenderOptions,
     pub max_fields: Option<usize>,
     pub max_inline_lines: Option<usize>,
+    pub max_inline_bytes: Option<u64>,
+    pub oversize_policy: OversizeOutputPolicy,
     pub include_evidence_refs: bool,
     pub include_output_refs: bool,
     pub include_redactions: bool,
@@ -73,6 +76,8 @@ impl ToolOutputRenderPolicy {
             render_options,
             max_fields: None,
             max_inline_lines: None,
+            max_inline_bytes: None,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
             include_evidence_refs: true,
             include_output_refs: true,
             include_redactions: true,
@@ -92,6 +97,7 @@ pub struct RenderedToolOutput {
 pub enum ToolOutputRenderError {
     UnsupportedFormat { format: OutputFormat },
     JsonSerialize { reason: String },
+    OversizeOutput { reason: String },
 }
 
 impl fmt::Display for ToolOutputRenderError {
@@ -102,6 +108,9 @@ impl fmt::Display for ToolOutputRenderError {
             }
             Self::JsonSerialize { reason } => {
                 write!(f, "tool output json serialization failed: {reason}")
+            }
+            Self::OversizeOutput { reason } => {
+                write!(f, "tool output exceeds byte budget: {reason}")
             }
         }
     }
@@ -127,7 +136,7 @@ pub fn render_tool_result_with_policy(
 
     match policy.render_options.format {
         OutputFormat::Toon => {
-            let (body, fallback_reason) = render_toon(result, policy, None);
+            let (body, fallback_reason) = render_toon(result, policy, None)?;
             Ok(RenderedToolOutput {
                 format: OutputFormat::Toon,
                 schema_version,
@@ -136,7 +145,7 @@ pub fn render_tool_result_with_policy(
             })
         }
         OutputFormat::Text => {
-            let (body, fallback_reason) = render_text(result, policy);
+            let (body, fallback_reason) = render_text(result, policy)?;
             Ok(RenderedToolOutput {
                 format: OutputFormat::Text,
                 schema_version,
@@ -161,9 +170,12 @@ fn render_toon(
     result: &ToolResult,
     policy: &ToolOutputRenderPolicy,
     fallback_reason: Option<&str>,
-) -> (String, Option<String>) {
-    let rendered_result = renderable_result(result, policy);
-    let policy_fallback_reason = render_policy_fallback_reason(result, &rendered_result);
+) -> Result<(String, Option<String>), ToolOutputRenderError> {
+    let (rendered_result, mut policy_fallback_reason) = renderable_result(result, policy)?;
+    policy_fallback_reason = combine_fallback_reasons(
+        policy_fallback_reason,
+        render_policy_fallback_reason(result, &rendered_result),
+    );
     let mut lines = Vec::new();
 
     lines.push(format!("status {}", status_name(rendered_result.status)));
@@ -249,16 +261,22 @@ fn render_toon(
         let mut kept_lines = lines.into_iter().take(keep_len).collect::<Vec<_>>();
         kept_lines.extend(notice_lines);
         let fallback_reason = combine_fallback_reasons(policy_fallback_reason, Some(reason));
-        (kept_lines.join("\n"), fallback_reason)
+        Ok((kept_lines.join("\n"), fallback_reason))
     } else {
         let fallback_reason = policy_fallback_reason;
-        (lines.join("\n"), fallback_reason)
+        Ok((lines.join("\n"), fallback_reason))
     }
 }
 
-fn render_text(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> (String, Option<String>) {
-    let rendered_result = renderable_result(result, policy);
-    let fallback_reason = render_policy_fallback_reason(result, &rendered_result);
+fn render_text(
+    result: &ToolResult,
+    policy: &ToolOutputRenderPolicy,
+) -> Result<(String, Option<String>), ToolOutputRenderError> {
+    let (rendered_result, mut policy_fallback_reason) = renderable_result(result, policy)?;
+    policy_fallback_reason = combine_fallback_reasons(
+        policy_fallback_reason,
+        render_policy_fallback_reason(result, &rendered_result),
+    );
     let summary = summary_field(&rendered_result)
         .map(normalize_text_output_value)
         .unwrap_or_else(|| "no summary".to_string());
@@ -318,15 +336,18 @@ fn render_text(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> (String,
         ));
     }
 
-    (parts.join("; "), fallback_reason)
+    Ok((parts.join("; "), policy_fallback_reason))
 }
 
 fn render_json(
     result: &ToolResult,
     policy: &ToolOutputRenderPolicy,
 ) -> Result<(String, Option<String>), ToolOutputRenderError> {
-    let rendered_result = renderable_result(result, policy);
-    let policy_fallback_reason = render_policy_fallback_reason(result, &rendered_result);
+    let (rendered_result, mut policy_fallback_reason) = renderable_result(result, policy)?;
+    policy_fallback_reason = combine_fallback_reasons(
+        policy_fallback_reason,
+        render_policy_fallback_reason(result, &rendered_result),
+    );
     let pretty_body = serde_json::to_string_pretty(&rendered_result).map_err(|error| {
         ToolOutputRenderError::JsonSerialize {
             reason: error.to_string(),
@@ -376,7 +397,10 @@ fn render_json(
     ))
 }
 
-fn renderable_result(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> ToolResult {
+fn renderable_result(
+    result: &ToolResult,
+    policy: &ToolOutputRenderPolicy,
+) -> Result<(ToolResult, Option<String>), ToolOutputRenderError> {
     let mut result = result.clone();
     result
         .fields
@@ -394,7 +418,177 @@ fn renderable_result(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> To
     if !policy.include_redactions {
         result.redactions.clear();
     }
-    result
+
+    let mut fallback_reason = None;
+
+    if let Some(max_inline_bytes) = policy.max_inline_bytes {
+        let byte_budget_reason =
+            apply_render_byte_budget(&mut result, max_inline_bytes, policy.oversize_policy)?;
+        fallback_reason = combine_fallback_reasons(fallback_reason, byte_budget_reason);
+    }
+
+    Ok((result, fallback_reason))
+}
+
+fn apply_render_byte_budget(
+    result: &mut ToolResult,
+    max_inline_bytes: u64,
+    oversize_policy: OversizeOutputPolicy,
+) -> Result<Option<String>, ToolOutputRenderError> {
+    let max_inline_bytes = max_inline_bytes_as_usize(max_inline_bytes);
+    let oversized_fields = result
+        .fields
+        .iter()
+        .filter_map(|field| {
+            oversized_field_bytes(field, max_inline_bytes).map(|bytes| (field.key.clone(), bytes))
+        })
+        .collect::<Vec<_>>();
+
+    if oversized_fields.is_empty() {
+        return Ok(None);
+    }
+
+    let details = oversized_fields
+        .iter()
+        .map(|(key, size)| format!("{key} ({size} bytes)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    match oversize_policy {
+        OversizeOutputPolicy::RejectOversize => Err(ToolOutputRenderError::OversizeOutput {
+            reason: format!(
+                "tool output field(s) exceed max_inline_bytes={max_inline_bytes} with configured policy reject_oversize: {details}"
+            ),
+        }),
+        OversizeOutputPolicy::TruncateWithMetadata | OversizeOutputPolicy::SpillToArtifactRef => {
+            let mut omitted_fields = 0usize;
+            let mut original_bytes = 0u64;
+            let mut retained_bytes = 0u64;
+
+            for field in &mut result.fields {
+                let Some(bytes) = oversized_field_bytes(field, max_inline_bytes) else {
+                    continue;
+                };
+
+                original_bytes = original_bytes.saturating_add(bytes as u64);
+                omitted_fields += 1;
+
+                match &field.value {
+                    StructuredValue::String(value) => {
+                        if let Some(truncated_value) = truncate_string_value(value, max_inline_bytes) {
+                            retained_bytes = retained_bytes.saturating_add(truncated_value.len() as u64);
+                            field.value = StructuredValue::String(truncated_value);
+                        }
+                    }
+                    StructuredValue::StringList(values) => {
+                        let (truncated_values, retained) = truncate_string_list(values, max_inline_bytes);
+                        retained_bytes = retained_bytes.saturating_add(retained);
+                        field.value = StructuredValue::StringList(truncated_values);
+                    }
+                    _ => {}
+                }
+            }
+
+            if omitted_fields == 0 {
+                return Ok(None);
+            }
+
+            let rendered_truncation = TruncationMetadata {
+                original_bytes,
+                retained_bytes,
+                reason: format!(
+                    "rendering truncated oversized tool output to max_inline_bytes={max_inline_bytes}"
+                ),
+            };
+
+            result.truncation = Some(match result.truncation.take() {
+                Some(existing) => TruncationMetadata {
+                    original_bytes: existing.original_bytes.saturating_add(rendered_truncation.original_bytes),
+                    retained_bytes: existing.retained_bytes.saturating_add(rendered_truncation.retained_bytes),
+                    reason: format!(
+                        "{}; {}",
+                        existing.reason, rendered_truncation.reason
+                    ),
+                },
+                None => rendered_truncation,
+            });
+
+            Ok(Some(format!(
+                "rendering truncated oversized output to max_inline_bytes={max_inline_bytes}; omitted fields={omitted_fields}, details={details}"
+            )))
+        }
+    }
+}
+
+fn max_inline_bytes_as_usize(max_inline_bytes: u64) -> usize {
+    match usize::try_from(max_inline_bytes) {
+        Ok(max_inline_bytes) => max_inline_bytes,
+        Err(_) => usize::MAX,
+    }
+}
+
+fn oversized_field_bytes(
+    field: &crate::domain::ToolResultField,
+    max_inline_bytes: usize,
+) -> Option<usize> {
+    let bytes = match &field.value {
+        StructuredValue::String(value) => value.len(),
+        StructuredValue::StringList(values) => {
+            if values.is_empty() {
+                0
+            } else {
+                values.iter().map(|value| value.len()).sum::<usize>() + (values.len() - 1)
+            }
+        }
+        _ => return None,
+    };
+
+    if bytes > max_inline_bytes {
+        Some(bytes)
+    } else {
+        None
+    }
+}
+
+fn truncate_string_value(value: &str, max_inline_bytes: usize) -> Option<String> {
+    if value.len() <= max_inline_bytes {
+        return None;
+    }
+
+    let mut end = max_inline_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    Some(value[..end].to_string())
+}
+
+fn truncate_string_list(values: &[String], max_inline_bytes: usize) -> (Vec<String>, u64) {
+    let mut kept_values = Vec::new();
+    let mut kept_bytes = 0usize;
+
+    for value in values {
+        let separator = usize::from(!kept_values.is_empty());
+        let remaining = max_inline_bytes.saturating_sub(kept_bytes.saturating_add(separator));
+        if remaining == 0 {
+            break;
+        }
+
+        let Some(truncated) = truncate_string_value(value, remaining).or_else(|| {
+            if value.len() <= remaining {
+                Some(value.clone())
+            } else {
+                None
+            }
+        }) else {
+            break;
+        };
+
+        kept_bytes = kept_bytes.saturating_add(separator + truncated.len());
+        kept_values.push(truncated);
+    }
+
+    (kept_values, kept_bytes as u64)
 }
 
 fn prioritize_renderable_fields(fields: &mut [crate::domain::ToolResultField]) {
@@ -960,6 +1154,12 @@ mod tests {
         result
     }
 
+    fn result_with_oversized_summary(summary: &str) -> ToolResult {
+        let mut result = sample_result();
+        result.fields[0].value = StructuredValue::String(summary.to_string());
+        result
+    }
+
     #[test]
     fn toon_rendering_keeps_contract_order_and_content() {
         let result = sample_result();
@@ -1006,6 +1206,57 @@ mod tests {
     }
 
     #[test]
+    fn defaults_render_policy_applies_byte_budget_to_runtime_rendering() {
+        let defaults = crate::settings::ToolOutputDefaults {
+            render_options: RenderOptions::new(OutputFormat::Text),
+            max_inline_bytes: 8,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+            ..crate::settings::ToolOutputDefaults::default()
+        };
+        let policy = defaults.render_policy();
+        let result = result_with_oversized_summary("1234567890");
+
+        assert_eq!(policy.max_inline_bytes, Some(8));
+        assert_eq!(
+            policy.oversize_policy,
+            OversizeOutputPolicy::TruncateWithMetadata
+        );
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+
+        assert!(rendered.body.contains("git_status succeeded: 12345678"));
+        assert!(rendered.body.contains("truncated "));
+        assert!(rendered
+            .body
+            .contains("rendering truncated oversized tool output to max_inline_bytes=8"));
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("max_inline_bytes=8"));
+    }
+
+    #[test]
+    fn defaults_render_policy_can_reject_oversized_runtime_rendering() {
+        let defaults = crate::settings::ToolOutputDefaults {
+            render_options: RenderOptions::new(OutputFormat::Text),
+            max_inline_bytes: 8,
+            oversize_policy: OversizeOutputPolicy::RejectOversize,
+            ..crate::settings::ToolOutputDefaults::default()
+        };
+        let policy = defaults.render_policy();
+        let result = result_with_oversized_summary("1234567890");
+
+        let error = render_tool_result_with_policy(&result, &policy).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolOutputRenderError::OversizeOutput { .. }
+        ));
+        assert!(error.to_string().contains("max_inline_bytes=8"));
+    }
+
+    #[test]
     fn json_rendering_uses_canonical_result_schema() {
         let result = sample_result();
         let options = RenderOptions::new(OutputFormat::Json);
@@ -1025,6 +1276,8 @@ mod tests {
             render_options: RenderOptions::new(OutputFormat::Json),
             max_fields: None,
             max_inline_lines: Some(64),
+            max_inline_bytes: None,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
             include_evidence_refs: true,
             include_output_refs: true,
             include_redactions: true,
@@ -1098,6 +1351,8 @@ mod tests {
             render_options: RenderOptions::new(OutputFormat::Json),
             max_fields: None,
             max_inline_lines: Some(2),
+            max_inline_bytes: None,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
             include_evidence_refs: true,
             include_output_refs: true,
             include_redactions: true,
@@ -1158,6 +1413,8 @@ mod tests {
             render_options: RenderOptions::new(OutputFormat::Json),
             max_fields: None,
             max_inline_lines: Some(0),
+            max_inline_bytes: None,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
             include_evidence_refs: true,
             include_output_refs: true,
             include_redactions: true,
@@ -1191,6 +1448,8 @@ mod tests {
             render_options: RenderOptions::default(),
             max_fields: None,
             max_inline_lines: Some(1),
+            max_inline_bytes: None,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
             include_evidence_refs: true,
             include_output_refs: true,
             include_redactions: true,
@@ -1289,6 +1548,8 @@ mod tests {
             render_options: RenderOptions::default(),
             max_fields: Some(2),
             max_inline_lines: Some(16),
+            max_inline_bytes: None,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
             include_evidence_refs: false,
             include_output_refs: false,
             include_redactions: false,
@@ -1341,6 +1602,8 @@ mod tests {
             },
             max_fields: Some(2),
             max_inline_lines: None,
+            max_inline_bytes: None,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
             include_evidence_refs: false,
             include_output_refs: false,
             include_redactions: false,
@@ -1458,6 +1721,8 @@ mod tests {
             render_options: RenderOptions::default(),
             max_fields: Some(3),
             max_inline_lines: Some(15),
+            max_inline_bytes: None,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
             include_evidence_refs: true,
             include_output_refs: true,
             include_redactions: true,
@@ -1483,6 +1748,8 @@ mod tests {
             render_options: RenderOptions::default(),
             max_fields: Some(3),
             max_inline_lines: Some(9),
+            max_inline_bytes: None,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
             include_evidence_refs: true,
             include_output_refs: true,
             include_redactions: true,
@@ -1523,6 +1790,8 @@ mod tests {
             render_options: RenderOptions::default(),
             max_fields: Some(1),
             max_inline_lines: Some(7),
+            max_inline_bytes: None,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
             include_evidence_refs: false,
             include_output_refs: false,
             include_redactions: false,
