@@ -145,6 +145,7 @@ impl SecretaryService {
                 "health".to_string(),
                 "register_repository".to_string(),
                 "list_repositories".to_string(),
+                "get_repository".to_string(),
             ],
             repository_count,
             started_at: self.started_at,
@@ -248,6 +249,7 @@ mod tests {
         assert!(health
             .capabilities
             .contains(&"list_repositories".to_string()));
+        assert!(health.capabilities.contains(&"get_repository".to_string()));
     }
 
     #[test]
