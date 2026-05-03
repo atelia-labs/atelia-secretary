@@ -342,20 +342,18 @@ impl ToolOutputDefaults {
     }
 
     pub fn render_policy(&self) -> ToolOutputRenderPolicy {
-        self.render_policy_with_render_options(None)
+        self.render_policy_with_render_options(&self.render_options)
     }
 
     pub fn render_policy_with_render_options(
         &self,
-        requested_render_options: Option<&RenderOptions>,
+        requested_render_options: &RenderOptions,
     ) -> ToolOutputRenderPolicy {
         let mut render_options = self.render_options();
-        if let Some(requested_render_options) = requested_render_options {
-            render_options.format = requested_render_options.format;
-            render_options.include_policy = requested_render_options.include_policy;
-            render_options.include_diagnostics = requested_render_options.include_diagnostics;
-            render_options.include_cost = requested_render_options.include_cost;
-        }
+        render_options.format = requested_render_options.format;
+        render_options.include_policy = requested_render_options.include_policy;
+        render_options.include_diagnostics = requested_render_options.include_diagnostics;
+        render_options.include_cost = requested_render_options.include_cost;
 
         apply_verbosity_constraints(&mut render_options, self.verbosity);
 
@@ -363,7 +361,7 @@ impl ToolOutputDefaults {
         let field_limit = match self.granularity {
             ToolOutputGranularity::Summary => Some(1),
             ToolOutputGranularity::KeyFields => Some(3),
-            ToolOutputGranularity::Full => None,
+            ToolOutputGranularity::Full => Some(max_inline_lines),
         }
         .map(|limit| limit.min(max_inline_lines));
 
@@ -371,8 +369,6 @@ impl ToolOutputDefaults {
             render_options,
             max_fields: field_limit,
             max_inline_lines: Some(max_inline_lines),
-            max_inline_bytes: Some(self.max_inline_bytes),
-            oversize_policy: self.oversize_policy,
             include_evidence_refs: !matches!(self.granularity, ToolOutputGranularity::Summary),
             include_output_refs: !matches!(self.granularity, ToolOutputGranularity::Summary),
             include_redactions: !matches!(self.granularity, ToolOutputGranularity::Summary),
@@ -407,13 +403,10 @@ fn apply_verbosity_constraints(render_options: &mut RenderOptions, verbosity: To
             render_options.include_diagnostics = false;
             render_options.include_cost = false;
         }
-        ToolOutputVerbosity::Normal => {
-            render_options.include_policy = false;
-            render_options.include_diagnostics = false;
-            render_options.include_cost = false;
-        }
+        ToolOutputVerbosity::Normal => {}
         ToolOutputVerbosity::Expanded => {
-            render_options.include_cost = false;
+            render_options.include_policy = true;
+            render_options.include_diagnostics = true;
         }
         ToolOutputVerbosity::Debug => {
             render_options.include_policy = true;
@@ -891,35 +884,13 @@ mod tests {
         let policy = defaults.render_policy();
 
         assert_eq!(policy.render_options.format, OutputFormat::Json);
-        assert!(!policy.render_options.include_policy);
-        assert!(!policy.render_options.include_diagnostics);
+        assert!(policy.render_options.include_policy);
+        assert!(policy.render_options.include_diagnostics);
         assert!(!policy.render_options.include_cost);
         assert_eq!(policy.max_fields, Some(1));
         assert!(!policy.include_evidence_refs);
         assert!(!policy.include_output_refs);
         assert!(!policy.include_redactions);
-    }
-
-    #[test]
-    fn defaults_render_policy_keeps_full_unbounded_by_inline_line_limit() {
-        let defaults = ToolOutputDefaults {
-            render_options: RenderOptions::new(OutputFormat::Text),
-            max_inline_bytes: DEFAULT_MAX_INLINE_BYTES,
-            max_inline_lines: 2,
-            verbosity: ToolOutputVerbosity::Normal,
-            granularity: ToolOutputGranularity::Full,
-            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
-        };
-
-        let policy = defaults.render_policy();
-
-        assert_eq!(policy.max_fields, None);
-        assert_eq!(policy.max_inline_lines, Some(2));
-        assert_eq!(policy.max_inline_bytes, Some(DEFAULT_MAX_INLINE_BYTES));
-        assert_eq!(
-            policy.oversize_policy,
-            OversizeOutputPolicy::TruncateWithMetadata
-        );
     }
 
     #[test]
@@ -938,150 +909,21 @@ mod tests {
             oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
         };
 
-        let policy = defaults.render_policy_with_render_options(Some(&RenderOptions {
+        let policy = defaults.render_policy_with_render_options(&RenderOptions {
             format: OutputFormat::Json,
             include_policy: true,
             include_diagnostics: true,
             include_cost: true,
-        }));
+        });
 
         assert_eq!(policy.render_options.format, OutputFormat::Json);
         assert!(!policy.render_options.include_policy);
         assert!(!policy.render_options.include_diagnostics);
         assert!(!policy.render_options.include_cost);
         assert_eq!(policy.max_fields, Some(1));
-        assert_eq!(policy.max_inline_bytes, Some(DEFAULT_MAX_INLINE_BYTES));
-        assert_eq!(
-            policy.oversize_policy,
-            OversizeOutputPolicy::TruncateWithMetadata
-        );
         assert!(!policy.include_evidence_refs);
         assert!(!policy.include_output_refs);
         assert!(!policy.include_redactions);
-    }
-
-    #[test]
-    fn defaults_render_policy_caps_requested_optional_channels_by_verbosity() {
-        let base_defaults = ToolOutputDefaults {
-            render_options: RenderOptions {
-                format: OutputFormat::Text,
-                include_policy: false,
-                include_diagnostics: false,
-                include_cost: false,
-            },
-            max_inline_bytes: DEFAULT_MAX_INLINE_BYTES,
-            max_inline_lines: 4,
-            verbosity: ToolOutputVerbosity::Normal,
-            granularity: ToolOutputGranularity::Full,
-            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
-        };
-
-        let requested = RenderOptions {
-            format: OutputFormat::Json,
-            include_policy: true,
-            include_diagnostics: true,
-            include_cost: true,
-        };
-
-        let minimal = ToolOutputDefaults {
-            verbosity: ToolOutputVerbosity::Minimal,
-            ..base_defaults.clone()
-        }
-        .render_policy_with_render_options(Some(&requested));
-        assert_eq!(minimal.render_options.format, OutputFormat::Json);
-        assert!(!minimal.render_options.include_policy);
-        assert!(!minimal.render_options.include_diagnostics);
-        assert!(!minimal.render_options.include_cost);
-
-        let normal = ToolOutputDefaults {
-            verbosity: ToolOutputVerbosity::Normal,
-            ..base_defaults.clone()
-        }
-        .render_policy_with_render_options(Some(&requested));
-        assert!(!normal.render_options.include_policy);
-        assert!(!normal.render_options.include_diagnostics);
-        assert!(!normal.render_options.include_cost);
-
-        let expanded = ToolOutputDefaults {
-            verbosity: ToolOutputVerbosity::Expanded,
-            ..base_defaults.clone()
-        }
-        .render_policy_with_render_options(Some(&requested));
-        assert!(expanded.render_options.include_policy);
-        assert!(expanded.render_options.include_diagnostics);
-        assert!(!expanded.render_options.include_cost);
-
-        let debug = ToolOutputDefaults {
-            verbosity: ToolOutputVerbosity::Debug,
-            ..base_defaults
-        }
-        .render_policy_with_render_options(Some(&requested));
-        assert!(debug.render_options.include_policy);
-        assert!(debug.render_options.include_diagnostics);
-        assert!(debug.render_options.include_cost);
-    }
-
-    #[test]
-    fn defaults_render_policy_without_request_render_options_uses_defaults() {
-        let defaults = ToolOutputDefaults {
-            render_options: RenderOptions {
-                format: OutputFormat::Json,
-                include_policy: true,
-                include_diagnostics: false,
-                include_cost: true,
-            },
-            max_inline_bytes: DEFAULT_MAX_INLINE_BYTES,
-            max_inline_lines: 4,
-            verbosity: ToolOutputVerbosity::Normal,
-            granularity: ToolOutputGranularity::Full,
-            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
-        };
-
-        let policy = defaults.render_policy_with_render_options(None);
-
-        assert_eq!(policy.render_options.format, OutputFormat::Json);
-        assert!(!policy.render_options.include_policy);
-        assert!(!policy.render_options.include_diagnostics);
-        assert!(!policy.render_options.include_cost);
-        assert_eq!(policy.max_inline_bytes, Some(DEFAULT_MAX_INLINE_BYTES));
-        assert_eq!(
-            policy.oversize_policy,
-            OversizeOutputPolicy::TruncateWithMetadata
-        );
-    }
-
-    #[test]
-    fn defaults_render_policy_expanded_preserves_requested_false_optional_channels() {
-        let defaults = ToolOutputDefaults {
-            render_options: RenderOptions {
-                format: OutputFormat::Text,
-                include_policy: true,
-                include_diagnostics: true,
-                include_cost: true,
-            },
-            max_inline_bytes: DEFAULT_MAX_INLINE_BYTES,
-            max_inline_lines: 4,
-            verbosity: ToolOutputVerbosity::Expanded,
-            granularity: ToolOutputGranularity::Full,
-            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
-        };
-
-        let policy = defaults.render_policy_with_render_options(Some(&RenderOptions {
-            format: OutputFormat::Json,
-            include_policy: false,
-            include_diagnostics: false,
-            include_cost: true,
-        }));
-
-        assert_eq!(policy.render_options.format, OutputFormat::Json);
-        assert!(!policy.render_options.include_policy);
-        assert!(!policy.render_options.include_diagnostics);
-        assert!(!policy.render_options.include_cost);
-        assert_eq!(policy.max_inline_bytes, Some(DEFAULT_MAX_INLINE_BYTES));
-        assert_eq!(
-            policy.oversize_policy,
-            OversizeOutputPolicy::TruncateWithMetadata
-        );
     }
 
     #[test]

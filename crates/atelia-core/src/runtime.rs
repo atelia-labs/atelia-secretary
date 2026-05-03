@@ -18,7 +18,8 @@ use crate::policy::{
 use crate::settings::{OversizeOutputPolicy, ToolOutputDefaults};
 use crate::store::{EventCursor, InMemoryStore, JobPage, JobQuery, SecretaryStore, StoreError};
 use crate::tool_output::{
-    render_tool_result_with_policy, RenderOptions, RenderedToolOutput, ToolOutputRenderError,
+    render_tool_result_with_policy, OutputFormat, RenderOptions, RenderedToolOutput,
+    ToolOutputRenderError,
 };
 use std::error::Error;
 use std::fmt;
@@ -637,24 +638,12 @@ where
         );
         job.latest_event_id = events.last().map(|event| event.id.clone());
 
-        let rendered_output = if should_rerender_output {
-            match render_tool_result_with_policy(&result, &render_policy) {
-                Ok(rendered_output) => rendered_output,
-                Err(error) => {
-                    let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
-                    append_failed_job_event(
-                        &self.store,
-                        &mut job,
-                        &mut events,
-                        "tool output rendering failed",
-                        failure_refs,
-                    )?;
-                    return Err(RuntimeError::ToolOutputRender(error));
-                }
-            }
-        } else {
-            rendered_output
-        };
+        let rendered_output = render_tool_result_with_policy(
+            &result,
+            &request
+                .tool_output_defaults
+                .render_policy_with_render_options(&request.render_options),
+        )?;
 
         Ok(RuntimeJobReceipt {
             job,
@@ -1495,48 +1484,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_uses_settings_render_options_when_request_does_not_override() {
-        let runtime = SecretaryRuntime::in_memory();
-        let repository = repository();
-        runtime
-            .store()
-            .create_repository(repository.clone())
-            .unwrap();
-
-        let request = RuntimeJobRequest::new(
-            actor(),
-            repository.id.clone(),
-            JobKind::Read,
-            "prove settings drive rendering",
-        )
-        .with_tool_output_defaults(ToolOutputDefaults {
-            render_options: RenderOptions {
-                format: OutputFormat::Json,
-                include_policy: true,
-                include_diagnostics: true,
-                include_cost: true,
-            },
-            max_inline_bytes: 16 * 1024,
-            max_inline_lines: 8,
-            verbosity: crate::settings::ToolOutputVerbosity::Normal,
-            granularity: crate::settings::ToolOutputGranularity::Full,
-            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
-        });
-
-        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
-        let rendered = receipt.rendered_output.unwrap();
-        let json: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
-
-        assert_eq!(rendered.format, OutputFormat::Json);
-        assert_eq!(json["tool_id"], "secretary.echo");
-        assert!(!json["fields"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|field| field["key"] == "policy.state"));
-    }
-
-    #[test]
     fn runtime_honors_per_request_render_options_as_an_explicit_override() {
         let runtime = SecretaryRuntime::in_memory();
         let repository = repository();
@@ -1577,7 +1524,7 @@ mod tests {
 
         assert_eq!(rendered.format, OutputFormat::Json);
         assert_eq!(json["tool_id"], "secretary.echo");
-        assert!(!json["fields"]
+        assert!(json["fields"]
             .as_array()
             .unwrap()
             .iter()
@@ -1680,6 +1627,11 @@ mod tests {
 
         assert_eq!(rendered.format, OutputFormat::Json);
         assert_eq!(rendered.body.lines().count(), 1);
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("render policy compacted output"));
         assert!(rendered
             .fallback_reason
             .as_deref()
