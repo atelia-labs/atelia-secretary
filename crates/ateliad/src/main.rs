@@ -12,6 +12,7 @@ async fn main() -> Result<()> {
     let mut service = service::SecretaryService::new();
     info!("Atelia Secretary daemon starting");
 
+    service.set_running();
     let health = service.health();
     info!(
         version = %health.daemon_version,

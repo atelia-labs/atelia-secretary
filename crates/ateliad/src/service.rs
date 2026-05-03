@@ -22,6 +22,7 @@ const STORAGE_VERSION: &str = "0.1.0";
 #[allow(dead_code)]
 pub enum DaemonStatus {
     Starting,
+    Running,
     Ready,
     Degraded,
     Stopping,
@@ -114,6 +115,11 @@ impl SecretaryService {
             started_at: LedgerTimestamp::now(),
             daemon_status: DaemonStatus::Starting,
         }
+    }
+
+    /// Transition the daemon into [`DaemonStatus::Running`].
+    pub fn set_running(&mut self) {
+        self.daemon_status = DaemonStatus::Running;
     }
 
     /// Transition the daemon into [`DaemonStatus::Ready`].
@@ -289,6 +295,13 @@ mod tests {
     fn health_starts_starting() {
         let svc = SecretaryService::new();
         assert_eq!(svc.health().daemon_status, DaemonStatus::Starting);
+    }
+
+    #[test]
+    fn health_returns_running_after_set_running() {
+        let mut svc = SecretaryService::new();
+        svc.set_running();
+        assert_eq!(svc.health().daemon_status, DaemonStatus::Running);
     }
 
     #[test]
