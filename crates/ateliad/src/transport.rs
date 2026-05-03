@@ -1421,10 +1421,10 @@ mod tests {
                     atelia_core::ToolOutputSettingsScope::workspace()
                         .for_tool(tool_result.tool_id.clone()),
                     atelia_core::ToolOutputOverrides {
-                        include_policy: Some(true),
+                        granularity: Some(atelia_core::ToolOutputGranularity::Summary),
                         ..atelia_core::ToolOutputOverrides::default()
                     },
-                    "Expose policy fields in rendered tool output".to_string(),
+                    "Compact rendered stored results".to_string(),
                 )
                 .expect("tool output settings update should succeed");
 
@@ -1468,13 +1468,19 @@ mod tests {
         );
         assert_eq!(
             payload["data"]["rendered_output_metadata"]["degraded"],
-            false
+            true
         );
-        assert!(payload["data"]["rendered_output_metadata"]["fallback_reason"].is_null());
-        assert!(payload["data"]["rendered_output"]
-            .as_str()
-            .expect("rendered output string")
-            .contains("policy.state"));
+        assert!(
+            payload["data"]["rendered_output_metadata"]["fallback_reason"]
+                .as_str()
+                .expect("fallback reason")
+                .contains("render policy compacted output")
+        );
+        let rendered_output: serde_json::Value =
+            serde_json::from_str(payload["data"]["rendered_output"].as_str().unwrap())
+                .expect("rendered json");
+        assert_eq!(rendered_output["fields"].as_array().unwrap().len(), 1);
+        assert_eq!(rendered_output["fields"][0]["key"], "summary");
         let _ = fs::remove_dir_all(root);
     }
 

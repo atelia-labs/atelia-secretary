@@ -5,18 +5,18 @@
 //! registration/listing, and the first supported job lifecycle calls.
 
 use atelia_core::{
-    canonicalize_job_requested_capability, canonicalize_within_scope, render_tool_result, Actor,
-    ApplyBlocklistRequest, ApplyBlocklistResponse, CancelJobReceipt, DefaultPolicyEngine,
-    ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, InMemoryStore,
-    InMemoryToolOutputSettingsService, InstallExtensionRequest, InstallExtensionResponse, JobId,
-    JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
-    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
-    OutputFormat, PathScope, PolicyEngine, PolicyInput, RegistryError, RenderedToolOutput,
-    RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RollbackExtensionRequest,
-    RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore,
-    StoreError, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
-    ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
-    TruncationMetadata,
+    canonicalize_job_requested_capability, canonicalize_within_scope,
+    render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
+    CancelJobReceipt, DefaultPolicyEngine, ExtensionRegistryService, ExtensionStatusRequest,
+    ExtensionStatusResponse, InMemoryStore, InMemoryToolOutputSettingsService,
+    InstallExtensionRequest, InstallExtensionResponse, JobId, JobKind, JobLifecycleService,
+    JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest,
+    ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse, OutputFormat, PathScope,
+    PolicyEngine, PolicyInput, RegistryError, RenderedToolOutput, RepositoryId, RepositoryRecord,
+    RepositoryTrustState, ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse,
+    RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
+    ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange,
+    ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId, TruncationMetadata,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -36,6 +36,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "tool_output_render.v1",
 ];
 const MAX_HISTORY_PAGE: usize = 1000;
+const SECRETARY_ECHO_TOOL_ID: &str = "secretary.echo";
 
 fn daemon_capabilities() -> Vec<String> {
     DAEMON_CAPABILITIES
@@ -568,6 +569,11 @@ impl SecretaryService {
             None
         };
 
+        let tool_output_defaults = self.get_tool_output_defaults(
+            ToolOutputSettingsScope::repository(request.repository_id.clone())
+                .for_tool(SECRETARY_ECHO_TOOL_ID),
+        )?;
+
         let runtime_request = RuntimeJobRequest::new(
             request.requester,
             request.repository_id,
@@ -575,6 +581,7 @@ impl SecretaryService {
             request.goal,
         )
         .with_requested_capabilities(requested_capabilities)
+        .with_tool_output_defaults(tool_output_defaults)
         .with_resource_scope(
             request
                 .resource_scope
@@ -654,16 +661,16 @@ impl SecretaryService {
         let repository = self.get_repository(&tool_invocation.repository_id)?;
         let render_scope = ToolOutputSettingsScope::repository(repository.id.clone())
             .for_tool(tool_result.tool_id.clone());
-        let mut render_options = self
+        let defaults = self
             .lock_tool_output_settings()?
-            .resolve_render_options(&render_scope);
+            .resolve_defaults(&render_scope);
+        let mut render_options = defaults.render_options();
         render_options.format = request.format;
+        let render_policy = defaults.render_policy_with_render_options(Some(&render_options));
 
-        let rendered_output =
-            render_tool_result(&tool_result, &render_options).map_err(|error| {
-                ServiceError::Internal {
-                    reason: error.to_string(),
-                }
+        let rendered_output = render_tool_result_with_policy(&tool_result, &render_policy)
+            .map_err(|error| ServiceError::Internal {
+                reason: error.to_string(),
             })?;
 
         Ok(RenderToolOutputResult {
@@ -1889,10 +1896,10 @@ mod tests {
             actor(),
             ToolOutputSettingsScope::workspace().for_tool(tool_result.tool_id.clone()),
             ToolOutputOverrides {
-                include_policy: Some(true),
+                granularity: Some(atelia_core::ToolOutputGranularity::Summary),
                 ..ToolOutputOverrides::default()
             },
-            "Surface policy fields when rendering stored results".to_string(),
+            "Compact rendered stored results".to_string(),
         )
         .expect("tool output settings update should succeed");
 
@@ -1907,6 +1914,8 @@ mod tests {
                 format: OutputFormat::Json,
             })
             .expect("rendering should succeed");
+        let rendered_json: serde_json::Value =
+            serde_json::from_str(&rendered.rendered_output.body).expect("rendered json");
 
         assert_eq!(rendered.rendered_output.format, OutputFormat::Json);
         assert_eq!(rendered.tool_result.tool_result_id, tool_result_id);
@@ -1914,9 +1923,14 @@ mod tests {
         assert_eq!(rendered.tool_result.job_id, job_id);
         assert_eq!(rendered.tool_result.repository_id, repository_id);
         assert_eq!(rendered.tool_result.content_type, "application/json");
-        assert!(rendered.rendered_output.body.contains("policy.state"));
-        assert!(rendered.rendered_output.body.contains("render tool output"));
-        assert!(rendered.rendered_output.fallback_reason.is_none());
+        assert_eq!(rendered_json["fields"].as_array().unwrap().len(), 1);
+        assert_eq!(rendered_json["fields"][0]["key"], "summary");
+        assert!(rendered
+            .rendered_output
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("render policy compacted output"));
         assert_eq!(rendered.truncation, tool_result.truncation.clone());
         let _ = fs::remove_dir_all(root);
     }
@@ -2413,6 +2427,60 @@ mod tests {
         assert_eq!(second.jobs.len(), 1);
         assert_ne!(second.jobs[0].id, first.jobs[0].id);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_uses_tool_output_settings_for_runtime_rendering() {
+        let svc = ready_service();
+        let root = test_repo_dir("submit-job-tool-output-settings");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "submit-job-tool-output-settings".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        svc.update_tool_output_defaults(
+            actor(),
+            ToolOutputSettingsScope::repository(repository.id.clone())
+                .for_tool(SECRETARY_ECHO_TOOL_ID),
+            ToolOutputOverrides {
+                granularity: Some(atelia_core::ToolOutputGranularity::Summary),
+                ..ToolOutputOverrides::default()
+            },
+            "Compact secretary echo runtime output".to_string(),
+        )
+        .expect("tool output settings update should succeed");
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "summarize the runtime output".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("submit should succeed");
+        let rendered = receipt
+            .rendered_output
+            .expect("rendered output should exist");
+
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("render policy compacted output"));
+        assert!(rendered.body.contains("summary"));
+        assert!(!rendered
+            .body
+            .lines()
+            .any(|line| line.starts_with("  goal,")));
         let _ = fs::remove_dir_all(root);
     }
 
