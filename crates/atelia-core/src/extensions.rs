@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::net::Ipv6Addr;
+use std::str::FromStr;
 
 pub const EXTENSION_MANIFEST_SCHEMA: &str = "atelia.extension.v1";
 pub const EXTENSION_RPC_PROTOCOL: &str = "atelia-extension-rpc.v1";
@@ -871,7 +873,7 @@ fn validate_tool_output(manifest: &ExtensionManifest) -> ExtensionValidationResu
     let mut seen_tool_output_ids = BTreeSet::new();
 
     for tool_output in &manifest.tool_output {
-        require_non_empty("tool_output.tool_id", &tool_output.tool_id)?;
+        require_trimmed_non_empty("tool_output.tool_id", &tool_output.tool_id)?;
         if !seen_tool_output_ids.insert(tool_output.tool_id.clone()) {
             return Err(ExtensionValidationError::DuplicateToolOutputDeclaration {
                 tool_id: tool_output.tool_id.clone(),
@@ -927,7 +929,7 @@ fn validate_hooks(
     let mut seen_hook_ids = BTreeSet::new();
 
     for hook in &manifest.hooks {
-        require_non_empty("hooks.hook_id", &hook.hook_id)?;
+        require_trimmed_non_empty("hooks.hook_id", &hook.hook_id)?;
         if !seen_hook_ids.insert(hook.hook_id.clone()) {
             return Err(ExtensionValidationError::DuplicateHookDeclaration {
                 hook_id: hook.hook_id.clone(),
@@ -990,7 +992,7 @@ fn validate_webhooks(
     let mut seen_webhook_ids = BTreeSet::new();
 
     for webhook in &manifest.webhooks {
-        require_non_empty("webhooks.webhook_id", &webhook.webhook_id)?;
+        require_trimmed_non_empty("webhooks.webhook_id", &webhook.webhook_id)?;
         if !seen_webhook_ids.insert(webhook.webhook_id.clone()) {
             return Err(ExtensionValidationError::DuplicateWebhookDeclaration {
                 webhook_id: webhook.webhook_id.clone(),
@@ -1137,6 +1139,12 @@ fn validate_https_endpoint_authority(
                 reason: "must include a host".to_string(),
             });
         }
+        if Ipv6Addr::from_str(host).is_err() {
+            return Err(ExtensionValidationError::InvalidField {
+                field,
+                reason: "must contain a valid IPv6 host inside brackets".to_string(),
+            });
+        }
         if !remainder.is_empty() {
             let Some(port) = remainder.strip_prefix(':') else {
                 return Err(ExtensionValidationError::InvalidField {
@@ -1260,6 +1268,17 @@ fn require_non_empty(field: &'static str, value: &str) -> ExtensionValidationRes
     } else {
         Ok(())
     }
+}
+
+fn require_trimmed_non_empty(field: &'static str, value: &str) -> ExtensionValidationResult<()> {
+    require_non_empty(field, value)?;
+    if value.trim() != value {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must not contain surrounding whitespace".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn has_non_empty_trimmed(value: Option<&str>) -> bool {
@@ -2588,6 +2607,97 @@ mod tests {
         legacy_missing_endpoint
             .validate(&ManifestValidationPolicy::default())
             .unwrap();
+    }
+
+    #[test]
+    fn webhook_endpoints_reject_invalid_bracketed_ipv6_hosts() {
+        let mut webhooks = manifest("com.example.webhook-bracketed-host");
+        webhooks.types.push(ExtensionKind::WebhookReceiver);
+        webhooks.webhooks.push(ExtensionWebhookDefinition {
+            endpoint: Some("https://[foo]/webhook".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        let err = webhooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "webhooks.endpoint",
+                ..
+            }
+        ));
+
+        let mut ipv6_webhook = manifest("com.example.webhook-ipv6");
+        ipv6_webhook.types.push(ExtensionKind::WebhookReceiver);
+        ipv6_webhook.webhooks.push(ExtensionWebhookDefinition {
+            endpoint: Some("https://[2001:db8::1]/webhook".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        ipv6_webhook
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn whitespace_padded_duplicate_declaration_ids_are_rejected() {
+        let mut tool_output = manifest("com.example.whitespace-tool-output");
+        tool_output.types.push(ExtensionKind::ToolOutputCustomizer);
+        tool_output.tool_output.push(tool_output_definition("ping"));
+        tool_output
+            .tool_output
+            .push(tool_output_definition(" ping "));
+
+        let err = tool_output
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "tool_output.tool_id",
+                ..
+            }
+        ));
+
+        let mut hooks = manifest("com.example.whitespace-hooks");
+        hooks.types.push(ExtensionKind::HookProvider);
+        hooks.hooks.push(hook_definition("hk_review"));
+        hooks.hooks.push(ExtensionHookDefinition {
+            hook_id: " hk_review ".to_string(),
+            ..hook_definition("hk_review")
+        });
+
+        let err = hooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "hooks.hook_id",
+                ..
+            }
+        ));
+
+        let mut webhooks = manifest("com.example.whitespace-webhooks");
+        webhooks.types.push(ExtensionKind::WebhookReceiver);
+        webhooks.webhooks.push(webhook_definition("wh_review"));
+        webhooks.webhooks.push(ExtensionWebhookDefinition {
+            webhook_id: " wh_review ".to_string(),
+            ..webhook_definition("wh_review")
+        });
+
+        let err = webhooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "webhooks.webhook_id",
+                ..
+            }
+        ));
     }
 
     #[test]
