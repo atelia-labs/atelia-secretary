@@ -31,6 +31,7 @@ enum Route {
     RollbackExtension { extension_id: String },
     ApplyBlocklist,
     ListBlocklist,
+    RenderToolOutput,
     Unsupported,
 }
 
@@ -60,6 +61,7 @@ fn route_for_path(path: &str) -> Route {
         "/v1/extensions/list" => Route::ListExtensions,
         "/v1/extensions/blocklist/apply" => Route::ApplyBlocklist,
         "/v1/extensions/blocklist/list" => Route::ListBlocklist,
+        "/v1/tool-results:render" => Route::RenderToolOutput,
         _ => Route::Unsupported,
     }
 }
@@ -116,6 +118,21 @@ struct ListRepositoriesRequestPayload {
     page_token: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ToolResultRefPayload {
+    tool_result_id: String,
+    tool_invocation_id: String,
+    job_id: String,
+    repository_id: String,
+    content_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenderToolOutputRequestPayload {
+    tool_result: ToolResultRefPayload,
+    format: String,
+}
+
 pub fn listen_addr() -> Result<(SocketAddr, bool)> {
     let raw_addr = std::env::var(LISTEN_ADDR_ENV)
         .ok()
@@ -162,6 +179,34 @@ fn parse_list_repositories_payload(
         trust_state: parse_trust_state(payload.trust_state)?,
         page_size: payload.page_size,
         page_token: payload.page_token,
+    })
+}
+
+fn parse_output_format(value: String) -> Result<rpc::RpcOutputFormat, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "toon" => Ok(rpc::RpcOutputFormat::Toon),
+        "json" => Ok(rpc::RpcOutputFormat::Json),
+        "text" => Ok(rpc::RpcOutputFormat::Text),
+        unknown => Err(format!("unknown render format '{unknown}'")),
+    }
+}
+
+fn parse_tool_result_ref_payload(payload: ToolResultRefPayload) -> rpc::ToolResultRef {
+    rpc::ToolResultRef {
+        tool_result_id: payload.tool_result_id,
+        tool_invocation_id: payload.tool_invocation_id,
+        job_id: payload.job_id,
+        repository_id: payload.repository_id,
+        content_type: payload.content_type,
+    }
+}
+
+fn parse_render_tool_output_payload(
+    payload: RenderToolOutputRequestPayload,
+) -> Result<rpc::RenderToolOutputRequest, String> {
+    Ok(rpc::RenderToolOutputRequest {
+        tool_result: parse_tool_result_ref_payload(payload.tool_result),
+        format: parse_output_format(payload.format)?,
     })
 }
 
@@ -284,6 +329,35 @@ fn serialize_list_blocklist_response(response: rpc::ListBlocklistResponse) -> se
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "entries": response.entries,
+    })
+}
+
+fn serialize_output_format(format: &rpc::RpcOutputFormat) -> &'static str {
+    match format {
+        rpc::RpcOutputFormat::Toon => "toon",
+        rpc::RpcOutputFormat::Json => "json",
+        rpc::RpcOutputFormat::Text => "text",
+    }
+}
+
+fn serialize_tool_result_ref(tool_result: &rpc::ToolResultRef) -> serde_json::Value {
+    serde_json::json!({
+        "tool_result_id": tool_result.tool_result_id,
+        "tool_invocation_id": tool_result.tool_invocation_id,
+        "job_id": tool_result.job_id,
+        "repository_id": tool_result.repository_id,
+        "content_type": tool_result.content_type,
+    })
+}
+
+fn serialize_render_tool_output_response(
+    response: rpc::RenderToolOutputResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "tool_result": serialize_tool_result_ref(&response.tool_result),
+        "format": serialize_output_format(&response.format),
+        "rendered_output": response.rendered_output,
     })
 }
 
@@ -480,6 +554,48 @@ async fn dispatch_list_extensions(state: RpcServerState, request: Request<Body>)
     }
 }
 
+async fn dispatch_render_tool_output(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<RenderToolOutputRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let parsed = match parse_render_tool_output_payload(payload) {
+        Ok(request) => request,
+        Err(reason) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                reason,
+                false,
+                next_state,
+            );
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.render_tool_output(parsed) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_render_tool_output_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
 async fn dispatch_extension_status(
     state: RpcServerState,
     extension_id: String,
@@ -587,7 +703,6 @@ async fn dispatch_list_blocklist(state: RpcServerState, request: Request<Body>) 
         }
     }
 }
-
 async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Body>) -> Response {
     let method = request.method().clone();
     let path = request.uri().path();
@@ -671,6 +786,26 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                 response
             } else {
                 dispatch_list_extensions(state, request).await
+            }
+        }
+        Route::RenderToolOutput => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_render_tool_output(state, request).await
             }
         }
         Route::ExtensionStatus { extension_id } => {
@@ -789,6 +924,7 @@ pub fn build_router(rpc_server: RpcServerState) -> Router {
         .route("/v1/extensions/blocklist/apply", any(dispatch_route))
         .route("/v1/extensions/blocklist/list", any(dispatch_route))
         .route("/v1/extensions/*path", any(dispatch_route))
+        .route("/v1/tool-results:render", any(dispatch_route))
         .fallback(fallback_route)
         .with_state(rpc_server)
 }
@@ -827,11 +963,16 @@ mod tests {
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+    use std::fs;
     use std::io::ErrorKind;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, MutexGuard,
+    };
     use tower::util::ServiceExt;
 
     static LISTEN_ADDR_ENV_MUTEX: Mutex<()> = Mutex::new(());
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct ListenAddrEnvGuard {
         previous: Option<OsString>,
@@ -856,6 +997,19 @@ mod tests {
                 None => std::env::remove_var(LISTEN_ADDR_ENV),
             }
         }
+    }
+
+    fn test_repo_dir(name: &str) -> std::path::PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "atelia-transport-test-{}-{}-{name}",
+            std::process::id(),
+            id
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        dir
     }
 
     fn ready_rpc_server() -> RpcServerState {
@@ -999,6 +1153,10 @@ mod tests {
         assert_eq!(
             route_for_path("/v1/extensions/a/b/rollback"),
             Route::Unsupported
+        );
+        assert_eq!(
+            route_for_path("/v1/tool-results:render"),
+            Route::RenderToolOutput
         );
         assert_eq!(route_for_path("/unknown"), Route::Unsupported);
         assert_eq!(route_for_path("/v1/health/"), Route::Unsupported);
@@ -1199,6 +1357,102 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn render_tool_output_endpoint_returns_rendered_output() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("render-tool-output");
+        let request_json = {
+            let mut server = rpc_server.write().await;
+            let repository = server
+                .service_mut()
+                .register_repository(service::RegisterRepositoryRequest {
+                    display_name: "render-tool-output".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    trust_state: atelia_core::RepositoryTrustState::Trusted,
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("repository registration should succeed");
+
+            let receipt = server
+                .service_mut()
+                .submit_job(service::SubmitJobRequest {
+                    requester: atelia_core::Actor::Agent {
+                        id: "agent:render".to_string(),
+                        display_name: Some("Render Test".to_string()),
+                    },
+                    repository_id: repository.id.clone(),
+                    kind: atelia_core::JobKind::Read,
+                    goal: "render tool output".to_string(),
+                    resource_scope: None,
+                    requested_capabilities: Vec::new(),
+                    idempotency_key: None,
+                })
+                .expect("job submission should succeed");
+            let tool_result = receipt.tool_result.expect("tool result should be stored");
+
+            server
+                .service_mut()
+                .update_tool_output_defaults(
+                    atelia_core::Actor::Agent {
+                        id: "agent:render".to_string(),
+                        display_name: Some("Render Test".to_string()),
+                    },
+                    atelia_core::ToolOutputSettingsScope::workspace()
+                        .for_tool(tool_result.tool_id.clone()),
+                    atelia_core::ToolOutputOverrides {
+                        include_policy: Some(true),
+                        ..atelia_core::ToolOutputOverrides::default()
+                    },
+                    "Expose policy fields in rendered tool output".to_string(),
+                )
+                .expect("tool output settings update should succeed");
+
+            serde_json::json!({
+                "tool_result": {
+                    "tool_result_id": tool_result.id.as_str(),
+                    "tool_invocation_id": tool_result.invocation_id.as_str(),
+                    "job_id": receipt.job.id.as_str(),
+                    "repository_id": repository.id.as_str(),
+                    "content_type": "application/json",
+                },
+                "format": "json",
+            })
+        };
+
+        let app = build_router(rpc_server.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/tool-results:render")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&request_json).expect("request json"),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["data"]["format"], "json");
+        assert_eq!(
+            payload["data"]["tool_result"]["content_type"],
+            "application/json"
+        );
+        assert!(payload["data"]["rendered_output"]
+            .as_str()
+            .expect("rendered output string")
+            .contains("policy.state"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

@@ -41,9 +41,9 @@ diagnostic metadata.
 ## Service Surface
 
 This table is the required service contract, not a description of the current
-protobuf implementation. The current proto may expose only
-`SecretaryService.Health`; the other RPC groups are planned contract surface and
-must be added before clients or agents depend on them.
+protobuf implementation. The current daemon already exposes the health,
+repository, job, policy, tool-output settings, and `RenderToolOutput` groups;
+`WatchEvents` and `GetProjectStatus` are still planned contract surface.
 
 Required RPC groups:
 

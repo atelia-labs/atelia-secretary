@@ -12,7 +12,8 @@ use crate::service::{
     ListRepositoriesRequest as ServiceListRepositoriesRequest,
     ListToolOutputSettingsHistoryRequest as ServiceListToolOutputSettingsHistoryRequest,
     ProtocolMetadata as ServiceProtocolMetadata,
-    RegisterRepositoryRequest as ServiceRegisterRepositoryRequest, SecretaryService, ServiceError,
+    RegisterRepositoryRequest as ServiceRegisterRepositoryRequest,
+    RenderToolOutputRequest as ServiceRenderToolOutputRequest, SecretaryService, ServiceError,
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
 };
 use atelia_core::{
@@ -22,7 +23,7 @@ use atelia_core::{
     OversizeOutputPolicy, PathScope, PolicyOutcome, ProjectId, RenderOptions, RepositoryId,
     RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier, RollbackExtensionRequest,
     StoreError, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
-    ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity,
+    ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity, ToolResultId,
 };
 use std::convert::TryFrom;
 
@@ -280,6 +281,27 @@ impl SecretaryRpcServer {
             metadata: self.metadata(),
             job,
             cancellation,
+        })
+    }
+
+    pub fn render_tool_output(
+        &self,
+        request: RenderToolOutputRequest,
+    ) -> RpcResult<RenderToolOutputResponse> {
+        let request = parse_render_tool_output_request(request)?;
+        let rendered = self
+            .service
+            .render_tool_output(ServiceRenderToolOutputRequest {
+                tool_result_id: request.tool_result_id,
+                repository_id: None,
+                format: request.format,
+            })?;
+
+        Ok(RenderToolOutputResponse {
+            metadata: self.metadata(),
+            tool_result: tool_result_ref_from_canonical(rendered.tool_result),
+            format: RpcOutputFormat::from(rendered.rendered_output.format),
+            rendered_output: rendered.rendered_output.body,
         })
     }
 
@@ -933,6 +955,20 @@ pub struct ListBlocklistResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderToolOutputRequest {
+    pub tool_result: ToolResultRef,
+    pub format: RpcOutputFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderToolOutputResponse {
+    pub metadata: ProtocolMetadata,
+    pub tool_result: ToolResultRef,
+    pub format: RpcOutputFormat,
+    pub rendered_output: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultRef {
     pub tool_result_id: String,
     pub tool_invocation_id: String,
@@ -1059,18 +1095,50 @@ fn parse_non_empty_field(field_name: &str, value: String) -> RpcResult<String> {
 }
 
 fn validate_tool_result_ref(tool_result: ToolResultRef) -> RpcResult<ToolResultRef> {
-    if tool_result.tool_result_id.trim().is_empty()
-        && tool_result.tool_invocation_id.trim().is_empty()
-        && tool_result.job_id.trim().is_empty()
-        && tool_result.repository_id.trim().is_empty()
-        && tool_result.content_type.trim().is_empty()
-    {
+    if tool_result.tool_result_id.trim().is_empty() {
         return Err(RpcError::invalid_argument(
-            "tool_result must include at least one identifier",
+            "tool_result.tool_result_id must not be empty",
         ));
     }
 
     Ok(tool_result)
+}
+
+fn tool_result_ref_from_canonical(
+    tool_result: crate::service::CanonicalToolResultRef,
+) -> ToolResultRef {
+    ToolResultRef {
+        tool_result_id: tool_result.tool_result_id.as_str().to_string(),
+        tool_invocation_id: tool_result.tool_invocation_id.as_str().to_string(),
+        job_id: tool_result.job_id.as_str().to_string(),
+        repository_id: tool_result.repository_id.as_str().to_string(),
+        content_type: tool_result.content_type,
+    }
+}
+
+fn parse_tool_result_id(value: &str) -> RpcResult<ToolResultId> {
+    ToolResultId::try_from_string(value.to_string()).map_err(|_| {
+        RpcError::invalid_argument("tool_result.tool_result_id must be a valid tool result id")
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ParsedRenderToolOutputRequest {
+    tool_result_id: ToolResultId,
+    format: OutputFormat,
+}
+
+fn parse_render_tool_output_request(
+    request: RenderToolOutputRequest,
+) -> RpcResult<ParsedRenderToolOutputRequest> {
+    let tool_result = validate_tool_result_ref(request.tool_result)?;
+    let tool_result_id = parse_tool_result_id(&tool_result.tool_result_id)?;
+    let format = request.format.try_into()?;
+
+    Ok(ParsedRenderToolOutputRequest {
+        tool_result_id,
+        format,
+    })
 }
 
 fn parse_list_repositories_request(
@@ -1784,6 +1852,12 @@ mod tests {
             .contains(&"repositories.v1".to_string()));
         assert!(response.capabilities.contains(&"jobs.v1".to_string()));
         assert!(response.capabilities.contains(&"policy.v1".to_string()));
+        assert!(response
+            .capabilities
+            .contains(&"tool_output_settings.v1".to_string()));
+        assert!(response
+            .capabilities
+            .contains(&"tool_output_render.v1".to_string()));
     }
 
     #[test]
@@ -1820,6 +1894,151 @@ mod tests {
         assert!(response
             .capabilities
             .contains(&"tool_output_settings.v1".to_string()));
+        assert!(response
+            .capabilities
+            .contains(&"tool_output_render.v1".to_string()));
+    }
+
+    #[test]
+    fn render_tool_output_returns_rendered_stored_tool_result() {
+        let mut server = ready_server();
+        let root = test_repo_dir("render-tool-output");
+        let repository = server
+            .service_mut()
+            .register_repository(crate::service::RegisterRepositoryRequest {
+                display_name: "render-tool-output".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("repository registration should succeed");
+
+        let receipt = server
+            .service_mut()
+            .submit_job(crate::service::SubmitJobRequest {
+                requester: actor_record(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "render tool output".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("job submission should succeed");
+        let tool_result = receipt.tool_result.expect("tool result should be stored");
+
+        server
+            .service_mut()
+            .update_tool_output_defaults(
+                actor_record(),
+                ToolOutputSettingsScope::workspace().for_tool(tool_result.tool_id.clone()),
+                ToolOutputOverrides {
+                    include_policy: Some(true),
+                    ..ToolOutputOverrides::default()
+                },
+                "Expose policy fields in rendered tool output".to_string(),
+            )
+            .expect("tool output settings update should succeed");
+
+        let tool_result_id = tool_result.id.as_str().to_string();
+        let tool_invocation_id = tool_result.invocation_id.as_str().to_string();
+        let job_id = receipt.job.id.as_str().to_string();
+        let repository_id = repository.id.as_str().to_string();
+        let response = server
+            .render_tool_output(RenderToolOutputRequest {
+                tool_result: ToolResultRef {
+                    tool_result_id: tool_result_id.clone(),
+                    tool_invocation_id: tool_invocation_id.clone(),
+                    job_id: job_id.clone(),
+                    repository_id: repository_id.clone(),
+                    content_type: "application/json".to_string(),
+                },
+                format: RpcOutputFormat::Json,
+            })
+            .expect("rendering should succeed");
+
+        assert_eq!(response.format, RpcOutputFormat::Json);
+        assert_eq!(response.tool_result.tool_result_id, tool_result_id);
+        assert_eq!(response.tool_result.tool_invocation_id, tool_invocation_id);
+        assert_eq!(response.tool_result.job_id, job_id);
+        assert_eq!(response.tool_result.repository_id, repository_id);
+        assert_eq!(response.tool_result.content_type, "application/json");
+        assert!(response.rendered_output.contains("policy.state"));
+        assert!(response.rendered_output.contains("render tool output"));
+    }
+
+    #[test]
+    fn render_tool_output_canonicalizes_mismatched_request_ref_fields() {
+        let mut server = ready_server();
+        let root = test_repo_dir("render-tool-output-canonicalize");
+        let repository = server
+            .service_mut()
+            .register_repository(crate::service::RegisterRepositoryRequest {
+                display_name: "render-tool-output-canonicalize".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("repository registration should succeed");
+
+        let receipt = server
+            .service_mut()
+            .submit_job(crate::service::SubmitJobRequest {
+                requester: actor_record(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "render tool output".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("job submission should succeed");
+        let tool_result = receipt.tool_result.expect("tool result should be stored");
+
+        let wrong_repository = RepositoryId::new();
+        server
+            .service_mut()
+            .update_tool_output_defaults(
+                actor_record(),
+                ToolOutputSettingsScope::repository(repository.id.clone())
+                    .for_tool(tool_result.tool_id.clone()),
+                ToolOutputOverrides {
+                    include_policy: Some(true),
+                    ..ToolOutputOverrides::default()
+                },
+                "Expose policy fields in rendered tool output".to_string(),
+            )
+            .expect("tool output settings update should succeed");
+
+        let tool_result_id = tool_result.id.as_str().to_string();
+        let canonical_tool_invocation_id = tool_result.invocation_id.as_str().to_string();
+        let canonical_job_id = receipt.job.id.as_str().to_string();
+        let canonical_repository_id = repository.id.as_str().to_string();
+        let response = server
+            .render_tool_output(RenderToolOutputRequest {
+                tool_result: ToolResultRef {
+                    tool_result_id: tool_result_id.clone(),
+                    tool_invocation_id: atelia_core::ToolInvocationId::new().as_str().to_string(),
+                    job_id: JobId::new().as_str().to_string(),
+                    repository_id: wrong_repository.as_str().to_string(),
+                    content_type: "text/plain".to_string(),
+                },
+                format: RpcOutputFormat::Json,
+            })
+            .expect("rendering should succeed");
+
+        assert_eq!(response.tool_result.tool_result_id, tool_result_id);
+        assert_eq!(
+            response.tool_result.tool_invocation_id,
+            canonical_tool_invocation_id
+        );
+        assert_eq!(response.tool_result.job_id, canonical_job_id);
+        assert_eq!(response.tool_result.repository_id, canonical_repository_id);
+        assert_eq!(response.tool_result.content_type, "application/json");
+        assert!(response.rendered_output.contains("policy.state"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
