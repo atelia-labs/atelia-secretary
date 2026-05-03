@@ -308,7 +308,7 @@ impl LocalArtifactStore {
 
         let write_result = (|| {
             let _guard = ScopeIndexGuard::acquire(&dir)?;
-            let mut records = self.read_scope_records(&dir)?;
+            let mut records = self.read_scope_records_unlocked(&dir)?;
             records.push(index_record);
             self.write_scope_records_unlocked(&dir, records)
         })();
@@ -412,7 +412,7 @@ impl LocalArtifactStore {
 
             {
                 let _guard = ScopeIndexGuard::acquire(&scope_dir)?;
-                let mut scope_records = self.read_scope_records(&scope_dir)?;
+                let mut scope_records = self.read_scope_records_unlocked(&scope_dir)?;
                 for record in &mut scope_records {
                     if !target_ids.contains(&record.id) {
                         continue;
@@ -540,6 +540,14 @@ impl LocalArtifactStore {
     }
 
     fn read_scope_records(&self, scope_dir: &Path) -> ArtifactResult<Vec<LocalArtifactRecord>> {
+        let _guard = ScopeIndexGuard::acquire(scope_dir)?;
+        self.read_scope_records_unlocked(scope_dir)
+    }
+
+    fn read_scope_records_unlocked(
+        &self,
+        scope_dir: &Path,
+    ) -> ArtifactResult<Vec<LocalArtifactRecord>> {
         let index_path = scope_dir.join(DEFAULT_ARTIFACT_INDEX_FILE);
         if !index_path.exists() {
             return Ok(Vec::new());
@@ -608,23 +616,23 @@ impl LocalArtifactStore {
     }
     pub fn delete_artifact(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
         let path = Path::new(&output_ref.uri);
-        if !path.exists() {
+        let Some(parent) = path.parent() else {
             return Ok(());
-        }
+        };
 
         let root = self.canonical_root_dir().map_err(ArtifactError::Io)?;
 
-        let resolved_path = match path.canonicalize() {
+        let canonical_parent = match parent.canonicalize() {
             Ok(path) => path,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(ArtifactError::Io(error)),
         };
 
-        if !resolved_path.starts_with(&root) {
+        if !canonical_parent.starts_with(&root) {
             return Ok(());
         }
 
-        match fs::remove_file(resolved_path) {
+        match fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -1098,7 +1106,7 @@ fn update_record_bytes(
 ) -> ArtifactResult<()> {
     let scope_dir = store.config.root_dir.join(sanitize_segment(scope)?);
     let _guard = ScopeIndexGuard::acquire(&scope_dir)?;
-    let mut records = store.read_scope_records(&scope_dir)?;
+    let mut records = store.read_scope_records_unlocked(&scope_dir)?;
     let mut needs_persist = false;
     let mut found = false;
 
@@ -1136,7 +1144,7 @@ fn remove_record_bytes(
 ) -> ArtifactResult<()> {
     let scope_dir = store.config.root_dir.join(sanitize_segment(scope)?);
     let _guard = ScopeIndexGuard::acquire(&scope_dir)?;
-    let mut records = store.read_scope_records(&scope_dir)?;
+    let mut records = store.read_scope_records_unlocked(&scope_dir)?;
     let mut found = false;
     records.retain(|record| {
         let is_target = record.id == *id;
@@ -1264,6 +1272,8 @@ mod tests {
     use super::*;
     use crate::domain::{LedgerTimestamp, ToolInvocationId, ToolResultId, ToolResultStatus};
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
@@ -1402,6 +1412,39 @@ mod tests {
         store.delete_artifact(&forged_output_ref).unwrap();
 
         assert!(outside_artifact.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_artifact_removes_symlink_entry_without_touching_target() {
+        let root = temp_root("delete-symlink");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let target_path = scope_dir.join("target.artifact");
+        fs::write(&target_path, b"kept").unwrap();
+
+        let symlink_path = scope_dir.join("linked.artifact");
+        symlink(&target_path, &symlink_path).unwrap();
+        assert!(symlink_path.exists());
+        assert!(fs::symlink_metadata(&symlink_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let output_ref = OutputRef {
+            id: OutputRefId::new(),
+            uri: symlink_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("linked".to_string()),
+            digest: None,
+        };
+
+        store.delete_artifact(&output_ref).unwrap();
+
+        assert!(!symlink_path.exists());
+        assert!(target_path.exists());
     }
 
     #[test]
@@ -2175,6 +2218,42 @@ mod tests {
         assert!(remaining_entries
             .iter()
             .any(|entry| entry.to_string_lossy() == ".index.lock"));
+    }
+
+    #[test]
+    fn read_scope_records_blocks_until_scope_lock_is_released() {
+        let root = temp_root("read-lock-held");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let reference = store
+            .write_bytes("repo_example", "search output", "text/plain", b"hello")
+            .unwrap();
+        assert!(Path::new(&reference.uri).exists());
+
+        let held_lock = hold_index_lock(&scope_dir);
+        let started = Arc::new(Barrier::new(2));
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_started = Arc::clone(&started);
+        let worker_finished = Arc::clone(&finished);
+        let worker_store = store.clone();
+
+        let handle = std::thread::spawn(move || {
+            worker_started.wait();
+            let records = worker_store.list_records(Some("repo_example")).unwrap();
+            worker_finished.store(true, AtomicOrdering::SeqCst);
+            records
+        });
+
+        started.wait();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!finished.load(AtomicOrdering::SeqCst));
+
+        drop(held_lock);
+        let records = handle.join().unwrap();
+        assert_eq!(1, records.len());
+        assert_eq!(reference.id, records[0].id);
     }
 
     #[cfg(not(unix))]
