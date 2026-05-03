@@ -157,6 +157,8 @@ pub struct TruncationMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OutputRef {
     pub id: OutputRefId,
+    #[serde(default)]
+    pub uri: String,
     pub media_type: String,
     pub label: Option<String>,
     pub digest: Option<String>,
@@ -165,6 +167,8 @@ pub struct OutputRef {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactRef {
     pub id: ArtifactRefId,
+    #[serde(default)]
+    pub uri: String,
     pub media_type: String,
     pub label: Option<String>,
     pub digest: Option<String>,
@@ -820,6 +824,7 @@ mod tests {
     use serde::de::{value::StrDeserializer, IntoDeserializer};
     use serde::ser::{Error as SerError, Impossible, Serialize, Serializer};
     use serde::Deserialize;
+    use serde_json::from_str;
     use std::fmt;
 
     #[derive(Debug)]
@@ -1109,6 +1114,34 @@ mod tests {
         assert_serde_record::<ToolInvocation>();
         assert_serde_record::<ToolResult>();
         assert_serde_record::<AuditRecord>();
+    }
+
+    #[test]
+    fn output_ref_deserializes_without_uri() {
+        let id = OutputRefId::new();
+        let json = format!(
+            r#"{{"id":"{}","media_type":"text/plain","label":null}}"#,
+            id.as_str()
+        );
+        let output_ref: OutputRef = from_str(&json).unwrap();
+
+        assert_eq!(id, output_ref.id);
+        assert_eq!("", output_ref.uri);
+        assert_eq!("text/plain", output_ref.media_type);
+    }
+
+    #[test]
+    fn artifact_ref_deserializes_without_uri() {
+        let id = ArtifactRefId::new();
+        let json = format!(
+            r#"{{"id":"{}","media_type":"application/json","digest":null}}"#,
+            id.as_str()
+        );
+        let artifact_ref: ArtifactRef = from_str(&json).unwrap();
+
+        assert_eq!(id, artifact_ref.id);
+        assert_eq!("", artifact_ref.uri);
+        assert_eq!("application/json", artifact_ref.media_type);
     }
 
     #[test]

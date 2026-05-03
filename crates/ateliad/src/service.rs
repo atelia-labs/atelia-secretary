@@ -65,7 +65,7 @@ pub struct ProtocolMetadata {
 // Service errors
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 #[allow(dead_code)]
 pub enum ServiceError {
     Conflict { reason: String },
