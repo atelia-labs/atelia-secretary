@@ -18,9 +18,17 @@ use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
 const WRITE_FILE_TMP_PREFIX: &str = ".atelia-artifact-tmp";
 static WRITE_FILE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -637,7 +645,9 @@ struct ScopeIndexGuard {
     #[cfg(unix)]
     _file: fs::File,
     #[cfg(not(unix))]
-    lock_path: PathBuf,
+    _file: fs::File,
+    #[cfg(not(unix))]
+    _lock_path: PathBuf,
 }
 
 impl ScopeIndexGuard {
@@ -665,7 +675,65 @@ impl ScopeIndexGuard {
             Ok(Self { _file: file })
         }
 
-        #[cfg(not(unix))]
+        #[cfg(all(not(unix), windows))]
+        {
+            const LOCK_RETRY_ATTEMPTS: usize = 8;
+            let mut backoff = Duration::from_millis(5);
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&lock_path)?;
+
+            file.set_len(1)?;
+
+            for attempt in 0..LOCK_RETRY_ATTEMPTS {
+                match try_lock_scope_index_file(&file) {
+                    Ok(()) => {
+                        return Ok(Self {
+                            _file: file,
+                            _lock_path: lock_path,
+                        })
+                    }
+                    Err(error)
+                        if is_scope_index_lock_contention(&error)
+                            && attempt + 1 < LOCK_RETRY_ATTEMPTS =>
+                    {
+                        std::thread::sleep(backoff);
+                        let next_backoff_ms = (backoff.as_millis() as u64).saturating_mul(2);
+                        backoff = Duration::from_millis(next_backoff_ms);
+                    }
+                    Err(error) if is_scope_index_lock_contention(&error) => {
+                        return Err(io::Error::new(
+                            ErrorKind::WouldBlock,
+                            format!(
+                                "failed to acquire scope index lock at {}: lock is held",
+                                lock_path.display()
+                            ),
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!(
+                                "failed to acquire scope index lock at {}: {error}",
+                                lock_path.display()
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            Err(io::Error::new(
+                ErrorKind::WouldBlock,
+                format!(
+                    "failed to acquire scope index lock at {}: lock is held",
+                    lock_path.display()
+                ),
+            ))
+        }
+
+        #[cfg(all(not(unix), not(windows)))]
         {
             const LOCK_RETRY_ATTEMPTS: usize = 8;
             let mut backoff = Duration::from_millis(5);
@@ -676,20 +744,25 @@ impl ScopeIndexGuard {
                     .create_new(true)
                     .open(&lock_path)
                 {
-                    Ok(_) => return Ok(Self { lock_path }),
-                    Err(e)
-                        if e.kind() == ErrorKind::AlreadyExists
+                    Ok(file) => {
+                        return Ok(Self {
+                            _file: file,
+                            _lock_path: lock_path,
+                        })
+                    }
+                    Err(error)
+                        if error.kind() == ErrorKind::AlreadyExists
                             && attempt + 1 < LOCK_RETRY_ATTEMPTS =>
                     {
                         std::thread::sleep(backoff);
                         let next_backoff_ms = (backoff.as_millis() as u64).saturating_mul(2);
                         backoff = Duration::from_millis(next_backoff_ms);
                     }
-                    Err(e) => {
+                    Err(error) => {
                         return Err(io::Error::new(
-                            e.kind(),
+                            error.kind(),
                             format!(
-                                "failed to acquire scope index lock at {}: {e}",
+                                "failed to acquire scope index lock at {}: {error}",
                                 lock_path.display()
                             ),
                         ));
@@ -708,10 +781,42 @@ impl ScopeIndexGuard {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn try_lock_scope_index_file(file: &fs::File) -> io::Result<()> {
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn is_scope_index_lock_contention(error: &io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::WouldBlock)
+        || matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32
+                    || code == windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32
+        )
+}
+
+#[cfg(all(not(unix), not(windows)))]
 impl Drop for ScopeIndexGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.lock_path);
+        let _ = fs::remove_file(&self._lock_path);
     }
 }
 
@@ -974,6 +1079,16 @@ fn rollback_artifact_writes(writer: &impl ArtifactWriter, scope: &str, output_re
     }
 }
 
+fn missing_scope_record_error(scope_dir: &Path, id: &OutputRefId) -> ArtifactError {
+    ArtifactError::InvalidIndex {
+        path: scope_dir
+            .join(DEFAULT_ARTIFACT_INDEX_FILE)
+            .to_string_lossy()
+            .into_owned(),
+        reason: format!("missing index row for artifact {}", id.as_str()),
+    }
+}
+
 fn update_record_bytes(
     store: &LocalArtifactStore,
     scope: &str,
@@ -985,9 +1100,11 @@ fn update_record_bytes(
     let _guard = ScopeIndexGuard::acquire(&scope_dir)?;
     let mut records = store.read_scope_records(&scope_dir)?;
     let mut needs_persist = false;
+    let mut found = false;
 
     for record in &mut records {
         if record.id == *id {
+            found = true;
             if let Some(original_bytes) = original_bytes {
                 record.original_bytes = Some(original_bytes);
                 needs_persist = true;
@@ -998,6 +1115,10 @@ fn update_record_bytes(
             }
             break;
         }
+    }
+
+    if !found {
+        return Err(missing_scope_record_error(&scope_dir, id));
     }
 
     if !needs_persist {
@@ -1016,7 +1137,19 @@ fn remove_record_bytes(
     let scope_dir = store.config.root_dir.join(sanitize_segment(scope)?);
     let _guard = ScopeIndexGuard::acquire(&scope_dir)?;
     let mut records = store.read_scope_records(&scope_dir)?;
-    records.retain(|record| record.id != *id);
+    let mut found = false;
+    records.retain(|record| {
+        let is_target = record.id == *id;
+        if is_target {
+            found = true;
+        }
+        !is_target
+    });
+
+    if !found {
+        return Err(missing_scope_record_error(&scope_dir, id));
+    }
+
     store.write_scope_records_unlocked(&scope_dir, records)?;
     Ok(())
 }
@@ -1172,11 +1305,28 @@ mod tests {
         file
     }
 
-    #[cfg(not(unix))]
-    fn hold_index_lock(scope_dir: &Path) -> bool {
+    #[cfg(windows)]
+    fn hold_index_lock(scope_dir: &Path) -> fs::File {
         let lock_path = scope_dir.join(".index.lock");
-        fs::write(&lock_path, b"").unwrap();
-        true
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .unwrap();
+        file.set_len(1).unwrap();
+        try_lock_scope_index_file(&file).unwrap();
+        file
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    fn hold_index_lock(scope_dir: &Path) -> fs::File {
+        let lock_path = scope_dir.join(".index.lock");
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap()
     }
 
     fn result_with_field(key: &str, value: StructuredValue) -> ToolResult {
@@ -2046,10 +2196,15 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(matches!(error, ArtifactError::Io(error) if matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::AlreadyExists
-        )));
+        let expected_kind = if cfg!(windows) {
+            io::ErrorKind::WouldBlock
+        } else {
+            io::ErrorKind::AlreadyExists
+        };
+        assert!(matches!(
+            error,
+            ArtifactError::Io(error) if error.kind() == expected_kind
+        ));
         let remaining_entries: Vec<_> = fs::read_dir(&scope_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -2066,16 +2221,17 @@ mod tests {
         let scope_dir = root.join("repo_example");
         create_scope_dir(&scope_dir).unwrap();
 
-        let lock_path = scope_dir.join(".index.lock");
-        fs::write(&lock_path, b"").unwrap();
+        let started = Arc::new(Barrier::new(2));
+        let worker_started = Arc::clone(&started);
+        let worker_scope_dir = scope_dir.clone();
+        let holder = std::thread::spawn(move || {
+            let held_lock = hold_index_lock(&worker_scope_dir);
+            worker_started.wait();
+            std::thread::sleep(Duration::from_millis(25));
+            held_lock
+        });
 
-        let remover = {
-            let lock_path = lock_path.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(25));
-                let _ = fs::remove_file(lock_path);
-            })
-        };
+        started.wait();
 
         let reference = store
             .write_bytes_with_metadata(
@@ -2087,12 +2243,15 @@ mod tests {
             )
             .unwrap();
 
-        remover.join().unwrap();
+        drop(holder.join().unwrap());
+
         assert!(Path::new(&reference.uri).exists());
-        assert!(
-            !lock_path.exists(),
-            "lock file should be removed after the guard drops"
-        );
+        let lock_exists = scope_dir.join(".index.lock").exists();
+        if cfg!(windows) {
+            assert!(lock_exists, "lock file should remain on disk");
+        } else {
+            assert!(!lock_exists, "lock file should be removed after release");
+        }
     }
 
     #[test]
@@ -2336,6 +2495,48 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ArtifactError::InvalidScope { .. }));
+    }
+
+    #[test]
+    fn update_record_bytes_reports_missing_index_row() {
+        let root = temp_root("update-missing");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let id = OutputRefId::new();
+        let error = update_record_bytes(&store, "repo_example", &id, Some(4), Some(2)).unwrap_err();
+        let expected_path = scope_dir
+            .join(DEFAULT_ARTIFACT_INDEX_FILE)
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidIndex { path, reason }
+            if path == expected_path && reason.contains("missing index row")
+        ));
+    }
+
+    #[test]
+    fn remove_record_bytes_reports_missing_index_row() {
+        let root = temp_root("remove-missing");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let id = OutputRefId::new();
+        let error = remove_record_bytes(&store, "repo_example", &id).unwrap_err();
+        let expected_path = scope_dir
+            .join(DEFAULT_ARTIFACT_INDEX_FILE)
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidIndex { path, reason }
+            if path == expected_path && reason.contains("missing index row")
+        ));
     }
 
     #[derive(Debug)]
