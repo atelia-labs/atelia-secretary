@@ -3600,7 +3600,7 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
             .expect("resolved target path must include a file name");
 
         #[cfg(unix)]
-        let content =
+        let _content =
             match read_entire_text_file_in_parent_dir(&parent_dir, file_name, self.max_bytes) {
                 Ok(content) => content,
                 Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
@@ -3624,22 +3624,22 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
                     );
                 }
             };
+        if metadata.len() > self.max_bytes as u64 {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "patch failed: file exceeds configured byte limit".to_string(),
+                format!(
+                    "{} is {} bytes; limit is {} bytes",
+                    target.display_path(),
+                    metadata.len(),
+                    self.max_bytes
+                ),
+            );
+        }
 
-        #[cfg(not(unix))]
         let content = match read_entire_text_file(path, self.max_bytes) {
             Ok(content) => content,
-            Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
-                return failed_result(
-                    invocation,
-                    schema_ref,
-                    "patch failed: file exceeds configured byte limit".to_string(),
-                    format!(
-                        "{} is larger than {} bytes",
-                        target.display_path(),
-                        self.max_bytes
-                    ),
-                );
-            }
             Err(err) => {
                 return failed_result(
                     invocation,
@@ -3707,9 +3707,19 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
                 format!("{}: {}", target.display_path(), err),
             );
         }
+        let mut file = match open_write_file_no_follow(path, false) {
+            Ok(file) => file,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: cannot open scoped file".to_string(),
+                    format!("{}: {}", target.display_path(), err),
+                );
+            }
+        };
 
-        #[cfg(not(unix))]
-        if let Err(err) = write_file_bytes_atomically(path, updated.as_bytes(), false) {
+        if let Err(err) = file.write_all(updated.as_bytes()) {
             return failed_result(
                 invocation,
                 schema_ref,
@@ -5226,7 +5236,6 @@ mod tests {
         unlink_in_parent_dir(&parent, &temp_name).unwrap();
         env.cleanup();
     }
-
     #[test]
     fn fs_write_rejects_byte_limit_overrun() {
         let env = TestEnv::new("write-limit");
@@ -6045,6 +6054,7 @@ exit 0
         assert_eq!(io::ErrorKind::FileTooLarge, err.kind());
         env.cleanup();
     }
+    // -- Rendering compatibility --
 
     #[test]
     fn read_tool_results_render_in_all_formats() {
