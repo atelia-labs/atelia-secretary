@@ -8,8 +8,9 @@
 #![allow(dead_code)]
 
 use crate::service::{
-    DaemonHealth, DaemonStatus, RegisterRepositoryRequest as ServiceRegisterRepositoryRequest,
-    SecretaryService, ServiceError, StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
+    DaemonHealth, DaemonStatus, ProtocolMetadata as ServiceProtocolMetadata,
+    RegisterRepositoryRequest as ServiceRegisterRepositoryRequest, SecretaryService, ServiceError,
+    StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
 };
 use atelia_core::{
     Actor, CancellationState, JobId, JobKind, JobRecord, JobStatus, PolicyOutcome, RepositoryId,
@@ -136,7 +137,7 @@ impl SecretaryRpcServer {
     }
 
     fn metadata(&self) -> ProtocolMetadata {
-        ProtocolMetadata::from(self.service.health())
+        ProtocolMetadata::from(self.service.protocol_metadata())
     }
 }
 
@@ -162,6 +163,10 @@ impl From<ServiceError> for RpcError {
         match error {
             ServiceError::InvalidArgument { reason } => Self {
                 code: RpcErrorCode::InvalidArgument,
+                reason,
+            },
+            ServiceError::Conflict { reason } => Self {
+                code: RpcErrorCode::Conflict,
                 reason,
             },
             ServiceError::Store(error) => store_error_to_rpc(error),
@@ -217,13 +222,13 @@ pub struct ProtocolMetadata {
     pub capabilities: Vec<String>,
 }
 
-impl From<DaemonHealth> for ProtocolMetadata {
-    fn from(health: DaemonHealth) -> Self {
+impl From<ServiceProtocolMetadata> for ProtocolMetadata {
+    fn from(metadata: ServiceProtocolMetadata) -> Self {
         Self {
-            protocol_version: health.protocol_version,
-            daemon_version: health.daemon_version,
-            storage_version: health.storage_version,
-            capabilities: health.capabilities,
+            protocol_version: metadata.protocol_version,
+            daemon_version: metadata.daemon_version,
+            storage_version: metadata.storage_version,
+            capabilities: metadata.capabilities,
         }
     }
 }
@@ -334,9 +339,9 @@ pub struct Job {
     pub status: String,
     pub policy_summary: Option<PolicySummary>,
     pub created_at_unix_ms: i64,
-    pub started_at_unix_ms: i64,
-    pub completed_at_unix_ms: i64,
-    pub latest_event_id: String,
+    pub started_at_unix_ms: Option<i64>,
+    pub completed_at_unix_ms: Option<i64>,
+    pub latest_event_id: Option<String>,
     pub cancellation_state: String,
 }
 
@@ -350,12 +355,9 @@ impl From<JobRecord> for Job {
             status: job_status_label(record.status).to_string(),
             policy_summary: record.policy_summary.map(PolicySummary::from),
             created_at_unix_ms: record.created_at.unix_millis,
-            started_at_unix_ms: record.started_at.map(|ts| ts.unix_millis).unwrap_or(0),
-            completed_at_unix_ms: record.completed_at.map(|ts| ts.unix_millis).unwrap_or(0),
-            latest_event_id: record
-                .latest_event_id
-                .map(|id| id.as_str().to_string())
-                .unwrap_or_default(),
+            started_at_unix_ms: record.started_at.map(|ts| ts.unix_millis),
+            completed_at_unix_ms: record.completed_at.map(|ts| ts.unix_millis),
+            latest_event_id: record.latest_event_id.map(|id| id.as_str().to_string()),
             cancellation_state: cancellation_state_label(record.cancellation_state).to_string(),
         }
     }
@@ -363,7 +365,7 @@ impl From<JobRecord> for Job {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicySummary {
-    pub decision_id: String,
+    pub decision_id: Option<String>,
     pub outcome: String,
     pub risk_tier: String,
     pub reason_code: String,
@@ -372,10 +374,7 @@ pub struct PolicySummary {
 impl From<atelia_core::PolicySummary> for PolicySummary {
     fn from(summary: atelia_core::PolicySummary) -> Self {
         Self {
-            decision_id: summary
-                .decision_id
-                .map(|id| id.as_str().to_string())
-                .unwrap_or_default(),
+            decision_id: summary.decision_id.map(|id| id.as_str().to_string()),
             outcome: policy_outcome_label(summary.outcome).to_string(),
             risk_tier: risk_tier_label(summary.risk_tier).to_string(),
             reason_code: summary.reason_code,
@@ -657,6 +656,87 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn duplicate_repository_maps_to_conflict() {
+        let server = ready_server();
+        let root = test_repo_dir("duplicate-conflict");
+
+        server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "first-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .expect("register should succeed");
+
+        let error = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "second-repo".to_string(),
+                root_path: root.join(".").to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, RpcErrorCode::Conflict);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn job_dto_maps_absent_timestamps_and_event_id_to_none() {
+        let record = JobRecord::new(
+            actor(),
+            RepositoryId::new(),
+            JobKind::Read,
+            "dry run".to_string(),
+            atelia_core::LedgerTimestamp::from_unix_millis(1_000),
+        );
+
+        let dto = Job::from(record);
+
+        assert_eq!(dto.started_at_unix_ms, None);
+        assert_eq!(dto.completed_at_unix_ms, None);
+        assert_eq!(dto.latest_event_id, None);
+    }
+
+    #[test]
+    fn job_dto_maps_present_timestamps_and_event_id_to_some() {
+        let started = atelia_core::LedgerTimestamp::from_unix_millis(1_100);
+        let completed = atelia_core::LedgerTimestamp::from_unix_millis(1_200);
+        let event_id = atelia_core::JobEventId::new();
+        let event_id_str = event_id.as_str().to_string();
+        let decision_id = atelia_core::PolicyDecisionId::new();
+        let decision_id_str = decision_id.as_str().to_string();
+
+        let mut record = JobRecord::new(
+            actor(),
+            RepositoryId::new(),
+            JobKind::Read,
+            "dry run".to_string(),
+            atelia_core::LedgerTimestamp::from_unix_millis(1_000),
+        );
+        record.started_at = Some(started);
+        record.completed_at = Some(completed);
+        record.latest_event_id = Some(event_id);
+        record.policy_summary = Some(atelia_core::PolicySummary {
+            decision_id: Some(decision_id),
+            outcome: PolicyOutcome::Allowed,
+            risk_tier: RiskTier::R1,
+            reason_code: "policy-checked".to_string(),
+        });
+
+        let dto = Job::from(record);
+
+        assert_eq!(dto.started_at_unix_ms, Some(started.unix_millis));
+        assert_eq!(dto.completed_at_unix_ms, Some(completed.unix_millis));
+        assert_eq!(dto.latest_event_id, Some(event_id_str));
+        assert_eq!(
+            dto.policy_summary
+                .expect("policy summary should be present")
+                .decision_id,
+            Some(decision_id_str)
+        );
     }
 
     #[test]

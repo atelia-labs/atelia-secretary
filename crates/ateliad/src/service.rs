@@ -8,7 +8,7 @@ use atelia_core::{
     Actor, CancelJobReceipt, DefaultPolicyEngine, InMemoryStore, JobId, JobKind,
     JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, RepositoryId,
     RepositoryRecord, RepositoryTrustState, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest,
-    SecretaryStore,
+    SecretaryStore, StoreError,
 };
 use std::path::PathBuf;
 
@@ -51,6 +51,14 @@ pub struct DaemonHealth {
     pub started_at: LedgerTimestamp,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolMetadata {
+    pub protocol_version: String,
+    pub daemon_version: String,
+    pub storage_version: String,
+    pub capabilities: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Service errors
 // ---------------------------------------------------------------------------
@@ -58,6 +66,7 @@ pub struct DaemonHealth {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum ServiceError {
+    Conflict { reason: String },
     Store(atelia_core::StoreError),
     Runtime(RuntimeError),
     InvalidArgument { reason: String },
@@ -66,6 +75,7 @@ pub enum ServiceError {
 impl std::fmt::Display for ServiceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Conflict { reason } => write!(f, "conflict: {reason}"),
             Self::Store(err) => write!(f, "{err}"),
             Self::Runtime(err) => write!(f, "{err}"),
             Self::InvalidArgument { reason } => write!(f, "invalid argument: {reason}"),
@@ -182,6 +192,19 @@ impl SecretaryService {
         }
     }
 
+    pub fn protocol_metadata(&self) -> ProtocolMetadata {
+        ProtocolMetadata {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            daemon_version: DAEMON_VERSION.to_string(),
+            storage_version: STORAGE_VERSION.to_string(),
+            capabilities: vec![
+                "health.v1".to_string(),
+                "repositories.v1".to_string(),
+                "jobs.v1".to_string(),
+            ],
+        }
+    }
+
     /// Register a new repository and persist it in the store.
     #[allow(dead_code)]
     pub fn register_repository(
@@ -211,11 +234,14 @@ impl SecretaryService {
             .store()
             .create_repository(record.clone())
             .map_err(|err| match err {
-                atelia_core::StoreError::DuplicateId {
+                StoreError::DuplicateId {
                     collection: "repositories",
                     ..
-                } => ServiceError::InvalidArgument {
+                } => ServiceError::Conflict {
                     reason: "root_path is already registered".to_string(),
+                },
+                StoreError::Conflict { .. } => ServiceError::Conflict {
+                    reason: "repository root path conflicts".to_string(),
                 },
                 err => ServiceError::Store(err),
             })?;
@@ -410,6 +436,20 @@ mod tests {
         assert!(health.started_at.unix_millis > 0);
     }
 
+    #[test]
+    fn protocol_metadata_matches_protocol_versions() {
+        let metadata = ready_service().protocol_metadata();
+
+        assert_eq!(metadata.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(metadata.daemon_version, DAEMON_VERSION);
+        assert_eq!(metadata.storage_version, STORAGE_VERSION);
+        assert!(metadata.capabilities.contains(&"health.v1".to_string()));
+        assert!(metadata
+            .capabilities
+            .contains(&"repositories.v1".to_string()));
+        assert!(metadata.capabilities.contains(&"jobs.v1".to_string()));
+    }
+
     // -- register / list round trip -----------------------------------------
 
     #[test]
@@ -496,7 +536,7 @@ mod tests {
             })
             .unwrap_err();
 
-        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(matches!(err, ServiceError::Conflict { .. }));
         assert_eq!(svc.health().repository_count, 1);
         let _ = fs::remove_dir_all(root);
     }
