@@ -1841,9 +1841,7 @@ impl ExtensionRegistryService {
         request: InstallExtensionRequest,
     ) -> RegistryResult<InstallExtensionResponse> {
         let options = InstallOptions::from(&request);
-        let InstallExtensionRequest {
-            manifest,
-        } = request;
+        let InstallExtensionRequest { manifest, .. } = request;
         let record = self
             .registry
             .install(manifest, options)
