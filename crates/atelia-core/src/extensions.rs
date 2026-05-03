@@ -513,8 +513,8 @@ fn validate_manifest(
     validate_tools(manifest)?;
     validate_services(manifest)?;
     validate_tool_output(manifest)?;
-    validate_hooks(manifest)?;
-    validate_webhooks(manifest)?;
+    validate_hooks(manifest, boundary)?;
+    validate_webhooks(manifest, boundary)?;
 
     Ok(ValidatedExtensionManifest {
         manifest: manifest.clone(),
@@ -910,7 +910,10 @@ fn validate_tool_output(manifest: &ExtensionManifest) -> ExtensionValidationResu
     Ok(())
 }
 
-fn validate_hooks(manifest: &ExtensionManifest) -> ExtensionValidationResult<()> {
+fn validate_hooks(
+    manifest: &ExtensionManifest,
+    boundary: ExtensionBoundary,
+) -> ExtensionValidationResult<()> {
     let has_hook_provider_kind = manifest.types.contains(&ExtensionKind::HookProvider);
     let declares_hooks = !manifest.hooks.is_empty();
 
@@ -936,6 +939,15 @@ fn validate_hooks(manifest: &ExtensionManifest) -> ExtensionValidationResult<()>
             hook.verification.as_deref(),
             &["hmac", "github_signature", "oidc", "none_for_local_only"],
         )?;
+        if matches!(hook.verification.as_deref(), Some("none_for_local_only"))
+            && boundary != ExtensionBoundary::LocalDevelopment
+        {
+            return Err(ExtensionValidationError::InvalidField {
+                field: "hooks.verification",
+                reason: "none_for_local_only is only allowed for local-development manifests"
+                    .to_string(),
+            });
+        }
         validate_string_list("hooks.required_capabilities", &hook.required_capabilities)?;
         for capability in &hook.required_capabilities {
             require_permission_name(capability)?;
@@ -961,7 +973,10 @@ fn validate_hooks(manifest: &ExtensionManifest) -> ExtensionValidationResult<()>
     Ok(())
 }
 
-fn validate_webhooks(manifest: &ExtensionManifest) -> ExtensionValidationResult<()> {
+fn validate_webhooks(
+    manifest: &ExtensionManifest,
+    boundary: ExtensionBoundary,
+) -> ExtensionValidationResult<()> {
     let has_webhook_receiver_kind = manifest.types.contains(&ExtensionKind::WebhookReceiver);
     let declares_webhooks = !manifest.webhooks.is_empty();
 
@@ -993,6 +1008,15 @@ fn validate_webhooks(manifest: &ExtensionManifest) -> ExtensionValidationResult<
             webhook.verification.as_deref(),
             &["hmac", "github_signature", "oidc", "none_for_local_only"],
         )?;
+        if matches!(webhook.verification.as_deref(), Some("none_for_local_only"))
+            && boundary != ExtensionBoundary::LocalDevelopment
+        {
+            return Err(ExtensionValidationError::InvalidField {
+                field: "webhooks.verification",
+                reason: "none_for_local_only is only allowed for local-development manifests"
+                    .to_string(),
+            });
+        }
         validate_string_list(
             "webhooks.required_capabilities",
             &webhook.required_capabilities,
@@ -1060,7 +1084,7 @@ fn validate_http_endpoint(
     value: Option<&str>,
 ) -> ExtensionValidationResult<()> {
     let Some(value) = value else {
-        return Err(ExtensionValidationError::MissingField { field });
+        return Ok(());
     };
 
     require_non_empty(field, value)?;
@@ -1070,11 +1094,101 @@ fn validate_http_endpoint(
             reason: "must not contain whitespace".to_string(),
         });
     }
-    if !(value.starts_with("https://") || value.starts_with("http://")) {
+    let Some(rest) = value.strip_prefix("https://") else {
         return Err(ExtensionValidationError::InvalidField {
             field,
-            reason: "must start with http:// or https://".to_string(),
+            reason: "must start with https://".to_string(),
         });
+    };
+
+    validate_https_endpoint_authority(field, rest)
+}
+
+fn validate_https_endpoint_authority(
+    field: &'static str,
+    value: &str,
+) -> ExtensionValidationResult<()> {
+    let authority = value.split(['/', '?', '#']).next().unwrap_or_default();
+
+    if authority.is_empty() {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must include a host".to_string(),
+        });
+    }
+
+    if authority.contains('@') {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must not contain userinfo".to_string(),
+        });
+    }
+
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        let Some((host, remainder)) = stripped.split_once(']') else {
+            return Err(ExtensionValidationError::InvalidField {
+                field,
+                reason: "must contain a closing ] for IPv6 hosts".to_string(),
+            });
+        };
+        if host.is_empty() {
+            return Err(ExtensionValidationError::InvalidField {
+                field,
+                reason: "must include a host".to_string(),
+            });
+        }
+        if !remainder.is_empty() {
+            let Some(port) = remainder.strip_prefix(':') else {
+                return Err(ExtensionValidationError::InvalidField {
+                    field,
+                    reason: "must separate the host and path with /".to_string(),
+                });
+            };
+            if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+                return Err(ExtensionValidationError::InvalidField {
+                    field,
+                    reason: "port must be numeric".to_string(),
+                });
+            }
+        }
+        return Ok(());
+    } else {
+        authority
+    };
+
+    let (host, port) = match host.rsplit_once(':') {
+        Some((candidate_host, candidate_port))
+            if !candidate_host.contains(':') && !candidate_port.is_empty() =>
+        {
+            (candidate_host, Some(candidate_port))
+        }
+        _ => (host, None),
+    };
+
+    if host.is_empty() || host.starts_with('.') || host.ends_with('.') {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "must include a valid host".to_string(),
+        });
+    }
+
+    if host
+        .chars()
+        .any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
+    {
+        return Err(ExtensionValidationError::InvalidField {
+            field,
+            reason: "host contains invalid characters".to_string(),
+        });
+    }
+
+    if let Some(port) = port {
+        if !port.chars().all(|c| c.is_ascii_digit()) {
+            return Err(ExtensionValidationError::InvalidField {
+                field,
+                reason: "port must be numeric".to_string(),
+            });
+        }
     }
 
     Ok(())
@@ -2267,6 +2381,78 @@ mod tests {
     }
 
     #[test]
+    fn local_only_hook_and_webhook_verification_is_rejected_for_non_local_manifests() {
+        let mut hooks = manifest("com.example.hook-verification");
+        hooks.types.push(ExtensionKind::HookProvider);
+        hooks.hooks.push(ExtensionHookDefinition {
+            verification: Some("none_for_local_only".to_string()),
+            ..hook_definition("hk_review")
+        });
+
+        let err = hooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "hooks.verification",
+                ..
+            }
+        ));
+
+        let mut webhooks = manifest("com.example.webhook-verification");
+        webhooks.types.push(ExtensionKind::WebhookReceiver);
+        webhooks.webhooks.push(ExtensionWebhookDefinition {
+            verification: Some("none_for_local_only".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        let err = webhooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "webhooks.verification",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn local_only_hook_and_webhook_verification_is_allowed_for_local_manifests() {
+        let mut hooks = manifest("local.test.hook-verification");
+        hooks.provenance.source = ProvenanceSource::Local;
+        hooks.provenance.registry_identity = None;
+        hooks.provenance.signature = None;
+        hooks.provenance.signer = None;
+        hooks.types.push(ExtensionKind::HookProvider);
+        hooks.hooks.push(ExtensionHookDefinition {
+            verification: Some("none_for_local_only".to_string()),
+            ..hook_definition("hk_review")
+        });
+
+        hooks
+            .validate(&ManifestValidationPolicy::default().with_local_unsigned())
+            .unwrap();
+
+        let mut webhooks = manifest("local.test.webhook-verification");
+        webhooks.provenance.source = ProvenanceSource::Local;
+        webhooks.provenance.registry_identity = None;
+        webhooks.provenance.signature = None;
+        webhooks.provenance.signer = None;
+        webhooks.types.push(ExtensionKind::WebhookReceiver);
+        webhooks.webhooks.push(ExtensionWebhookDefinition {
+            verification: Some("none_for_local_only".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        webhooks
+            .validate(&ManifestValidationPolicy::default().with_local_unsigned())
+            .unwrap();
+    }
+
+    #[test]
     fn security_sensitive_section_fields_are_validated() {
         let mut extension = manifest("com.example.invalid-tool-output");
         extension.types.push(ExtensionKind::ToolOutputCustomizer);
@@ -2337,6 +2523,71 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn webhook_endpoints_require_https_and_preserve_legacy_omission_compatibility() {
+        let mut webhooks = manifest("com.example.webhook-endpoint");
+        webhooks.types.push(ExtensionKind::WebhookReceiver);
+        webhooks.webhooks.push(ExtensionWebhookDefinition {
+            endpoint: Some("https://example.com/webhook".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        webhooks
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap();
+
+        let mut http_webhook = manifest("com.example.webhook-http");
+        http_webhook.types.push(ExtensionKind::WebhookReceiver);
+        http_webhook.webhooks.push(ExtensionWebhookDefinition {
+            endpoint: Some("http://example.com/webhook".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        let err = http_webhook
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "webhooks.endpoint",
+                ..
+            }
+        ));
+
+        let mut malformed_webhook = manifest("com.example.webhook-malformed");
+        malformed_webhook.types.push(ExtensionKind::WebhookReceiver);
+        malformed_webhook.webhooks.push(ExtensionWebhookDefinition {
+            endpoint: Some("https:/example.com/webhook".to_string()),
+            ..webhook_definition("wh_review")
+        });
+
+        let err = malformed_webhook
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "webhooks.endpoint",
+                ..
+            }
+        ));
+
+        let mut legacy_missing_endpoint = manifest("com.example.webhook-legacy-endpoint");
+        legacy_missing_endpoint
+            .types
+            .push(ExtensionKind::WebhookReceiver);
+        legacy_missing_endpoint
+            .webhooks
+            .push(ExtensionWebhookDefinition {
+                endpoint: None,
+                ..webhook_definition("wh_review")
+            });
+
+        legacy_missing_endpoint
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap();
     }
 
     #[test]
