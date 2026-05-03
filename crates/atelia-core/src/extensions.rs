@@ -3690,6 +3690,7 @@ mod tests {
         assert_eq!(InstallOptions::from(request), InstallOptions::default());
     }
 
+    #[test]
     fn extension_service_blocklist_listing_works() {
         let mut service = ExtensionRegistryService::new();
         service
