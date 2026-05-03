@@ -82,6 +82,10 @@ trait ArtifactWriter {
         media_type: &str,
         bytes: &[u8],
     ) -> ArtifactResult<OutputRef>;
+
+    fn delete_artifact_bytes(&self, _output_ref: &OutputRef) -> ArtifactResult<()> {
+        Ok(())
+    }
 }
 
 impl ArtifactWriter for LocalArtifactStore {
@@ -93,6 +97,10 @@ impl ArtifactWriter for LocalArtifactStore {
         bytes: &[u8],
     ) -> ArtifactResult<OutputRef> {
         self.write_bytes(scope, label, media_type, bytes)
+    }
+
+    fn delete_artifact_bytes(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
+        self.delete_artifact(output_ref)
     }
 }
 
@@ -139,6 +147,14 @@ impl LocalArtifactStore {
             label: Some(label.to_string()),
             digest: None,
         })
+    }
+
+    pub fn delete_artifact(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
+        let path = Path::new(&output_ref.uri);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(())
     }
 }
 
@@ -233,6 +249,7 @@ fn spill_large_tool_result_fields_with_writer(
 
     let mut original_bytes = 0u64;
     let mut retained_bytes = 0u64;
+    let mut written_output_refs: Vec<OutputRef> = Vec::new();
     let mut planned_spills: Vec<(
         usize,     // field index
         String,    // field key
@@ -249,12 +266,21 @@ fn spill_large_tool_result_fields_with_writer(
             continue;
         }
 
-        let output_ref = store.write_artifact_bytes(
+        let output_ref = match store.write_artifact_bytes(
             scope,
             &format!("{}.{}", result.tool_id, field.key),
             &options.media_type,
             &bytes,
-        )?;
+        ) {
+            Ok(output_ref) => {
+                written_output_refs.push(output_ref.clone());
+                output_ref
+            }
+            Err(error) => {
+                rollback_artifact_writes(store, &written_output_refs);
+                return Err(error);
+            }
+        };
         let replacement = format!("artifact_ref {}", output_ref.uri);
 
         original_bytes += bytes.len() as u64;
@@ -291,6 +317,12 @@ fn spill_large_tool_result_fields_with_writer(
         original_bytes,
         retained_bytes,
     }))
+}
+
+fn rollback_artifact_writes(writer: &impl ArtifactWriter, output_refs: &[OutputRef]) {
+    for output_ref in output_refs {
+        let _ = writer.delete_artifact_bytes(output_ref);
+    }
 }
 
 fn spillable_field_bytes(field: &ToolResultField) -> Option<Vec<u8>> {
@@ -474,6 +506,49 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailingLocalWriter {
+        delegate: LocalArtifactStore,
+        writes: Cell<usize>,
+        fail_on: usize,
+    }
+
+    impl FailingLocalWriter {
+        fn new(delegate: LocalArtifactStore, fail_on: usize) -> Self {
+            Self {
+                delegate,
+                writes: Cell::new(0),
+                fail_on,
+            }
+        }
+    }
+
+    impl ArtifactWriter for FailingLocalWriter {
+        fn write_artifact_bytes(
+            &self,
+            scope: &str,
+            label: &str,
+            media_type: &str,
+            bytes: &[u8],
+        ) -> ArtifactResult<OutputRef> {
+            let write_count = self.writes.get() + 1;
+            self.writes.set(write_count);
+
+            if write_count == self.fail_on {
+                return Err(ArtifactError::Io(std::io::Error::other(
+                    "simulated write failure",
+                )));
+            }
+
+            self.delegate
+                .write_artifact_bytes(scope, label, media_type, bytes)
+        }
+
+        fn delete_artifact_bytes(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
+            self.delegate.delete_artifact(output_ref)
+        }
+    }
+
     impl ArtifactWriter for FailingWriter {
         fn write_artifact_bytes(
             &self,
@@ -540,6 +615,59 @@ mod tests {
 
         assert!(matches!(error, ArtifactError::Io(_)));
         assert_eq!(expected, result);
+    }
+
+    #[test]
+    fn rolls_back_partial_artifact_writes_on_later_failure() {
+        let root = temp_root("spill-rollback");
+        let delegate = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let mut result = ToolResult {
+            id: ToolResultId::new(),
+            schema_version: 1,
+            created_at: LedgerTimestamp::now(),
+            invocation_id: ToolInvocationId::new(),
+            tool_id: "fs.search".to_string(),
+            status: ToolResultStatus::Succeeded,
+            schema_ref: Some("tool_result.test.v1".to_string()),
+            fields: vec![
+                ToolResultField {
+                    key: "matches".to_string(),
+                    value: StructuredValue::String("abcdef".into()),
+                },
+                ToolResultField {
+                    key: "summary".to_string(),
+                    value: StructuredValue::String("ghijkl".into()),
+                },
+            ],
+            evidence_refs: Vec::new(),
+            output_refs: Vec::new(),
+            truncation: None,
+            redactions: Vec::new(),
+        };
+        let expected = result.clone();
+        let writer = FailingLocalWriter::new(delegate, 2);
+
+        let error = spill_large_tool_result_fields_with_writer(
+            &mut result,
+            &writer,
+            "repo_example",
+            &ToolResultSpilloverOptions::new(4),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ArtifactError::Io(_)));
+        assert_eq!(expected, result);
+
+        let scope_dir = root.join("repo_example");
+        let entries = if scope_dir.exists() {
+            fs::read_dir(&scope_dir)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        } else {
+            Vec::new()
+        };
+        assert!(entries.is_empty());
     }
 
     #[cfg(unix)]
