@@ -1182,32 +1182,108 @@ fn create_scope_dir(path: &Path) -> io::Result<()> {
 }
 
 fn write_file_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = {
+    write_file_bytes_inner(path, bytes, false)
+}
+
+#[cfg(test)]
+fn write_file_bytes_with_injected_failure(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_file_bytes_inner(path, bytes, true)
+}
+
+fn write_file_bytes_inner(path: &Path, bytes: &[u8], fail_after_write: bool) -> io::Result<()> {
+    let mut open_result = None;
+
+    for attempt in 0..64 {
+        let temp_path = temporary_file_path(path, attempt);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+
         #[cfg(unix)]
         {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true).mode(0o600);
-            options.open(path)?
+            options.mode(0o600);
         }
 
-        #[cfg(not(unix))]
-        {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            options.open(path)?
+        match options.open(&temp_path) {
+            Ok(file) => {
+                open_result = Some((file, temp_path));
+                break;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
         }
+    }
+
+    let (mut file, temp_path) = open_result.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "failed to create temporary artifact file",
+        )
+    })?;
+
+    let cleanup_temp_file = || {
+        let _ = fs::remove_file(&temp_path);
     };
 
     use std::io::Write;
-    file.write_all(bytes)?;
-    file.flush()?;
+    if let Err(error) = file.write_all(bytes) {
+        cleanup_temp_file();
+        return Err(error);
+    }
+
+    if fail_after_write {
+        cleanup_temp_file();
+        return Err(io::Error::other("simulated post-write failure"));
+    }
+
+    if let Err(error) = file.flush() {
+        cleanup_temp_file();
+        return Err(error);
+    }
 
     #[cfg(unix)]
     {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        if let Err(error) = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)) {
+            cleanup_temp_file();
+            return Err(error);
+        }
+    }
+
+    drop(file);
+
+    if let Err(error) = rename_atomic(&temp_path, path) {
+        cleanup_temp_file();
+        return Err(error);
     }
 
     Ok(())
+}
+
+fn temporary_file_path(path: &Path, attempt: u32) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    let suffix = WRITE_FILE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        "{WRITE_FILE_TMP_PREFIX}-{file_name}-{attempt}-{suffix}"
+    ))
+}
+
+fn rename_atomic(source: &Path, destination: &Path) -> io::Result<()> {
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        #[cfg(not(unix))]
+        Err(error) => match error.kind() {
+            ErrorKind::AlreadyExists => {
+                fs::remove_file(destination)?;
+                fs::rename(source, destination)
+            }
+            _ => Err(error),
+        },
+        #[cfg(unix)]
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
