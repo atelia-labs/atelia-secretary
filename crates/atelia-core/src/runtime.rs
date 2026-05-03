@@ -288,11 +288,10 @@ where
         T: RuntimeTool,
     {
         let requested_capability = tool.requested_capability().to_string();
-        let normalized_requested_capability =
-            normalized_requested_capability(&requested_capability);
+        let canonical_requested_capability = normalized_requested_capability(&requested_capability);
         validate_requested_capability_hints(
             &request.requested_capabilities,
-            normalized_requested_capability,
+            canonical_requested_capability,
         )?;
         let repository = self.store.get_repository(&request.repository_id)?;
         let mut events = Vec::new();
@@ -321,7 +320,7 @@ where
             PolicyInput::new(
                 request.requester.clone(),
                 request.repository_id.clone(),
-                requested_capability.clone(),
+                canonical_requested_capability,
                 request.resource_scope.clone(),
                 tool.declared_effect(),
                 repository.trust_state,
@@ -406,7 +405,7 @@ where
             policy_decision_id: policy_decision.id.clone(),
             actor: request.requester.clone(),
             tool_id: tool.tool_id().to_string(),
-            requested_capability,
+            requested_capability: canonical_requested_capability.to_string(),
             args_summary: tool.args_summary(&request),
             resolved_paths: tool.resolved_paths(&request),
             timeout_millis: None,
@@ -527,7 +526,7 @@ where
             created_at: LedgerTimestamp::now(),
             actor: request.requester,
             repository_id: request.repository_id,
-            requested_capability: tool.requested_capability().to_string(),
+            requested_capability: canonical_requested_capability.to_string(),
             policy_decision_id: policy_decision.id.clone(),
             tool_invocation_id: Some(invocation.id.clone()),
             effect_summary: format!("{} completed with {:?}", invocation.tool_id, result.status),
@@ -1953,9 +1952,12 @@ mod tests {
         let receipt = runtime.run_tool_job(request, &AliasCapabilityTool).unwrap();
 
         assert_eq!(JobStatus::Succeeded, receipt.job.status);
-        assert_eq!("policy.check", receipt.policy_decision.requested_capability);
         assert_eq!(
-            "policy.check",
+            "capability.discovery",
+            receipt.policy_decision.requested_capability
+        );
+        assert_eq!(
+            "capability.discovery",
             receipt
                 .tool_invocation
                 .as_ref()
@@ -1963,7 +1965,7 @@ mod tests {
                 .requested_capability
         );
         assert_eq!(
-            "policy.check",
+            "capability.discovery",
             receipt.audit_record.as_ref().unwrap().requested_capability
         );
     }
