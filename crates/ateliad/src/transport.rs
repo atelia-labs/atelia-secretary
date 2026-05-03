@@ -2763,19 +2763,6 @@ mod tests {
                 })
                 .expect("register should succeed");
 
-        let repository_id = {
-            let mut server = rpc_server.write().await;
-            let registered = server
-                .service_mut()
-                .register_repository(service::RegisterRepositoryRequest {
-                    display_name: "transport-repo".to_string(),
-                    root_path: root.to_string_lossy().to_string(),
-                    trust_state: atelia_core::RepositoryTrustState::Trusted,
-                    allowed_scope: None,
-                    requester: None,
-                })
-                .expect("register should succeed");
-
             let submitted = server
                 .service_mut()
                 .submit_job(service::SubmitJobRequest {
