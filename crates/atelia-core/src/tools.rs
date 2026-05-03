@@ -12,16 +12,17 @@ use crate::domain::{
 };
 use crate::runtime::RuntimeJobRequest;
 use std::collections::HashSet;
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, BufRead, Read, Write};
 #[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::path::{Path, PathBuf};
 
 const TOOLS_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_READ_MAX_LINES: usize = 120;
@@ -276,6 +277,86 @@ fn open_file_no_follow(path: &Path) -> io::Result<File> {
     }
 
     fs::File::open(path)
+}
+
+#[cfg(unix)]
+fn open_parent_no_follow(path: &Path) -> io::Result<File> {
+    use std::path::Component;
+
+    let mut dir = if path.is_absolute() {
+        File::open("/")?
+    } else {
+        File::open(".")?
+    };
+
+    for component in path.components() {
+        let segment = match component {
+            Component::RootDir => continue,
+            Component::CurDir => continue,
+            Component::Normal(segment) => segment,
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsupported path component for write operations",
+                ));
+            }
+        };
+
+        let cstring = CString::new(segment.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+        // SAFETY: `dir` is a live directory file descriptor and the `cstring` is valid
+        // and nul-terminated for the `openat` syscall.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                cstring.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: `fd` was returned from `openat` and is uniquely owned by this branch.
+        dir = unsafe { File::from_raw_fd(fd) };
+    }
+
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn open_no_follow_in_parent_dir(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    create_new: bool,
+) -> io::Result<File> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    let mut flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    if create_new {
+        flags |= libc::O_CREAT | libc::O_EXCL;
+    } else {
+        flags |= libc::O_TRUNC;
+    }
+
+    // SAFETY: `parent` is a live directory file descriptor and the `cstring` is valid for
+    // `openat`; mode is only consulted when creating a new file.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            cstring.as_ptr(),
+            flags,
+            0o666 as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `fd` was returned from `openat` and is uniquely owned by this branch.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 // ---------------------------------------------------------------------------
@@ -1629,41 +1710,82 @@ fn resolve_mutation_target(
 }
 
 fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true);
-    if create_new {
-        options.create_new(true);
-    } else {
-        options.truncate(true);
-    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path does not name a file in its parent",
+        )
+    })?;
 
     #[cfg(unix)]
     {
-        options.custom_flags(libc::O_NOFOLLOW);
+        let parent_dir = open_parent_no_follow(parent)?;
+        open_no_follow_in_parent_dir(&parent_dir, file_name, create_new)
     }
 
-    let file = options.open(path)?;
-
-    #[cfg(target_os = "linux")]
+    #[cfg(not(unix))]
     {
-        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-        let opened_path = fs::canonicalize(fd_path)?;
-        if !opened_path.starts_with(path.parent().unwrap_or(Path::new("/"))) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "opened file escaped repository root",
-            ));
-        }
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "filesystem write/patch is best-effort on non-Unix platforms",
+        ))
     }
-
-    Ok(file)
 }
 
-fn read_entire_text_file(path: &Path) -> io::Result<String> {
+fn read_entire_text_file(path: &Path, max_bytes: usize) -> io::Result<String> {
     let mut file = open_file_no_follow(path)?;
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    Ok(content)
+    let mut content = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut total_bytes = 0usize;
+
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+
+        total_bytes += n;
+        if total_bytes > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "file exceeds configured byte limit",
+            ));
+        }
+
+        content.extend_from_slice(&buffer[..n]);
+    }
+
+    String::from_utf8(content).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid UTF-8 content: {error}"),
+        )
+    })
+}
+
+fn count_overlapping_matches(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.len() > haystack.len() {
+        return 0;
+    }
+
+    let mut count = 0usize;
+    let mut index = 0usize;
+    while index + needle.len() <= haystack.len() {
+        if &haystack[index..index + needle.len()] == needle {
+            count += 1;
+        }
+        index += 1;
+    }
+    count
 }
 
 #[derive(Debug, Clone)]
@@ -1991,22 +2113,20 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
             );
         }
 
-        if metadata.len() > self.max_bytes as u64 {
-            return failed_result(
-                invocation,
-                schema_ref,
-                "patch failed: file exceeds configured byte limit".to_string(),
-                format!(
-                    "{} is {} bytes; limit is {} bytes",
-                    target.display_path(),
-                    metadata.len(),
-                    self.max_bytes
-                ),
-            );
-        }
-
-        let content = match read_entire_text_file(path) {
+        let content = match read_entire_text_file(path, self.max_bytes) {
             Ok(content) => content,
+            Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: file exceeds configured byte limit".to_string(),
+                    format!(
+                        "{} is larger than {} bytes",
+                        target.display_path(),
+                        self.max_bytes
+                    ),
+                );
+            }
             Err(err) => {
                 return failed_result(
                     invocation,
@@ -2017,7 +2137,7 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
             }
         };
 
-        let match_count = content.matches(&self.find_text).count();
+        let match_count = count_overlapping_matches(&content, &self.find_text);
         if match_count == 0 {
             return failed_result(
                 invocation,
@@ -3369,6 +3489,39 @@ mod tests {
         env.cleanup();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_rejects_parent_directory_swap_after_scope_validation() {
+        let env = TestEnv::new("write-parent-swap");
+        let outside = unique_test_dir("write-parent-swap-outside");
+        let backup_path = env.root.join("notes_backup");
+
+        env.create_file("notes/note.txt", "inside");
+        fs::create_dir_all(outside.join("notes")).unwrap();
+        fs::write(outside.join("notes").join("note.txt"), "outside").unwrap();
+
+        let target = resolve_mutation_target(&env.root, Path::new("notes/note.txt")).unwrap();
+
+        let parent = env.root.join("notes");
+        fs::rename(&parent, &backup_path).unwrap();
+        std::os::unix::fs::symlink(outside.join("notes"), &parent).unwrap();
+
+        let open_result = open_write_file_no_follow(target.path(), false);
+        assert!(open_result.is_err());
+
+        assert_eq!(
+            "outside",
+            fs::read_to_string(outside.join("notes").join("note.txt")).unwrap()
+        );
+        assert_eq!(
+            "inside",
+            fs::read_to_string(backup_path.join("note.txt")).unwrap()
+        );
+
+        env.cleanup();
+        let _ = fs::remove_dir_all(&outside);
+    }
+
     // -- FsPatchTool tests --
 
     #[test]
@@ -3408,6 +3561,26 @@ mod tests {
     }
 
     #[test]
+    fn fs_patch_rejects_overlapping_match() {
+        let env = TestEnv::new("patch-overlapping");
+        env.create_file("notes.txt", "aaa");
+
+        let tool = FsPatchTool::new(&env.root, "aa", "b");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("matched 2 times"));
+        assert_eq!(
+            "aaa",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        env.cleanup();
+    }
+
+    #[test]
     fn fs_patch_rejects_missing_match() {
         let env = TestEnv::new("patch-missing");
         env.create_file("notes.txt", "alpha");
@@ -3438,6 +3611,17 @@ mod tests {
             "alpha\nbeta",
             fs::read_to_string(env.root.join("notes.txt")).unwrap()
         );
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_patch_read_rejects_content_exceeding_byte_cap() {
+        let env = TestEnv::new("patch-read-limit");
+        let large_path = env.root.join("notes.txt");
+        env.create_file("notes.txt", &"a".repeat(1200));
+
+        let err = read_entire_text_file(&large_path, 1024).unwrap_err();
+        assert_eq!(io::ErrorKind::FileTooLarge, err.kind());
         env.cleanup();
     }
 
