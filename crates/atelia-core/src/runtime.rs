@@ -18,7 +18,8 @@ use crate::policy::{
 use crate::settings::{OversizeOutputPolicy, ToolOutputDefaults};
 use crate::store::{EventCursor, InMemoryStore, JobPage, JobQuery, SecretaryStore, StoreError};
 use crate::tool_output::{
-    render_tool_result, OutputFormat, RenderOptions, RenderedToolOutput, ToolOutputRenderError,
+    render_tool_result_with_policy, OutputFormat, RenderOptions, RenderedToolOutput,
+    ToolOutputRenderError,
 };
 use std::error::Error;
 use std::fmt;
@@ -580,7 +581,12 @@ where
         );
         job.latest_event_id = events.last().map(|event| event.id.clone());
 
-        let rendered_output = render_tool_result(&result, &request.render_options)?;
+        let rendered_output = render_tool_result_with_policy(
+            &result,
+            &request
+                .tool_output_defaults
+                .render_policy_with_render_options(&request.render_options),
+        )?;
 
         Ok(RuntimeJobReceipt {
             job,
@@ -1087,7 +1093,7 @@ fn tool_result_event_severity(status: ToolResultStatus) -> EventSeverity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{RepositoryRecord, RepositoryTrustState};
+    use crate::domain::{OutputRef, OutputRefId, RepositoryRecord, RepositoryTrustState};
     use crate::settings::{OversizeOutputPolicy, ToolOutputDefaults};
     use crate::store::EventCursor;
     use std::ffi::OsString;
@@ -1417,6 +1423,199 @@ mod tests {
             .replay_job_events(EventCursor::Beginning, None)
             .unwrap();
         assert_eq!(receipt.events, replayed);
+    }
+
+    #[test]
+    fn runtime_honors_per_request_render_options_as_an_explicit_override() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "prove settings drive rendering",
+        )
+        .with_render_options(RenderOptions {
+            format: OutputFormat::Json,
+            include_policy: true,
+            include_diagnostics: true,
+            include_cost: true,
+        })
+        .with_tool_output_defaults(ToolOutputDefaults {
+            render_options: RenderOptions {
+                format: OutputFormat::Text,
+                include_policy: false,
+                include_diagnostics: false,
+                include_cost: false,
+            },
+            max_inline_bytes: 16 * 1024,
+            max_inline_lines: 8,
+            verbosity: crate::settings::ToolOutputVerbosity::Normal,
+            granularity: crate::settings::ToolOutputGranularity::Full,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        });
+
+        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+        let rendered = receipt.rendered_output.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Json);
+        assert_eq!(json["tool_id"], "secretary.echo");
+        assert!(json["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field["key"] == "policy.state"));
+    }
+
+    #[test]
+    fn runtime_uses_compact_json_without_unnecessary_truncation() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        struct JsonFallbackTool;
+
+        impl RuntimeTool for JsonFallbackTool {
+            fn tool_id(&self) -> &'static str {
+                "secretary.json_fallback_fixture"
+            }
+
+            fn requested_capability(&self) -> &'static str {
+                "capability.discovery"
+            }
+
+            fn declared_effect(&self) -> &'static str {
+                "return a structured output that exceeds the JSON line budget"
+            }
+
+            fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+                format!("goal={}", request.goal)
+            }
+
+            fn execute(
+                &self,
+                invocation: &ToolInvocation,
+                _request: &RuntimeJobRequest,
+            ) -> ToolResult {
+                ToolResult {
+                    id: ToolResultId::new(),
+                    schema_version: RUNTIME_SCHEMA_VERSION,
+                    created_at: LedgerTimestamp::now(),
+                    invocation_id: invocation.id.clone(),
+                    tool_id: invocation.tool_id.clone(),
+                    status: ToolResultStatus::Succeeded,
+                    schema_ref: Some("tool_result.json_fallback_fixture.v1".to_string()),
+                    fields: vec![
+                        ToolResultField {
+                            key: "summary".to_string(),
+                            value: StructuredValue::String("json fallback probe".to_string()),
+                        },
+                        ToolResultField {
+                            key: "detail".to_string(),
+                            value: StructuredValue::String("first detail".to_string()),
+                        },
+                        ToolResultField {
+                            key: "secondary".to_string(),
+                            value: StructuredValue::String("second detail".to_string()),
+                        },
+                    ],
+                    evidence_refs: Vec::new(),
+                    output_refs: vec![OutputRef {
+                        id: OutputRefId::new(),
+                        uri: "artifact://json-fallback/output".to_string(),
+                        media_type: "text/plain".to_string(),
+                        label: Some("fallback output".to_string()),
+                        digest: None,
+                    }],
+                    truncation: None,
+                    redactions: Vec::new(),
+                }
+            }
+        }
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "surface render fallback",
+        )
+        .with_render_options(RenderOptions {
+            format: OutputFormat::Json,
+            include_policy: true,
+            include_diagnostics: true,
+            include_cost: true,
+        })
+        .with_tool_output_defaults(ToolOutputDefaults {
+            render_options: RenderOptions::new(OutputFormat::Toon),
+            max_inline_bytes: 16 * 1024,
+            max_inline_lines: 2,
+            verbosity: crate::settings::ToolOutputVerbosity::Normal,
+            granularity: crate::settings::ToolOutputGranularity::Full,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        });
+
+        let receipt = runtime.run_tool_job(request, &JsonFallbackTool).unwrap();
+        let rendered = receipt.rendered_output.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Json);
+        assert_eq!(rendered.body.lines().count(), 1);
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("render policy compacted output"));
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("json rendering switched from pretty to compact"));
+        assert_eq!(json["output_refs"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn runtime_exposes_toon_render_fallback_reason_in_rendered_output() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "surface toon render fallback",
+        )
+        .with_tool_output_defaults(ToolOutputDefaults {
+            render_options: RenderOptions::new(OutputFormat::Toon),
+            max_inline_bytes: 16 * 1024,
+            max_inline_lines: 8,
+            verbosity: crate::settings::ToolOutputVerbosity::Normal,
+            granularity: crate::settings::ToolOutputGranularity::Summary,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        });
+
+        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+        let rendered = receipt.rendered_output.unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Toon);
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("render policy compacted output"));
+        assert!(rendered.body.contains("rendering_truncation_reason"));
     }
 
     #[test]

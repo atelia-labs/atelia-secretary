@@ -58,6 +58,29 @@ impl Default for RenderOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutputRenderPolicy {
+    pub render_options: RenderOptions,
+    pub max_fields: Option<usize>,
+    pub max_inline_lines: Option<usize>,
+    pub include_evidence_refs: bool,
+    pub include_output_refs: bool,
+    pub include_redactions: bool,
+}
+
+impl ToolOutputRenderPolicy {
+    pub fn from_render_options(render_options: RenderOptions) -> Self {
+        Self {
+            render_options,
+            max_fields: None,
+            max_inline_lines: None,
+            include_evidence_refs: true,
+            include_output_refs: true,
+            include_redactions: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedToolOutput {
     pub format: OutputFormat,
     pub schema_version: String,
@@ -90,41 +113,61 @@ pub fn render_tool_result(
     result: &ToolResult,
     options: &RenderOptions,
 ) -> Result<RenderedToolOutput, ToolOutputRenderError> {
+    render_tool_result_with_policy(
+        result,
+        &ToolOutputRenderPolicy::from_render_options(options.clone()),
+    )
+}
+
+pub fn render_tool_result_with_policy(
+    result: &ToolResult,
+    policy: &ToolOutputRenderPolicy,
+) -> Result<RenderedToolOutput, ToolOutputRenderError> {
     let schema_version = schema_version(result);
 
-    match options.format {
-        OutputFormat::Toon => Ok(RenderedToolOutput {
-            format: OutputFormat::Toon,
-            schema_version,
-            body: render_toon(result, options, None),
-            fallback_reason: None,
-        }),
-        OutputFormat::Text => Ok(RenderedToolOutput {
-            format: OutputFormat::Text,
-            schema_version,
-            body: render_text(result, options),
-            fallback_reason: None,
-        }),
-        OutputFormat::Json => Ok(RenderedToolOutput {
-            format: OutputFormat::Json,
-            schema_version,
-            body: serde_json::to_string_pretty(&renderable_result(result, options)).map_err(
-                |error| ToolOutputRenderError::JsonSerialize {
-                    reason: error.to_string(),
-                },
-            )?,
-            fallback_reason: None,
-        }),
+    match policy.render_options.format {
+        OutputFormat::Toon => {
+            let (body, fallback_reason) = render_toon(result, policy, None);
+            Ok(RenderedToolOutput {
+                format: OutputFormat::Toon,
+                schema_version,
+                body,
+                fallback_reason,
+            })
+        }
+        OutputFormat::Text => {
+            let (body, fallback_reason) = render_text(result, policy);
+            Ok(RenderedToolOutput {
+                format: OutputFormat::Text,
+                schema_version,
+                body,
+                fallback_reason,
+            })
+        }
+        OutputFormat::Json => {
+            let (body, fallback_reason) = render_json(result, policy)?;
+
+            Ok(RenderedToolOutput {
+                format: OutputFormat::Json,
+                schema_version,
+                body,
+                fallback_reason,
+            })
+        }
     }
 }
 
 fn render_toon(
     result: &ToolResult,
-    options: &RenderOptions,
+    policy: &ToolOutputRenderPolicy,
     fallback_reason: Option<&str>,
-) -> String {
+) -> (String, Option<String>) {
+    let policy_fallback_reason = {
+        let result = &result;
+        render_policy_fallback_reason(result, policy)
+    };
+    let result = renderable_result(result, policy);
     let mut lines = Vec::new();
-    let result = renderable_result(result, options);
 
     lines.push(format!("status {}", status_name(result.status)));
     lines.push(format!("schema_version {}", schema_version(&result)));
@@ -149,21 +192,67 @@ fn render_toon(
         lines.push(format!("schema_ref {}", render_toon_value(schema_ref)));
     }
 
-    append_fields(&mut lines, &result);
-    append_artifact_refs(&mut lines, "evidence_refs", &result.evidence_refs);
-    append_output_refs(&mut lines, &result.output_refs);
+    let sections = toon_sections(&result);
+    let mut truncation_reason = None;
+    let mut body_lines = lines.len();
 
-    if let Some(truncation) = &result.truncation {
-        append_truncation(&mut lines, truncation);
+    if policy
+        .max_inline_lines
+        .is_some_and(|max_inline_lines| body_lines > max_inline_lines)
+    {
+        truncation_reason = Some(rendering_truncation_reason(
+            &sections,
+            policy.max_inline_lines,
+            "tool output prelude",
+            policy
+                .max_inline_lines
+                .map(|max_inline_lines| body_lines.saturating_sub(max_inline_lines)),
+        ));
     }
 
-    append_redactions(&mut lines, &result.redactions);
+    if truncation_reason.is_none() {
+        for (index, section) in sections.iter().enumerate() {
+            if section.lines.is_empty() {
+                continue;
+            }
 
-    lines.join("\n")
+            if policy
+                .max_inline_lines
+                .is_some_and(|max_inline_lines| body_lines + section.lines.len() > max_inline_lines)
+            {
+                truncation_reason = Some(rendering_truncation_reason(
+                    &sections[index..],
+                    policy.max_inline_lines,
+                    section.label,
+                    None,
+                ));
+                break;
+            }
+
+            body_lines += section.lines.len();
+            lines.extend(section.lines.iter().cloned());
+        }
+    }
+
+    if let Some(reason) = truncation_reason {
+        let max_inline_lines = policy.max_inline_lines.unwrap_or(usize::MAX);
+        let remaining_lines = max_inline_lines.saturating_sub(lines.len());
+        let notice_lines = build_rendering_truncation_notice(&reason, remaining_lines);
+        let notice_len = notice_lines.len();
+        let keep_len = max_inline_lines.saturating_sub(notice_len);
+        let mut kept_lines = lines.into_iter().take(keep_len).collect::<Vec<_>>();
+        kept_lines.extend(notice_lines);
+        let fallback_reason = combine_fallback_reasons(policy_fallback_reason, Some(reason));
+        (kept_lines.join("\n"), fallback_reason)
+    } else {
+        let fallback_reason = policy_fallback_reason;
+        (lines.join("\n"), fallback_reason)
+    }
 }
 
-fn render_text(result: &ToolResult, options: &RenderOptions) -> String {
-    let result = renderable_result(result, options);
+fn render_text(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> (String, Option<String>) {
+    let fallback_reason = render_policy_fallback_reason(result, policy);
+    let result = renderable_result(result, policy);
     let summary = summary_field(&result).unwrap_or("no summary");
     let mut parts = vec![format!(
         "{} {}: {}",
@@ -211,15 +300,192 @@ fn render_text(result: &ToolResult, options: &RenderOptions) -> String {
         ));
     }
 
-    parts.join("; ")
+    (parts.join("; "), fallback_reason)
 }
 
-fn renderable_result(result: &ToolResult, options: &RenderOptions) -> ToolResult {
+fn render_json(
+    result: &ToolResult,
+    policy: &ToolOutputRenderPolicy,
+) -> Result<(String, Option<String>), ToolOutputRenderError> {
+    let policy_fallback_reason = render_policy_fallback_reason(result, policy);
+    let mut result = renderable_result(result, policy);
+    let pretty_body = serde_json::to_string_pretty(&result).map_err(|error| {
+        ToolOutputRenderError::JsonSerialize {
+            reason: error.to_string(),
+        }
+    })?;
+
+    if policy
+        .max_inline_lines
+        .is_none_or(|max_inline_lines| pretty_body.lines().count() <= max_inline_lines)
+    {
+        return Ok((pretty_body, policy_fallback_reason));
+    }
+
+    let compact_fallback_reason = policy.max_inline_lines.map(|max_inline_lines| {
+        format!("json rendering switched from pretty to compact to fit max_inline_lines={max_inline_lines}")
+    });
+    let compact_body =
+        serde_json::to_string(&result).map_err(|error| ToolOutputRenderError::JsonSerialize {
+            reason: error.to_string(),
+        })?;
+
+    if policy
+        .max_inline_lines
+        .is_none_or(|max_inline_lines| compact_body.lines().count() <= max_inline_lines)
+    {
+        return Ok((
+            compact_body,
+            combine_fallback_reasons(policy_fallback_reason, compact_fallback_reason),
+        ));
+    }
+
+    let fallback_reason = policy
+        .max_inline_lines
+        .and_then(|max_inline_lines| truncate_json_rendering(&mut result, max_inline_lines));
+    let body =
+        serde_json::to_string(&result).map_err(|error| ToolOutputRenderError::JsonSerialize {
+            reason: error.to_string(),
+        })?;
+
+    Ok((
+        body,
+        combine_fallback_reasons(policy_fallback_reason, fallback_reason),
+    ))
+}
+
+fn renderable_result(result: &ToolResult, policy: &ToolOutputRenderPolicy) -> ToolResult {
     let mut result = result.clone();
     result
         .fields
-        .retain(|field| should_render_field(&field.key, options));
+        .retain(|field| should_render_field(&field.key, &policy.render_options));
+    if let Some(max_fields) = policy.max_fields {
+        result.fields.truncate(max_fields);
+    }
+    if !policy.include_evidence_refs {
+        result.evidence_refs.clear();
+    }
+    if !policy.include_output_refs {
+        result.output_refs.clear();
+    }
+    if !policy.include_redactions {
+        result.redactions.clear();
+    }
     result
+}
+
+fn render_policy_fallback_reason(
+    original: &ToolResult,
+    policy: &ToolOutputRenderPolicy,
+) -> Option<String> {
+    let rendered = renderable_result(original, policy);
+    let omitted_fields = original.fields.len().saturating_sub(rendered.fields.len());
+    let omitted_evidence_refs = original
+        .evidence_refs
+        .len()
+        .saturating_sub(rendered.evidence_refs.len());
+    let omitted_output_refs = original
+        .output_refs
+        .len()
+        .saturating_sub(rendered.output_refs.len());
+    let omitted_redactions = original
+        .redactions
+        .len()
+        .saturating_sub(rendered.redactions.len());
+
+    let compacted_by_policy = omitted_fields > 0
+        || omitted_evidence_refs > 0
+        || omitted_output_refs > 0
+        || omitted_redactions > 0;
+
+    let mut reasons = Vec::new();
+
+    if compacted_by_policy {
+        reasons.push(format!(
+            "render policy compacted output; omitted fields={omitted_fields}, evidence_refs={omitted_evidence_refs}, output_refs={omitted_output_refs}, redactions={omitted_redactions}"
+        ));
+    }
+
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join("; "))
+    }
+}
+
+fn combine_fallback_reasons(
+    policy_reason: Option<String>,
+    truncation_reason: Option<String>,
+) -> Option<String> {
+    match (policy_reason, truncation_reason) {
+        (None, None) => None,
+        (Some(reason), None) | (None, Some(reason)) => Some(reason),
+        (Some(policy_reason), Some(truncation_reason)) => {
+            Some(format!("{policy_reason}; {truncation_reason}"))
+        }
+    }
+}
+
+fn truncate_json_rendering(result: &mut ToolResult, max_inline_lines: usize) -> Option<String> {
+    if serde_json::to_string(result)
+        .ok()
+        .is_some_and(|body| body.lines().count() <= max_inline_lines)
+    {
+        return None;
+    }
+
+    let mut remaining = max_inline_lines;
+    let mut omitted_fields = 0usize;
+
+    if result.fields.len() > remaining {
+        omitted_fields = result.fields.len() - remaining;
+        result.fields.truncate(remaining);
+    }
+
+    remaining = remaining.saturating_sub(result.fields.len());
+
+    let omitted_evidence_refs;
+    let omitted_output_refs;
+    let omitted_redactions;
+
+    if remaining == 0 {
+        omitted_evidence_refs = result.evidence_refs.len();
+        omitted_output_refs = result.output_refs.len();
+        omitted_redactions = result.redactions.len();
+        result.evidence_refs.clear();
+        result.output_refs.clear();
+        result.redactions.clear();
+    } else {
+        let keep = remaining.min(result.evidence_refs.len());
+        omitted_evidence_refs = result.evidence_refs.len() - keep;
+        result.evidence_refs.truncate(keep);
+        remaining -= keep;
+
+        let keep = remaining.min(result.output_refs.len());
+        omitted_output_refs = result.output_refs.len() - keep;
+        result.output_refs.truncate(keep);
+        remaining -= keep;
+
+        let keep = remaining.min(result.redactions.len());
+        omitted_redactions = result.redactions.len() - keep;
+        result.redactions.truncate(keep);
+    }
+
+    if omitted_fields == 0
+        && omitted_evidence_refs == 0
+        && omitted_output_refs == 0
+        && omitted_redactions == 0
+    {
+        None
+    } else {
+        let _body_fits = serde_json::to_string(result)
+            .ok()
+            .is_some_and(|body| body.lines().count() <= max_inline_lines);
+
+        Some(format!(
+            "json rendering truncated to max_inline_lines={max_inline_lines}; omitted fields={omitted_fields}, evidence_refs={omitted_evidence_refs}, output_refs={omitted_output_refs}, redactions={omitted_redactions}"
+        ))
+    }
 }
 
 fn should_render_field(key: &str, options: &RenderOptions) -> bool {
@@ -267,32 +533,74 @@ fn optional_field_channel(key: &str) -> Option<OptionalFieldChannel> {
     }
 }
 
-fn append_fields(lines: &mut Vec<String>, result: &ToolResult) {
-    if result.fields.is_empty() {
-        return;
+#[derive(Debug, Clone)]
+struct ToonSection {
+    label: &'static str,
+    count: usize,
+    lines: Vec<String>,
+}
+
+fn toon_sections(result: &ToolResult) -> Vec<ToonSection> {
+    let mut sections = Vec::new();
+    sections.push(ToonSection {
+        label: "fields",
+        count: result.fields.len(),
+        lines: build_fields_section(&result.fields),
+    });
+    sections.push(ToonSection {
+        label: "evidence_refs",
+        count: result.evidence_refs.len(),
+        lines: build_artifact_refs_section("evidence_refs", &result.evidence_refs),
+    });
+    sections.push(ToonSection {
+        label: "output_refs",
+        count: result.output_refs.len(),
+        lines: build_output_refs_section(&result.output_refs),
+    });
+    if let Some(truncation) = &result.truncation {
+        sections.push(ToonSection {
+            label: "truncation",
+            count: 1,
+            lines: build_truncation_section(truncation),
+        });
+    }
+    sections.push(ToonSection {
+        label: "redactions",
+        count: result.redactions.len(),
+        lines: build_redactions_section(&result.redactions),
+    });
+
+    sections
+}
+
+fn build_fields_section(fields: &[crate::domain::ToolResultField]) -> Vec<String> {
+    if fields.is_empty() {
+        return Vec::new();
     }
 
-    lines.push(format!("fields[{}]{{key,value}}", result.fields.len()));
-
-    for field in &result.fields {
+    let mut lines = Vec::with_capacity(fields.len() + 1);
+    lines.push(format!("fields[{}]{{key,value}}", fields.len()));
+    for field in fields {
         lines.push(format!(
             "  {},{}",
             render_toon_value(&field.key),
             render_structured_value(&field.value)
         ));
     }
+
+    lines
 }
 
-fn append_artifact_refs(lines: &mut Vec<String>, label: &str, refs: &[ArtifactRef]) {
+fn build_artifact_refs_section(label: &str, refs: &[ArtifactRef]) -> Vec<String> {
     if refs.is_empty() {
-        return;
+        return Vec::new();
     }
 
+    let mut lines = Vec::with_capacity(refs.len() + 1);
     lines.push(format!(
         "{label}[{}]{{id,uri,media_type,label,digest}}",
         refs.len()
     ));
-
     for reference in refs {
         lines.push(format!(
             "  {},{},{},{},{}",
@@ -303,18 +611,20 @@ fn append_artifact_refs(lines: &mut Vec<String>, label: &str, refs: &[ArtifactRe
             render_optional_string(reference.digest.as_deref())
         ));
     }
+
+    lines
 }
 
-fn append_output_refs(lines: &mut Vec<String>, refs: &[OutputRef]) {
+fn build_output_refs_section(refs: &[OutputRef]) -> Vec<String> {
     if refs.is_empty() {
-        return;
+        return Vec::new();
     }
 
+    let mut lines = Vec::with_capacity(refs.len() + 1);
     lines.push(format!(
         "output_refs[{}]{{id,uri,media_type,label,digest}}",
         refs.len()
     ));
-
     for reference in refs {
         lines.push(format!(
             "  {},{},{},{},{}",
@@ -325,29 +635,30 @@ fn append_output_refs(lines: &mut Vec<String>, refs: &[OutputRef]) {
             render_optional_string(reference.digest.as_deref())
         ));
     }
+
+    lines
 }
 
-fn append_truncation(lines: &mut Vec<String>, truncation: &TruncationMetadata) {
-    lines.push("truncation".to_string());
-    lines.push("  truncated true".to_string());
-    lines.push(format!("  original_bytes {}", truncation.original_bytes));
-    lines.push(format!("  retained_bytes {}", truncation.retained_bytes));
-    lines.push(format!(
-        "  reason {}",
-        render_toon_value(&truncation.reason)
-    ));
+fn build_truncation_section(truncation: &TruncationMetadata) -> Vec<String> {
+    vec![
+        "truncation".to_string(),
+        "  truncated true".to_string(),
+        format!("  original_bytes {}", truncation.original_bytes),
+        format!("  retained_bytes {}", truncation.retained_bytes),
+        format!("  reason {}", render_toon_value(&truncation.reason)),
+    ]
 }
 
-fn append_redactions(lines: &mut Vec<String>, redactions: &[RedactionMarker]) {
+fn build_redactions_section(redactions: &[RedactionMarker]) -> Vec<String> {
     if redactions.is_empty() {
-        return;
+        return Vec::new();
     }
 
+    let mut lines = Vec::with_capacity(redactions.len() + 1);
     lines.push(format!(
         "redactions[{}]{{field_path,reason,redacted_at_ms}}",
         redactions.len()
     ));
-
     for redaction in redactions {
         lines.push(format!(
             "  {},{},{}",
@@ -356,6 +667,70 @@ fn append_redactions(lines: &mut Vec<String>, redactions: &[RedactionMarker]) {
             redaction.redacted_at.unix_millis
         ));
     }
+
+    lines
+}
+
+fn rendering_truncation_reason(
+    omitted_sections: &[ToonSection],
+    max_inline_lines: Option<usize>,
+    omitted_section: &str,
+    prelude_lines_omitted: Option<usize>,
+) -> String {
+    let omitted_counts = format_omitted_section_counts(omitted_sections);
+    let max_inline_lines =
+        max_inline_lines.map_or_else(|| "unbounded".to_string(), |value| value.to_string());
+    let prelude_lines_omitted = prelude_lines_omitted
+        .map(|value| format!("; prelude_lines_omitted={value}"))
+        .unwrap_or_default();
+    format!(
+        "toon rendering truncated to max_inline_lines={max_inline_lines} before {omitted_section}{prelude_lines_omitted}; omitted {omitted_counts}"
+    )
+}
+
+fn build_rendering_truncation_notice(reason: &str, remaining_lines: usize) -> Vec<String> {
+    match remaining_lines {
+        0 | 1 => vec![format!(
+            "rendering_truncated true; rendering_truncation_reason {}",
+            render_toon_value(reason)
+        )],
+        _ => vec![
+            "rendering_truncated true".to_string(),
+            format!("rendering_truncation_reason {}", render_toon_value(reason)),
+        ],
+    }
+}
+
+fn format_omitted_section_counts(sections: &[ToonSection]) -> String {
+    let fields = sections
+        .iter()
+        .filter(|section| section.label == "fields")
+        .map(|section| section.count)
+        .sum::<usize>();
+    let evidence_refs = sections
+        .iter()
+        .filter(|section| section.label == "evidence_refs")
+        .map(|section| section.count)
+        .sum::<usize>();
+    let output_refs = sections
+        .iter()
+        .filter(|section| section.label == "output_refs")
+        .map(|section| section.count)
+        .sum::<usize>();
+    let truncation = sections
+        .iter()
+        .filter(|section| section.label == "truncation")
+        .map(|section| section.count)
+        .sum::<usize>();
+    let redactions = sections
+        .iter()
+        .filter(|section| section.label == "redactions")
+        .map(|section| section.count)
+        .sum::<usize>();
+
+    format!(
+        "fields={fields}, evidence_refs={evidence_refs}, output_refs={output_refs}, truncation={truncation}, redactions={redactions}"
+    )
 }
 
 fn schema_version(result: &ToolResult) -> String {
@@ -569,6 +944,7 @@ mod tests {
         let rendered = render_tool_result(&result, &options).unwrap();
 
         assert_eq!(rendered.format, OutputFormat::Text);
+        assert_eq!(rendered.fallback_reason, None);
         assert_eq!(
             rendered.body,
             "git_status succeeded: 2 modified files; 3 field(s); 1 evidence ref(s); 1 output ref(s)"
@@ -586,6 +962,212 @@ mod tests {
         assert!(rendered.body.contains("\"tool_id\": \"git_status\""));
         assert!(rendered.body.contains("\"status\": \"succeeded\""));
         assert!(rendered.body.contains("\"schema_version\": 1"));
+    }
+
+    #[test]
+    fn json_rendering_preserves_pretty_output_when_inline_budget_is_sufficient() {
+        let result = sample_result();
+        let policy = ToolOutputRenderPolicy {
+            render_options: RenderOptions::new(OutputFormat::Json),
+            max_fields: None,
+            max_inline_lines: Some(64),
+            include_evidence_refs: true,
+            include_output_refs: true,
+            include_redactions: true,
+        };
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Json);
+        assert_eq!(rendered.fallback_reason, None);
+        assert!(rendered.body.lines().count() > 1);
+        assert!(rendered.body.starts_with("{\n"));
+        assert!(rendered.body.contains("\n  \"tool_id\": \"git_status\""));
+        assert!(rendered.body.contains("\n  \"fields\": ["));
+    }
+
+    #[test]
+    fn json_rendering_sets_fallback_reason_when_render_policy_compacts_output() {
+        let result = result_with_optional_channels();
+        let rendered =
+            render_tool_result(&result, &RenderOptions::new(OutputFormat::Json)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Json);
+        assert_eq!(json["fields"].as_array().unwrap().len(), 1);
+        assert_eq!(json["fields"][0]["key"], "summary");
+        assert_eq!(
+            json["fields"][0]["value"]["string"],
+            "optional channel sample"
+        );
+        assert!(!rendered.body.contains("\"policy.state\""));
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("render policy compacted output"));
+    }
+
+    #[test]
+    fn json_rendering_sets_fallback_reason_when_pretty_output_exceeds_inline_budget_but_compact_fits(
+    ) {
+        let mut result = sample_result();
+        result.fields.push(ToolResultField {
+            key: "debug_note".to_string(),
+            value: StructuredValue::String("keep me out".to_string()),
+        });
+        result.fields.push(ToolResultField {
+            key: "extra_note".to_string(),
+            value: StructuredValue::String("still keep me out".to_string()),
+        });
+        result.evidence_refs.push(ArtifactRef {
+            id: ArtifactRefId::new(),
+            uri: "/tmp/evidence-2.txt".to_string(),
+            media_type: "text/plain".to_string(),
+            label: Some("secondary evidence".to_string()),
+            digest: Some("sha256:def456".to_string()),
+        });
+        result.output_refs.push(OutputRef {
+            id: OutputRefId::new(),
+            uri: "/tmp/stdout-2.txt".to_string(),
+            media_type: "text/plain".to_string(),
+            label: Some("stdout-2".to_string()),
+            digest: Some("sha256:ghi789".to_string()),
+        });
+        result.redactions = vec![RedactionMarker {
+            field_path: "fields.debug_note".to_string(),
+            reason: "policy secret".to_string(),
+            redacted_at: LedgerTimestamp::from_unix_millis(1_700_000_000_123),
+        }];
+
+        let policy = ToolOutputRenderPolicy {
+            render_options: RenderOptions::new(OutputFormat::Json),
+            max_fields: None,
+            max_inline_lines: Some(2),
+            include_evidence_refs: true,
+            include_output_refs: true,
+            include_redactions: true,
+        };
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Json);
+        assert_eq!(rendered.body.lines().count(), 1);
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("json rendering switched from pretty to compact"));
+        assert_eq!(
+            json["fields"].as_array().unwrap().len(),
+            5,
+            "compact JSON should keep all renderable fields when it fits"
+        );
+        assert_eq!(json["evidence_refs"].as_array().unwrap().len(), 2);
+        assert_eq!(json["output_refs"].as_array().unwrap().len(), 2);
+        assert_eq!(json["redactions"].as_array().unwrap().len(), 1);
+        assert_eq!(json["fields"][0]["key"], "summary");
+        assert_eq!(json["fields"][1]["key"], "changed_files");
+        assert!(rendered.body.contains("debug_note"));
+        assert!(rendered.body.contains("secondary evidence"));
+    }
+
+    #[test]
+    fn toon_rendering_emits_truncation_notice_when_budget_is_smaller_than_prelude() {
+        let result = sample_result();
+        let policy = ToolOutputRenderPolicy {
+            render_options: RenderOptions::default(),
+            max_fields: None,
+            max_inline_lines: Some(1),
+            include_evidence_refs: true,
+            include_output_refs: true,
+            include_redactions: true,
+        };
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Toon);
+        assert_eq!(rendered.body.lines().count(), 1);
+        assert!(rendered.body.contains("rendering_truncated true"));
+        assert!(rendered.body.contains("rendering_truncation_reason"));
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("max_inline_lines=1"));
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("prelude_lines_omitted="));
+    }
+
+    #[test]
+    fn toon_rendering_sets_fallback_reason_when_render_policy_compacts_output() {
+        let result = result_with_optional_channels();
+        let rendered = render_tool_result(&result, &RenderOptions::default()).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Toon);
+        assert!(rendered.body.contains("fields[1]{key,value}"));
+        assert!(!rendered.body.contains("policy.state"));
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("render policy compacted output"));
+    }
+
+    #[test]
+    fn text_rendering_sets_fallback_reason_when_render_policy_compacts_output() {
+        let result = result_with_optional_channels();
+        let rendered =
+            render_tool_result(&result, &RenderOptions::new(OutputFormat::Text)).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Text);
+        assert!(rendered
+            .body
+            .starts_with("git_status succeeded: optional channel sample"));
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("render policy compacted output"));
+    }
+
+    #[test]
+    fn render_policy_limits_fields_and_secondary_sections() {
+        let mut result = sample_result();
+        result.fields.push(ToolResultField {
+            key: "debug_note".to_string(),
+            value: StructuredValue::String("keep me out".to_string()),
+        });
+        result.redactions = vec![RedactionMarker {
+            field_path: "fields.debug_note".to_string(),
+            reason: "policy secret".to_string(),
+            redacted_at: LedgerTimestamp::from_unix_millis(1_700_000_000_123),
+        }];
+
+        let policy = ToolOutputRenderPolicy {
+            render_options: RenderOptions::default(),
+            max_fields: Some(2),
+            max_inline_lines: Some(16),
+            include_evidence_refs: false,
+            include_output_refs: false,
+            include_redactions: false,
+        };
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+
+        assert!(rendered.body.contains("fields[2]{key,value}"));
+        assert!(rendered.body.contains("  summary,\"2 modified files\""));
+        assert!(rendered.body.contains(
+            "  changed_files,[crates/atelia-core/src/lib.rs,docs/tool-output-schema.md]"
+        ));
+        assert!(!rendered.body.contains("debug_note"));
+        assert!(!rendered.body.contains("evidence_refs["));
+        assert!(!rendered.body.contains("output_refs["));
+        assert!(!rendered.body.contains("redactions["));
     }
 
     #[test]
@@ -666,6 +1248,95 @@ mod tests {
             .body
             .contains("\"key\": \"diagnostics.parser_failure\""));
         assert!(rendered.body.contains("\"key\": \"cost.output_tokens\""));
+    }
+
+    #[test]
+    fn toon_rendering_truncates_before_secondary_sections_with_marker() {
+        let mut result = sample_result();
+        result.redactions = vec![RedactionMarker {
+            field_path: "fields.exit_code".to_string(),
+            reason: "policy secret".to_string(),
+            redacted_at: LedgerTimestamp::from_unix_millis(1_700_000_000_123),
+        }];
+        let policy = ToolOutputRenderPolicy {
+            render_options: RenderOptions::default(),
+            max_fields: Some(3),
+            max_inline_lines: Some(15),
+            include_evidence_refs: true,
+            include_output_refs: true,
+            include_redactions: true,
+        };
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+        let lines = rendered.body.lines().collect::<Vec<_>>();
+
+        assert!(lines.len() <= 15);
+        assert!(rendered.body.contains("fields[3]{key,value}"));
+        assert!(rendered
+            .body
+            .contains("evidence_refs[1]{id,uri,media_type,label,digest}"));
+        assert!(!rendered.body.contains("redactions["));
+        assert!(rendered.body.contains("rendering_truncated true"));
+        assert!(rendered.body.contains("rendering_truncation_reason"));
+    }
+
+    #[test]
+    fn toon_rendering_reports_truncation_when_fields_do_not_fit() {
+        let result = sample_result();
+        let policy = ToolOutputRenderPolicy {
+            render_options: RenderOptions::default(),
+            max_fields: Some(3),
+            max_inline_lines: Some(9),
+            include_evidence_refs: true,
+            include_output_refs: true,
+            include_redactions: true,
+        };
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Toon);
+        assert!(rendered.body.lines().count() <= 9);
+        assert!(rendered.body.contains("rendering_truncated true"));
+        assert!(rendered.body.contains("rendering_truncation_reason"));
+        assert!(!rendered.body.contains("fields["));
+        assert!(rendered
+            .body
+            .contains("schema_ref \"schema:git.status.v1\""));
+    }
+
+    #[test]
+    fn toon_rendering_uses_a_single_line_notice_when_only_one_line_remains() {
+        let result = ToolResult {
+            id: ToolResultId::new(),
+            schema_version: 1,
+            created_at: LedgerTimestamp::from_unix_millis(1_700_000_000_000),
+            invocation_id: ToolInvocationId::new(),
+            tool_id: "git_status".to_string(),
+            status: ToolResultStatus::Succeeded,
+            schema_ref: None,
+            fields: vec![ToolResultField {
+                key: "summary".to_string(),
+                value: StructuredValue::String("one field".to_string()),
+            }],
+            evidence_refs: Vec::new(),
+            output_refs: Vec::new(),
+            truncation: None,
+            redactions: Vec::new(),
+        };
+        let policy = ToolOutputRenderPolicy {
+            render_options: RenderOptions::default(),
+            max_fields: Some(1),
+            max_inline_lines: Some(7),
+            include_evidence_refs: false,
+            include_output_refs: false,
+            include_redactions: false,
+        };
+
+        let rendered = render_tool_result_with_policy(&result, &policy).unwrap();
+
+        assert!(rendered.body.lines().count() <= 7);
+        assert!(rendered.body.contains("rendering_truncation_reason"));
+        assert!(!rendered.body.contains("rendering_truncated true\n"));
     }
 
     #[test]
