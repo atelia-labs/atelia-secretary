@@ -156,10 +156,36 @@ impl LocalArtifactStore {
 
     pub fn delete_artifact(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
         let path = Path::new(&output_ref.uri);
-        if path.exists() {
-            fs::remove_file(path)?;
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let root = self.canonical_root_dir().map_err(ArtifactError::Io)?;
+
+        let resolved_path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(ArtifactError::Io(error)),
+        };
+
+        if !resolved_path.starts_with(&root) {
+            return Ok(());
+        }
+
+        match fs::remove_file(resolved_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         Ok(())
+    }
+
+    fn canonical_root_dir(&self) -> io::Result<PathBuf> {
+        match self.config.root_dir.canonicalize() {
+            Ok(root) => Ok(root),
+            Err(_) if self.config.root_dir.is_absolute() => Ok(self.config.root_dir.clone()),
+            Err(_) => std::env::current_dir().map(|cwd| cwd.join(&self.config.root_dir)),
+        }
     }
 }
 
@@ -222,16 +248,19 @@ fn write_file_bytes_inner(path: &Path, bytes: &[u8], fail_after_write: bool) -> 
 
     use std::io::Write;
     if let Err(error) = file.write_all(bytes) {
+        drop(file);
         cleanup_temp_file();
         return Err(error);
     }
 
     if fail_after_write {
+        drop(file);
         cleanup_temp_file();
         return Err(io::Error::other("simulated post-write failure"));
     }
 
     if let Err(error) = file.flush() {
+        drop(file);
         cleanup_temp_file();
         return Err(error);
     }
@@ -239,6 +268,7 @@ fn write_file_bytes_inner(path: &Path, bytes: &[u8], fail_after_write: bool) -> 
     #[cfg(unix)]
     {
         if let Err(error) = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)) {
+            drop(file);
             cleanup_temp_file();
             return Err(error);
         }
@@ -524,6 +554,30 @@ mod tests {
             fs::read_dir(&dir).unwrap().next().is_none(),
             "directory should contain no artifacts after injected failure",
         );
+    }
+
+    #[test]
+    fn delete_artifact_ignores_path_outside_root() {
+        let root = temp_root("delete-outside-root");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let outside_root = temp_root("delete-outside-root-target");
+        let outside_dir = outside_root.join("other_scope");
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let outside_artifact = outside_dir.join("outside.artifact");
+        fs::write(&outside_artifact, b"don't touch").unwrap();
+
+        let forged_output_ref = OutputRef {
+            id: OutputRefId::new(),
+            uri: outside_artifact.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("outside".to_string()),
+            digest: None,
+        };
+
+        store.delete_artifact(&forged_output_ref).unwrap();
+
+        assert!(outside_artifact.exists());
     }
 
     #[test]
