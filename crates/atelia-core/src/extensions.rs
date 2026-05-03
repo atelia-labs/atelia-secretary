@@ -25,13 +25,25 @@ pub struct ExtensionManifest {
     pub types: Vec<ExtensionKind>,
     pub compatibility: ExtensionCompatibility,
     pub entrypoints: ExtensionEntrypoints,
+    #[serde(default)]
     pub permissions: BTreeMap<String, ExtensionPermission>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ExtensionToolDefinition>,
+    #[serde(default)]
     pub services: ExtensionServices,
+    #[serde(default)]
+    pub tool_output: Vec<ExtensionToolOutputDefinition>,
+    #[serde(default)]
+    pub hooks: Vec<ExtensionHookDefinition>,
+    #[serde(default)]
+    pub webhooks: Vec<ExtensionWebhookDefinition>,
+    #[serde(default)]
+    pub composition: ExtensionComposition,
     pub failure: ExtensionFailure,
     pub provenance: ExtensionProvenance,
     pub bundle: Option<ExtensionBundleMembership>,
+    #[serde(default)]
+    pub migration: ExtensionMigration,
 }
 
 impl Default for ExtensionManifest {
@@ -62,6 +74,10 @@ impl Default for ExtensionManifest {
             permissions: BTreeMap::new(),
             tools: Vec::new(),
             services: ExtensionServices::default(),
+            tool_output: Vec::new(),
+            hooks: Vec::new(),
+            webhooks: Vec::new(),
+            composition: ExtensionComposition::default(),
             failure: ExtensionFailure {
                 degrade: DegradeBehavior::ReturnUnavailable,
                 retry_policy: RetryPolicy::None,
@@ -77,6 +93,7 @@ impl Default for ExtensionManifest {
                 signer: None,
             },
             bundle: None,
+            migration: ExtensionMigration::default(),
         }
     }
 }
@@ -102,12 +119,21 @@ pub enum ExtensionKind {
     Tool,
     Service,
     HookProvider,
+    WebhookReceiver,
     ToolOutputCustomizer,
+    Workflow,
+    Notification,
     ApprovalAgent,
-    DelegatedAgentProvider,
+    Review,
+    ReviewAgent,
+    AgentProvider,
+    #[serde(alias = "delegated_agent_provider")]
+    DelegatedAgent,
     MemoryProvider,
     MemoryStrategy,
-    ClientSurface,
+    Integration,
+    #[serde(alias = "client_surface")]
+    Presentation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,6 +189,57 @@ pub struct ExtensionToolDefinition {
 pub struct ExtensionServices {
     pub provides: Vec<ExtensionServiceDefinition>,
     pub consumes: Vec<ExtensionServiceDependency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionToolOutputDefinition {
+    pub tool_id: String,
+    pub format: Option<String>,
+    pub verbosity: Option<String>,
+    pub language_mode: Option<String>,
+    pub fields: Vec<String>,
+    pub redactions: Vec<String>,
+    pub include_policy: Option<bool>,
+    pub include_cost: Option<bool>,
+    pub include_diagnostics: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionHookDefinition {
+    pub hook_id: String,
+    pub trigger: Option<String>,
+    pub verification: Option<String>,
+    pub required_capabilities: Vec<String>,
+    pub action: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionWebhookDefinition {
+    pub webhook_id: String,
+    pub source: Option<String>,
+    pub event: Option<String>,
+    pub endpoint: Option<String>,
+    pub verification: Option<String>,
+    pub required_capabilities: Vec<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionComposition {
+    pub attachments: Vec<ExtensionCompositionAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionCompositionAttachment {
+    pub extension_id: String,
+    pub required: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionMigration {
+    pub from: Vec<String>,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -417,6 +494,9 @@ fn validate_manifest(
     validate_permissions(&manifest.permissions)?;
     validate_tools(manifest)?;
     validate_services(manifest)?;
+    validate_tool_output(manifest)?;
+    validate_hooks(manifest)?;
+    validate_webhooks(manifest)?;
 
     Ok(ValidatedExtensionManifest {
         manifest: manifest.clone(),
@@ -746,6 +826,92 @@ fn validate_services(manifest: &ExtensionManifest) -> ExtensionValidationResult<
                 schema_version: dependency.schema_version.clone(),
             });
         }
+    }
+
+    Ok(())
+}
+
+fn validate_tool_output(manifest: &ExtensionManifest) -> ExtensionValidationResult<()> {
+    let has_tool_output_kind = manifest
+        .types
+        .contains(&ExtensionKind::ToolOutputCustomizer);
+    let declares_tool_output = !manifest.tool_output.is_empty();
+
+    if declares_tool_output && !has_tool_output_kind {
+        return Err(ExtensionValidationError::InvalidField {
+            field: "types",
+            reason: "tool output declarations require type tool_output_customizer".to_string(),
+        });
+    }
+
+    if has_tool_output_kind && !declares_tool_output {
+        return Err(ExtensionValidationError::MissingField {
+            field: "tool_output",
+        });
+    }
+
+    let declared_tools = manifest
+        .tools
+        .iter()
+        .map(|tool| tool.id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for tool_output in &manifest.tool_output {
+        require_non_empty("tool_output.tool_id", &tool_output.tool_id)?;
+
+        if !declared_tools.contains(tool_output.tool_id.as_str()) {
+            return Err(ExtensionValidationError::InvalidField {
+                field: "tool_output.tool_id",
+                reason: format!(
+                    "tool output customization targets undeclared tool {}",
+                    tool_output.tool_id
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_hooks(manifest: &ExtensionManifest) -> ExtensionValidationResult<()> {
+    let has_hook_provider_kind = manifest.types.contains(&ExtensionKind::HookProvider);
+    let declares_hooks = !manifest.hooks.is_empty();
+
+    if declares_hooks && !has_hook_provider_kind {
+        return Err(ExtensionValidationError::InvalidField {
+            field: "types",
+            reason: "hook declarations require type hook_provider".to_string(),
+        });
+    }
+
+    if has_hook_provider_kind && !declares_hooks {
+        return Err(ExtensionValidationError::MissingField { field: "hooks" });
+    }
+
+    for hook in &manifest.hooks {
+        require_non_empty("hooks.hook_id", &hook.hook_id)?;
+    }
+
+    Ok(())
+}
+
+fn validate_webhooks(manifest: &ExtensionManifest) -> ExtensionValidationResult<()> {
+    let has_webhook_receiver_kind = manifest.types.contains(&ExtensionKind::WebhookReceiver);
+    let declares_webhooks = !manifest.webhooks.is_empty();
+
+    if declares_webhooks && !has_webhook_receiver_kind {
+        return Err(ExtensionValidationError::InvalidField {
+            field: "types",
+            reason: "webhook declarations require type webhook_receiver".to_string(),
+        });
+    }
+
+    if has_webhook_receiver_kind && !declares_webhooks {
+        return Err(ExtensionValidationError::MissingField { field: "webhooks" });
+    }
+
+    for webhook in &manifest.webhooks {
+        require_non_empty("webhooks.webhook_id", &webhook.webhook_id)?;
     }
 
     Ok(())
@@ -1756,6 +1922,43 @@ mod tests {
         }
     }
 
+    fn tool_output_definition(tool_id: &str) -> ExtensionToolOutputDefinition {
+        ExtensionToolOutputDefinition {
+            tool_id: tool_id.to_string(),
+            format: Some("toon".to_string()),
+            verbosity: Some("normal".to_string()),
+            language_mode: Some("english_agent".to_string()),
+            fields: vec!["summary".to_string()],
+            redactions: vec!["secret".to_string()],
+            include_policy: Some(true),
+            include_cost: Some(false),
+            include_diagnostics: Some(true),
+        }
+    }
+
+    fn hook_definition(hook_id: &str) -> ExtensionHookDefinition {
+        ExtensionHookDefinition {
+            hook_id: hook_id.to_string(),
+            trigger: Some("pull_request.opened".to_string()),
+            verification: Some("github_signature".to_string()),
+            required_capabilities: vec!["review.comment".to_string()],
+            action: Some("workflow".to_string()),
+            status: Some("enabled".to_string()),
+        }
+    }
+
+    fn webhook_definition(webhook_id: &str) -> ExtensionWebhookDefinition {
+        ExtensionWebhookDefinition {
+            webhook_id: webhook_id.to_string(),
+            source: Some("github".to_string()),
+            event: Some("pull_request.opened".to_string()),
+            endpoint: Some("https://example.com/webhook".to_string()),
+            verification: Some("hmac".to_string()),
+            required_capabilities: vec!["network.webhook.receive:github".to_string()],
+            status: Some("enabled".to_string()),
+        }
+    }
+
     #[test]
     fn validates_backend_wasm_rust_manifest() {
         let validated = manifest("com.example.extension")
@@ -2434,6 +2637,166 @@ mod tests {
             serde_json::from_value(serialized).expect("missing tools should default to empty");
 
         assert!(deserialized.tools.is_empty());
+    }
+
+    #[test]
+    fn extension_manifest_roundtrips_extended_sections_with_defaults() {
+        let mut extension = manifest("com.example.extended-sections");
+        extension.tool_output.push(tool_output_definition("ping"));
+        extension.hooks.push(hook_definition("hk_review"));
+        extension.webhooks.push(webhook_definition("wh_review"));
+        extension
+            .composition
+            .attachments
+            .push(ExtensionCompositionAttachment {
+                extension_id: "com.example.partner".to_string(),
+                required: Some(true),
+            });
+        extension.migration.from.push("1.0.0".to_string());
+        extension.migration.notes = Some("backfills tool output defaults".to_string());
+
+        let serialized = serde_json::to_value(&extension).unwrap();
+
+        assert!(serialized.get("tool_output").is_some());
+        assert!(serialized.get("hooks").is_some());
+        assert!(serialized.get("webhooks").is_some());
+        assert!(serialized.get("composition").is_some());
+        assert!(serialized.get("migration").is_some());
+
+        let deserialized: ExtensionManifest = serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized.tool_output.len(), 1);
+        assert_eq!(deserialized.hooks.len(), 1);
+        assert_eq!(deserialized.webhooks.len(), 1);
+        assert_eq!(deserialized.composition.attachments.len(), 1);
+        assert_eq!(deserialized.migration.from, vec!["1.0.0".to_string()]);
+        assert_eq!(
+            deserialized.migration.notes.as_deref(),
+            Some("backfills tool output defaults")
+        );
+    }
+
+    #[test]
+    fn extension_manifest_deserializes_missing_extended_sections_as_defaults() {
+        let extension = manifest("com.example.missing-sections");
+        let mut serialized = serde_json::to_value(&extension).unwrap();
+        let object = serialized
+            .as_object_mut()
+            .expect("manifest should serialize to an object");
+        object.remove("tool_output");
+        object.remove("hooks");
+        object.remove("webhooks");
+        object.remove("composition");
+        object.remove("migration");
+
+        let deserialized: ExtensionManifest = serde_json::from_value(serialized).unwrap();
+        assert!(deserialized.tool_output.is_empty());
+        assert!(deserialized.hooks.is_empty());
+        assert!(deserialized.webhooks.is_empty());
+        assert!(deserialized.composition.attachments.is_empty());
+        assert!(deserialized.migration.from.is_empty());
+        assert!(deserialized.migration.notes.is_none());
+    }
+
+    #[test]
+    fn extension_kind_roundtrips_extended_taxonomy_and_aliases() {
+        let kinds = vec![
+            ExtensionKind::Tool,
+            ExtensionKind::Service,
+            ExtensionKind::HookProvider,
+            ExtensionKind::WebhookReceiver,
+            ExtensionKind::ToolOutputCustomizer,
+            ExtensionKind::Workflow,
+            ExtensionKind::Notification,
+            ExtensionKind::ApprovalAgent,
+            ExtensionKind::Review,
+            ExtensionKind::ReviewAgent,
+            ExtensionKind::AgentProvider,
+            ExtensionKind::DelegatedAgent,
+            ExtensionKind::MemoryProvider,
+            ExtensionKind::MemoryStrategy,
+            ExtensionKind::Integration,
+            ExtensionKind::Presentation,
+        ];
+
+        let serialized = serde_json::to_value(&kinds).unwrap();
+        let deserialized: Vec<ExtensionKind> = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(deserialized, kinds);
+
+        let legacy_aliases: Vec<ExtensionKind> = serde_json::from_value(serde_json::json!([
+            "client_surface",
+            "delegated_agent_provider"
+        ]))
+        .unwrap();
+        assert_eq!(
+            legacy_aliases,
+            vec![ExtensionKind::Presentation, ExtensionKind::DelegatedAgent]
+        );
+
+        assert_eq!(
+            serialized,
+            serde_json::json!([
+                "tool",
+                "service",
+                "hook_provider",
+                "webhook_receiver",
+                "tool_output_customizer",
+                "workflow",
+                "notification",
+                "approval_agent",
+                "review",
+                "review_agent",
+                "agent_provider",
+                "delegated_agent",
+                "memory_provider",
+                "memory_strategy",
+                "integration",
+                "presentation"
+            ])
+        );
+    }
+
+    #[test]
+    fn extended_taxonomy_manifest_validates_with_new_sections() {
+        let mut extension = manifest("com.example.taxonomy");
+        extension.types = vec![
+            ExtensionKind::Tool,
+            ExtensionKind::Service,
+            ExtensionKind::ToolOutputCustomizer,
+            ExtensionKind::HookProvider,
+            ExtensionKind::WebhookReceiver,
+            ExtensionKind::Workflow,
+            ExtensionKind::Notification,
+            ExtensionKind::ApprovalAgent,
+            ExtensionKind::Review,
+            ExtensionKind::ReviewAgent,
+            ExtensionKind::AgentProvider,
+            ExtensionKind::DelegatedAgent,
+            ExtensionKind::MemoryProvider,
+            ExtensionKind::MemoryStrategy,
+            ExtensionKind::Integration,
+            ExtensionKind::Presentation,
+        ];
+        extension.permissions.insert(
+            "service.review.comments".to_string(),
+            permission("provide service"),
+        );
+        extension
+            .services
+            .provides
+            .push(ExtensionServiceDefinition {
+                service: "review.comments".to_string(),
+                method: "summarize".to_string(),
+                schema_version: "v1".to_string(),
+                required_permission: "service.review.comments".to_string(),
+            });
+        extension.tool_output.push(tool_output_definition("ping"));
+        extension.hooks.push(hook_definition("hk_review"));
+        extension.webhooks.push(webhook_definition("wh_review"));
+
+        let validated = extension
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap();
+        assert_eq!(validated.boundary, ExtensionBoundary::ThirdParty);
     }
 
     #[test]

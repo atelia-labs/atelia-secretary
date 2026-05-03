@@ -83,6 +83,8 @@ migration:
   notes: null
 ```
 
+これらの additive section は daemon の manifest model では空の collection か null の note として default されるため、古い manifest も問題なく deserialize できます。
+
 manifest は enforceable contract です。runtime behavior が manifest を超える場合、Secretary は実行を block します。
 
 初期の backend enforcement は `atelia-core::extensions` の
