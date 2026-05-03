@@ -1,8 +1,9 @@
 //! Built-in filesystem read tools for Atelia Secretary.
 //!
-//! Provides repository-scoped `fs.list`, `fs.stat`, and `fs.search` tools that
-//! implement [`crate::runtime::RuntimeTool`] and enforce path canonicalization with symlink
-//! escape rejection per `docs/execution-semantics.md`.
+//! Provides repository-scoped `fs.list`, `fs.stat`, `fs.read`, and `fs.search`
+//! tools that implement [`crate::runtime::RuntimeTool`] and enforce path
+//! canonicalization with symlink escape rejection per
+//! `docs/execution-semantics.md`.
 
 use crate::domain::{
     LedgerTimestamp, RedactionMarker, ResolvedPath, StructuredValue, ToolInvocation, ToolResult,
@@ -10,11 +11,19 @@ use crate::domain::{
 };
 use crate::runtime::RuntimeJobRequest;
 use std::collections::HashSet;
-use std::fs;
-use std::io::{self, BufRead};
+use std::fs::{self, File};
+use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+
 const TOOLS_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_READ_MAX_LINES: usize = 120;
+const DEFAULT_READ_MAX_CHARS: usize = 32 * 1024;
+const DEFAULT_READ_MAX_SCAN_BYTES: u64 = 1024 * 1024;
 const DEFAULT_SEARCH_MAX_RESULTS: usize = 100;
 const DEFAULT_SEARCH_MAX_FILE_BYTES: u64 = 64 * 1024;
 
@@ -190,6 +199,37 @@ fn failed_result(
         None,
         Vec::new(),
     )
+}
+
+fn open_canonical_file_within_scope(canonical: &CanonicalPath) -> io::Result<File> {
+    let file = open_file_no_follow(&canonical.canonical)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let opened_path = fs::canonicalize(fd_path)?;
+        if !opened_path.starts_with(&canonical.root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "opened file escaped repository root",
+            ));
+        }
+    }
+
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_file_no_follow(path: &Path) -> io::Result<File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_file_no_follow(path: &Path) -> io::Result<File> {
+    fs::File::open(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +498,252 @@ impl crate::runtime::RuntimeTool for FsStatTool {
                 },
             ],
             None,
+            Vec::new(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FsReadTool
+// ---------------------------------------------------------------------------
+
+/// Reads a bounded text window from a file within the registered repository scope.
+#[derive(Debug, Clone)]
+pub struct FsReadTool {
+    repository_root: PathBuf,
+    start_line: usize,
+    max_lines: usize,
+    max_chars: usize,
+    max_scan_bytes: u64,
+    max_file_bytes: Option<u64>,
+    include_line_numbers: bool,
+}
+
+impl FsReadTool {
+    pub fn new(repository_root: impl Into<PathBuf>) -> Self {
+        Self {
+            repository_root: repository_root.into(),
+            start_line: 1,
+            max_lines: DEFAULT_READ_MAX_LINES,
+            max_chars: DEFAULT_READ_MAX_CHARS,
+            max_scan_bytes: DEFAULT_READ_MAX_SCAN_BYTES,
+            max_file_bytes: None,
+            include_line_numbers: false,
+        }
+    }
+
+    pub fn with_window(mut self, start_line: usize, max_lines: usize) -> Self {
+        self.start_line = start_line.max(1);
+        self.max_lines = max_lines;
+        self
+    }
+
+    pub fn with_max_chars(mut self, max_chars: usize) -> Self {
+        self.max_chars = max_chars;
+        self
+    }
+
+    pub fn with_max_scan_bytes(mut self, max_scan_bytes: u64) -> Self {
+        self.max_scan_bytes = max_scan_bytes;
+        self
+    }
+
+    pub fn with_max_file_bytes(mut self, max_file_bytes: u64) -> Self {
+        self.max_file_bytes = Some(max_file_bytes);
+        self
+    }
+
+    pub fn with_line_numbers(mut self) -> Self {
+        self.include_line_numbers = true;
+        self
+    }
+}
+
+impl crate::runtime::RuntimeTool for FsReadTool {
+    fn tool_id(&self) -> &'static str {
+        "fs.read"
+    }
+
+    fn requested_capability(&self) -> &'static str {
+        "filesystem.read"
+    }
+
+    fn declared_effect(&self) -> &'static str {
+        "read a bounded text window within the registered repository scope"
+    }
+
+    fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+        let mut parts = vec![format!("path={}", request.resource_scope.value)];
+        if self.start_line != 1 || self.max_lines != DEFAULT_READ_MAX_LINES {
+            parts.push(format!("window={}:{}", self.start_line, self.max_lines));
+        }
+        if self.max_chars != DEFAULT_READ_MAX_CHARS {
+            parts.push(format!("chars={}", self.max_chars));
+        }
+        if self.max_scan_bytes != DEFAULT_READ_MAX_SCAN_BYTES {
+            parts.push(format!("scan={}", self.max_scan_bytes));
+        }
+        if let Some(max_file_bytes) = self.max_file_bytes {
+            parts.push(format!("file={max_file_bytes}"));
+        }
+        if self.include_line_numbers {
+            parts.push("ln=true".to_string());
+        }
+        parts.join(" ")
+    }
+
+    fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
+        resolved_path_for_request(&self.repository_root, request)
+    }
+
+    fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
+        let schema_ref = "tool_result.fs.read.v1";
+        let relative = target_from_request(request);
+
+        let canonical = match canonicalize_within_scope(&self.repository_root, &relative) {
+            Ok(c) => c,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "read failed: path rejected".to_string(),
+                    err.to_string(),
+                );
+            }
+        };
+
+        let file = match open_canonical_file_within_scope(&canonical) {
+            Ok(file) => file,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "read failed: cannot open scoped file".to_string(),
+                    format!("{}: {}", canonical.display_path(), err),
+                );
+            }
+        };
+
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "read failed: cannot read file metadata".to_string(),
+                    format!("{}: {}", canonical.display_path(), err),
+                );
+            }
+        };
+
+        if !metadata.is_file() {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "read failed: target is not a file".to_string(),
+                canonical.display_path(),
+            );
+        }
+
+        if let Some(max_file_bytes) = self.max_file_bytes {
+            if metadata.len() > max_file_bytes {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "read failed: file exceeds configured byte limit".to_string(),
+                    format!(
+                        "{} is {} bytes; limit is {} bytes",
+                        canonical.display_path(),
+                        metadata.len(),
+                        max_file_bytes
+                    ),
+                );
+            }
+        }
+
+        let window = match read_text_window(
+            file,
+            self.start_line,
+            self.max_lines,
+            self.max_chars,
+            self.max_scan_bytes,
+            self.include_line_numbers,
+        ) {
+            Ok(window) => window,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "read failed: cannot read UTF-8 text".to_string(),
+                    format!("{}: {}", canonical.display_path(), err),
+                );
+            }
+        };
+
+        let mut truncation_reasons = Vec::new();
+        if self.start_line > 1 {
+            truncation_reasons.push(format!("window starts at line {}", self.start_line));
+        }
+        if window.truncated_by_lines {
+            truncation_reasons.push(format!("line limit {}", self.max_lines));
+        }
+        if window.truncated_by_chars {
+            truncation_reasons.push(format!("character limit {}", self.max_chars));
+        }
+        if window.truncated_by_scan {
+            truncation_reasons.push(format!("scan byte limit {}", self.max_scan_bytes));
+        }
+        let truncation = if truncation_reasons.is_empty() {
+            None
+        } else {
+            Some(TruncationMetadata {
+                original_bytes: metadata.len(),
+                retained_bytes: window.retained_source_bytes,
+                reason: truncation_reasons.join("; "),
+            })
+        };
+
+        let summary = format!(
+            "read {} line(s) from {}",
+            window.line_count,
+            canonical.display_path()
+        );
+
+        make_tool_result(
+            invocation,
+            ToolResultStatus::Succeeded,
+            schema_ref,
+            vec![
+                ToolResultField {
+                    key: "summary".to_string(),
+                    value: StructuredValue::String(summary),
+                },
+                ToolResultField {
+                    key: "path".to_string(),
+                    value: StructuredValue::String(canonical.display_path()),
+                },
+                ToolResultField {
+                    key: "content".to_string(),
+                    value: StructuredValue::String(window.content),
+                },
+                ToolResultField {
+                    key: "start_line".to_string(),
+                    value: StructuredValue::Integer(self.start_line as i64),
+                },
+                ToolResultField {
+                    key: "end_line".to_string(),
+                    value: StructuredValue::Integer(window.end_line as i64),
+                },
+                ToolResultField {
+                    key: "line_count".to_string(),
+                    value: StructuredValue::Integer(window.line_count as i64),
+                },
+                ToolResultField {
+                    key: "file_size_bytes".to_string(),
+                    value: StructuredValue::Integer(metadata.len() as i64),
+                },
+            ],
+            truncation,
             Vec::new(),
         )
     }
@@ -740,6 +1026,176 @@ fn search_recursive(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadWindow {
+    content: String,
+    end_line: usize,
+    line_count: usize,
+    retained_source_bytes: u64,
+    truncated_by_lines: bool,
+    truncated_by_chars: bool,
+    truncated_by_scan: bool,
+}
+
+fn read_text_window(
+    file: File,
+    start_line: usize,
+    max_lines: usize,
+    max_chars: usize,
+    max_scan_bytes: u64,
+    include_line_numbers: bool,
+) -> io::Result<ReadWindow> {
+    let mut reader = io::BufReader::new(file);
+    let start_line = start_line.max(1);
+
+    let mut content = String::new();
+    let mut end_line = 0;
+    let mut line_count = 0;
+    let mut used_chars = 0;
+    let mut retained_source_bytes = 0;
+    let mut scanned_bytes = 0;
+    let mut previous_retained_newline_bytes = 0;
+    let mut truncated_by_lines = false;
+    let mut truncated_by_chars = false;
+    let mut truncated_by_scan = false;
+    let mut current_line = 0;
+    let mut line_bytes = Vec::new();
+
+    loop {
+        if current_line >= start_line {
+            if line_count >= max_lines {
+                truncated_by_lines = !reader.fill_buf()?.is_empty();
+                break;
+            }
+            if used_chars >= max_chars {
+                truncated_by_chars = !reader.fill_buf()?.is_empty();
+                break;
+            }
+        }
+
+        if scanned_bytes >= max_scan_bytes {
+            truncated_by_scan = !reader.fill_buf()?.is_empty();
+            break;
+        }
+
+        line_bytes.clear();
+        let remaining_scan = max_scan_bytes - scanned_bytes;
+        let bytes_read = reader
+            .by_ref()
+            .take(remaining_scan)
+            .read_until(b'\n', &mut line_bytes)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        scanned_bytes += bytes_read as u64;
+        current_line += 1;
+        let ended_with_newline = line_bytes.last() == Some(&b'\n');
+        let mut source_newline_bytes = 0;
+        if ended_with_newline {
+            line_bytes.pop();
+            source_newline_bytes = 1;
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes.pop();
+                source_newline_bytes += 1;
+            }
+        } else if scanned_bytes >= max_scan_bytes {
+            truncated_by_scan = !reader.fill_buf()?.is_empty();
+        }
+
+        if current_line < start_line {
+            if truncated_by_scan {
+                break;
+            }
+            continue;
+        }
+
+        let line = match std::str::from_utf8(&line_bytes) {
+            Ok(line) => line.to_string(),
+            Err(error) if truncated_by_scan && error.error_len().is_none() => {
+                let valid_up_to = error.valid_up_to();
+                line_bytes.truncate(valid_up_to);
+                std::str::from_utf8(&line_bytes)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                    .to_string()
+            }
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        };
+        let rendered = if include_line_numbers {
+            format!("{current_line}: {line}")
+        } else {
+            line.clone()
+        };
+        let separator_chars = usize::from(!content.is_empty());
+        if used_chars + separator_chars >= max_chars {
+            truncated_by_chars = true;
+            break;
+        }
+
+        if separator_chars == 1 {
+            content.push('\n');
+            used_chars += 1;
+            retained_source_bytes += previous_retained_newline_bytes;
+        }
+
+        let remaining_chars = max_chars - used_chars;
+        let rendered_chars = rendered.chars().count();
+        if rendered_chars > remaining_chars {
+            content.extend(rendered.chars().take(remaining_chars));
+            retained_source_bytes += retained_source_bytes_for_rendered_chars(
+                &line,
+                current_line,
+                include_line_numbers,
+                remaining_chars,
+            );
+            line_count += 1;
+            end_line = current_line;
+            truncated_by_chars = true;
+            break;
+        }
+
+        content.push_str(&rendered);
+        used_chars += rendered_chars;
+        retained_source_bytes += line.len() as u64;
+        line_count += 1;
+        end_line = current_line;
+        previous_retained_newline_bytes = source_newline_bytes;
+
+        if truncated_by_scan {
+            break;
+        }
+    }
+
+    Ok(ReadWindow {
+        content,
+        end_line,
+        line_count,
+        retained_source_bytes,
+        truncated_by_lines,
+        truncated_by_chars,
+        truncated_by_scan,
+    })
+}
+
+fn retained_source_bytes_for_rendered_chars(
+    line: &str,
+    current_line: usize,
+    include_line_numbers: bool,
+    rendered_char_count: usize,
+) -> u64 {
+    let source_char_count = if include_line_numbers {
+        let prefix_chars = format!("{current_line}: ").chars().count();
+        rendered_char_count.saturating_sub(prefix_chars)
+    } else {
+        rendered_char_count
+    };
+
+    line.chars()
+        .take(source_char_count)
+        .map(|character| character.len_utf8() as u64)
+        .sum()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1147,6 +1603,227 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    // -- FsReadTool tests --
+
+    #[test]
+    fn fs_read_reads_text_file() {
+        let env = TestEnv::new("read-ok");
+        env.create_file("notes.txt", "alpha\nbeta\ngamma");
+
+        let tool = FsReadTool::new(&env.root);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            Some("tool_result.fs.read.v1".to_string()),
+            result.schema_ref
+        );
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("alpha\nbeta\ngamma", string_value(&content.value));
+        let line_count = result
+            .fields
+            .iter()
+            .find(|f| f.key == "line_count")
+            .unwrap();
+        assert_eq!(3, integer_value(&line_count.value));
+        assert!(result.truncation.is_none());
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_supports_line_windows_and_line_numbers() {
+        let env = TestEnv::new("read-window");
+        env.create_file("notes.txt", "alpha\nbeta\ngamma\ndelta");
+
+        let tool = FsReadTool::new(&env.root)
+            .with_window(2, 2)
+            .with_line_numbers();
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("2: beta\n3: gamma", string_value(&content.value));
+        let end_line = result.fields.iter().find(|f| f.key == "end_line").unwrap();
+        assert_eq!(3, integer_value(&end_line.value));
+        let trunc = result.truncation.unwrap();
+        assert!(trunc.reason.contains("window starts at line 2"));
+        assert!(trunc.reason.contains("line limit 2"));
+        assert!(trunc.retained_bytes <= trunc.original_bytes);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_applies_character_limit() {
+        let env = TestEnv::new("read-chars");
+        env.create_file("long.txt", "abcdef\nghijkl");
+
+        let tool = FsReadTool::new(&env.root).with_max_chars(4);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("long.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("abcd", string_value(&content.value));
+        assert!(result
+            .truncation
+            .unwrap()
+            .reason
+            .contains("character limit 4"));
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_applies_scan_limit_before_allocating_unbounded_lines() {
+        let env = TestEnv::new("read-scan");
+        env.create_file("long-line.txt", &"x".repeat(1024));
+
+        let tool = FsReadTool::new(&env.root)
+            .with_max_chars(16)
+            .with_max_scan_bytes(32);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("long-line.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!(16, string_value(&content.value).len());
+        let trunc = result.truncation.unwrap();
+        assert!(trunc.reason.contains("character limit 16"));
+        assert!(trunc.reason.contains("scan byte limit 32"));
+        assert_eq!(16, trunc.retained_bytes);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_scan_limit_preserves_utf8_boundaries() {
+        let env = TestEnv::new("read-utf8-scan");
+        env.create_file("utf8.txt", "ééé");
+
+        let tool = FsReadTool::new(&env.root)
+            .with_max_chars(16)
+            .with_max_scan_bytes(3);
+        let invocation = fake_invocation(tool.tool_id());
+        let result = tool.execute(&invocation, &request_with_path("utf8.txt"));
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("é", string_value(&content.value));
+        let trunc = result.truncation.unwrap();
+        assert!(trunc.reason.contains("scan byte limit 3"));
+        assert_eq!(2, trunc.retained_bytes);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_exact_scan_limit_at_eof_is_not_truncated() {
+        let env = TestEnv::new("read-scan-eof");
+        env.create_file("small.txt", "abc");
+
+        let tool = FsReadTool::new(&env.root).with_max_scan_bytes(3);
+        let invocation = fake_invocation(tool.tool_id());
+        let result = tool.execute(&invocation, &request_with_path("small.txt"));
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("abc", string_value(&content.value));
+        assert!(result.truncation.is_none());
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_exact_line_limit_at_eof_is_not_truncated() {
+        let env = TestEnv::new("read-lines-eof");
+        env.create_file("two.txt", "a\nb");
+
+        let tool = FsReadTool::new(&env.root).with_window(1, 2);
+        let invocation = fake_invocation(tool.tool_id());
+        let result = tool.execute(&invocation, &request_with_path("two.txt"));
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("a\nb", string_value(&content.value));
+        assert!(result.truncation.is_none());
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_exact_character_limit_at_eof_is_not_truncated() {
+        let env = TestEnv::new("read-chars-eof");
+        env.create_file("small.txt", "abcd");
+
+        let tool = FsReadTool::new(&env.root).with_max_chars(4);
+        let invocation = fake_invocation(tool.tool_id());
+        let result = tool.execute(&invocation, &request_with_path("small.txt"));
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("abcd", string_value(&content.value));
+        assert!(result.truncation.is_none());
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_retained_source_bytes_track_crlf_newlines() {
+        let env = TestEnv::new("read-crlf");
+        env.create_file("crlf.txt", "a\r\nb");
+
+        let file = File::open(env.root.join("crlf.txt")).unwrap();
+        let window = read_text_window(file, 1, 2, 100, 1024, true).unwrap();
+
+        assert_eq!("1: a\n2: b", window.content);
+        assert_eq!(4, window.retained_source_bytes);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_args_summary_includes_only_non_default_limits() {
+        let tool = FsReadTool::new("/repo")
+            .with_window(2, 4)
+            .with_max_chars(128)
+            .with_max_scan_bytes(256)
+            .with_max_file_bytes(512)
+            .with_line_numbers();
+        let request = request_with_path("artifact.txt");
+
+        assert_eq!(
+            "path=artifact.txt window=2:4 chars=128 scan=256 file=512 ln=true",
+            tool.args_summary(&request)
+        );
+    }
+
+    #[test]
+    fn fs_read_rejects_out_of_scope_and_directories() {
+        let env = TestEnv::new("read-reject");
+        env.create_dir("src");
+
+        let tool = FsReadTool::new(&env.root);
+        let invocation = fake_invocation(tool.tool_id());
+        let outside = tool.execute(&invocation, &request_with_path("/etc/passwd"));
+        assert_eq!(ToolResultStatus::Failed, outside.status);
+
+        let directory = tool.execute(&invocation, &request_with_path("src"));
+        assert_eq!(ToolResultStatus::Failed, directory.status);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_respects_optional_file_size_limit() {
+        let env = TestEnv::new("read-size-limit");
+        env.create_file("large.txt", "large enough");
+
+        let tool = FsReadTool::new(&env.root).with_max_file_bytes(4);
+        let invocation = fake_invocation(tool.tool_id());
+        let result = tool.execute(&invocation, &request_with_path("large.txt"));
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        env.cleanup();
+    }
+
     // -- FsSearchTool tests --
 
     #[test]
@@ -1435,6 +2112,48 @@ mod tests {
             .unwrap()
             .body
             .contains("entries"));
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_read_integrates_with_secretary_runtime() {
+        let env = TestEnv::new("runtime-read");
+        env.create_file("readme.md", "# hello\nbody");
+
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = RepositoryRecord::new(
+            "test-repo",
+            env.root.to_string_lossy(),
+            RepositoryTrustState::Trusted,
+            LedgerTimestamp::now(),
+        );
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let tool = FsReadTool::new(&env.root);
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "read repository file",
+        )
+        .with_resource_scope("path", "readme.md");
+
+        let receipt = runtime.run_tool_job(request, &tool).unwrap();
+
+        assert_eq!(crate::domain::JobStatus::Succeeded, receipt.job.status);
+        assert_eq!("fs.read", receipt.tool_invocation.as_ref().unwrap().tool_id);
+        assert!(!receipt
+            .tool_invocation
+            .as_ref()
+            .unwrap()
+            .resolved_paths
+            .is_empty());
+        let result = receipt.tool_result.unwrap();
+        let content = result.fields.iter().find(|f| f.key == "content").unwrap();
+        assert_eq!("# hello\nbody", string_value(&content.value));
         env.cleanup();
     }
 
