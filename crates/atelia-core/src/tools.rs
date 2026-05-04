@@ -3478,11 +3478,7 @@ fn unlink_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<()>
     // SAFETY: `parent` is a live directory file descriptor and `cstring` is a valid name.
     let result = unsafe { libc::unlinkat(parent.as_raw_fd(), cstring.as_ptr(), 0) };
     if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            return Ok(());
-        }
-        return Err(error);
+        return Err(io::Error::last_os_error());
     }
 
     Ok(())
@@ -3494,8 +3490,8 @@ fn acquire_ordered_write_locks(first_path: &Path, second_path: &Path) -> io::Res
         return Ok(vec![acquire_write_lock(first_path)?]);
     }
 
-    let first_key = first_path.to_string_lossy();
-    let second_key = second_path.to_string_lossy();
+    let first_key = first_path.as_os_str().as_bytes();
+    let second_key = second_path.as_os_str().as_bytes();
     if first_key <= second_key {
         Ok(vec![
             acquire_write_lock(first_path)?,
