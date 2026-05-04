@@ -36,6 +36,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+
 const TOOLS_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_READ_MAX_LINES: usize = 120;
 const DEFAULT_READ_MAX_CHARS: usize = 32 * 1024;
@@ -357,8 +358,6 @@ fn open_no_follow_in_parent_dir(
     let mut flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     if create_new {
         flags |= libc::O_CREAT | libc::O_EXCL;
-    } else {
-        flags |= libc::O_TRUNC;
     }
 
     // SAFETY: `parent` is a live directory file descriptor and the `cstring` is valid for
@@ -2960,7 +2959,7 @@ fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> 
         )
     })?;
     #[cfg(unix)]
-    let expected_metadata = if create_new {
+    let _expected_metadata = if create_new {
         None
     } else {
         let metadata = fs::metadata(path)?;
@@ -2968,7 +2967,7 @@ fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> 
     };
 
     #[cfg(target_os = "linux")]
-    let expected_path = if create_new {
+    let _expected_path = if create_new {
         None
     } else {
         Some(path.canonicalize()?)
@@ -2981,7 +2980,7 @@ fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> 
 
         #[cfg(unix)]
         {
-            if let Some((expected_dev, expected_ino)) = expected_metadata {
+            if let Some((expected_dev, expected_ino)) = _expected_metadata {
                 let opened_metadata = file.metadata()?;
                 if opened_metadata.dev() != expected_dev || opened_metadata.ino() != expected_ino {
                     return Err(io::Error::new(
@@ -2992,7 +2991,7 @@ fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> 
             }
 
             #[cfg(target_os = "linux")]
-            if let Some(expected_path) = expected_path {
+            if let Some(expected_path) = _expected_path {
                 let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
                 let opened_path = fs::canonicalize(fd_path)?;
                 if opened_path != expected_path {
