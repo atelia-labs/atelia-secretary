@@ -3720,19 +3720,8 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
                 format!("{}: {}", target.display_path(), err),
             );
         }
-        let mut file = match open_write_file_no_follow(path, false) {
-            Ok(file) => file,
-            Err(err) => {
-                return failed_result(
-                    invocation,
-                    schema_ref,
-                    "patch failed: cannot open scoped file".to_string(),
-                    format!("{}: {}", target.display_path(), err),
-                );
-            }
-        };
-
-        if let Err(err) = file.write_all(updated.as_bytes()) {
+        #[cfg(not(unix))]
+        if let Err(err) = write_file_bytes_atomically(path, updated.as_bytes(), false) {
             return failed_result(
                 invocation,
                 schema_ref,
@@ -5924,6 +5913,24 @@ exit 0
         );
         let changed = result.fields.iter().find(|f| f.key == "changed").unwrap();
         assert_eq!(StructuredValue::Bool(true), changed.value);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_patch_truncates_when_replacement_is_shorter() {
+        let env = TestEnv::new("patch-shorter");
+        env.create_file("notes.txt", "alpha\nlong-token\ngamma");
+
+        let tool = FsPatchTool::new(&env.root, "long-token", "x");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            "alpha\nx\ngamma",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
         env.cleanup();
     }
 
