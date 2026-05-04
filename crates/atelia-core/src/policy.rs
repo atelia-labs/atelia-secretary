@@ -341,9 +341,8 @@ impl Capability {
             | "filesystem.diff" | "fs.read" | "fs.list" | "fs.search" | "fs.stat" | "fs.diff" => {
                 Self::FilesystemRead
             }
-            "filesystem.write" | "filesystem.patch" | "fs.write" | "fs.patch" => {
-                Self::FilesystemWrite
-            }
+            "filesystem.write" | "filesystem.patch" | "filesystem.delete" | "filesystem.move"
+            | "fs.write" | "fs.patch" | "fs.delete" | "fs.move" => Self::FilesystemWrite,
             "process.exec" | "process.execute" | "process.run" | "proc.exec" => Self::ProcessExec,
             "repository.mutate.broad"
             | "repo.mutate.broad"
