@@ -22,7 +22,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1471,6 +1471,33 @@ struct ProcessExecutionOutcome {
     timed_out: bool,
 }
 
+struct TempCaptureFile {
+    path: PathBuf,
+}
+
+impl TempCaptureFile {
+    fn create(label: &str) -> io::Result<(Self, File)> {
+        static CAPTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let seq = CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("atelia-proc-exec-{pid}-{seq}-{label}.out"));
+
+        let file = File::create(&path)?;
+        Ok((Self { path }, file))
+    }
+
+    fn read(&self) -> io::Result<Vec<u8>> {
+        fs::read(&self.path)
+    }
+}
+
+impl Drop for TempCaptureFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn capture_text_output(bytes: Vec<u8>, max_output_bytes: usize) -> CapturedStream {
     let original_bytes = bytes.len();
     let retained_bytes = original_bytes.min(max_output_bytes);
@@ -1483,63 +1510,36 @@ fn capture_text_output(bytes: Vec<u8>, max_output_bytes: usize) -> CapturedStrea
     }
 }
 
-fn read_child_stream(
-    handle: Option<impl Read + Send + 'static>,
-) -> thread::JoinHandle<io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut reader) = handle {
-            reader.read_to_end(&mut bytes)?;
-        }
-        Ok(bytes)
-    })
-}
-
-fn join_reader_with_timeout(
-    handle: thread::JoinHandle<io::Result<Vec<u8>>>,
-    timeout: Duration,
-) -> io::Result<(Vec<u8>, bool)> {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(handle.join());
-    });
-
-    match receiver.recv_timeout(timeout) {
-        Ok(join_result) => match join_result {
-            Ok(bytes) => Ok((bytes?, false)),
-            Err(_) => Err(io::Error::other("reader thread panicked")),
-        },
-        Err(RecvTimeoutError::Timeout) => Ok((Vec::new(), true)),
-        Err(_) => Err(io::Error::other("reader join thread failed")),
-    }
-}
-
 #[cfg(unix)]
-fn kill_process_tree(child: &mut std::process::Child) {
+fn kill_process_tree(child: &mut std::process::Child) -> bool {
     let pid = child.id() as i32;
     let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    let _ = child.kill();
+    true
 }
 
 #[cfg(not(unix))]
-fn kill_process_tree(child: &mut std::process::Child) {
+fn kill_process_tree(child: &mut std::process::Child) -> bool {
     let _ = child.kill();
+    false
 }
 
 fn wait_for_child(
     child: &mut std::process::Child,
     timeout: Duration,
-) -> io::Result<(Option<std::process::ExitStatus>, bool)> {
+) -> io::Result<(Option<std::process::ExitStatus>, bool, bool)> {
     let start = Instant::now();
 
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok((Some(status), false));
+            return Ok((Some(status), false, false));
         }
 
         if start.elapsed() >= timeout {
-            kill_process_tree(child);
+            let process_tree_handled = kill_process_tree(child);
             let status = child.wait()?;
-            return Ok((Some(status), true));
+            return Ok((Some(status), true, process_tree_handled));
         }
 
         thread::sleep(Duration::from_millis(10));
@@ -1566,8 +1566,12 @@ fn execute_explicit_argv_process(
     command.args(&argv[1..]);
     command.current_dir(&canonical_cwd.canonical);
     command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
+    let (stdout_capture, stdout_file) = TempCaptureFile::create("stdout")
+        .map_err(|error| format!("failed to create stdout capture file: {error}"))?;
+    let (stderr_capture, stderr_file) = TempCaptureFile::create("stderr")
+        .map_err(|error| format!("failed to create stderr capture file: {error}"))?;
+    command.stdout(Stdio::from(stdout_file));
+    command.stderr(Stdio::from(stderr_file));
     command.env_clear();
     #[cfg(unix)]
     command.process_group(0);
@@ -1586,17 +1590,14 @@ fn execute_explicit_argv_process(
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to spawn process: {error}"))?;
-    let stdout_handle = read_child_stream(child.stdout.take());
-    let stderr_handle = read_child_stream(child.stderr.take());
-    let (status, mut timed_out) = wait_for_child(&mut child, timeout)
+    let (status, timed_out, process_tree_handled) = wait_for_child(&mut child, timeout)
         .map_err(|error| format!("process wait failed: {error}"))?;
-    let (stdout_bytes, stdout_timed_out) =
-        join_reader_with_timeout(stdout_handle, Duration::from_millis(250))
-            .map_err(|error| format!("stdout read failed: {error}"))?;
-    let (stderr_bytes, stderr_timed_out) =
-        join_reader_with_timeout(stderr_handle, Duration::from_millis(250))
-            .map_err(|error| format!("stderr read failed: {error}"))?;
-    timed_out |= stdout_timed_out || stderr_timed_out;
+    let stdout_bytes = stdout_capture
+        .read()
+        .map_err(|error| format!("stdout read failed: {error}"))?;
+    let stderr_bytes = stderr_capture
+        .read()
+        .map_err(|error| format!("stderr read failed: {error}"))?;
 
     let stdout = capture_text_output(stdout_bytes, max_output_bytes);
     let stderr = capture_text_output(stderr_bytes, max_output_bytes);
@@ -1614,6 +1615,11 @@ fn execute_explicit_argv_process(
             duration_ms
         ),
     };
+    if timed_out && !process_tree_handled {
+        summary.push_str(
+            " process tree cleanup is unsupported on this platform (best-effort child kill only)",
+        );
+    }
     summary.push_str(&format!(" in {}", canonical_cwd.display_path()));
 
     let status = if timed_out {
@@ -4724,6 +4730,38 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "timed out execution did not hard-stop"
         );
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_large_output_does_not_misclassify_timeout() {
+        let env = TestEnv::new("proc-large-output");
+        let tool = ProcExecTool::new(
+            &env.root,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "yes x | head -c 64000000".to_string(),
+            ],
+        )
+        .with_timeout(Duration::from_secs(10))
+        .with_max_output_bytes(32);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
+        assert_eq!(StructuredValue::Bool(false), timed_out.value);
+        let stdout_retained = result
+            .fields
+            .iter()
+            .find(|f| f.key == "stdout_retained_bytes")
+            .unwrap();
+        assert_eq!(32, integer_value(&stdout_retained.value));
+        let stdout = result.fields.iter().find(|f| f.key == "stdout").unwrap();
+        assert_eq!(32, string_value(&stdout.value).len());
         env.cleanup();
     }
 
