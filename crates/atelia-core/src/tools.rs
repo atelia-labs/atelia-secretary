@@ -2043,6 +2043,9 @@ fn execute_explicit_argv_process(
     if capture_timed_out || capture_thread_aborted {
         process_tree_handled = process_tree_handled || kill_process_group(child.id() as i32);
     }
+    if !process_timed_out {
+        process_tree_handled = process_tree_handled || kill_process_group(child.id() as i32);
+    }
 
     let (stdout_bytes, _stdout_original_bytes) = stdout_capture
         .read_retained_and_original(max_output_bytes)
@@ -5426,6 +5429,64 @@ exec 'sleep', '9999';
         assert!(
             !child_still_running,
             "background descendant should be cleaned up when parent exits normally (pid={child_pid}, pgrp={child_pgid}, parent_pgid={expected_parent_pgid})"
+        );
+        env.cleanup();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_exec_normal_exit_with_redirected_background_descendant_is_cleaned_up() {
+        let env = TestEnv::new("proc-normal-exit-redirected-descendant-cleanup");
+        let background_pid_file = env.root.join("background-child.pid");
+        let script = format!(
+            "sleep 9999 >/dev/null 2>&1 & printf '%s\\n' $! > '{}' ; exit 0",
+            background_pid_file.to_string_lossy()
+        );
+
+        let tool = ProcExecTool::new(&env.root, vec!["sh".to_string(), "-c".to_string(), script])
+            .with_timeout(Duration::from_secs(1));
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
+        assert_eq!(StructuredValue::Bool(false), timed_out.value);
+
+        let child_pid: u32 = (0..50)
+            .find_map(|_| {
+                std::fs::read_to_string(&background_pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                    .or_else(|| {
+                        thread::sleep(Duration::from_millis(10));
+                        None
+                    })
+            })
+            .unwrap_or_else(|| panic!("missing child pid file {}", background_pid_file.display()));
+
+        let mut child_gone = false;
+        for _ in 0..50 {
+            match std::fs::read_to_string(format!("/proc/{}/stat", child_pid)) {
+                Ok(stat) => {
+                    let state = stat.split_whitespace().nth(2).unwrap_or_default();
+                    if state == "Z" {
+                        child_gone = true;
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    child_gone = true;
+                    break;
+                }
+                Err(_) => {}
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            child_gone,
+            "background descendant should be cleaned up after normal exit (pid={child_pid})"
         );
         env.cleanup();
     }
