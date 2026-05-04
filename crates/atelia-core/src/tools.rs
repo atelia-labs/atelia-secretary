@@ -1783,6 +1783,7 @@ fn join_capture_thread<T>(
     Ok(Some(captured?))
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 trait ChildTimeoutProbe {
     fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>>;
     fn wait(&mut self) -> io::Result<std::process::ExitStatus>;
@@ -1803,6 +1804,7 @@ impl ChildTimeoutProbe for std::process::Child {
     }
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn wait_for_child_with_recheck<C: ChildTimeoutProbe>(
     child: &mut C,
     timeout: Duration,
@@ -1870,6 +1872,56 @@ fn current_uptime_jiffies() -> io::Result<u64> {
 }
 
 #[cfg(target_os = "linux")]
+fn child_exited_without_reaping(child: &std::process::Child) -> io::Result<bool> {
+    let mut siginfo = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    let pid = child.id() as libc::id_t;
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            siginfo.as_mut_ptr(),
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let siginfo = unsafe { siginfo.assume_init() };
+    Ok(unsafe { siginfo.si_pid() } == pid as libc::pid_t)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_child_with_exit_cutoff(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> io::Result<(Option<std::process::ExitStatus>, bool, bool, Option<u64>)> {
+    let start = Instant::now();
+
+    loop {
+        if child_exited_without_reaping(child)? {
+            let process_exit_cutoff = current_uptime_jiffies().ok();
+            let status = child.wait()?;
+            return Ok((Some(status), false, false, process_exit_cutoff));
+        }
+
+        if start.elapsed() >= timeout {
+            if child_exited_without_reaping(child)? {
+                let process_exit_cutoff = current_uptime_jiffies().ok();
+                let status = child.wait()?;
+                return Ok((Some(status), false, false, process_exit_cutoff));
+            }
+
+            let process_tree_handled = kill_process_tree(child);
+            let status = child.wait()?;
+            return Ok((Some(status), true, process_tree_handled, None));
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn proc_stat_process_group_and_starttime(stat: &str) -> Option<(i32, u64)> {
     let end_comm = stat.rfind(')')?;
     let fields: Vec<&str> = stat[end_comm + 1..].split_whitespace().collect();
@@ -1918,6 +1970,7 @@ fn kill_process_group(_pgid: i32) -> bool {
     false
 }
 
+#[cfg(not(target_os = "linux"))]
 fn wait_for_child(
     child: &mut std::process::Child,
     timeout: Duration,
@@ -2049,7 +2102,12 @@ fn execute_explicit_argv_process(
     };
 
     #[cfg(target_os = "linux")]
-    let process_exit_cutoff = current_uptime_jiffies().ok();
+    let (status, process_timed_out, mut process_tree_handled, process_exit_cutoff) =
+        wait_for_child_with_exit_cutoff(&mut child, timeout).map_err(|error| {
+            cleanup_spawned_child(&mut child);
+            format!("process wait failed: {error}")
+        })?;
+    #[cfg(not(target_os = "linux"))]
     let (status, process_timed_out, mut process_tree_handled) = wait_for_child(&mut child, timeout)
         .map_err(|error| {
             cleanup_spawned_child(&mut child);
@@ -5528,6 +5586,37 @@ exec 'sleep', '9999';
             !process_group_has_live_member_from_before_exit(pgid, cutoff),
             "empty process group should not be eligible for post-wait cleanup"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_exit_probe_with_wnowait_does_not_reap_child() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("failed to spawn child");
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        while Instant::now() < deadline {
+            if child_exited_without_reaping(&child).expect("failed to probe child exit") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            child_exited_without_reaping(&child).expect("failed to probe child exit"),
+            "child should be visible as exited without being reaped"
+        );
+        assert!(
+            Path::new(&format!("/proc/{pid}")).exists(),
+            "WNOWAIT probe should leave the child as a zombie until it is explicitly reaped"
+        );
+
+        let status = child.wait().expect("failed to reap child");
+        assert_eq!(Some(0), status.code());
     }
 
     #[cfg(target_os = "linux")]
