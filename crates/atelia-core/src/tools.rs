@@ -3805,6 +3805,11 @@ fn unlink_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<()>
 //
 // Multi-link targets (nlink > 1) are rejected because a concurrent removal of
 // a different hardlink would decrease nlink independently, masking a leaf swap.
+//
+// Known residual risk: dev/ino identity can be spoofed by inode reuse on fast-
+// cycling filesystems (e.g. tmpfs).  Fully closing this window requires carrying
+// the fd from the initial resolution step through to mutation, which is a larger
+// architectural change tracked for a follow-up iteration.
 fn unlink_validated_file_in_parent_dir(
     parent: &File,
     name: &std::ffi::OsStr,
