@@ -430,35 +430,6 @@ fn lock_target_file_in_parent_dir(
     Ok(lock_file)
 }
 
-#[cfg(unix)]
-fn write_file_exists_in_parent_dir(parent_dir: &File, name: &std::ffi::OsStr) -> io::Result<bool> {
-    let cstring = CString::new(name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
-
-    let fd = unsafe {
-        libc::openat(
-            parent_dir.as_raw_fd(),
-            cstring.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o0 as libc::mode_t,
-        )
-    };
-    if fd < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            return Ok(false);
-        }
-        return Err(error);
-    }
-
-    let close_result = unsafe { libc::close(fd) };
-    if close_result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(true)
-}
-
 // ---------------------------------------------------------------------------
 // FsListTool
 // ---------------------------------------------------------------------------
@@ -1933,28 +1904,23 @@ fn rename_in_parent_dir(
 
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
-                Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => {
-                    // renameat2 unavailable on very old kernels or older libc/feature combinations.
-                    if write_file_exists_in_parent_dir(parent, destination)? {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            "destination file already exists",
-                        ));
-                    }
-                }
                 Some(libc::EEXIST) => return Err(error),
+                Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "filesystem does not support atomic create_new renames",
+                    ));
+                }
                 _ => return Err(error),
             }
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            if write_file_exists_in_parent_dir(parent, destination)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "destination file already exists",
-                ));
-            }
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "create_new writes are supported only with renameat2(RENAME_NOREPLACE)",
+            ));
         }
     }
 
@@ -3937,6 +3903,53 @@ mod tests {
             "temporary write file should be cleaned up on failure"
         );
 
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_rename_create_new_fails_if_destination_exists() {
+        let env = TestEnv::new("write-create-rename-no-replace");
+        let path = env.root.join("notes.txt");
+        env.create_file("notes.txt", "original");
+
+        let parent = open_parent_no_follow(path.parent().unwrap()).unwrap();
+        let (temp_name, temp_file) =
+            create_temporary_file_in_parent_dir(&parent, path.file_name().unwrap()).unwrap();
+        drop(temp_file);
+
+        let rename_result =
+            rename_in_parent_dir(&parent, &temp_name, path.file_name().unwrap(), true).unwrap_err();
+        assert_eq!(io::ErrorKind::AlreadyExists, rename_result.kind());
+
+        assert_eq!("original", fs::read_to_string(&path).unwrap());
+        assert!(
+            fs::read_dir(&env.root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().as_os_str() == temp_name),
+            "temporary file should remain when no-replace rename fails",
+        );
+        unlink_in_parent_dir(&parent, &temp_name).unwrap();
+        env.cleanup();
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn fs_rename_create_new_unsupported_without_renameat2() {
+        let env = TestEnv::new("write-create-rename-unsupported");
+        let path = env.root.join("notes.txt");
+
+        let parent = open_parent_no_follow(path.parent().unwrap()).unwrap();
+        let (temp_name, temp_file) =
+            create_temporary_file_in_parent_dir(&parent, path.file_name().unwrap()).unwrap();
+        drop(temp_file);
+
+        let rename_result =
+            rename_in_parent_dir(&parent, &temp_name, path.file_name().unwrap(), true).unwrap_err();
+        assert_eq!(io::ErrorKind::Unsupported, rename_result.kind());
+
+        unlink_in_parent_dir(&parent, &temp_name).unwrap();
         env.cleanup();
     }
 
