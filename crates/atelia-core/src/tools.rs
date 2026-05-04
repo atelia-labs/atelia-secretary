@@ -1610,19 +1610,19 @@ fn capture_stream_to_file<R: Read + AsRawFd + Send + 'static>(
             Err(error) => return Err(error),
         };
 
-        if stop_after_timeout.load(Ordering::Acquire)
-            && original_bytes >= max_output_bytes
-            && retained_bytes >= max_output_bytes
-        {
-            break;
-        }
-
         original_bytes = original_bytes.saturating_add(read);
         let budget = max_output_bytes.saturating_sub(retained_bytes);
         if budget > 0 {
             let bytes_to_store = budget.min(read);
             output_file.write_all(&buffer[..bytes_to_store])?;
             retained_bytes = retained_bytes.saturating_add(bytes_to_store);
+        }
+
+        if stop_after_timeout.load(Ordering::Acquire)
+            && original_bytes >= max_output_bytes
+            && retained_bytes >= max_output_bytes
+        {
+            break;
         }
     }
 
@@ -1638,13 +1638,32 @@ fn spawn_capture_thread<R>(
     writer: File,
     max_output_bytes: usize,
     stop_after_timeout: Arc<AtomicBool>,
-) -> thread::JoinHandle<io::Result<StreamCaptureResult>>
+) -> io::Result<thread::JoinHandle<io::Result<StreamCaptureResult>>>
 where
     R: Read + AsRawFd + Send + 'static,
 {
-    thread::spawn(move || {
-        capture_stream_to_file(stream, writer, max_output_bytes, stop_after_timeout)
-    })
+    thread::Builder::new()
+        .spawn(move || capture_stream_to_file(stream, writer, max_output_bytes, stop_after_timeout))
+}
+
+fn join_capture_thread<T>(
+    label: &str,
+    task: thread::JoinHandle<io::Result<T>>,
+    timeout: Duration,
+) -> io::Result<Option<T>> {
+    let deadline = Instant::now() + timeout;
+
+    while !task.is_finished() {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let captured = task
+        .join()
+        .map_err(|_| io::Error::other(format!("{label} capture thread panicked")))?;
+    Ok(Some(captured?))
 }
 
 #[cfg(unix)]
@@ -1771,18 +1790,32 @@ fn execute_explicit_argv_process(
         }
     };
 
-    let stdout_handle = spawn_capture_thread(
+    let stdout_handle = match spawn_capture_thread(
         stdout_reader,
         stdout_writer,
         max_output_bytes,
         capture_timeout.clone(),
-    );
-    let stderr_handle = spawn_capture_thread(
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            capture_timeout.store(true, Ordering::Release);
+            cleanup_spawned_child(&mut child);
+            return Err(format!("failed to start stdout capture thread: {error}"));
+        }
+    };
+    let stderr_handle = match spawn_capture_thread(
         stderr_reader,
         stderr_writer,
         max_output_bytes,
         capture_timeout.clone(),
-    );
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            capture_timeout.store(true, Ordering::Release);
+            cleanup_spawned_child(&mut child);
+            return Err(format!("failed to start stderr capture thread: {error}"));
+        }
+    };
 
     let (status, timed_out, process_tree_handled) =
         wait_for_child(&mut child, timeout).map_err(|error| {
@@ -1792,36 +1825,65 @@ fn execute_explicit_argv_process(
     capture_timeout.store(true, Ordering::Release);
 
     let mut process_tree_handled = process_tree_handled;
+    let mut capture_thread_timed_out = false;
+
+    let stdout_capture_result =
+        match join_capture_thread("stdout", stdout_handle, CAPTURE_THREAD_JOIN_TIMEOUT)
+            .map_err(|error| format!("stdout capture thread failed: {error}"))?
+        {
+            Some(result) => result,
+            None => {
+                capture_thread_timed_out = true;
+                StreamCaptureResult {
+                    original_bytes: 0,
+                    retained_bytes: 0,
+                }
+            }
+        };
+
+    let stderr_capture_result =
+        match join_capture_thread("stderr", stderr_handle, CAPTURE_THREAD_JOIN_TIMEOUT)
+            .map_err(|error| format!("stderr capture thread failed: {error}"))?
+        {
+            Some(result) => result,
+            None => {
+                capture_thread_timed_out = true;
+                StreamCaptureResult {
+                    original_bytes: 0,
+                    retained_bytes: 0,
+                }
+            }
+        };
+
+    let timed_out = timed_out || capture_thread_timed_out;
     if timed_out {
         process_tree_handled = process_tree_handled || kill_process_tree(&mut child);
     }
 
-    let stdout_capture_result = stdout_handle
-        .join()
-        .map_err(|_| "stdout capture thread panicked".to_string())?
-        .map_err(|error| format!("stdout capture failed: {error}"))?;
-    let stderr_capture_result = stderr_handle
-        .join()
-        .map_err(|_| "stderr capture thread panicked".to_string())?
-        .map_err(|error| format!("stderr capture failed: {error}"))?;
-
-    let (stdout_bytes, _stdout_original_bytes) = stdout_capture
+    let (stdout_bytes, stdout_original_bytes) = stdout_capture
         .read_retained_and_original(max_output_bytes)
         .map_err(|error| format!("stdout read failed: {error}"))?;
-    let (stderr_bytes, _stderr_original_bytes) = stderr_capture
+    let (stderr_bytes, stderr_original_bytes) = stderr_capture
         .read_retained_and_original(max_output_bytes)
         .map_err(|error| format!("stderr read failed: {error}"))?;
 
     let mut stdout = capture_text_output(stdout_bytes, 0);
     let mut stderr = capture_text_output(stderr_bytes, 0);
-    stdout.original_bytes = stdout_capture_result.original_bytes;
-    stderr.original_bytes = stderr_capture_result.original_bytes;
-    stdout.retained_bytes = stdout_capture_result.retained_bytes;
-    stderr.retained_bytes = stderr_capture_result.retained_bytes;
-    stdout.truncated =
-        stdout_capture_result.original_bytes > stdout_capture_result.retained_bytes || timed_out;
-    stderr.truncated =
-        stderr_capture_result.original_bytes > stderr_capture_result.retained_bytes || timed_out;
+    if capture_thread_timed_out {
+        stdout.original_bytes = stdout_original_bytes;
+        stderr.original_bytes = stderr_original_bytes;
+    } else {
+        stdout.original_bytes = stdout_capture_result.original_bytes;
+        stderr.original_bytes = stderr_capture_result.original_bytes;
+        stdout.retained_bytes = stdout_capture_result.retained_bytes;
+        stderr.retained_bytes = stderr_capture_result.retained_bytes;
+    }
+    stdout.truncated = capture_thread_timed_out
+        || stdout_capture_result.original_bytes > stdout_capture_result.retained_bytes
+        || timed_out;
+    stderr.truncated = capture_thread_timed_out
+        || stderr_capture_result.original_bytes > stderr_capture_result.retained_bytes
+        || timed_out;
 
     let duration_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
     let exit_code = status.and_then(|exit_status| exit_status.code().map(i64::from));
@@ -1841,7 +1903,7 @@ fn execute_explicit_argv_process(
         summary.push_str(
             " process tree cleanup is unsupported on this platform (best-effort child kill only)",
         );
-    } else if timed_out {
+    } else if capture_thread_timed_out {
         summary.push_str(
             " output capture stream timeout may indicate escaped descendants with inherited stdio; detached process-tree cleanup is unsupported",
         );
@@ -4996,7 +5058,7 @@ mod tests {
         let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
         let summary = string_value(&summary.value);
         assert!(summary.contains("timed out"));
-        assert!(summary.contains("detached"));
+        assert!(!summary.contains("detached"));
         env.cleanup();
     }
 
