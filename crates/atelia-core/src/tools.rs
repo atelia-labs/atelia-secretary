@@ -489,6 +489,10 @@ fn read_entire_text_file_in_parent_dir(
     max_bytes: usize,
 ) -> io::Result<String> {
     let mut file = open_read_no_follow_in_parent_dir(parent, file_name)?;
+    read_entire_text_file_from_open_file(&mut file, max_bytes)
+}
+
+fn read_entire_text_file_from_open_file(file: &mut File, max_bytes: usize) -> io::Result<String> {
     let mut content = Vec::new();
     let mut buffer = [0u8; 8192];
     let mut total_bytes = 0usize;
@@ -3600,30 +3604,31 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
             .expect("resolved target path must include a file name");
 
         #[cfg(unix)]
-        let content =
-            match read_entire_text_file_in_parent_dir(&parent_dir, file_name, self.max_bytes) {
-                Ok(content) => content,
-                Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
-                    return failed_result(
-                        invocation,
-                        schema_ref,
-                        "patch failed: file exceeds configured byte limit".to_string(),
-                        format!(
-                            "{} is larger than {} bytes",
-                            target.display_path(),
-                            self.max_bytes
-                        ),
-                    );
-                }
-                Err(err) => {
-                    return failed_result(
-                        invocation,
-                        schema_ref,
-                        "patch failed: cannot read UTF-8 text".to_string(),
-                        format!("{}: {}", target.display_path(), err),
-                    );
-                }
-            };
+        let mut file = match open_read_no_follow_in_parent_dir(&parent_dir, file_name) {
+            Ok(file) => file,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: cannot read UTF-8 text".to_string(),
+                    format!("{}: {}", target.display_path(), err),
+                );
+            }
+        };
+
+        #[cfg(unix)]
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: cannot read UTF-8 text".to_string(),
+                    format!("{}: {}", target.display_path(), err),
+                );
+            }
+        };
+
         if metadata.len() > self.max_bytes as u64 {
             return failed_result(
                 invocation,
@@ -3637,6 +3642,31 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
                 ),
             );
         }
+
+        #[cfg(unix)]
+        let content = match read_entire_text_file_from_open_file(&mut file, self.max_bytes) {
+            Ok(content) => content,
+            Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: file exceeds configured byte limit".to_string(),
+                    format!(
+                        "{} is larger than {} bytes",
+                        target.display_path(),
+                        self.max_bytes
+                    ),
+                );
+            }
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: cannot read UTF-8 text".to_string(),
+                    format!("{}: {}", target.display_path(), err),
+                );
+            }
+        };
 
         #[cfg(not(unix))]
         let content = match read_entire_text_file(path, self.max_bytes) {
