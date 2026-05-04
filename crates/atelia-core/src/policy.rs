@@ -343,7 +343,9 @@ impl Capability {
             }
             "filesystem.write" | "filesystem.patch" | "filesystem.delete" | "filesystem.move"
             | "fs.write" | "fs.patch" | "fs.delete" | "fs.move" => Self::FilesystemWrite,
-            "process.exec" | "process.execute" | "process.run" | "proc.exec" => Self::ProcessExec,
+            "process.exec" | "process.execute" | "process.run" | "proc.exec" | "proc.run" => {
+                Self::ProcessExec
+            }
             "repository.mutate.broad"
             | "repo.mutate.broad"
             | "repository.broad.mutation"
