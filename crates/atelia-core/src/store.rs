@@ -701,6 +701,12 @@ impl SecretaryStore for InMemoryStore {
                 reason: "leader_id must not be blank".to_string(),
             });
         }
+        if timeout_millis == 0 {
+            return Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "timeout_millis must be greater than zero".to_string(),
+            });
+        }
 
         let mut inner = self.lock()?;
         expire_schema_migration_locks(&mut inner, &locked_at)?;
@@ -714,10 +720,7 @@ impl SecretaryStore for InMemoryStore {
 
         let record =
             SchemaMigrationRecord::new_migration_lock(leader_id, locked_at, safe, timeout_millis)
-                .map_err(|_| StoreError::InvalidRecord {
-                collection: "schema_migrations",
-                reason: "timeout_millis must be greater than zero".to_string(),
-            })?;
+                .expect("timeout_millis validated above");
         insert_record(
             &mut inner.schema_migrations,
             record.id.clone(),
@@ -2958,6 +2961,33 @@ mod tests {
                 reason: "leader_id must not be blank".to_string(),
             }),
             store.acquire_schema_migration_lock("   ".to_string(), true, 5_000, timestamp(10))
+        );
+    }
+
+    #[test]
+    fn schema_migration_lock_acquire_rejects_zero_timeout_without_expiring_existing_locks() {
+        let store = InMemoryStore::new();
+        let first = store
+            .acquire_schema_migration_lock("daemon-a".to_string(), true, 5_000, timestamp(10))
+            .unwrap();
+
+        assert_eq!(
+            Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "timeout_millis must be greater than zero".to_string(),
+            }),
+            store.acquire_schema_migration_lock("daemon-b".to_string(), false, 0, timestamp(11))
+        );
+
+        let current = store.get_schema_migration_lock(timestamp(11)).unwrap();
+        assert_eq!(current.as_ref().map(|record| &record.id), Some(&first.id));
+        assert_eq!(
+            current
+                .expect("existing lock must remain available")
+                .migration_lock
+                .expect("existing lock must include metadata")
+                .status,
+            MigrationLockStatus::Held
         );
     }
 
