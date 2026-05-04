@@ -170,7 +170,7 @@ impl DefaultPolicyEngine {
                     RuleDecision::audited(
                         RiskTier::R2,
                         "bounded_write_audited",
-                        "Filesystem write or patch inside the registered repository scope requires audit evidence.",
+                        "Filesystem modifications inside the registered repository scope require audit evidence.",
                     )
                 }
             }
@@ -449,9 +449,11 @@ mod tests {
     #[test]
     fn r2_filesystem_write_is_audited() {
         for capability in [
+            "filesystem.write",
             "filesystem.patch",
             "filesystem.delete",
             "filesystem.move",
+            "fs.write",
             "fs.delete",
             "fs.move",
         ] {
