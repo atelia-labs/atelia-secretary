@@ -284,17 +284,17 @@ fn scope_migration_depth(scope: &ToolOutputSettingsScope) -> usize {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolOutputDefaults {
     pub render_options: RenderOptions,
-    /// Number of bytes kept in the "inlined" renderer path before truncation.
-    /// Validation runs on deserialize/update, but policy application is not yet
-    /// wired to runtime rendering (tracked in follow-ups #20 and #17).
+    /// Number of bytes kept in the inline renderer path before truncation.
+    /// This budget is carried into `ToolOutputRenderPolicy` and enforced by
+    /// the runtime render and oversize-handling paths.
     pub max_inline_bytes: u64,
     pub max_inline_lines: u32,
     /// Reserved for future renderer policy rollout; currently persisted and
     /// validated but not yet enforced by runtime output rendering.
     pub verbosity: ToolOutputVerbosity,
     pub granularity: ToolOutputGranularity,
-    /// Reserved for future runtime policy enforcement; currently persisted and
-    /// stored in settings, but not yet enforced in this PR.
+    /// Runtime oversize behavior carried into `ToolOutputRenderPolicy` and
+    /// enforced by the runtime reject/spill/truncate paths.
     pub oversize_policy: OversizeOutputPolicy,
 }
 
