@@ -668,6 +668,13 @@ impl SecretaryStore for InMemoryStore {
         timeout_millis: u64,
         locked_at: LedgerTimestamp,
     ) -> StoreResult<SchemaMigrationRecord> {
+        if leader_id.trim().is_empty() {
+            return Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "leader_id must not be blank".to_string(),
+            });
+        }
+
         let mut inner = self.lock()?;
         expire_schema_migration_locks(&mut inner, &locked_at)?;
 
@@ -2281,53 +2288,55 @@ fn validate_schema_migration_record(record: &SchemaMigrationRecord) -> StoreResu
         });
     }
 
-    if is_schema_migration_lock(record) {
-        if let Some(lock) = &record.migration_lock {
-            if lock.timeout_millis == 0 {
-                return Err(StoreError::InvalidRecord {
-                    collection: "schema_migrations",
-                    reason: "schema migration lock timeout_millis must be greater than zero"
-                        .to_string(),
-                });
-            }
-            if lock.leader_id.is_empty() {
-                return Err(StoreError::InvalidRecord {
-                    collection: "schema_migrations",
-                    reason: "schema migration lock leader_id must not be empty".to_string(),
-                });
-            }
-            if lock.status == MigrationLockStatus::Held && record.created_at != lock.locked_at {
-                return Err(StoreError::InvalidRecord {
-                    collection: "schema_migrations",
-                    reason: "lock held record created_at must equal locked_at".to_string(),
-                });
-            }
-            if lock.status == MigrationLockStatus::Held {
-                if lock.released_at.is_some() {
-                    return Err(StoreError::InvalidRecord {
-                        collection: "schema_migrations",
-                        reason: "lock held records cannot have released_at".to_string(),
-                    });
-                }
-            } else if let Some(released_at) = lock.released_at {
-                if released_at < record.created_at {
-                    return Err(StoreError::InvalidRecord {
-                        collection: "schema_migrations",
-                        reason: "lock released_at must not be earlier than created_at".to_string(),
-                    });
-                }
-            } else {
-                return Err(StoreError::InvalidRecord {
-                    collection: "schema_migrations",
-                    reason: "lock released/expired records require released_at".to_string(),
-                });
-            }
-            return Ok(());
+    if record.migration_name == MIGRATION_LOCK_RECORD_NAME {
+        let lock = record
+            .migration_lock
+            .as_ref()
+            .ok_or_else(|| StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "migration_lock record requires migration_lock metadata".to_string(),
+            })?;
+
+        if lock.timeout_millis == 0 {
+            return Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "schema migration lock timeout_millis must be greater than zero"
+                    .to_string(),
+            });
         }
-        return Err(StoreError::InvalidRecord {
-            collection: "schema_migrations",
-            reason: "migration_lock record requires migration_lock metadata".to_string(),
-        });
+        if lock.leader_id.trim().is_empty() {
+            return Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "schema migration lock leader_id must not be blank".to_string(),
+            });
+        }
+        if lock.status == MigrationLockStatus::Held && record.created_at != lock.locked_at {
+            return Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "lock held record created_at must equal locked_at".to_string(),
+            });
+        }
+        if lock.status == MigrationLockStatus::Held {
+            if lock.released_at.is_some() {
+                return Err(StoreError::InvalidRecord {
+                    collection: "schema_migrations",
+                    reason: "lock held records cannot have released_at".to_string(),
+                });
+            }
+        } else if let Some(released_at) = lock.released_at {
+            if released_at < record.created_at {
+                return Err(StoreError::InvalidRecord {
+                    collection: "schema_migrations",
+                    reason: "lock released_at must not be earlier than created_at".to_string(),
+                });
+            }
+        } else {
+            return Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "lock released/expired records require released_at".to_string(),
+            });
+        }
+        return Ok(());
     }
 
     if record.migration_lock.is_some() {
@@ -2886,6 +2895,57 @@ mod tests {
             Err(StoreError::InvalidRecord {
                 collection: "schema_migrations",
                 reason: "leader_id must not be blank".to_string(),
+            }),
+            store.create_schema_migration(migration)
+        );
+    }
+
+    #[test]
+    fn schema_migration_lock_acquire_rejects_blank_leader_id() {
+        let store = InMemoryStore::new();
+
+        assert_eq!(
+            Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "leader_id must not be blank".to_string(),
+            }),
+            store.acquire_schema_migration_lock("   ".to_string(), true, 5_000, timestamp(10))
+        );
+    }
+
+    #[test]
+    fn schema_migration_records_reject_reserved_lock_name_without_metadata() {
+        let store = InMemoryStore::new();
+        let mut migration = schema_migration_record();
+        migration.migration_name = MIGRATION_LOCK_RECORD_NAME.to_string();
+
+        assert_eq!(
+            Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "migration_lock record requires migration_lock metadata".to_string(),
+            }),
+            store.create_schema_migration(migration)
+        );
+    }
+
+    #[test]
+    fn schema_migration_records_reject_blank_nested_lock_leader_id() {
+        let store = InMemoryStore::new();
+        let mut migration = schema_migration_record();
+        migration.migration_name = MIGRATION_LOCK_RECORD_NAME.to_string();
+        migration.migration_lock = Some(
+            crate::domain::MigrationLockRecord::new("daemon-1", true, 5_000, timestamp(6)).unwrap(),
+        );
+        migration
+            .migration_lock
+            .as_mut()
+            .expect("lock metadata must be present")
+            .leader_id = "   ".to_string();
+
+        assert_eq!(
+            Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "schema migration lock leader_id must not be blank".to_string(),
             }),
             store.create_schema_migration(migration)
         );
