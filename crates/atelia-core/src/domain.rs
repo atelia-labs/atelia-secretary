@@ -96,6 +96,7 @@ opaque_id!(LockDecisionId, "lock_");
 opaque_id!(ToolInvocationId, "tool_");
 opaque_id!(ToolResultId, "res_");
 opaque_id!(AuditRecordId, "aud_");
+opaque_id!(SchemaMigrationId, "mig_");
 opaque_id!(OutputRefId, "out_");
 opaque_id!(ArtifactRefId, "art_");
 
@@ -818,13 +819,34 @@ pub struct AuditRecord {
     pub redactions: Vec<RedactionMarker>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaMigrationStatus {
+    Applied,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchemaMigrationRecord {
+    pub id: SchemaMigrationId,
+    pub schema_version: u32,
+    pub created_at: LedgerTimestamp,
+    pub updated_at: LedgerTimestamp,
+    pub migration_name: String,
+    pub migration_version: u32,
+    pub status: SchemaMigrationStatus,
+    pub leader_id: Option<String>,
+    pub notes: Option<String>,
+    pub redactions: Vec<RedactionMarker>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde::de::{value::StrDeserializer, IntoDeserializer};
     use serde::ser::{Error as SerError, Impossible, Serialize, Serializer};
     use serde::Deserialize;
-    use serde_json::from_str;
+    use serde_json::{from_str, to_string};
     use std::fmt;
 
     #[derive(Debug)]
@@ -1114,6 +1136,28 @@ mod tests {
         assert_serde_record::<ToolInvocation>();
         assert_serde_record::<ToolResult>();
         assert_serde_record::<AuditRecord>();
+        assert_serde_record::<SchemaMigrationRecord>();
+    }
+
+    #[test]
+    fn schema_migration_record_round_trips_through_serde() {
+        let record = SchemaMigrationRecord {
+            id: SchemaMigrationId::new(),
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            created_at: LedgerTimestamp::from_unix_millis(10),
+            updated_at: LedgerTimestamp::from_unix_millis(10),
+            migration_name: "create_schema_migrations".to_string(),
+            migration_version: 2024050401,
+            status: SchemaMigrationStatus::Applied,
+            leader_id: Some("daemon-1".to_string()),
+            notes: Some("bootstrapped schema migrations".to_string()),
+            redactions: Vec::new(),
+        };
+
+        let json = to_string(&record).unwrap();
+        let round_tripped: SchemaMigrationRecord = from_str(&json).unwrap();
+
+        assert_eq!(record, round_tripped);
     }
 
     #[test]
