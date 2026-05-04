@@ -1581,6 +1581,7 @@ fn capture_stream_to_file<R: Read + AsRawFd + Send + 'static>(
     mut output_file: File,
     max_output_bytes: usize,
     stop_after_timeout: Arc<AtomicBool>,
+    stop_immediately: Arc<AtomicBool>,
 ) -> io::Result<StreamCaptureResult> {
     #[cfg(unix)]
     {
@@ -1597,6 +1598,10 @@ fn capture_stream_to_file<R: Read + AsRawFd + Send + 'static>(
     let mut retained_bytes = 0usize;
 
     loop {
+        if stop_immediately.load(Ordering::Acquire) {
+            break;
+        }
+
         let read = match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(bytes) => bytes,
@@ -1624,6 +1629,10 @@ fn capture_stream_to_file<R: Read + AsRawFd + Send + 'static>(
         {
             break;
         }
+
+        if stop_immediately.load(Ordering::Acquire) {
+            break;
+        }
     }
 
     Ok(StreamCaptureResult {
@@ -1638,23 +1647,33 @@ fn spawn_capture_thread<R>(
     writer: File,
     max_output_bytes: usize,
     stop_after_timeout: Arc<AtomicBool>,
+    stop_immediately: Arc<AtomicBool>,
 ) -> io::Result<thread::JoinHandle<io::Result<StreamCaptureResult>>>
 where
     R: Read + AsRawFd + Send + 'static,
 {
-    thread::Builder::new()
-        .spawn(move || capture_stream_to_file(stream, writer, max_output_bytes, stop_after_timeout))
+    thread::Builder::new().spawn(move || {
+        capture_stream_to_file(
+            stream,
+            writer,
+            max_output_bytes,
+            stop_after_timeout,
+            stop_immediately,
+        )
+    })
 }
 
 fn join_capture_thread<T>(
     label: &str,
     task: thread::JoinHandle<io::Result<T>>,
+    stop_immediately: Arc<AtomicBool>,
     timeout: Duration,
 ) -> io::Result<Option<T>> {
     let deadline = Instant::now() + timeout;
 
     while !task.is_finished() {
         if Instant::now() >= deadline {
+            stop_immediately.store(true, Ordering::Release);
             return Ok(None);
         }
         thread::sleep(Duration::from_millis(5));
@@ -1774,6 +1793,7 @@ fn execute_explicit_argv_process(
     };
 
     let capture_timeout = Arc::new(AtomicBool::new(false));
+    let stop_immediately = Arc::new(AtomicBool::new(false));
 
     let stdout_reader = match child.stdout.take() {
         Some(reader) => reader,
@@ -1795,6 +1815,7 @@ fn execute_explicit_argv_process(
         stdout_writer,
         max_output_bytes,
         capture_timeout.clone(),
+        stop_immediately.clone(),
     ) {
         Ok(handle) => handle,
         Err(error) => {
@@ -1808,6 +1829,7 @@ fn execute_explicit_argv_process(
         stderr_writer,
         max_output_bytes,
         capture_timeout.clone(),
+        stop_immediately.clone(),
     ) {
         Ok(handle) => handle,
         Err(error) => {
@@ -1827,33 +1849,41 @@ fn execute_explicit_argv_process(
     let mut stdout_capture_timed_out = false;
     let mut stderr_capture_timed_out = false;
 
-    let stdout_capture_result =
-        match join_capture_thread("stdout", stdout_handle, CAPTURE_THREAD_JOIN_TIMEOUT)
-            .map_err(|error| format!("stdout capture thread failed: {error}"))?
-        {
-            Some(result) => result,
-            None => {
-                stdout_capture_timed_out = true;
-                StreamCaptureResult {
-                    original_bytes: 0,
-                    retained_bytes: 0,
-                }
+    let stdout_capture_result = match join_capture_thread(
+        "stdout",
+        stdout_handle,
+        stop_immediately.clone(),
+        CAPTURE_THREAD_JOIN_TIMEOUT,
+    )
+    .map_err(|error| format!("stdout capture thread failed: {error}"))?
+    {
+        Some(result) => result,
+        None => {
+            stdout_capture_timed_out = true;
+            StreamCaptureResult {
+                original_bytes: 0,
+                retained_bytes: 0,
             }
-        };
+        }
+    };
 
-    let stderr_capture_result =
-        match join_capture_thread("stderr", stderr_handle, CAPTURE_THREAD_JOIN_TIMEOUT)
-            .map_err(|error| format!("stderr capture thread failed: {error}"))?
-        {
-            Some(result) => result,
-            None => {
-                stderr_capture_timed_out = true;
-                StreamCaptureResult {
-                    original_bytes: 0,
-                    retained_bytes: 0,
-                }
+    let stderr_capture_result = match join_capture_thread(
+        "stderr",
+        stderr_handle,
+        stop_immediately.clone(),
+        CAPTURE_THREAD_JOIN_TIMEOUT,
+    )
+    .map_err(|error| format!("stderr capture thread failed: {error}"))?
+    {
+        Some(result) => result,
+        None => {
+            stderr_capture_timed_out = true;
+            StreamCaptureResult {
+                original_bytes: 0,
+                retained_bytes: 0,
             }
-        };
+        }
+    };
 
     if process_timed_out {
         process_tree_handled = process_tree_handled || kill_process_tree(&mut child);
@@ -1865,6 +1895,8 @@ fn execute_explicit_argv_process(
     let (stderr_bytes, stderr_original_bytes) = stderr_capture
         .read_retained_and_original(max_output_bytes)
         .map_err(|error| format!("stderr read failed: {error}"))?;
+    let stdout_retained_bytes = stdout_bytes.len();
+    let stderr_retained_bytes = stderr_bytes.len();
 
     let mut stdout = capture_text_output(stdout_bytes, 0);
     let mut stderr = capture_text_output(stderr_bytes, 0);
@@ -1874,7 +1906,7 @@ fn execute_explicit_argv_process(
         stdout_capture_result.original_bytes
     };
     stdout.retained_bytes = if stdout_capture_timed_out {
-        stdout.text.len()
+        stdout_retained_bytes
     } else {
         stdout_capture_result.retained_bytes
     };
@@ -1884,7 +1916,7 @@ fn execute_explicit_argv_process(
         stderr_capture_result.original_bytes
     };
     stderr.retained_bytes = if stderr_capture_timed_out {
-        stderr.text.len()
+        stderr_retained_bytes
     } else {
         stderr_capture_result.retained_bytes
     };
