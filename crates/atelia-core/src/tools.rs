@@ -36,6 +36,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+
 const TOOLS_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_READ_MAX_LINES: usize = 120;
 const DEFAULT_READ_MAX_CHARS: usize = 32 * 1024;
@@ -481,13 +482,7 @@ fn lock_target_for_patch(path: &Path) -> io::Result<(File, File)> {
     Ok((parent_dir, destination_lock))
 }
 
-#[cfg(unix)]
-fn read_entire_text_file_in_parent_dir(
-    parent: &File,
-    file_name: &std::ffi::OsStr,
-    max_bytes: usize,
-) -> io::Result<String> {
-    let mut file = open_read_no_follow_in_parent_dir(parent, file_name)?;
+fn read_entire_text_file_from_open_file(file: &mut File, max_bytes: usize) -> io::Result<String> {
     let mut content = Vec::new();
     let mut buffer = [0u8; 8192];
     let mut total_bytes = 0usize;
@@ -515,6 +510,16 @@ fn read_entire_text_file_in_parent_dir(
             format!("invalid UTF-8 content: {error}"),
         )
     })
+}
+
+#[cfg(all(unix, test))]
+fn read_entire_text_file_in_parent_dir(
+    parent: &File,
+    file_name: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> io::Result<String> {
+    let mut file = open_read_no_follow_in_parent_dir(parent, file_name)?;
+    read_entire_text_file_from_open_file(&mut file, max_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -2957,9 +2962,8 @@ fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> 
             "path does not name a file in its parent",
         )
     })?;
-
     #[cfg(unix)]
-    let expected_metadata = if create_new {
+    let _expected_metadata = if create_new {
         None
     } else {
         let metadata = fs::metadata(path)?;
@@ -2967,7 +2971,7 @@ fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> 
     };
 
     #[cfg(target_os = "linux")]
-    let expected_path = if create_new {
+    let _expected_path = if create_new {
         None
     } else {
         Some(path.canonicalize()?)
@@ -2980,7 +2984,7 @@ fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> 
 
         #[cfg(unix)]
         {
-            if let Some((expected_dev, expected_ino)) = expected_metadata {
+            if let Some((expected_dev, expected_ino)) = _expected_metadata {
                 let opened_metadata = file.metadata()?;
                 if opened_metadata.dev() != expected_dev || opened_metadata.ino() != expected_ino {
                     return Err(io::Error::new(
@@ -2991,7 +2995,7 @@ fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> 
             }
 
             #[cfg(target_os = "linux")]
-            if let Some(expected_path) = expected_path {
+            if let Some(expected_path) = _expected_path {
                 let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
                 let opened_path = fs::canonicalize(fd_path)?;
                 if opened_path != expected_path {
@@ -3600,30 +3604,69 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
             .expect("resolved target path must include a file name");
 
         #[cfg(unix)]
-        let content =
-            match read_entire_text_file_in_parent_dir(&parent_dir, file_name, self.max_bytes) {
-                Ok(content) => content,
-                Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
-                    return failed_result(
-                        invocation,
-                        schema_ref,
-                        "patch failed: file exceeds configured byte limit".to_string(),
-                        format!(
-                            "{} is larger than {} bytes",
-                            target.display_path(),
-                            self.max_bytes
-                        ),
-                    );
-                }
-                Err(err) => {
-                    return failed_result(
-                        invocation,
-                        schema_ref,
-                        "patch failed: cannot read UTF-8 text".to_string(),
-                        format!("{}: {}", target.display_path(), err),
-                    );
-                }
-            };
+        let mut file = match open_read_no_follow_in_parent_dir(&parent_dir, file_name) {
+            Ok(file) => file,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: cannot read UTF-8 text".to_string(),
+                    format!("{}: {}", target.display_path(), err),
+                );
+            }
+        };
+
+        #[cfg(unix)]
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: cannot read UTF-8 text".to_string(),
+                    format!("{}: {}", target.display_path(), err),
+                );
+            }
+        };
+
+        if metadata.len() > self.max_bytes as u64 {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "patch failed: file exceeds configured byte limit".to_string(),
+                format!(
+                    "{} is {} bytes; limit is {} bytes",
+                    target.display_path(),
+                    metadata.len(),
+                    self.max_bytes
+                ),
+            );
+        }
+
+        #[cfg(unix)]
+        let content = match read_entire_text_file_from_open_file(&mut file, self.max_bytes) {
+            Ok(content) => content,
+            Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: file exceeds configured byte limit".to_string(),
+                    format!(
+                        "{} is larger than {} bytes",
+                        target.display_path(),
+                        self.max_bytes
+                    ),
+                );
+            }
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: cannot read UTF-8 text".to_string(),
+                    format!("{}: {}", target.display_path(), err),
+                );
+            }
+        };
 
         #[cfg(not(unix))]
         let content = match read_entire_text_file(path, self.max_bytes) {
@@ -3707,7 +3750,6 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
                 format!("{}: {}", target.display_path(), err),
             );
         }
-
         #[cfg(not(unix))]
         if let Err(err) = write_file_bytes_atomically(path, updated.as_bytes(), false) {
             return failed_result(
@@ -5226,7 +5268,6 @@ mod tests {
         unlink_in_parent_dir(&parent, &temp_name).unwrap();
         env.cleanup();
     }
-
     #[test]
     fn fs_write_rejects_byte_limit_overrun() {
         let env = TestEnv::new("write-limit");
@@ -5906,6 +5947,24 @@ exit 0
     }
 
     #[test]
+    fn fs_patch_truncates_when_replacement_is_shorter() {
+        let env = TestEnv::new("patch-shorter");
+        env.create_file("notes.txt", "alpha\nlong-token\ngamma");
+
+        let tool = FsPatchTool::new(&env.root, "long-token", "x");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            "alpha\nx\ngamma",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        env.cleanup();
+    }
+
+    #[test]
     fn fs_patch_rejects_ambiguous_match() {
         let env = TestEnv::new("patch-ambiguous");
         env.create_file("notes.txt", "beta\nbeta");
@@ -6045,6 +6104,8 @@ exit 0
         assert_eq!(io::ErrorKind::FileTooLarge, err.kind());
         env.cleanup();
     }
+
+    // -- Rendering compatibility --
 
     #[test]
     fn read_tool_results_render_in_all_formats() {
