@@ -1683,6 +1683,11 @@ fn wait_for_child(
     }
 }
 
+fn cleanup_spawned_child(child: &mut std::process::Child) {
+    let _ = kill_process_tree(child);
+    let _ = child.wait();
+}
+
 #[cfg(unix)]
 fn execute_explicit_argv_process(
     repository_root: &Path,
@@ -1729,23 +1734,42 @@ fn execute_explicit_argv_process(
         .spawn()
         .map_err(|error| format!("failed to spawn process: {error}"))?;
 
-    let stdout_writer = stdout_capture.writer().map_err(|error| {
-        format!("failed to clone stdout capture writer for stream reader: {error}")
-    })?;
-    let stderr_writer = stderr_capture.writer().map_err(|error| {
-        format!("failed to clone stderr capture writer for stream reader: {error}")
-    })?;
+    let stdout_writer = match stdout_capture.writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            cleanup_spawned_child(&mut child);
+            return Err(format!(
+                "failed to clone stdout capture writer for stream reader: {error}"
+            ));
+        }
+    };
+
+    let stderr_writer = match stderr_capture.writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            cleanup_spawned_child(&mut child);
+            return Err(format!(
+                "failed to clone stderr capture writer for stream reader: {error}"
+            ));
+        }
+    };
 
     let capture_timeout = Arc::new(AtomicBool::new(false));
 
-    let stdout_reader = child
-        .stdout
-        .take()
-        .ok_or_else(|| "child process did not provide stdout".to_string())?;
-    let stderr_reader = child
-        .stderr
-        .take()
-        .ok_or_else(|| "child process did not provide stderr".to_string())?;
+    let stdout_reader = match child.stdout.take() {
+        Some(reader) => reader,
+        None => {
+            cleanup_spawned_child(&mut child);
+            return Err("child process did not provide stdout".to_string());
+        }
+    };
+    let stderr_reader = match child.stderr.take() {
+        Some(reader) => reader,
+        None => {
+            cleanup_spawned_child(&mut child);
+            return Err("child process did not provide stderr".to_string());
+        }
+    };
 
     let stdout_handle = spawn_capture_thread(
         stdout_reader,
@@ -1760,8 +1784,11 @@ fn execute_explicit_argv_process(
         capture_timeout.clone(),
     );
 
-    let (status, timed_out, process_tree_handled) = wait_for_child(&mut child, timeout)
-        .map_err(|error| format!("process wait failed: {error}"))?;
+    let (status, timed_out, process_tree_handled) =
+        wait_for_child(&mut child, timeout).map_err(|error| {
+            cleanup_spawned_child(&mut child);
+            format!("process wait failed: {error}")
+        })?;
     capture_timeout.store(true, Ordering::Release);
 
     let mut process_tree_handled = process_tree_handled;
