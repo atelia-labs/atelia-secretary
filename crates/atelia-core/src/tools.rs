@@ -15,13 +15,17 @@ use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, BufRead, ErrorKind, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, ErrorKind, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -1565,6 +1569,84 @@ fn capture_text_output(bytes: Vec<u8>, original_bytes: usize) -> CapturedStream 
     }
 }
 
+#[derive(Debug)]
+struct StreamCaptureResult {
+    original_bytes: usize,
+    retained_bytes: usize,
+}
+
+#[cfg(unix)]
+fn capture_stream_to_file<R: Read + AsRawFd + Send + 'static>(
+    mut stream: R,
+    mut output_file: File,
+    max_output_bytes: usize,
+    stop_after_timeout: Arc<AtomicBool>,
+) -> io::Result<StreamCaptureResult> {
+    #[cfg(unix)]
+    {
+        let raw_fd = stream.as_raw_fd();
+        // SAFETY: `raw_fd` is a valid file descriptor borrowed for the lifetime of the reader.
+        let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL, 0) };
+        if flags >= 0 {
+            let _ = unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+    }
+
+    let mut buffer = [0u8; 8192];
+    let mut original_bytes = 0usize;
+    let mut retained_bytes = 0usize;
+
+    loop {
+        let read = match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if stop_after_timeout.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        if stop_after_timeout.load(Ordering::Acquire)
+            && original_bytes >= max_output_bytes
+            && retained_bytes >= max_output_bytes
+        {
+            break;
+        }
+
+        original_bytes = original_bytes.saturating_add(read);
+        let budget = max_output_bytes.saturating_sub(retained_bytes);
+        if budget > 0 {
+            let bytes_to_store = budget.min(read);
+            output_file.write_all(&buffer[..bytes_to_store])?;
+            retained_bytes = retained_bytes.saturating_add(bytes_to_store);
+        }
+    }
+
+    Ok(StreamCaptureResult {
+        original_bytes,
+        retained_bytes,
+    })
+}
+
+#[cfg(unix)]
+fn spawn_capture_thread<R>(
+    stream: R,
+    writer: File,
+    max_output_bytes: usize,
+    stop_after_timeout: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<StreamCaptureResult>>
+where
+    R: Read + AsRawFd + Send + 'static,
+{
+    thread::spawn(move || {
+        capture_stream_to_file(stream, writer, max_output_bytes, stop_after_timeout)
+    })
+}
+
 #[cfg(unix)]
 fn kill_process_tree(child: &mut std::process::Child) -> bool {
     let pid = child.id() as i32;
@@ -1601,6 +1683,7 @@ fn wait_for_child(
     }
 }
 
+#[cfg(unix)]
 fn execute_explicit_argv_process(
     repository_root: &Path,
     cwd_request: &str,
@@ -1621,18 +1704,12 @@ fn execute_explicit_argv_process(
     command.args(&argv[1..]);
     command.current_dir(&canonical_cwd.canonical);
     command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
     let stdout_capture = TempCaptureFile::create("stdout")
         .map_err(|error| format!("failed to create stdout capture file: {error}"))?;
     let stderr_capture = TempCaptureFile::create("stderr")
         .map_err(|error| format!("failed to create stderr capture file: {error}"))?;
-    let stdout_writer = stdout_capture
-        .writer()
-        .map_err(|error| format!("failed to clone stdout capture writer: {error}"))?;
-    let stderr_writer = stderr_capture
-        .writer()
-        .map_err(|error| format!("failed to clone stderr capture writer: {error}"))?;
-    command.stdout(Stdio::from(stdout_writer));
-    command.stderr(Stdio::from(stderr_writer));
     command.env_clear();
     #[cfg(unix)]
     command.process_group(0);
@@ -1652,31 +1729,72 @@ fn execute_explicit_argv_process(
         .spawn()
         .map_err(|error| format!("failed to spawn process: {error}"))?;
 
+    let stdout_writer = stdout_capture.writer().map_err(|error| {
+        format!("failed to clone stdout capture writer for stream reader: {error}")
+    })?;
+    let stderr_writer = stderr_capture.writer().map_err(|error| {
+        format!("failed to clone stderr capture writer for stream reader: {error}")
+    })?;
+
+    let capture_timeout = Arc::new(AtomicBool::new(false));
+
+    let stdout_reader = child
+        .stdout
+        .take()
+        .ok_or_else(|| "child process did not provide stdout".to_string())?;
+    let stderr_reader = child
+        .stderr
+        .take()
+        .ok_or_else(|| "child process did not provide stderr".to_string())?;
+
+    let stdout_handle = spawn_capture_thread(
+        stdout_reader,
+        stdout_writer,
+        max_output_bytes,
+        capture_timeout.clone(),
+    );
+    let stderr_handle = spawn_capture_thread(
+        stderr_reader,
+        stderr_writer,
+        max_output_bytes,
+        capture_timeout.clone(),
+    );
+
     let (status, timed_out, process_tree_handled) = wait_for_child(&mut child, timeout)
         .map_err(|error| format!("process wait failed: {error}"))?;
+    capture_timeout.store(true, Ordering::Release);
 
-    let capture_timed_out = timed_out;
     let mut process_tree_handled = process_tree_handled;
-
-    if capture_timed_out {
+    if timed_out {
         process_tree_handled = process_tree_handled || kill_process_tree(&mut child);
     }
 
-    let timed_out = timed_out || capture_timed_out;
+    let stdout_capture_result = stdout_handle
+        .join()
+        .map_err(|_| "stdout capture thread panicked".to_string())?
+        .map_err(|error| format!("stdout capture failed: {error}"))?;
+    let stderr_capture_result = stderr_handle
+        .join()
+        .map_err(|_| "stderr capture thread panicked".to_string())?
+        .map_err(|error| format!("stderr capture failed: {error}"))?;
 
-    let (stdout_bytes, stdout_original_bytes) = stdout_capture
+    let (stdout_bytes, _stdout_original_bytes) = stdout_capture
         .read_retained_and_original(max_output_bytes)
         .map_err(|error| format!("stdout read failed: {error}"))?;
-    let (stderr_bytes, stderr_original_bytes) = stderr_capture
+    let (stderr_bytes, _stderr_original_bytes) = stderr_capture
         .read_retained_and_original(max_output_bytes)
         .map_err(|error| format!("stderr read failed: {error}"))?;
 
-    let mut stdout = capture_text_output(stdout_bytes, stdout_original_bytes);
-    let mut stderr = capture_text_output(stderr_bytes, stderr_original_bytes);
-    if capture_timed_out {
-        stdout.truncated = true;
-        stderr.truncated = true;
-    }
+    let mut stdout = capture_text_output(stdout_bytes, 0);
+    let mut stderr = capture_text_output(stderr_bytes, 0);
+    stdout.original_bytes = stdout_capture_result.original_bytes;
+    stderr.original_bytes = stderr_capture_result.original_bytes;
+    stdout.retained_bytes = stdout_capture_result.retained_bytes;
+    stderr.retained_bytes = stderr_capture_result.retained_bytes;
+    stdout.truncated =
+        stdout_capture_result.original_bytes > stdout_capture_result.retained_bytes || timed_out;
+    stderr.truncated =
+        stderr_capture_result.original_bytes > stderr_capture_result.retained_bytes || timed_out;
 
     let duration_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
     let exit_code = status.and_then(|exit_status| exit_status.code().map(i64::from));
@@ -1692,14 +1810,11 @@ fn execute_explicit_argv_process(
             duration_ms
         ),
     };
-    if capture_timed_out {
-        summary.push_str(" output capture streams did not finish draining");
-    }
     if timed_out && !process_tree_handled {
         summary.push_str(
             " process tree cleanup is unsupported on this platform (best-effort child kill only)",
         );
-    } else if timed_out && capture_timed_out {
+    } else if timed_out {
         summary.push_str(
             " output capture stream timeout may indicate escaped descendants with inherited stdio; detached process-tree cleanup is unsupported",
         );
@@ -1723,6 +1838,19 @@ fn execute_explicit_argv_process(
         stderr,
         timed_out,
     })
+}
+
+#[cfg(not(unix))]
+fn execute_explicit_argv_process(
+    _repository_root: &Path,
+    _cwd_request: &str,
+    _argv: &[String],
+    _env_allowlist: &HashSet<String>,
+    _env_overrides: &HashMap<String, String>,
+    _timeout: Duration,
+    _max_output_bytes: usize,
+) -> Result<ProcessExecutionOutcome, String> {
+    Err("proc.exec is unsupported on non-Unix platforms".to_string())
 }
 
 impl crate::runtime::RuntimeTool for ProcExecTool {
