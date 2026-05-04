@@ -430,6 +430,20 @@ fn lock_target_file_in_parent_dir(
     Ok(lock_file)
 }
 
+#[cfg(unix)]
+fn lock_target_for_patch(path: &Path) -> io::Result<(File, File)> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let parent_dir = open_parent_no_follow(parent)?;
+    let destination_lock = lock_target_file_in_parent_dir(&parent_dir, file_name)?;
+
+    Ok((parent_dir, destination_lock))
+}
+
 // ---------------------------------------------------------------------------
 // FsListTool
 // ---------------------------------------------------------------------------
@@ -1974,7 +1988,29 @@ fn write_file_bytes_atomically_inner(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
 
     let parent_dir = open_parent_no_follow(parent)?;
-    let _destination_lock = lock_target_file_in_parent_dir(&parent_dir, file_name)?;
+    let destination_lock = lock_target_file_in_parent_dir(&parent_dir, file_name)?;
+
+    write_file_bytes_atomically_inner_locked(
+        path,
+        &parent_dir,
+        file_name,
+        bytes,
+        create_new,
+        fail_after_write,
+        destination_lock,
+    )
+}
+
+#[cfg(unix)]
+fn write_file_bytes_atomically_inner_locked(
+    path: &Path,
+    parent_dir: &File,
+    file_name: &std::ffi::OsStr,
+    bytes: &[u8],
+    create_new: bool,
+    fail_after_write: bool,
+    _destination_lock: File,
+) -> io::Result<()> {
     let existing_permissions = if !create_new {
         let existing_file = open_write_file_no_follow(path, false)?;
         let existing_metadata = existing_file.metadata()?;
@@ -1983,7 +2019,7 @@ fn write_file_bytes_atomically_inner(
         None
     };
 
-    let (temp_name, mut temp_file) = create_temporary_file_in_parent_dir(&parent_dir, file_name)?;
+    let (temp_name, mut temp_file) = create_temporary_file_in_parent_dir(parent_dir, file_name)?;
 
     let cleanup = |parent_dir: &File, temp_name: &std::ffi::OsStr| {
         let _ = unlink_in_parent_dir(parent_dir, temp_name);
@@ -2001,12 +2037,12 @@ fn write_file_bytes_atomically_inner(
         }
         drop(temp_file);
 
-        rename_in_parent_dir(&parent_dir, &temp_name, file_name, create_new)?;
+        rename_in_parent_dir(parent_dir, &temp_name, file_name, create_new)?;
         Ok(())
     })();
 
     if let Err(error) = write_result {
-        cleanup(&parent_dir, &temp_name);
+        cleanup(parent_dir, &temp_name);
         return Err(error);
     }
 
@@ -2394,6 +2430,22 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
             );
         }
 
+        #[cfg(unix)]
+        let (parent_dir, destination_lock) = match lock_target_for_patch(path) {
+            Ok(values) => values,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: cannot write UTF-8 text".to_string(),
+                    format!("{}: {}", target.display_path(), err),
+                );
+            }
+        };
+        let file_name = path
+            .file_name()
+            .expect("resolved target path must include a file name");
+
         let content = match read_entire_text_file(path, self.max_bytes) {
             Ok(content) => content,
             Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
@@ -2459,6 +2511,25 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
             );
         }
 
+        #[cfg(unix)]
+        if let Err(err) = write_file_bytes_atomically_inner_locked(
+            path,
+            &parent_dir,
+            file_name,
+            updated.as_bytes(),
+            false,
+            false,
+            destination_lock,
+        ) {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "patch failed: cannot write UTF-8 text".to_string(),
+                format!("{}: {}", target.display_path(), err),
+            );
+        }
+
+        #[cfg(not(unix))]
         if let Err(err) = write_file_bytes_atomically(path, updated.as_bytes(), false) {
             return failed_result(
                 invocation,
