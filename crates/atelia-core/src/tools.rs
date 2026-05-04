@@ -4517,7 +4517,25 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
                         (Ok(_locks), Ok(source_parent_dir), Ok(destination_parent_dir)) => {
                             let destination_exists = match fs::symlink_metadata(destination.path())
                             {
-                                Ok(metadata) if metadata.is_file() => true,
+                                Ok(metadata) if metadata.is_file() => {
+                                    #[cfg(unix)]
+                                    if metadata.dev() == source_metadata.dev()
+                                        && metadata.ino() == source_metadata.ino()
+                                    {
+                                        return failed_result(
+                                            invocation,
+                                            schema_ref,
+                                            "move failed: source and destination are the same"
+                                                .to_string(),
+                                            format!(
+                                                "{} and {} reference the same file",
+                                                source.display_path(),
+                                                destination.display_path()
+                                            ),
+                                        );
+                                    }
+                                    true
+                                }
                                 Ok(_) => {
                                     return failed_result(
                                         invocation,
@@ -6844,6 +6862,32 @@ mod tests {
             .find(|f| f.key == "overwritten")
             .unwrap();
         assert_eq!(StructuredValue::Bool(true), overwritten.value);
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_move_rejects_hardlinked_destination() {
+        let env = TestEnv::new("move-hardlink-destination");
+        env.create_file("from.txt", "source");
+        fs::hard_link(env.root.join("from.txt"), env.root.join("to.txt")).unwrap();
+
+        let tool = FsMoveTool::new(&env.root, "to.txt").with_allow_overwrite(true);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("from.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        assert_eq!(
+            "source",
+            fs::read_to_string(env.root.join("from.txt")).unwrap()
+        );
+        assert_eq!(
+            "source",
+            fs::read_to_string(env.root.join("to.txt")).unwrap()
+        );
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("same file"));
         env.cleanup();
     }
 
