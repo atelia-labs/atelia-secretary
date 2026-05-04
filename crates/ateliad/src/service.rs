@@ -1795,9 +1795,13 @@ mod tests {
             .expect("project status should succeed");
 
         assert_eq!(status.repository.id, repository_a.id);
+        let latest_event = status
+            .latest_event
+            .expect("project status should include latest event");
+        assert_eq!(latest_event.refs.job_id, Some(submitted_a.job.id));
         assert_eq!(
-            status.latest_event.unwrap().refs.job_id,
-            Some(submitted_a.job.id)
+            latest_event.refs.repository_id,
+            Some(repository_a.id.clone())
         );
 
         let _ = fs::remove_dir_all(root_a);
