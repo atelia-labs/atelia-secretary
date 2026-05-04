@@ -1571,18 +1571,31 @@ impl ExtensionRegistry {
     }
 
     pub fn remove(&mut self, extension_id: &str) -> RegistryResult<ExtensionInstallRecord> {
-        let version = self.active_versions.remove(extension_id).ok_or_else(|| {
-            RegistryError::NotInstalled {
+        let version = self
+            .active_versions
+            .get(extension_id)
+            .cloned()
+            .ok_or_else(|| RegistryError::NotInstalled {
                 extension_id: extension_id.to_string(),
-            }
-        })?;
+            })?;
+
+        if self
+            .records
+            .get(extension_id)
+            .and_then(|records| records.get(&version))
+            .is_none()
+        {
+            return Err(RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            });
+        }
+
+        self.active_versions.remove(extension_id);
         let record = self
             .records
             .get_mut(extension_id)
             .and_then(|records| records.get_mut(&version))
-            .ok_or_else(|| RegistryError::NotInstalled {
-                extension_id: extension_id.to_string(),
-            })?;
+            .expect("record existence checked before active version removal");
 
         record.status = ExtensionInstallStatus::Disabled;
         Ok(record.clone())

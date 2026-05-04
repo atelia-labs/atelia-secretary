@@ -1378,6 +1378,16 @@ mod tests {
             atelia_core::ExtensionInstallStatus::Blocked
         );
 
+        let blocked_enable = svc
+            .enable_extension(EnableExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect_err("enable should fail while extension is blocklisted");
+        assert!(matches!(
+            blocked_enable,
+            ServiceError::ExtensionRegistry(RegistryError::Blocked { .. })
+        ));
+
         let blocked_list = svc
             .list_extensions(ListExtensionsRequest {
                 include_blocked: false,

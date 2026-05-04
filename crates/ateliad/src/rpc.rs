@@ -3960,13 +3960,15 @@ mod tests {
             .expect("install should succeed");
         assert_eq!(install.record.version, "1.0.0");
 
-        server
-            .install_extension(InstallExtensionRequest {
+        let updated = server
+            .update_extension(UpdateExtensionRequest {
                 manifest: manifest_v2,
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
             })
             .expect("update should succeed");
+        assert_eq!(updated.metadata.protocol_version, "1.0.0");
+        assert_eq!(updated.record.version, "2.0.0");
 
         let status = server
             .extension_status(ExtensionStatusRequest {
@@ -3985,6 +3987,26 @@ mod tests {
             })
             .expect("list should succeed");
         assert_eq!(list.extensions.len(), 1);
+
+        let disabled = server
+            .disable_extension(DisableExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("disable should succeed");
+        assert_eq!(
+            disabled.record.status,
+            atelia_core::ExtensionInstallStatus::Disabled
+        );
+
+        let enabled = server
+            .enable_extension(EnableExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("enable should succeed");
+        assert_eq!(
+            enabled.record.status,
+            atelia_core::ExtensionInstallStatus::Installed
+        );
 
         let rolled_back = server
             .rollback_extension(RollbackExtensionRequest {
@@ -4018,6 +4040,23 @@ mod tests {
             .list_blocklist(ListBlocklistRequest {})
             .expect("list blocklist should succeed");
         assert_eq!(blocklist.entries.len(), 1);
+
+        let removed = server
+            .remove_extension(RemoveExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("remove should succeed");
+        assert_eq!(
+            removed.record.status,
+            atelia_core::ExtensionInstallStatus::Disabled
+        );
+
+        let missing_after_remove = server
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect_err("removed extension should not have active status");
+        assert_eq!(missing_after_remove.code, RpcErrorCode::NotFound);
     }
 
     #[test]
