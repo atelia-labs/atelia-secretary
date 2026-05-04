@@ -40,11 +40,14 @@ diagnostic metadata.
 
 ## Service Surface
 
-This table is the required service contract, not a description of the current
-protobuf implementation. The current daemon already exposes the health,
-repository, job, policy, tool-output settings, `RenderToolOutput`, and
-extension RPC groups; `WatchEvents` and `GetProjectStatus` are still planned
-contract surface.
+This table is the required service contract, not merely a description of the
+current protobuf implementation. The current daemon exposes the health,
+repository, job, policy, event replay, project status, tool-output settings,
+`RenderToolOutput`, and extension RPC groups. Extension installation and
+blocklist operations are currently exposed through the daemon HTTP/JSON
+transport while the protobuf service remains focused on the shared client
+runtime contract. `WatchEvents` is implemented as a cursor replay surface today;
+a long-lived streaming transport remains a future transport refinement.
 
 Required RPC groups:
 
