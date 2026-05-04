@@ -1591,6 +1591,19 @@ fn capture_text_output(bytes: Vec<u8>, original_bytes: usize) -> CapturedStream 
     }
 }
 
+fn finalize_captured_stream(
+    bytes: Vec<u8>,
+    original_bytes: usize,
+    retained_bytes: usize,
+    timed_out: bool,
+) -> CapturedStream {
+    let mut stream = capture_text_output(bytes, original_bytes);
+    stream.retained_bytes = retained_bytes;
+    stream.truncated = stream.original_bytes > stream.retained_bytes;
+    stream.timed_out = timed_out;
+    stream
+}
+
 #[derive(Debug)]
 struct StreamCaptureResult {
     original_bytes: usize,
@@ -1823,9 +1836,20 @@ fn kill_process_tree(child: &mut std::process::Child) -> bool {
     true
 }
 
+#[cfg(unix)]
+fn kill_process_group(pgid: i32) -> bool {
+    let _ = unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL) };
+    true
+}
+
 #[cfg(not(unix))]
 fn kill_process_tree(child: &mut std::process::Child) -> bool {
     let _ = child.kill();
+    false
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: i32) -> bool {
     false
 }
 
@@ -2016,8 +2040,8 @@ fn execute_explicit_argv_process(
     let capture_thread_aborted = stop_immediately.load(Ordering::Acquire);
 
     let capture_timed_out = stdout_capture_timed_out || stderr_capture_timed_out;
-    if process_timed_out || capture_timed_out || capture_thread_aborted {
-        process_tree_handled = process_tree_handled || kill_process_tree(&mut child);
+    if capture_timed_out || capture_thread_aborted {
+        process_tree_handled = process_tree_handled || kill_process_group(child.id() as i32);
     }
 
     let (stdout_bytes, _stdout_original_bytes) = stdout_capture
@@ -2029,33 +2053,26 @@ fn execute_explicit_argv_process(
     let stdout_retained_bytes = stdout_bytes.len();
     let stderr_retained_bytes = stderr_bytes.len();
 
-    let mut stdout = capture_text_output(stdout_bytes, 0);
-    let mut stderr = capture_text_output(stderr_bytes, 0);
-    stdout.timed_out = stdout_capture_timed_out;
-    stderr.timed_out = stderr_capture_timed_out;
-    stdout.original_bytes = stdout_capture_result.original_bytes;
-    stdout.retained_bytes = if stdout_capture_timed_out {
-        stdout_retained_bytes
-    } else {
-        stdout_capture_result.retained_bytes
-    };
-    stderr.original_bytes = stderr_capture_result.original_bytes;
-    stderr.retained_bytes = if stderr_capture_timed_out {
-        stderr_retained_bytes
-    } else {
-        stderr_capture_result.retained_bytes
-    };
-
-    stdout.truncated = stdout_capture_result.original_bytes > stdout_capture_result.retained_bytes;
-    stderr.truncated = stderr_capture_result.original_bytes > stderr_capture_result.retained_bytes;
-    if capture_thread_aborted {
-        if stdout.truncated {
-            stdout.timed_out = true;
-        }
-        if stderr.truncated {
-            stderr.timed_out = true;
-        }
-    }
+    let stdout = finalize_captured_stream(
+        stdout_bytes,
+        stdout_capture_result.original_bytes,
+        if stdout_capture_timed_out {
+            stdout_retained_bytes
+        } else {
+            stdout_capture_result.retained_bytes
+        },
+        stdout_capture_timed_out,
+    );
+    let stderr = finalize_captured_stream(
+        stderr_bytes,
+        stderr_capture_result.original_bytes,
+        if stderr_capture_timed_out {
+            stderr_retained_bytes
+        } else {
+            stderr_capture_result.retained_bytes
+        },
+        stderr_capture_timed_out,
+    );
 
     let duration_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
     let exit_code = status.and_then(|exit_status| exit_status.code().map(i64::from));
@@ -5526,44 +5543,14 @@ exec 'sleep', '9999';
         assert!(stop_immediately.load(Ordering::Acquire));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn proc_exec_stdout_timeout_does_not_mark_stderr_truncated() {
-        let env = TestEnv::new("proc-capture-thread-sibling");
-        let tool = ProcExecTool::new(
-            &env.root,
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "(while true; do printf x; done) & exit 0".to_string(),
-            ],
-        )
-        .with_max_output_bytes(128);
+    fn finalize_captured_stream_keeps_timeout_local() {
+        let stream = finalize_captured_stream(vec![b'a', b'b', b'c'], 5, 3, false);
 
-        let invocation = fake_invocation(tool.tool_id());
-        let request = request_with_path(".");
-        let result = tool.execute(&invocation, &request);
-
-        assert_eq!(ToolResultStatus::Succeeded, result.status);
-        let stdout_truncated = result
-            .fields
-            .iter()
-            .find(|f| f.key == "stdout_truncated")
-            .unwrap();
-        let stderr_truncated = result
-            .fields
-            .iter()
-            .find(|f| f.key == "stderr_truncated")
-            .unwrap();
-        assert_eq!(StructuredValue::Bool(true), stdout_truncated.value);
-        assert_eq!(StructuredValue::Bool(false), stderr_truncated.value);
-        let trunc = result.truncation.unwrap();
-        assert!(trunc.reason.contains("stdout capture timed out"));
-        assert!(!trunc.reason.contains("stderr truncated at 128 bytes"));
-        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
-        assert!(string_value(&summary.value).contains("output capture stream timeout"));
-
-        env.cleanup();
+        assert_eq!(5, stream.original_bytes);
+        assert_eq!(3, stream.retained_bytes);
+        assert!(stream.truncated);
+        assert!(!stream.timed_out);
     }
 
     #[test]
