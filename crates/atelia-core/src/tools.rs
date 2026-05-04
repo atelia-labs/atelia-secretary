@@ -23,12 +23,11 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use uuid::Uuid;
 
 #[cfg(unix)]
@@ -37,9 +36,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-#[cfg(unix)]
-use std::sync::atomic::{AtomicU64, Ordering};
-
 const TOOLS_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_READ_MAX_LINES: usize = 120;
 const DEFAULT_READ_MAX_CHARS: usize = 32 * 1024;
