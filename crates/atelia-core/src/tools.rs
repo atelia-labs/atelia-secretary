@@ -3802,6 +3802,9 @@ fn unlink_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<()>
 // leaf and returns PermissionDenied, making this a detect-rather-than-prevent
 // defense.  The opened fd keeps the inode alive for the post-check even if
 // the directory entry is replaced between the two syscalls.
+//
+// Multi-link targets (nlink > 1) are rejected because a concurrent removal of
+// a different hardlink would decrease nlink independently, masking a leaf swap.
 fn unlink_validated_file_in_parent_dir(
     parent: &File,
     name: &std::ffi::OsStr,
@@ -3813,6 +3816,12 @@ fn unlink_validated_file_in_parent_dir(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "target is not a file",
+        ));
+    }
+    if opened_metadata.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "race-safe delete requires single-link target",
         ));
     }
     ensure_opened_metadata_matches(
@@ -6941,6 +6950,27 @@ mod tests {
         assert_eq!(io::ErrorKind::PermissionDenied, result.kind());
         assert_eq!("replacement", fs::read_to_string(&path).unwrap());
         assert_eq!("validated", fs::read_to_string(&backup).unwrap());
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_delete_rejects_multi_link_target() {
+        let env = TestEnv::new("delete-multi-link");
+        env.create_file("notes.txt", "shared content");
+        fs::hard_link(env.root.join("notes.txt"), env.root.join("alias.txt")).unwrap();
+
+        let path = env.root.join("notes.txt");
+        let expected_metadata = fs::symlink_metadata(&path).unwrap();
+        let parent = open_parent_no_follow(path.parent().unwrap()).unwrap();
+        let file_name = path.file_name().unwrap();
+
+        let result = unlink_validated_file_in_parent_dir(&parent, file_name, &expected_metadata)
+            .unwrap_err();
+        assert_eq!(io::ErrorKind::InvalidInput, result.kind());
+        assert!(result.to_string().contains("single-link"));
+        assert!(env.root.join("notes.txt").exists());
+        assert!(env.root.join("alias.txt").exists());
         env.cleanup();
     }
 
