@@ -1521,6 +1521,73 @@ impl ExtensionRegistry {
         Ok(previous_record.clone())
     }
 
+    pub fn disable(&mut self, extension_id: &str) -> RegistryResult<ExtensionInstallRecord> {
+        let version = self
+            .active_versions
+            .get(extension_id)
+            .cloned()
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+        let record = self
+            .records
+            .get_mut(extension_id)
+            .and_then(|records| records.get_mut(&version))
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+
+        record.status = ExtensionInstallStatus::Disabled;
+        Ok(record.clone())
+    }
+
+    pub fn enable(&mut self, extension_id: &str) -> RegistryResult<ExtensionInstallRecord> {
+        let version = self
+            .active_versions
+            .get(extension_id)
+            .cloned()
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+        let manifest = self
+            .manifests
+            .get(extension_id)
+            .and_then(|records| records.get(&version))
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+        self.ensure_not_blocked(manifest)?;
+
+        let record = self
+            .records
+            .get_mut(extension_id)
+            .and_then(|records| records.get_mut(&version))
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+
+        record.status = ExtensionInstallStatus::Installed;
+        Ok(record.clone())
+    }
+
+    pub fn remove(&mut self, extension_id: &str) -> RegistryResult<ExtensionInstallRecord> {
+        let version = self.active_versions.remove(extension_id).ok_or_else(|| {
+            RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            }
+        })?;
+        let record = self
+            .records
+            .get_mut(extension_id)
+            .and_then(|records| records.get_mut(&version))
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+
+        record.status = ExtensionInstallStatus::Disabled;
+        Ok(record.clone())
+    }
+
     pub fn active_record(&self, extension_id: &str) -> Option<ExtensionInstallRecord> {
         let version = self.active_versions.get(extension_id)?;
         self.records.get(extension_id)?.get(version).cloned()
@@ -1763,6 +1830,39 @@ pub struct InstallExtensionResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateExtensionRequest {
+    pub manifest: ExtensionManifest,
+    #[serde(default)]
+    pub approve_local_unsigned: bool,
+    #[serde(default)]
+    pub allow_local_process_runtime: bool,
+}
+
+impl From<UpdateExtensionRequest> for InstallOptions {
+    fn from(request: UpdateExtensionRequest) -> Self {
+        Self::from(&request)
+    }
+}
+
+impl From<&UpdateExtensionRequest> for InstallOptions {
+    fn from(request: &UpdateExtensionRequest) -> Self {
+        let mut options = InstallOptions::default();
+        if request.approve_local_unsigned {
+            options = options.approve_local_unsigned();
+        }
+        if request.allow_local_process_runtime {
+            options = options.allow_local_process_runtime();
+        }
+        options
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateExtensionResponse {
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtensionStatusRequest {
     pub extension_id: String,
 }
@@ -1806,6 +1906,36 @@ pub struct RollbackExtensionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RollbackExtensionResponse {
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisableExtensionRequest {
+    pub extension_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisableExtensionResponse {
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnableExtensionRequest {
+    pub extension_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnableExtensionResponse {
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoveExtensionRequest {
+    pub extension_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoveExtensionResponse {
     pub record: ExtensionInstallRecord,
 }
 
@@ -1854,6 +1984,18 @@ impl ExtensionRegistryService {
         Ok(record)
     }
 
+    pub fn update_extension(
+        &mut self,
+        request: UpdateExtensionRequest,
+    ) -> RegistryResult<UpdateExtensionResponse> {
+        let options = InstallOptions::from(&request);
+        let record = self
+            .registry
+            .install(request.manifest, options)
+            .map(|record| UpdateExtensionResponse { record })?;
+        Ok(record)
+    }
+
     pub fn extension_status(
         &self,
         request: ExtensionStatusRequest,
@@ -1889,6 +2031,39 @@ impl ExtensionRegistryService {
             .registry
             .rollback(&request.extension_id)
             .map(|record| RollbackExtensionResponse { record })?;
+        Ok(record)
+    }
+
+    pub fn disable_extension(
+        &mut self,
+        request: DisableExtensionRequest,
+    ) -> RegistryResult<DisableExtensionResponse> {
+        let record = self
+            .registry
+            .disable(&request.extension_id)
+            .map(|record| DisableExtensionResponse { record })?;
+        Ok(record)
+    }
+
+    pub fn enable_extension(
+        &mut self,
+        request: EnableExtensionRequest,
+    ) -> RegistryResult<EnableExtensionResponse> {
+        let record = self
+            .registry
+            .enable(&request.extension_id)
+            .map(|record| EnableExtensionResponse { record })?;
+        Ok(record)
+    }
+
+    pub fn remove_extension(
+        &mut self,
+        request: RemoveExtensionRequest,
+    ) -> RegistryResult<RemoveExtensionResponse> {
+        let record = self
+            .registry
+            .remove(&request.extension_id)
+            .map(|record| RemoveExtensionResponse { record })?;
         Ok(record)
     }
 
@@ -3033,6 +3208,35 @@ mod tests {
                 .status,
             ExtensionInstallStatus::Installed
         );
+    }
+
+    #[test]
+    fn registry_enable_disable_and_remove_manage_active_record() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let disabled = registry.disable("com.example.extension").unwrap();
+        assert_eq!(disabled.status, ExtensionInstallStatus::Disabled);
+        assert_eq!(
+            registry
+                .active_record("com.example.extension")
+                .unwrap()
+                .status,
+            ExtensionInstallStatus::Disabled
+        );
+
+        let enabled = registry.enable("com.example.extension").unwrap();
+        assert_eq!(enabled.status, ExtensionInstallStatus::Installed);
+
+        let removed = registry.remove("com.example.extension").unwrap();
+        assert_eq!(removed.status, ExtensionInstallStatus::Disabled);
+        assert!(registry.active_record("com.example.extension").is_none());
+        assert!(matches!(
+            registry.disable("com.example.extension"),
+            Err(RegistryError::NotInstalled { .. })
+        ));
     }
 
     #[test]
