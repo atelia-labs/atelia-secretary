@@ -482,16 +482,6 @@ fn lock_target_for_patch(path: &Path) -> io::Result<(File, File)> {
     Ok((parent_dir, destination_lock))
 }
 
-#[cfg(unix)]
-fn read_entire_text_file_in_parent_dir(
-    parent: &File,
-    file_name: &std::ffi::OsStr,
-    max_bytes: usize,
-) -> io::Result<String> {
-    let mut file = open_read_no_follow_in_parent_dir(parent, file_name)?;
-    read_entire_text_file_from_open_file(&mut file, max_bytes)
-}
-
 fn read_entire_text_file_from_open_file(file: &mut File, max_bytes: usize) -> io::Result<String> {
     let mut content = Vec::new();
     let mut buffer = [0u8; 8192];
@@ -520,6 +510,16 @@ fn read_entire_text_file_from_open_file(file: &mut File, max_bytes: usize) -> io
             format!("invalid UTF-8 content: {error}"),
         )
     })
+}
+
+#[cfg(all(unix, test))]
+fn read_entire_text_file_in_parent_dir(
+    parent: &File,
+    file_name: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> io::Result<String> {
+    let mut file = open_read_no_follow_in_parent_dir(parent, file_name)?;
+    read_entire_text_file_from_open_file(&mut file, max_bytes)
 }
 
 // ---------------------------------------------------------------------------
