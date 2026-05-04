@@ -1637,6 +1637,9 @@ impl ExtensionRegistry {
         &self,
         request: ServiceCallRequest,
     ) -> RegistryResult<ServiceCallGrant> {
+        self.ensure_active_record_enabled(&request.caller_extension_id, "caller")?;
+        self.ensure_active_record_enabled(&request.callee_extension_id, "callee")?;
+
         let caller_manifest = self
             .active_manifest(&request.caller_extension_id)
             .ok_or_else(|| RegistryError::NotInstalled {
@@ -1723,6 +1726,32 @@ impl ExtensionRegistry {
             schema_version: request.schema_version,
             required_permission: required_permission.to_string(),
         })
+    }
+
+    fn ensure_active_record_enabled(&self, extension_id: &str, role: &str) -> RegistryResult<()> {
+        let record =
+            self.active_record(extension_id)
+                .ok_or_else(|| RegistryError::NotInstalled {
+                    extension_id: extension_id.to_string(),
+                })?;
+
+        match record.status {
+            ExtensionInstallStatus::Installed
+            | ExtensionInstallStatus::InstalledPreviousVersion => Ok(()),
+            ExtensionInstallStatus::Disabled => Err(RegistryError::ServiceDenied {
+                reason: format!("{role} extension {extension_id} is disabled"),
+            }),
+            ExtensionInstallStatus::Blocked => Err(RegistryError::ServiceDenied {
+                reason: format!("{role} extension {extension_id} is blocked"),
+            }),
+            ExtensionInstallStatus::Updating | ExtensionInstallStatus::RollbackInProgress => {
+                Err(RegistryError::ServiceDenied {
+                    reason: format!(
+                        "{role} extension {extension_id} is not ready for service calls"
+                    ),
+                })
+            }
+        }
     }
 
     fn active_manifest(&self, extension_id: &str) -> Option<&ExtensionManifest> {
@@ -3312,6 +3341,40 @@ mod tests {
             .authorize_service_call(service_call(consumer_id, provider_id))
             .unwrap();
         assert_eq!(grant.required_permission, permission_name);
+    }
+
+    #[test]
+    fn disabled_extension_cannot_participate_in_service_calls() {
+        let permission_name = "service.review.comments";
+        let provider_id = "com.example.provider";
+        let consumer_id = "com.example.consumer";
+        let mut registry = ExtensionRegistry::in_memory();
+
+        registry
+            .install(
+                service_provider(provider_id, permission_name),
+                InstallOptions::default(),
+            )
+            .unwrap();
+        registry
+            .install(
+                service_consumer(consumer_id, provider_id, permission_name),
+                InstallOptions::default(),
+            )
+            .unwrap();
+
+        registry.disable(provider_id).unwrap();
+        let provider_err = registry
+            .authorize_service_call(service_call(consumer_id, provider_id))
+            .unwrap_err();
+        assert!(matches!(provider_err, RegistryError::ServiceDenied { .. }));
+
+        registry.enable(provider_id).unwrap();
+        registry.disable(consumer_id).unwrap();
+        let consumer_err = registry
+            .authorize_service_call(service_call(consumer_id, provider_id))
+            .unwrap_err();
+        assert!(matches!(consumer_err, RegistryError::ServiceDenied { .. }));
     }
 
     #[test]
