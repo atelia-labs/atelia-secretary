@@ -2518,6 +2518,10 @@ mod tests {
                 ..valid_ref.clone()
             },
             ToolResultRef {
+                tool_invocation_id: "not-a-tool-invocation-id".to_string(),
+                ..valid_ref.clone()
+            },
+            ToolResultRef {
                 job_id: "job_id".to_string(),
                 ..valid_ref.clone()
             },
