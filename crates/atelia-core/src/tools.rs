@@ -518,35 +518,6 @@ fn read_entire_text_file_in_parent_dir(
     })
 }
 
-#[cfg(unix)]
-fn write_file_exists_in_parent_dir(parent_dir: &File, name: &std::ffi::OsStr) -> io::Result<bool> {
-    let cstring = CString::new(name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
-
-    let fd = unsafe {
-        libc::openat(
-            parent_dir.as_raw_fd(),
-            cstring.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o0 as libc::mode_t,
-        )
-    };
-    if fd < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            return Ok(false);
-        }
-        return Err(error);
-    }
-
-    let close_result = unsafe { libc::close(fd) };
-    if close_result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(true)
-}
-
 // ---------------------------------------------------------------------------
 // FsListTool
 // ---------------------------------------------------------------------------
@@ -3629,7 +3600,7 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
             .expect("resolved target path must include a file name");
 
         #[cfg(unix)]
-        let _content =
+        let content =
             match read_entire_text_file_in_parent_dir(&parent_dir, file_name, self.max_bytes) {
                 Ok(content) => content,
                 Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
@@ -3666,30 +3637,6 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
                 ),
             );
         }
-
-        let content = match read_entire_text_file(path, self.max_bytes) {
-            Ok(content) => content,
-            Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
-                return failed_result(
-                    invocation,
-                    schema_ref,
-                    "patch failed: file exceeds configured byte limit".to_string(),
-                    format!(
-                        "{} is larger than {} bytes",
-                        target.display_path(),
-                        self.max_bytes
-                    ),
-                );
-            }
-            Err(err) => {
-                return failed_result(
-                    invocation,
-                    schema_ref,
-                    "patch failed: cannot read UTF-8 text".to_string(),
-                    format!("{}: {}", target.display_path(), err),
-                );
-            }
-        };
 
         let match_count = count_overlapping_matches(&content, &self.find_text);
         if match_count == 0 {
