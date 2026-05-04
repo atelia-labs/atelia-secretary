@@ -3304,6 +3304,7 @@ mod tests {
         assert_eq!(listed_status.status, ExtensionInstallStatus::Blocked);
     }
 
+    #[test]
     fn extension_manifest_serializes_empty_tools_as_missing_field() {
         let mut extension = manifest("com.example.empty-tools");
         extension.tools.clear();
