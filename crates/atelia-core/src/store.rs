@@ -743,6 +743,12 @@ impl SecretaryStore for InMemoryStore {
         }
 
         let lock_record = lock.migration_lock.as_ref().unwrap();
+        if lock_record.leader_id != leader_id {
+            return Err(StoreError::Conflict {
+                collection: "schema_migrations",
+                reason: "migration lock leader_id mismatch".to_string(),
+            });
+        }
         if lock_record.status == MigrationLockStatus::Released {
             return Ok(lock.clone());
         }
@@ -750,12 +756,6 @@ impl SecretaryStore for InMemoryStore {
             return Err(StoreError::Conflict {
                 collection: "schema_migrations",
                 reason: "migration lock is already expired".to_string(),
-            });
-        }
-        if lock_record.leader_id != leader_id {
-            return Err(StoreError::Conflict {
-                collection: "schema_migrations",
-                reason: "migration lock leader_id mismatch".to_string(),
             });
         }
         if released_at.unix_millis < lock_record.locked_at.unix_millis {
@@ -2289,6 +2289,14 @@ fn validate_schema_migration_record(record: &SchemaMigrationRecord) -> StoreResu
     }
 
     if record.migration_name == MIGRATION_LOCK_RECORD_NAME {
+        let top_level_leader_id =
+            record
+                .leader_id
+                .as_ref()
+                .ok_or_else(|| StoreError::InvalidRecord {
+                    collection: "schema_migrations",
+                    reason: "migration_lock records require leader_id".to_string(),
+                })?;
         let lock = record
             .migration_lock
             .as_ref()
@@ -2308,6 +2316,13 @@ fn validate_schema_migration_record(record: &SchemaMigrationRecord) -> StoreResu
             return Err(StoreError::InvalidRecord {
                 collection: "schema_migrations",
                 reason: "schema migration lock leader_id must not be blank".to_string(),
+            });
+        }
+        if top_level_leader_id != &lock.leader_id {
+            return Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "migration_lock record leader_id must match migration_lock.leader_id"
+                    .to_string(),
             });
         }
         if lock.status == MigrationLockStatus::Held && record.created_at != lock.locked_at {
@@ -2952,6 +2967,26 @@ mod tests {
     }
 
     #[test]
+    fn schema_migration_records_reject_leader_drift_for_reserved_lock_name() {
+        let store = InMemoryStore::new();
+        let mut migration = schema_migration_record();
+        migration.migration_name = MIGRATION_LOCK_RECORD_NAME.to_string();
+        migration.leader_id = Some("daemon-2".to_string());
+        migration.migration_lock = Some(
+            crate::domain::MigrationLockRecord::new("daemon-1", true, 5_000, timestamp(6)).unwrap(),
+        );
+
+        assert_eq!(
+            Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "migration_lock record leader_id must match migration_lock.leader_id"
+                    .to_string(),
+            }),
+            store.create_schema_migration(migration)
+        );
+    }
+
+    #[test]
     fn schema_migration_records_reject_non_monotonic_timestamps() {
         let store = InMemoryStore::new();
         let migration = schema_migration_record_with(
@@ -3020,6 +3055,14 @@ mod tests {
             .migration_lock
             .expect("idempotent release must include metadata");
         assert_eq!(lock.status, MigrationLockStatus::Released);
+
+        assert!(matches!(
+            store.release_schema_migration_lock(&first.id, "daemon-b", timestamp(30)),
+            Err(StoreError::Conflict {
+                collection: "schema_migrations",
+                ..
+            })
+        ));
     }
 
     #[test]
