@@ -17,16 +17,18 @@ use crate::service::{
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
 };
 use atelia_core::{
-    Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState,
-    ExtensionInstallRecord, ExtensionStatusRequest, InstallExtensionRequest, JobEventKind, JobId,
-    JobKind, JobRecord, JobStatus, ListBlocklistRequest, ListExtensionsRequest, OutputFormat,
-    OversizeOutputPolicy, PathScope, PolicyOutcome, ProjectId, RenderOptions, RepositoryId,
-    RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier, RollbackExtensionRequest,
-    StoreError, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
-    ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity, ToolResultId,
-    TruncationMetadata,
+    Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState, EventCursor,
+    EventQuery, EventSeverity, EventSubjectType, ExtensionInstallRecord, ExtensionStatusRequest,
+    InstallExtensionRequest, JobEvent, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
+    ListBlocklistRequest, ListExtensionsRequest, OutputFormat, OversizeOutputPolicy, PathScope,
+    PolicyOutcome, ProjectId, RenderOptions, RepositoryId, RepositoryRecord, RepositoryTrustState,
+    ResourceScope, RiskTier, RollbackExtensionRequest, StoreError, ToolOutputDefaults,
+    ToolOutputGranularity, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsScope,
+    ToolOutputVerbosity, ToolResultId, TruncationMetadata,
 };
 use std::convert::TryFrom;
+
+const MAX_WATCH_EVENTS_PAGE: usize = 1000;
 
 pub const TRANSPORT_BLOCKER: &str =
     "tonic/prost server dependencies are not configured for ateliad";
@@ -156,6 +158,62 @@ impl SecretaryRpcServer {
         Ok(CheckPolicyResponse {
             metadata: self.metadata(),
             decision: policy_decision_to_rpc(policy_decision),
+        })
+    }
+
+    pub fn list_events(&self, request: ListEventsRequest) -> RpcResult<ListEventsResponse> {
+        let query = parse_event_query(request)?;
+        let page = self.service.list_events_page(query)?;
+        let events = page
+            .events
+            .into_iter()
+            .map(RpcEvent::from)
+            .collect::<Vec<_>>();
+
+        Ok(ListEventsResponse {
+            metadata: self.metadata(),
+            events,
+            next_page_token: page.next_page_token,
+        })
+    }
+
+    pub fn watch_events(
+        &self,
+        request: WatchEventsRequest,
+    ) -> RpcResult<WatchEventsReplayResponse> {
+        let incoming_cursor = request
+            .cursor
+            .clone()
+            .unwrap_or(EventCursorRequest::Beginning);
+        let query = EventQuery {
+            repository_id: Some(parse_repository_id(&request.repository_id)?),
+            cursor: parse_event_cursor(incoming_cursor.clone())?,
+            subject_ids: request.subject_ids,
+            min_severity: request.min_severity.map(parse_event_severity),
+            page_size: Some(
+                request
+                    .limit
+                    .unwrap_or(MAX_WATCH_EVENTS_PAGE)
+                    .min(MAX_WATCH_EVENTS_PAGE),
+            ),
+            page_token: None,
+        };
+        let page = self.service.list_events_page(query)?;
+        let events = page
+            .events
+            .into_iter()
+            .map(RpcEvent::from)
+            .collect::<Vec<_>>();
+        let cursor = if let Some(event) = events.last() {
+            Some(EventCursorRequest::AfterSequence(event.sequence))
+        } else {
+            Some(incoming_cursor)
+        };
+
+        Ok(WatchEventsReplayResponse {
+            metadata: self.metadata(),
+            events,
+            cursor,
         })
     }
 
@@ -312,12 +370,13 @@ impl SecretaryRpcServer {
         &self,
         request: GetToolOutputDefaultsRequest,
     ) -> RpcResult<GetToolOutputDefaultsResponse> {
-        let scope = parse_tool_output_scope(request.scope.clone())?;
-        let defaults = self.service.get_tool_output_defaults(scope.clone())?;
+        let core_scope = parse_tool_output_scope(request.scope.clone())?;
+        let scope = RpcToolOutputScope::try_from(core_scope.clone())?;
+        let defaults = self.service.get_tool_output_defaults(core_scope)?;
 
         Ok(GetToolOutputDefaultsResponse {
             metadata: self.metadata(),
-            scope: RpcToolOutputScope::from(scope),
+            scope,
             defaults: RpcToolOutputDefaults::from(defaults),
         })
     }
@@ -327,6 +386,7 @@ impl SecretaryRpcServer {
         request: UpdateToolOutputDefaultsRequest,
     ) -> RpcResult<UpdateToolOutputDefaultsResponse> {
         let scope = parse_tool_output_scope(request.scope)?;
+        let rpc_scope = RpcToolOutputScope::try_from(scope.clone())?;
         let actor = Actor::try_from(request.actor)?;
         let overrides = parse_tool_output_overrides(request.overrides)?;
         let change =
@@ -335,7 +395,15 @@ impl SecretaryRpcServer {
 
         Ok(UpdateToolOutputDefaultsResponse {
             metadata: self.metadata(),
-            change: RpcToolOutputSettingsChange::from(change),
+            change: RpcToolOutputSettingsChange {
+                schema_version: change.schema_version,
+                actor: RpcActorDto::from(change.actor),
+                scope: rpc_scope,
+                old_defaults: RpcToolOutputDefaults::from(change.old_defaults),
+                new_defaults: RpcToolOutputDefaults::from(change.new_defaults),
+                reason: change.reason,
+                changed_at_unix_ms: change.changed_at.unix_millis,
+            },
         })
     }
 
@@ -355,8 +423,8 @@ impl SecretaryRpcServer {
         let changes = page
             .changes
             .into_iter()
-            .map(RpcToolOutputSettingsChange::from)
-            .collect();
+            .map(RpcToolOutputSettingsChange::try_from)
+            .collect::<RpcResult<Vec<_>>>()?;
 
         Ok(ListToolOutputSettingsHistoryResponse {
             metadata: self.metadata(),
@@ -656,16 +724,81 @@ pub struct RpcToolOutputSettingsChange {
     pub changed_at_unix_ms: i64,
 }
 
-impl From<ToolOutputSettingsChange> for RpcToolOutputSettingsChange {
-    fn from(change: ToolOutputSettingsChange) -> Self {
-        Self {
+impl TryFrom<ToolOutputSettingsChange> for RpcToolOutputSettingsChange {
+    type Error = RpcError;
+
+    fn try_from(change: ToolOutputSettingsChange) -> RpcResult<Self> {
+        Ok(Self {
             schema_version: change.schema_version,
             actor: RpcActorDto::from(change.actor),
-            scope: RpcToolOutputScope::from(change.scope),
+            scope: RpcToolOutputScope::try_from(change.scope)?,
             old_defaults: RpcToolOutputDefaults::from(change.old_defaults),
             new_defaults: RpcToolOutputDefaults::from(change.new_defaults),
             reason: change.reason,
             changed_at_unix_ms: change.changed_at.unix_millis,
+        })
+    }
+}
+
+impl From<JobEvent> for RpcEvent {
+    fn from(event: JobEvent) -> Self {
+        Self {
+            event_id: event.id.as_str().to_string(),
+            sequence: event.sequence_number,
+            occurred_at_unix_ms: event.created_at.unix_millis,
+            subject: RpcEventSubject::from(event.subject),
+            kind: rpc_event_kind_label(&event.kind).to_string(),
+            severity: RpcEventSeverity::from(event.severity),
+            message: event.public_message,
+            refs: RpcEventRefs::from(event.refs),
+        }
+    }
+}
+
+impl From<EventSeverity> for RpcEventSeverity {
+    fn from(value: EventSeverity) -> Self {
+        match value {
+            EventSeverity::Debug => Self::Debug,
+            EventSeverity::Info => Self::Info,
+            EventSeverity::Warning => Self::Warning,
+            EventSeverity::Error => Self::Error,
+        }
+    }
+}
+
+impl From<atelia_core::EventSubject> for RpcEventSubject {
+    fn from(subject: atelia_core::EventSubject) -> Self {
+        Self {
+            subject_type: RpcEventSubjectType::from(subject.subject_type),
+            id: subject.subject_id,
+        }
+    }
+}
+
+impl From<EventSubjectType> for RpcEventSubjectType {
+    fn from(value: EventSubjectType) -> Self {
+        match value {
+            EventSubjectType::Repository => Self::Repository,
+            EventSubjectType::Job => Self::Job,
+            EventSubjectType::PolicyDecision => Self::PolicyDecision,
+            EventSubjectType::LockDecision => Self::LockDecision,
+            EventSubjectType::ToolInvocation => Self::ToolInvocation,
+            EventSubjectType::ToolResult => Self::ToolResult,
+            EventSubjectType::AuditRecord => Self::AuditRecord,
+        }
+    }
+}
+
+impl From<atelia_core::EventRefs> for RpcEventRefs {
+    fn from(refs: atelia_core::EventRefs) -> Self {
+        Self {
+            repository_id: refs.repository_id.map(|id| id.as_str().to_string()),
+            job_id: refs.job_id.map(|id| id.as_str().to_string()),
+            policy_decision_id: refs.policy_decision_id.map(|id| id.as_str().to_string()),
+            lock_decision_id: refs.lock_decision_id.map(|id| id.as_str().to_string()),
+            tool_invocation_id: refs.tool_invocation_id.map(|id| id.as_str().to_string()),
+            tool_result_id: refs.tool_result_id.map(|id| id.as_str().to_string()),
+            audit_ref: refs.audit_record_id.map(|id| id.as_str().to_string()),
         }
     }
 }
@@ -789,9 +922,11 @@ impl TryFrom<RpcOversizeOutputPolicy> for OversizeOutputPolicy {
     }
 }
 
-impl From<ToolOutputSettingsScope> for RpcToolOutputScope {
-    fn from(scope: ToolOutputSettingsScope) -> Self {
-        Self {
+impl TryFrom<ToolOutputSettingsScope> for RpcToolOutputScope {
+    type Error = RpcError;
+
+    fn try_from(scope: ToolOutputSettingsScope) -> RpcResult<Self> {
+        Ok(Self {
             level: match scope.level {
                 atelia_core::ToolOutputSettingsLevel::Workspace => {
                     RpcToolOutputScopeLevel::Workspace
@@ -803,7 +938,7 @@ impl From<ToolOutputSettingsScope> for RpcToolOutputScope {
                 }
                 atelia_core::ToolOutputSettingsLevel::Project { project_id } => {
                     RpcToolOutputScopeLevel::Project {
-                        project_id: project_id_to_string(&project_id),
+                        project_id: project_id_to_string(&project_id)?,
                     }
                 }
                 atelia_core::ToolOutputSettingsLevel::Session { session_id } => {
@@ -814,7 +949,7 @@ impl From<ToolOutputSettingsScope> for RpcToolOutputScope {
                 }
             },
             tool_id: scope.tool_id,
-        }
+        })
     }
 }
 
@@ -919,6 +1054,96 @@ pub struct CheckPolicyRequest {
 pub struct CheckPolicyResponse {
     pub metadata: ProtocolMetadata,
     pub decision: PolicyDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListEventsRequest {
+    pub repository_id: Option<String>,
+    pub cursor: Option<EventCursorRequest>,
+    pub subject_ids: Vec<String>,
+    pub min_severity: Option<RpcEventSeverity>,
+    pub page_size: Option<usize>,
+    pub page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListEventsResponse {
+    pub metadata: ProtocolMetadata,
+    pub events: Vec<RpcEvent>,
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchEventsRequest {
+    pub repository_id: String,
+    pub cursor: Option<EventCursorRequest>,
+    pub subject_ids: Vec<String>,
+    pub min_severity: Option<RpcEventSeverity>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchEventsReplayResponse {
+    pub metadata: ProtocolMetadata,
+    pub events: Vec<RpcEvent>,
+    pub cursor: Option<EventCursorRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventCursorRequest {
+    Beginning,
+    AfterSequence(u64),
+    AfterEventId(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcEventSeverity {
+    Debug,
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcEvent {
+    pub event_id: String,
+    pub sequence: u64,
+    pub occurred_at_unix_ms: i64,
+    pub subject: RpcEventSubject,
+    pub kind: String,
+    pub severity: RpcEventSeverity,
+    pub message: String,
+    pub refs: RpcEventRefs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcEventSubject {
+    pub subject_type: RpcEventSubjectType,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcEventSubjectType {
+    Unspecified,
+    Daemon,
+    Repository,
+    Job,
+    PolicyDecision,
+    LockDecision,
+    ToolInvocation,
+    ToolResult,
+    AuditRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RpcEventRefs {
+    pub repository_id: Option<String>,
+    pub job_id: Option<String>,
+    pub policy_decision_id: Option<String>,
+    pub lock_decision_id: Option<String>,
+    pub tool_invocation_id: Option<String>,
+    pub tool_result_id: Option<String>,
+    pub audit_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1118,6 +1343,81 @@ fn parse_non_empty_field(field_name: &str, value: String) -> RpcResult<String> {
     Ok(normalized)
 }
 
+fn parse_event_query(request: ListEventsRequest) -> RpcResult<EventQuery> {
+    let page_size = match request.page_size {
+        Some(0) => {
+            return Err(RpcError::invalid_argument(
+                "page_size must be greater than 0",
+            ));
+        }
+        Some(page_size) => Some(page_size.min(MAX_WATCH_EVENTS_PAGE)),
+        None => Some(MAX_WATCH_EVENTS_PAGE),
+    };
+
+    let repository_id = request
+        .repository_id
+        .as_deref()
+        .map(parse_repository_id)
+        .transpose()?;
+    let cursor = match request.cursor.unwrap_or(EventCursorRequest::Beginning) {
+        EventCursorRequest::Beginning => EventCursor::Beginning,
+        EventCursorRequest::AfterSequence(sequence) => EventCursor::AfterSequence(sequence),
+        EventCursorRequest::AfterEventId(event_id) => {
+            EventCursor::AfterEventId(parse_event_id(&event_id)?)
+        }
+    };
+
+    Ok(EventQuery {
+        repository_id,
+        cursor,
+        subject_ids: request.subject_ids,
+        min_severity: request.min_severity.map(parse_event_severity),
+        page_size,
+        page_token: request.page_token,
+    })
+}
+
+fn parse_event_cursor(cursor: EventCursorRequest) -> RpcResult<EventCursor> {
+    Ok(match cursor {
+        EventCursorRequest::Beginning => EventCursor::Beginning,
+        EventCursorRequest::AfterSequence(sequence) => EventCursor::AfterSequence(sequence),
+        EventCursorRequest::AfterEventId(event_id) => {
+            EventCursor::AfterEventId(parse_event_id(&event_id)?)
+        }
+    })
+}
+
+fn parse_event_id(value: &str) -> RpcResult<atelia_core::JobEventId> {
+    atelia_core::JobEventId::try_from_string(value.to_string())
+        .map_err(|_| RpcError::invalid_argument("event_id must be a valid event id"))
+}
+
+fn parse_event_severity(value: RpcEventSeverity) -> EventSeverity {
+    match value {
+        RpcEventSeverity::Debug => EventSeverity::Debug,
+        RpcEventSeverity::Info => EventSeverity::Info,
+        RpcEventSeverity::Warning => EventSeverity::Warning,
+        RpcEventSeverity::Error => EventSeverity::Error,
+    }
+}
+
+fn rpc_event_kind_label(kind: &JobEventKind) -> &'static str {
+    match kind {
+        JobEventKind::JobSubmitted => "job_submitted",
+        JobEventKind::JobStatusChanged { .. } => "job_status_changed",
+        JobEventKind::PolicyDecided { .. } => "policy_decided",
+        JobEventKind::LockHeld => "lock_held",
+        JobEventKind::LockReleased => "lock_released",
+        JobEventKind::LockReclaimed => "lock_reclaimed",
+        JobEventKind::ToolInvoked { .. } => "tool_invoked",
+        JobEventKind::ToolResultRecorded { .. } => "tool_result_recorded",
+        JobEventKind::AuditRecorded => "audit_recorded",
+        JobEventKind::CancellationRequested => "cancellation_requested",
+        JobEventKind::RecoveryActionRecorded => "recovery_action_recorded",
+        JobEventKind::Message => "message",
+    }
+}
+
 fn validate_tool_result_ref(tool_result: ToolResultRef) -> RpcResult<ToolResultRef> {
     if tool_result.tool_result_id.trim().is_empty() {
         return Err(RpcError::invalid_argument(
@@ -1268,11 +1568,19 @@ fn parse_project_id(value: String) -> RpcResult<ProjectId> {
     Ok(project_id)
 }
 
-fn project_id_to_string(project_id: &ProjectId) -> String {
-    serde_json::to_string(project_id)
-        .unwrap_or_else(|_| "\"\"".to_string())
-        .trim_matches('"')
-        .to_string()
+pub(crate) fn project_id_to_string(project_id: &ProjectId) -> RpcResult<String> {
+    let value = serde_json::to_value(project_id).map_err(|error| RpcError {
+        code: RpcErrorCode::Internal,
+        reason: format!("failed to serialize project_id in tool output scope: {error}"),
+    })?;
+
+    value
+        .as_str()
+        .map(|value| value.to_string())
+        .ok_or_else(|| RpcError {
+            code: RpcErrorCode::Internal,
+            reason: "project_id serialization did not produce a string".to_string(),
+        })
 }
 
 fn parse_repository_allowed_scope(
@@ -1887,6 +2195,7 @@ mod tests {
         assert!(response
             .capabilities
             .contains(&"tool_output_render.v1".to_string()));
+        assert!(response.capabilities.contains(&"events.v1".to_string()));
     }
 
     #[test]
@@ -2425,6 +2734,135 @@ mod tests {
     }
 
     #[test]
+    fn list_and_watch_events_round_trip() {
+        let server = ready_server();
+        let root = test_repo_dir("event-round-trip");
+        let other_root = test_repo_dir("event-round-trip-other");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "event-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        let other_registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "other-event-repo".to_string(),
+                root_path: other_root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("other register should succeed");
+
+        server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "first".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("first submit should succeed");
+        server
+            .submit_job(SubmitJobRequest {
+                repository_id: other_registered.repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "between".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("other repo submit should succeed");
+        server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "second".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("second submit should succeed");
+
+        let page = server
+            .list_events(ListEventsRequest {
+                repository_id: Some(registered.repository.repository_id.clone()),
+                cursor: Some(EventCursorRequest::Beginning),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                page_size: Some(1),
+                page_token: None,
+            })
+            .expect("list events should succeed");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.next_page_token, Some("1".to_string()));
+
+        let watch = server
+            .watch_events(WatchEventsRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::AfterEventId(
+                    page.events[0].event_id.clone(),
+                )),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: Some(1),
+            })
+            .expect("watch events should succeed");
+        assert_eq!(watch.events.len(), 1);
+        assert_eq!(
+            watch.events[0].refs.repository_id.as_deref(),
+            Some(registered.repository.repository_id.as_str())
+        );
+        assert_eq!(
+            watch.cursor,
+            Some(EventCursorRequest::AfterSequence(watch.events[0].sequence))
+        );
+        assert!(watch
+            .events
+            .first()
+            .map(|event| event.sequence > page.events[0].sequence)
+            .unwrap_or(false));
+        let all_events = server
+            .list_events(ListEventsRequest {
+                repository_id: Some(registered.repository.repository_id.clone()),
+                cursor: Some(EventCursorRequest::Beginning),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                page_size: None,
+                page_token: None,
+            })
+            .expect("list all events should succeed");
+        let latest_sequence = all_events
+            .events
+            .last()
+            .expect("list should include at least one event")
+            .sequence;
+        let watch_exhausted = server
+            .watch_events(WatchEventsRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::AfterSequence(latest_sequence)),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: Some(1),
+            })
+            .expect("watch events should succeed when cursor at latest");
+        assert!(watch_exhausted.events.is_empty());
+        assert_eq!(
+            watch_exhausted.cursor,
+            Some(EventCursorRequest::AfterSequence(latest_sequence))
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(other_root);
+    }
+
+    #[test]
     fn check_policy_returns_preview_decision() {
         let server = ready_server();
         let root = test_repo_dir("check-policy-success");
@@ -2767,6 +3205,36 @@ mod tests {
         assert_ne!(second.jobs[0].job_id, first.jobs[0].job_id);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_event_query_rejects_zero_page_size() {
+        let err = parse_event_query(ListEventsRequest {
+            repository_id: None,
+            cursor: None,
+            subject_ids: Vec::new(),
+            min_severity: None,
+            page_size: Some(0),
+            page_token: None,
+        })
+        .unwrap_err();
+
+        assert_eq!(err.code, RpcErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_event_query_caps_page_size_to_maximum() {
+        let query = parse_event_query(ListEventsRequest {
+            repository_id: None,
+            cursor: None,
+            subject_ids: Vec::new(),
+            min_severity: None,
+            page_size: Some(MAX_WATCH_EVENTS_PAGE + 1),
+            page_token: None,
+        })
+        .expect("request with oversized page_size should be capped");
+
+        assert_eq!(query.page_size, Some(MAX_WATCH_EVENTS_PAGE));
     }
 
     #[test]
