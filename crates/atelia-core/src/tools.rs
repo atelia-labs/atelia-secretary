@@ -5525,8 +5525,7 @@ exec 'sleep', '9999';
         assert!(trunc.reason.contains("stdout truncated at 128 bytes"));
         assert!(!trunc.reason.contains("stderr truncated at 128 bytes"));
         let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
-        assert!(string_value(&summary.value)
-            .contains("output capture stream timeout"));
+        assert!(string_value(&summary.value).contains("output capture stream timeout"));
 
         env.cleanup();
     }
