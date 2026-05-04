@@ -1631,8 +1631,14 @@ fn capture_stream_to_file<R: Read + AsRawFd + Send + 'static>(
         let raw_fd = stream.as_raw_fd();
         // SAFETY: `raw_fd` is a valid file descriptor borrowed for the lifetime of the reader.
         let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL, 0) };
-        if flags >= 0 {
-            let _ = unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: `raw_fd` is valid and `flags` were returned by `F_GETFL` above.
+        let result = unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
         }
     }
 
