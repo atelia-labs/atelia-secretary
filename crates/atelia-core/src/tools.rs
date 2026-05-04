@@ -1879,12 +1879,7 @@ fn proc_stat_process_group_and_starttime(stat: &str) -> Option<(i32, u64)> {
 }
 
 #[cfg(target_os = "linux")]
-fn process_group_has_live_member_from_before_exit(pgid: i32) -> bool {
-    let cutoff = match current_uptime_jiffies() {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-
+fn process_group_has_live_member_from_before_exit(pgid: i32, cutoff: u64) -> bool {
     let entries = match fs::read_dir("/proc") {
         Ok(entries) => entries,
         Err(_) => return false,
@@ -1908,7 +1903,7 @@ fn process_group_has_live_member_from_before_exit(pgid: i32) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_group_has_live_member_from_before_exit(_pgid: i32) -> bool {
+fn process_group_has_live_member_from_before_exit(_pgid: i32, _cutoff: u64) -> bool {
     true
 }
 
@@ -2053,6 +2048,8 @@ fn execute_explicit_argv_process(
         }
     };
 
+    #[cfg(target_os = "linux")]
+    let process_exit_cutoff = current_uptime_jiffies().ok();
     let (status, process_timed_out, mut process_tree_handled) = wait_for_child(&mut child, timeout)
         .map_err(|error| {
             cleanup_spawned_child(&mut child);
@@ -2114,7 +2111,16 @@ fn execute_explicit_argv_process(
     if capture_timed_out || capture_thread_aborted {
         process_tree_handled = process_tree_handled || kill_process_group(child_pgid);
     }
-    if !process_timed_out && process_group_has_live_member_from_before_exit(child_pgid) {
+    #[cfg(target_os = "linux")]
+    if !process_timed_out
+        && process_exit_cutoff
+            .map(|cutoff| process_group_has_live_member_from_before_exit(child_pgid, cutoff))
+            .unwrap_or(false)
+    {
+        process_tree_handled = process_tree_handled || kill_process_group(child_pgid);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if !process_timed_out && process_group_has_live_member_from_before_exit(child_pgid, 0) {
         process_tree_handled = process_tree_handled || kill_process_group(child_pgid);
     }
 
@@ -5515,12 +5521,41 @@ exec 'sleep', '9999';
             .expect("failed to spawn child");
         let pgid = child_process_group_id(&child);
         let status = child.wait().expect("failed to reap child");
+        let cutoff = current_uptime_jiffies().expect("failed to read current uptime");
 
         assert_eq!(Some(0), status.code());
         assert!(
-            !process_group_has_live_member_from_before_exit(pgid),
+            !process_group_has_live_member_from_before_exit(pgid, cutoff),
             "empty process group should not be eligible for post-wait cleanup"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_group_cleanup_respects_cutoff_for_live_member_identity() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 1")
+            .process_group(0)
+            .spawn()
+            .expect("failed to spawn child");
+        let pgid = child_process_group_id(&child);
+        let stat_path = format!("/proc/{}/stat", child.id());
+        let stat = std::fs::read_to_string(&stat_path).expect("failed to read child stat");
+        let (_, starttime) =
+            proc_stat_process_group_and_starttime(&stat).expect("failed to parse child stat");
+
+        assert!(
+            process_group_has_live_member_from_before_exit(pgid, starttime),
+            "live member should be recognized when the cutoff is not earlier than its start time"
+        );
+        assert!(
+            !process_group_has_live_member_from_before_exit(pgid, starttime.saturating_sub(1)),
+            "live member should not be treated as pre-exit work when the cutoff is earlier than its start time"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[cfg(target_os = "linux")]
