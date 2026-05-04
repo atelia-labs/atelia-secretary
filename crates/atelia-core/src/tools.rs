@@ -1842,6 +1842,76 @@ fn kill_process_group(pgid: i32) -> bool {
     true
 }
 
+#[cfg(unix)]
+fn child_process_group_id(child: &std::process::Child) -> i32 {
+    let pid = child.id() as libc::pid_t;
+    let pgid = unsafe { libc::getpgid(pid) };
+    if pgid >= 0 {
+        pgid as i32
+    } else {
+        pid as i32
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_uptime_jiffies() -> io::Result<u64> {
+    let uptime = fs::read_to_string("/proc/uptime")?;
+    let uptime_seconds = uptime
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "missing uptime value"))?
+        .parse::<f64>()
+        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return Err(io::Error::other("clock tick rate unavailable"));
+    }
+    Ok((uptime_seconds * ticks_per_second as f64).floor() as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn proc_stat_process_group_and_starttime(stat: &str) -> Option<(i32, u64)> {
+    let end_comm = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[end_comm + 1..].split_whitespace().collect();
+    let pgrp = fields.get(2)?.parse::<i32>().ok()?;
+    let starttime = fields.get(19)?.parse::<u64>().ok()?;
+    Some((pgrp, starttime))
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_has_live_member_from_before_exit(pgid: i32) -> bool {
+    let cutoff = match current_uptime_jiffies() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+
+    let entries = match fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+
+    for entry in entries.flatten() {
+        let stat_path = entry.path().join("stat");
+        let stat = match fs::read_to_string(stat_path) {
+            Ok(stat) => stat,
+            Err(_) => continue,
+        };
+        let Some((entry_pgid, starttime)) = proc_stat_process_group_and_starttime(&stat) else {
+            continue;
+        };
+        if entry_pgid == pgid && starttime <= cutoff {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_group_has_live_member_from_before_exit(_pgid: i32) -> bool {
+    true
+}
+
 #[cfg(not(unix))]
 fn kill_process_tree(child: &mut std::process::Child) -> bool {
     let _ = child.kill();
@@ -1909,6 +1979,7 @@ fn execute_explicit_argv_process(
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to spawn process: {error}"))?;
+    let child_pgid = child_process_group_id(&child);
 
     let stdout_writer = match stdout_capture.writer() {
         Ok(writer) => writer,
@@ -2041,10 +2112,10 @@ fn execute_explicit_argv_process(
 
     let capture_timed_out = stdout_capture_timed_out || stderr_capture_timed_out;
     if capture_timed_out || capture_thread_aborted {
-        process_tree_handled = process_tree_handled || kill_process_group(child.id() as i32);
+        process_tree_handled = process_tree_handled || kill_process_group(child_pgid);
     }
-    if !process_timed_out {
-        process_tree_handled = process_tree_handled || kill_process_group(child.id() as i32);
+    if !process_timed_out && process_group_has_live_member_from_before_exit(child_pgid) {
+        process_tree_handled = process_tree_handled || kill_process_group(child_pgid);
     }
 
     let (stdout_bytes, _stdout_original_bytes) = stdout_capture
@@ -5431,6 +5502,25 @@ exec 'sleep', '9999';
             "background descendant should be cleaned up when parent exits normally (pid={child_pid}, pgrp={child_pgid}, parent_pgid={expected_parent_pgid})"
         );
         env.cleanup();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_group_cleanup_skips_empty_group_after_normal_exit() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .process_group(0)
+            .spawn()
+            .expect("failed to spawn child");
+        let pgid = child_process_group_id(&child);
+        let status = child.wait().expect("failed to reap child");
+
+        assert_eq!(Some(0), status.code());
+        assert!(
+            !process_group_has_live_member_from_before_exit(pgid),
+            "empty process group should not be eligible for post-wait cleanup"
+        );
     }
 
     #[cfg(target_os = "linux")]
