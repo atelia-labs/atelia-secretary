@@ -1884,6 +1884,7 @@ fn execute_explicit_argv_process(
             }
         }
     };
+    let capture_thread_aborted = stop_immediately.load(Ordering::Acquire);
 
     if process_timed_out {
         process_tree_handled = process_tree_handled || kill_process_tree(&mut child);
@@ -1921,9 +1922,11 @@ fn execute_explicit_argv_process(
         stderr_capture_result.retained_bytes
     };
 
-    stdout.truncated = stdout_capture_timed_out
+    stdout.truncated = capture_thread_aborted
+        || stdout_capture_timed_out
         || stdout_capture_result.original_bytes > stdout_capture_result.retained_bytes;
-    stderr.truncated = stderr_capture_timed_out
+    stderr.truncated = capture_thread_aborted
+        || stderr_capture_timed_out
         || stderr_capture_result.original_bytes > stderr_capture_result.retained_bytes;
 
     let duration_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
@@ -1951,7 +1954,7 @@ fn execute_explicit_argv_process(
             );
         }
     }
-    if stdout_capture_timed_out || stderr_capture_timed_out {
+    if capture_thread_aborted || stdout_capture_timed_out || stderr_capture_timed_out {
         summary.push_str(
             " output capture stream timeout may indicate escaped descendants with inherited stdio; detached process-tree cleanup is unsupported",
         );
@@ -3461,7 +3464,8 @@ mod tests {
     use crate::runtime::{RuntimeTool, SecretaryRuntime, RUNTIME_SCHEMA_VERSION};
     use crate::store::SecretaryStore;
     use crate::tool_output::{render_tool_result, OutputFormat, RenderOptions};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -5166,6 +5170,57 @@ mod tests {
         let stdout = result.fields.iter().find(|f| f.key == "stdout").unwrap();
         assert_eq!(32, string_value(&stdout.value).len());
         env.cleanup();
+    }
+
+    #[test]
+    fn join_capture_thread_timed_out_stream_forces_sibling_truncated() {
+        let stop_immediately = Arc::new(AtomicBool::new(false));
+
+        let blocking_handle = std::thread::spawn({
+            let stop_immediately = stop_immediately.clone();
+            move || -> io::Result<usize> {
+                loop {
+                    if stop_immediately.load(Ordering::Acquire) {
+                        return Ok(0);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        });
+        let quick_handle = std::thread::spawn(|| -> io::Result<usize> { Ok(1) });
+
+        let mut blocking_timed_out = false;
+        let blocking_capture_result = match join_capture_thread(
+            "stdout",
+            blocking_handle,
+            stop_immediately.clone(),
+            Duration::from_millis(50),
+        )
+        .unwrap()
+        {
+            Some(result) => result,
+            None => {
+                blocking_timed_out = true;
+                0
+            }
+        };
+
+        let quick_capture_result: usize = join_capture_thread(
+            "stderr",
+            quick_handle,
+            stop_immediately.clone(),
+            Duration::from_millis(50),
+        )
+        .unwrap()
+        .unwrap_or_default();
+
+        assert!(blocking_timed_out);
+        assert_eq!(0, blocking_capture_result);
+        assert_eq!(1, quick_capture_result);
+        assert!(stop_immediately.load(Ordering::Acquire));
+
+        let quick_truncated = stop_immediately.load(Ordering::Acquire);
+        assert!(quick_truncated);
     }
 
     #[test]
