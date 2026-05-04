@@ -23,7 +23,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::thread;
@@ -1576,12 +1576,35 @@ struct StreamCaptureResult {
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+struct StreamCaptureStats {
+    original_bytes: AtomicUsize,
+}
+
+impl StreamCaptureStats {
+    fn new() -> Self {
+        Self {
+            original_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn read_original_bytes(&self) -> usize {
+        self.original_bytes.load(Ordering::Acquire)
+    }
+
+    fn sync(&self, original_bytes: usize) {
+        self.original_bytes.store(original_bytes, Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
 fn capture_stream_to_file<R: Read + AsRawFd + Send + 'static>(
     mut stream: R,
     mut output_file: File,
     max_output_bytes: usize,
     stop_after_timeout: Arc<AtomicBool>,
     stop_immediately: Arc<AtomicBool>,
+    capture_stats: Arc<StreamCaptureStats>,
 ) -> io::Result<StreamCaptureResult> {
     #[cfg(unix)]
     {
@@ -1616,6 +1639,7 @@ fn capture_stream_to_file<R: Read + AsRawFd + Send + 'static>(
         };
 
         original_bytes = original_bytes.saturating_add(read);
+        capture_stats.sync(original_bytes);
         let budget = max_output_bytes.saturating_sub(retained_bytes);
         if budget > 0 {
             let bytes_to_store = budget.min(read);
@@ -1648,6 +1672,7 @@ fn spawn_capture_thread<R>(
     max_output_bytes: usize,
     stop_after_timeout: Arc<AtomicBool>,
     stop_immediately: Arc<AtomicBool>,
+    capture_stats: Arc<StreamCaptureStats>,
 ) -> io::Result<thread::JoinHandle<io::Result<StreamCaptureResult>>>
 where
     R: Read + AsRawFd + Send + 'static,
@@ -1659,6 +1684,7 @@ where
             max_output_bytes,
             stop_after_timeout,
             stop_immediately,
+            capture_stats,
         )
     })
 }
@@ -1810,12 +1836,16 @@ fn execute_explicit_argv_process(
         }
     };
 
+    let stdout_capture_stats = Arc::new(StreamCaptureStats::new());
+    let stderr_capture_stats = Arc::new(StreamCaptureStats::new());
+
     let stdout_handle = match spawn_capture_thread(
         stdout_reader,
         stdout_writer,
         max_output_bytes,
         capture_timeout.clone(),
         stop_immediately.clone(),
+        stdout_capture_stats.clone(),
     ) {
         Ok(handle) => handle,
         Err(error) => {
@@ -1830,6 +1860,7 @@ fn execute_explicit_argv_process(
         max_output_bytes,
         capture_timeout.clone(),
         stop_immediately.clone(),
+        stderr_capture_stats.clone(),
     ) {
         Ok(handle) => handle,
         Err(error) => {
@@ -1861,7 +1892,7 @@ fn execute_explicit_argv_process(
         None => {
             stdout_capture_timed_out = true;
             StreamCaptureResult {
-                original_bytes: 0,
+                original_bytes: stdout_capture_stats.read_original_bytes(),
                 retained_bytes: 0,
             }
         }
@@ -1879,7 +1910,7 @@ fn execute_explicit_argv_process(
         None => {
             stderr_capture_timed_out = true;
             StreamCaptureResult {
-                original_bytes: 0,
+                original_bytes: stderr_capture_stats.read_original_bytes(),
                 retained_bytes: 0,
             }
         }
@@ -1890,10 +1921,10 @@ fn execute_explicit_argv_process(
         process_tree_handled = process_tree_handled || kill_process_tree(&mut child);
     }
 
-    let (stdout_bytes, stdout_original_bytes) = stdout_capture
+    let (stdout_bytes, _stdout_original_bytes) = stdout_capture
         .read_retained_and_original(max_output_bytes)
         .map_err(|error| format!("stdout read failed: {error}"))?;
-    let (stderr_bytes, stderr_original_bytes) = stderr_capture
+    let (stderr_bytes, _stderr_original_bytes) = stderr_capture
         .read_retained_and_original(max_output_bytes)
         .map_err(|error| format!("stderr read failed: {error}"))?;
     let stdout_retained_bytes = stdout_bytes.len();
@@ -1901,21 +1932,13 @@ fn execute_explicit_argv_process(
 
     let mut stdout = capture_text_output(stdout_bytes, 0);
     let mut stderr = capture_text_output(stderr_bytes, 0);
-    stdout.original_bytes = if stdout_capture_timed_out {
-        stdout_original_bytes
-    } else {
-        stdout_capture_result.original_bytes
-    };
+    stdout.original_bytes = stdout_capture_result.original_bytes;
     stdout.retained_bytes = if stdout_capture_timed_out {
         stdout_retained_bytes
     } else {
         stdout_capture_result.retained_bytes
     };
-    stderr.original_bytes = if stderr_capture_timed_out {
-        stderr_original_bytes
-    } else {
-        stderr_capture_result.original_bytes
-    };
+    stderr.original_bytes = stderr_capture_result.original_bytes;
     stderr.retained_bytes = if stderr_capture_timed_out {
         stderr_retained_bytes
     } else {
@@ -5175,14 +5198,17 @@ mod tests {
     #[test]
     fn join_capture_thread_timed_out_stream_forces_sibling_truncated() {
         let stop_immediately = Arc::new(AtomicBool::new(false));
+        let blocking_original_counter = Arc::new(AtomicUsize::new(0));
 
         let blocking_handle = std::thread::spawn({
             let stop_immediately = stop_immediately.clone();
+            let blocking_original_counter = blocking_original_counter.clone();
             move || -> io::Result<usize> {
                 loop {
                     if stop_immediately.load(Ordering::Acquire) {
                         return Ok(0);
                     }
+                    blocking_original_counter.fetch_add(1, Ordering::Release);
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
@@ -5217,6 +5243,7 @@ mod tests {
         assert!(blocking_timed_out);
         assert_eq!(0, blocking_capture_result);
         assert_eq!(1, quick_capture_result);
+        assert!(blocking_original_counter.load(Ordering::Acquire) > 0);
         assert!(stop_immediately.load(Ordering::Acquire));
 
         let quick_truncated = stop_immediately.load(Ordering::Acquire);
