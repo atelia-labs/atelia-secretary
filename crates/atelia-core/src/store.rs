@@ -652,12 +652,28 @@ impl SecretaryStore for InMemoryStore {
 
     fn create_schema_migration(&self, record: SchemaMigrationRecord) -> StoreResult<()> {
         validate_schema_migration_record(&record)?;
-        let locked_at = record.migration_lock.as_ref().map(|lock| lock.locked_at);
+        let write_at = record
+            .migration_lock
+            .as_ref()
+            .map(|lock| lock.locked_at)
+            .unwrap_or(record.updated_at);
         let mut inner = self.lock()?;
-        if let Some(locked_at) = locked_at {
-            expire_schema_migration_locks(&mut inner, &locked_at)?;
+        expire_schema_migration_locks(&mut inner, &write_at)?;
 
-            if let Some(active_lock) = active_migration_lock(&inner, &locked_at) {
+        if let Some(active_lock) = active_migration_lock(&inner, &write_at) {
+            if record.is_migration_lock() {
+                return Err(StoreError::Conflict {
+                    collection: "schema_migrations",
+                    reason: schema_migration_lock_conflict_reason(active_lock),
+                });
+            }
+
+            let active_leader_id = active_lock
+                .migration_lock
+                .as_ref()
+                .map(|lock| lock.leader_id.as_str())
+                .unwrap_or("<unknown>");
+            if record.leader_id.as_deref() != Some(active_leader_id) {
                 return Err(StoreError::Conflict {
                     collection: "schema_migrations",
                     reason: schema_migration_lock_conflict_reason(active_lock),
@@ -996,9 +1012,10 @@ fn expire_schema_migration_locks(
     for record in inner.schema_migrations.values_mut() {
         if let Some(lock_record) = record.migration_lock.as_mut() {
             if lock_record.status == MigrationLockStatus::Held && lock_record.is_expired(now) {
+                let terminal_at = std::cmp::max(*now, record.updated_at);
                 lock_record.status = MigrationLockStatus::Expired;
-                lock_record.released_at = Some(*now);
-                record.updated_at = *now;
+                lock_record.released_at = Some(terminal_at);
+                record.updated_at = terminal_at;
             }
         }
     }
@@ -2355,6 +2372,12 @@ fn validate_schema_migration_record(record: &SchemaMigrationRecord) -> StoreResu
                     reason: "lock released_at must not be earlier than created_at".to_string(),
                 });
             }
+            if record.updated_at < released_at {
+                return Err(StoreError::InvalidRecord {
+                    collection: "schema_migrations",
+                    reason: "lock updated_at must not be earlier than released_at".to_string(),
+                });
+            }
         } else {
             return Err(StoreError::InvalidRecord {
                 collection: "schema_migrations",
@@ -3023,6 +3046,74 @@ mod tests {
     }
 
     #[test]
+    fn schema_migration_records_respect_active_lock_owner_for_ordinary_writes() {
+        let store = InMemoryStore::new();
+        store
+            .acquire_schema_migration_lock("daemon-a".to_string(), true, 5_000, timestamp(10))
+            .unwrap();
+
+        let mut owned_migration = schema_migration_record_with(
+            "mig_00000000-0000-0000-0000-000000000010",
+            "apply users table",
+            2,
+            10,
+            10,
+        );
+        owned_migration.leader_id = Some("daemon-a".to_string());
+
+        store
+            .create_schema_migration(owned_migration.clone())
+            .unwrap();
+
+        let mut foreign_migration = schema_migration_record_with(
+            "mig_00000000-0000-0000-0000-000000000011",
+            "apply groups table",
+            3,
+            10,
+            10,
+        );
+        foreign_migration.leader_id = Some("daemon-b".to_string());
+
+        match store.create_schema_migration(foreign_migration) {
+            Err(StoreError::Conflict { collection, reason }) => {
+                assert_eq!(collection, "schema_migrations");
+                assert!(reason.contains("active migration lock"));
+                assert!(reason.contains("daemon-a"));
+            }
+            other => panic!("expected active lock conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_migration_records_reject_terminal_lock_updated_at_before_release() {
+        let store = InMemoryStore::new();
+
+        for status in [MigrationLockStatus::Released, MigrationLockStatus::Expired] {
+            let mut migration =
+                SchemaMigrationRecord::new_migration_lock("daemon-a", timestamp(10), true, 5_000)
+                    .unwrap();
+            migration
+                .migration_lock
+                .as_mut()
+                .expect("lock metadata must be present")
+                .status = status;
+            migration
+                .migration_lock
+                .as_mut()
+                .expect("lock metadata must be present")
+                .released_at = Some(timestamp(11));
+
+            assert_eq!(
+                Err(StoreError::InvalidRecord {
+                    collection: "schema_migrations",
+                    reason: "lock updated_at must not be earlier than released_at".to_string(),
+                }),
+                store.create_schema_migration(migration)
+            );
+        }
+    }
+
+    #[test]
     fn schema_migration_records_reject_released_lock_created_at_mismatch() {
         let store = InMemoryStore::new();
         let mut migration =
@@ -3074,6 +3165,34 @@ mod tests {
             }),
             store.create_schema_migration(migration)
         );
+    }
+
+    #[test]
+    fn schema_migration_lock_expiration_preserves_updated_at_monotonicity() {
+        let store = InMemoryStore::new();
+        let mut first =
+            SchemaMigrationRecord::new_migration_lock("daemon-a", timestamp(1), true, 1).unwrap();
+        first.updated_at = timestamp(5);
+        store.create_schema_migration(first.clone()).unwrap();
+
+        let second = store
+            .acquire_schema_migration_lock("daemon-b".to_string(), false, 1_000, timestamp(2))
+            .unwrap();
+        assert_eq!(
+            second
+                .migration_lock
+                .expect("acquired lock must include lock metadata")
+                .status,
+            MigrationLockStatus::Held
+        );
+
+        let expired = store.get_schema_migration(&first.id).unwrap();
+        let lock = expired
+            .migration_lock
+            .expect("expired lock must include metadata");
+        assert_eq!(lock.status, MigrationLockStatus::Expired);
+        assert_eq!(lock.released_at, Some(timestamp(5)));
+        assert_eq!(expired.updated_at, timestamp(5));
     }
 
     #[test]
