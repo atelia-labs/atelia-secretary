@@ -832,18 +832,39 @@ impl LocalArtifactStore {
     }
     pub fn delete_artifact(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
         let path = Path::new(&output_ref.uri);
-        let Ok(_metadata) = fs::symlink_metadata(path) else {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
             return Ok(());
         };
 
-        let root = self.canonical_root_dir().map_err(ArtifactError::Io)?;
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(());
+        };
+
+        if matches!(file_name, DEFAULT_ARTIFACT_INDEX_FILE | ".index.lock") {
+            return Ok(());
+        }
+
+        if !artifact_file_name_matches(file_name, &output_ref.id) {
+            return Ok(());
+        }
 
         let resolved_path = match path.canonicalize() {
             Ok(path) => path,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let root = self.canonical_root_dir().map_err(ArtifactError::Io)?;
+                if metadata.file_type().is_symlink() && path_is_within_root(path, &root) {
+                    match fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                return Ok(());
+            }
             Err(error) => return Err(ArtifactError::Io(error)),
         };
 
+        let root = self.canonical_root_dir().map_err(ArtifactError::Io)?;
         if !resolved_path.starts_with(&root) {
             return Ok(());
         }
@@ -1467,6 +1488,25 @@ fn validate_record_path(
     Some(candidate_path)
 }
 
+fn artifact_file_name_matches(file_name: &str, record_id: &OutputRefId) -> bool {
+    let prefix = record_id.as_str();
+    file_name != DEFAULT_ARTIFACT_INDEX_FILE
+        && file_name != ".index.lock"
+        && file_name.starts_with(prefix)
+        && file_name.ends_with(".artifact")
+}
+
+fn path_is_within_root(path: &Path, root: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+
+    match parent.canonicalize() {
+        Ok(canonical_parent) => canonical_parent.starts_with(root),
+        Err(_) => false,
+    }
+}
+
 fn sanitize_segment(value: &str) -> ArtifactResult<String> {
     let sanitized = sanitize_label(value);
     if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
@@ -1701,25 +1741,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn delete_artifact_removes_symlink_entry_without_touching_target() {
+    fn delete_artifact_removes_dangling_symlink_entry() {
         let root = temp_root("delete-symlink");
         let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
         let scope_dir = root.join("repo_example");
         create_scope_dir(&scope_dir).unwrap();
 
-        let target_path = scope_dir.join("target.artifact");
-        fs::write(&target_path, b"kept").unwrap();
+        let output_id = OutputRefId::new();
+        let target_path = scope_dir.join(format!("{}-target.artifact", output_id.as_str()));
 
-        let symlink_path = scope_dir.join("linked.artifact");
+        let symlink_path = scope_dir.join(format!("{}-linked.artifact", output_id.as_str()));
         symlink(&target_path, &symlink_path).unwrap();
-        assert!(symlink_path.exists());
         assert!(fs::symlink_metadata(&symlink_path)
             .unwrap()
             .file_type()
             .is_symlink());
+        assert!(!symlink_path.exists());
 
         let output_ref = OutputRef {
-            id: OutputRefId::new(),
+            id: output_id,
             uri: symlink_path.to_string_lossy().into_owned(),
             media_type: "text/plain".to_string(),
             label: Some("linked".to_string()),
@@ -1728,8 +1768,52 @@ mod tests {
 
         store.delete_artifact(&output_ref).unwrap();
 
-        assert!(!symlink_path.exists());
-        assert!(target_path.exists());
+        assert!(fs::symlink_metadata(&symlink_path).is_err());
+    }
+
+    #[test]
+    fn delete_artifact_rejects_scope_files_and_mismatched_artifacts() {
+        let root = temp_root("delete-scope-files");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let index_path = scope_dir.join(DEFAULT_ARTIFACT_INDEX_FILE);
+        let lock_path = scope_dir.join(".index.lock");
+        let mismatched_path = scope_dir.join("different-id.artifact");
+        fs::write(&index_path, b"index").unwrap();
+        fs::write(&lock_path, b"lock").unwrap();
+        fs::write(&mismatched_path, b"artifact").unwrap();
+
+        let index_ref = OutputRef {
+            id: OutputRefId::new(),
+            uri: index_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("index".to_string()),
+            digest: None,
+        };
+        let lock_ref = OutputRef {
+            id: OutputRefId::new(),
+            uri: lock_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("lock".to_string()),
+            digest: None,
+        };
+        let mismatched_ref = OutputRef {
+            id: OutputRefId::new(),
+            uri: mismatched_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("mismatch".to_string()),
+            digest: None,
+        };
+
+        store.delete_artifact(&index_ref).unwrap();
+        store.delete_artifact(&lock_ref).unwrap();
+        store.delete_artifact(&mismatched_ref).unwrap();
+
+        assert!(index_path.exists());
+        assert!(lock_path.exists());
+        assert!(mismatched_path.exists());
     }
 
     #[test]
