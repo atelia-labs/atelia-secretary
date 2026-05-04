@@ -1487,19 +1487,34 @@ fn validate_record_path(
         return None;
     }
 
-    let canonical_parent = match path.parent() {
-        Some(parent) => match parent.canonicalize() {
-            Ok(dir) => dir,
-            Err(_) => return None,
-        },
-        None => canonical_scope_dir.clone(),
+    let metadata = match candidate_path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Some(candidate_path);
+        }
+        Err(_) => return None,
     };
 
-    if !canonical_parent.starts_with(&canonical_scope_dir) {
+    if metadata.file_type().is_symlink() {
         return None;
     }
 
-    Some(candidate_path)
+    let resolved_path = match candidate_path.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            if error.kind() == ErrorKind::NotFound {
+                candidate_path
+            } else {
+                return None;
+            }
+        }
+    };
+
+    if !resolved_path.starts_with(&canonical_scope_dir) {
+        return None;
+    }
+
+    Some(resolved_path)
 }
 
 fn validate_expiration_record_path(
@@ -1979,6 +1994,56 @@ mod tests {
             .resolve_output_path_for_context(&output_ref.id, Some("repo-b"), Some("repo-b"), None)
             .unwrap();
         assert_eq!(None, mismatched);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_output_path_rejects_symlink_record_escaping_root() {
+        let root = temp_root("resolve-output-path-symlink");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let output_id = OutputRefId::new();
+        let outside_root = temp_root("resolve-output-path-symlink-target");
+        create_scope_dir(&outside_root).unwrap();
+        let outside_artifact =
+            outside_root.join(format!("{}-outside.artifact", output_id.as_str()));
+        fs::write(&outside_artifact, b"outside root artifact").unwrap();
+
+        let symlink_path = scope_dir.join(format!("{}.artifact", output_id.as_str()));
+        symlink(&outside_artifact, &symlink_path).unwrap();
+
+        let forged = LocalArtifactRecord {
+            id: output_id.clone(),
+            scope: "repo_example".to_string(),
+            project_id: None,
+            repository_id: None,
+            path: symlink_path.to_string_lossy().into_owned(),
+            uri: symlink_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("escaped".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+        store.write_scope_records(&scope_dir, vec![forged]).unwrap();
+
+        let error = store
+            .resolve_output_record_for_context(
+                &output_id,
+                Some("repo_example"),
+                Some("repo_example"),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidIndex { path, reason }
+            if path == symlink_path.to_string_lossy() && reason == "artifact path failed scope validation"
+        ));
     }
 
     #[test]
