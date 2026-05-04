@@ -868,6 +868,15 @@ fn validate_schema_migration_record(record: &SchemaMigrationRecord) -> StoreResu
         });
     }
 
+    if let Some(leader_id) = &record.leader_id {
+        if leader_id.trim().is_empty() {
+            return Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "leader_id must not be blank".to_string(),
+            });
+        }
+    }
+
     if record.updated_at < record.created_at {
         return Err(StoreError::InvalidRecord {
             collection: "schema_migrations",
@@ -2622,6 +2631,21 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn schema_migration_records_reject_blank_leader_id() {
+        let store = InMemoryStore::new();
+        let mut migration = schema_migration_record();
+        migration.leader_id = Some("   ".to_string());
+
+        assert_eq!(
+            Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "leader_id must not be blank".to_string(),
+            }),
+            store.create_schema_migration(migration)
+        );
     }
 
     #[test]
