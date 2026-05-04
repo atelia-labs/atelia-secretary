@@ -2748,6 +2748,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn render_tool_output_endpoint_rejects_get_with_allow_post() {
+        let rpc_server = ready_rpc_server();
+        let response = send_request(&rpc_server, Method::GET, "/v1/tool-results:render").await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get(header::ALLOW),
+            Some(&header::HeaderValue::from_static("POST"))
+        );
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["error"]["code"], "method_not_allowed");
+    }
+
+    #[tokio::test]
     async fn unsupported_endpoint_returns_structured_json() {
         let rpc_server = ready_rpc_server();
         let response = send_request(&rpc_server, Method::GET, "/v1/does-not-exist").await;
