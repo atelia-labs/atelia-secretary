@@ -49,6 +49,7 @@ const WRITE_FILE_TMP_PREFIX: &str = "atelia-write-tmp";
 const WRITE_FILE_LOCK_PREFIX: &str = "atelia-write-lock";
 #[cfg(unix)]
 static WRITE_FILE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const CAPTURE_THREAD_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 // ---------------------------------------------------------------------------
 // Path canonicalization and scope validation
@@ -1473,7 +1474,7 @@ struct ProcessExecutionOutcome {
 }
 
 struct TempCaptureFile {
-    path: Option<PathBuf>,
+    path: PathBuf,
     file: File,
 }
 
@@ -1516,22 +1517,11 @@ impl TempCaptureFile {
             }
         };
 
-        #[cfg(unix)]
-        {
-            let _ = fs::remove_file(&path);
-        }
-        let path = {
-            #[cfg(unix)]
-            {
-                None
-            }
-            #[cfg(not(unix))]
-            {
-                Some(path)
-            }
-        };
-
         Ok(Self { path, file })
+    }
+
+    fn writer(&self) -> io::Result<File> {
+        self.file.try_clone()
     }
 
     fn read(&self) -> io::Result<Vec<u8>> {
@@ -1543,10 +1533,10 @@ impl TempCaptureFile {
     }
 
     fn capture<R: Read + Send>(
-        mut self,
         mut reader: R,
         max_output_bytes: usize,
-    ) -> io::Result<(Self, usize, bool)> {
+        mut writer: File,
+    ) -> io::Result<(usize, bool)> {
         let mut buffer = [0u8; 8192];
         let mut original_bytes = 0usize;
         let mut retained_bytes = 0usize;
@@ -1561,20 +1551,18 @@ impl TempCaptureFile {
             let budget = max_output_bytes.saturating_sub(retained_bytes);
             if budget > 0 {
                 let take = budget.min(read);
-                self.file.write_all(&buffer[..take])?;
+                writer.write_all(&buffer[..take])?;
                 retained_bytes = retained_bytes.saturating_add(take);
             }
         }
 
-        Ok((self, original_bytes, original_bytes > max_output_bytes))
+        Ok((original_bytes, original_bytes > max_output_bytes))
     }
 }
 
 impl Drop for TempCaptureFile {
     fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            let _ = fs::remove_file(path);
-        }
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -1586,6 +1574,26 @@ fn capture_text_output(bytes: Vec<u8>, original_bytes: usize) -> CapturedStream 
         original_bytes,
         truncated: original_bytes > bytes.len(),
     }
+}
+
+fn join_capture_task<T>(
+    label: &str,
+    task: thread::JoinHandle<io::Result<T>>,
+    timeout: Duration,
+) -> io::Result<Option<T>> {
+    let deadline = Instant::now() + timeout;
+
+    while !task.is_finished() {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let captured = task
+        .join()
+        .map_err(|_| io::Error::other(format!("{label} capture thread panicked")))?;
+    Ok(Some(captured?))
 }
 
 #[cfg(unix)]
@@ -1678,28 +1686,56 @@ fn execute_explicit_argv_process(
         .map_err(|error| format!("failed to create stdout capture file: {error}"))?;
     let stderr_capture = TempCaptureFile::create("stderr")
         .map_err(|error| format!("failed to create stderr capture file: {error}"))?;
+    let stdout_writer = stdout_capture
+        .writer()
+        .map_err(|error| format!("failed to clone stdout capture writer: {error}"))?;
+    let stderr_writer = stderr_capture
+        .writer()
+        .map_err(|error| format!("failed to clone stderr capture writer: {error}"))?;
 
     let stdout_capture_task = thread::spawn(move || {
-        stdout_capture
-            .capture(stdout_stream, max_output_bytes)
-            .map_err(|error| format!("stdout capture failed: {error}"))
+        TempCaptureFile::capture(stdout_stream, max_output_bytes, stdout_writer)
+            .map_err(|error| io::Error::other(format!("stdout capture failed: {error}")))
     });
 
     let stderr_capture_task = thread::spawn(move || {
-        stderr_capture
-            .capture(stderr_stream, max_output_bytes)
-            .map_err(|error| format!("stderr capture failed: {error}"))
+        TempCaptureFile::capture(stderr_stream, max_output_bytes, stderr_writer)
+            .map_err(|error| io::Error::other(format!("stderr capture failed: {error}")))
     });
 
     let (status, timed_out, process_tree_handled) = wait_for_child(&mut child, timeout)
         .map_err(|error| format!("process wait failed: {error}"))?;
 
-    let (stdout_capture, stdout_original_bytes, _) = stdout_capture_task
-        .join()
-        .map_err(|_| "stdout capture thread panicked".to_string())??;
-    let (stderr_capture, stderr_original_bytes, _) = stderr_capture_task
-        .join()
-        .map_err(|_| "stderr capture thread panicked".to_string())??;
+    let mut capture_timed_out = false;
+    let mut process_tree_handled = process_tree_handled;
+
+    let (stdout_original_bytes, stdout_truncated) =
+        match join_capture_task("stdout", stdout_capture_task, CAPTURE_THREAD_JOIN_TIMEOUT)
+            .map_err(|error| format!("stdout capture thread failed: {error}"))?
+        {
+            Some((original_bytes, truncated)) => (original_bytes, truncated),
+            None => {
+                capture_timed_out = true;
+                (0usize, true)
+            }
+        };
+
+    let (stderr_original_bytes, stderr_truncated) =
+        match join_capture_task("stderr", stderr_capture_task, CAPTURE_THREAD_JOIN_TIMEOUT)
+            .map_err(|error| format!("stderr capture thread failed: {error}"))?
+        {
+            Some((original_bytes, truncated)) => (original_bytes, truncated),
+            None => {
+                capture_timed_out = true;
+                (0usize, true)
+            }
+        };
+
+    if capture_timed_out {
+        process_tree_handled = process_tree_handled || kill_process_tree(&mut child);
+    }
+
+    let timed_out = timed_out || capture_timed_out;
 
     let stdout_bytes = stdout_capture
         .read()
@@ -1708,8 +1744,26 @@ fn execute_explicit_argv_process(
         .read()
         .map_err(|error| format!("stderr read failed: {error}"))?;
 
-    let stdout = capture_text_output(stdout_bytes, stdout_original_bytes);
-    let stderr = capture_text_output(stderr_bytes, stderr_original_bytes);
+    let stdout_original_bytes = if capture_timed_out {
+        stdout_bytes.len()
+    } else {
+        stdout_original_bytes
+    };
+    let stderr_original_bytes = if capture_timed_out {
+        stderr_bytes.len()
+    } else {
+        stderr_original_bytes
+    };
+
+    let mut stdout = capture_text_output(stdout_bytes, stdout_original_bytes);
+    let mut stderr = capture_text_output(stderr_bytes, stderr_original_bytes);
+    if capture_timed_out {
+        stdout.truncated = true;
+        stderr.truncated = true;
+    } else {
+        stdout.truncated = stdout_truncated;
+        stderr.truncated = stderr_truncated;
+    }
 
     let duration_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
     let exit_code = status.and_then(|exit_status| exit_status.code().map(i64::from));
@@ -1725,6 +1779,9 @@ fn execute_explicit_argv_process(
             duration_ms
         ),
     };
+    if capture_timed_out {
+        summary.push_str(" output capture streams did not finish draining");
+    }
     if timed_out && !process_tree_handled {
         summary.push_str(
             " process tree cleanup is unsupported on this platform (best-effort child kill only)",
@@ -4840,6 +4897,36 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "timed out execution did not hard-stop"
         );
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_hard_bounded_capture_join_without_terminating_child() {
+        let env = TestEnv::new("proc-timeout-hardened-capture-join");
+        let start = Instant::now();
+
+        let tool = ProcExecTool::new(
+            &env.root,
+            vec!["sh".to_string(), "-c".to_string(), "sleep 2 &".to_string()],
+        )
+        .with_timeout(Duration::from_millis(50));
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+        let elapsed = start.elapsed();
+
+        assert_eq!(ToolResultStatus::TimedOut, result.status);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "capture thread join did not hard-stop on background stream"
+        );
+        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
+        assert_eq!(StructuredValue::Bool(true), timed_out.value);
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        assert!(string_value(&summary.value)
+            .to_lowercase()
+            .contains("output capture streams did not finish draining"));
         env.cleanup();
     }
 
