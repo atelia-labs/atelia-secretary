@@ -826,6 +826,66 @@ pub enum SchemaMigrationStatus {
     Failed,
 }
 
+pub const MIGRATION_LOCK_RECORD_NAME: &str = "migration_lock";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationLockStatus {
+    Held,
+    Released,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationLockRecord {
+    pub status: MigrationLockStatus,
+    pub leader_id: String,
+    pub safe: bool,
+    pub locked_at: LedgerTimestamp,
+    pub timeout_millis: u64,
+    pub released_at: Option<LedgerTimestamp>,
+}
+
+impl MigrationLockRecord {
+    pub fn new(
+        leader_id: impl Into<String>,
+        safe: bool,
+        timeout_millis: u64,
+        locked_at: LedgerTimestamp,
+    ) -> Result<Self, SchemaMigrationRecordError> {
+        if timeout_millis == 0 {
+            return Err(SchemaMigrationRecordError::NonPositiveTimeout);
+        }
+
+        Ok(Self {
+            status: MigrationLockStatus::Held,
+            leader_id: leader_id.into(),
+            safe,
+            locked_at,
+            timeout_millis,
+            released_at: None,
+        })
+    }
+
+    pub fn expires_at(&self) -> LedgerTimestamp {
+        let locked_at = self.locked_at.unix_millis as i128;
+        let timeout = self.timeout_millis as i128;
+        let expires_at = locked_at.saturating_add(timeout).min(i64::MAX as i128);
+
+        LedgerTimestamp {
+            unix_millis: expires_at as i64,
+        }
+    }
+
+    pub fn is_active(&self, at: &LedgerTimestamp) -> bool {
+        self.status == MigrationLockStatus::Held && self.expires_at().unix_millis > at.unix_millis
+    }
+
+    pub fn is_expired(&self, at: &LedgerTimestamp) -> bool {
+        self.expires_at().unix_millis <= at.unix_millis
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchemaMigrationRecord {
     pub id: SchemaMigrationId,
@@ -836,8 +896,44 @@ pub struct SchemaMigrationRecord {
     pub migration_version: u32,
     pub status: SchemaMigrationStatus,
     pub leader_id: Option<String>,
+    pub migration_lock: Option<MigrationLockRecord>,
     pub notes: Option<String>,
     pub redactions: Vec<RedactionMarker>,
+}
+
+impl SchemaMigrationRecord {
+    pub fn new_migration_lock(
+        leader_id: impl Into<String>,
+        locked_at: LedgerTimestamp,
+        safe: bool,
+        timeout_millis: u64,
+    ) -> Result<Self, SchemaMigrationRecordError> {
+        let migration_lock = MigrationLockRecord::new(leader_id, safe, timeout_millis, locked_at)?;
+
+        Ok(Self {
+            id: SchemaMigrationId::new(),
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            created_at: locked_at,
+            updated_at: locked_at,
+            migration_name: MIGRATION_LOCK_RECORD_NAME.to_string(),
+            migration_version: 1,
+            status: SchemaMigrationStatus::Applied,
+            leader_id: Some(migration_lock.leader_id.clone()),
+            migration_lock: Some(migration_lock),
+            notes: None,
+            redactions: Vec::new(),
+        })
+    }
+
+    pub fn is_migration_lock(&self) -> bool {
+        self.migration_name == MIGRATION_LOCK_RECORD_NAME && self.migration_lock.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaMigrationRecordError {
+    NonPositiveTimeout,
 }
 
 #[cfg(test)]
@@ -1137,6 +1233,7 @@ mod tests {
         assert_serde_record::<ToolResult>();
         assert_serde_record::<AuditRecord>();
         assert_serde_record::<SchemaMigrationRecord>();
+        assert_serde_record::<MigrationLockRecord>();
     }
 
     #[test]
@@ -1150,6 +1247,7 @@ mod tests {
             migration_version: 2024050401,
             status: SchemaMigrationStatus::Applied,
             leader_id: Some("daemon-1".to_string()),
+            migration_lock: None,
             notes: Some("bootstrapped schema migrations".to_string()),
             redactions: Vec::new(),
         };
@@ -1158,6 +1256,23 @@ mod tests {
         let round_tripped: SchemaMigrationRecord = from_str(&json).unwrap();
 
         assert_eq!(record, round_tripped);
+    }
+
+    #[test]
+    fn migration_lock_record_round_trips_through_serde() {
+        let lock = MigrationLockRecord {
+            status: MigrationLockStatus::Held,
+            leader_id: "daemon-1".to_string(),
+            safe: true,
+            locked_at: LedgerTimestamp::from_unix_millis(1000),
+            timeout_millis: 3000,
+            released_at: None,
+        };
+
+        let json = to_string(&lock).unwrap();
+        let round_tripped: MigrationLockRecord = from_str(&json).unwrap();
+
+        assert_eq!(lock, round_tripped);
     }
 
     #[test]
