@@ -1735,6 +1735,80 @@ mod tests {
     }
 
     #[test]
+    fn get_project_status_keeps_latest_event_scoped_to_repository() {
+        let svc = ready_service();
+        let root_a = test_repo_dir("project-status-a");
+        let root_b = test_repo_dir("project-status-b");
+
+        let repository_a = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "project-status-repo-a".to_string(),
+                root_path: root_a.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register repository a should succeed");
+        let repository_b = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "project-status-repo-b".to_string(),
+                root_path: root_b.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register repository b should succeed");
+
+        let submitted_a = svc
+            .submit_job(SubmitJobRequest {
+                requester: Actor::Agent {
+                    id: "agent:a".to_string(),
+                    display_name: Some("Agent A".to_string()),
+                },
+                repository_id: repository_a.id.clone(),
+                kind: JobKind::Read,
+                goal: "summarize repository a".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("submit a should succeed");
+        let _submitted_b = svc
+            .submit_job(SubmitJobRequest {
+                requester: Actor::Agent {
+                    id: "agent:b".to_string(),
+                    display_name: Some("Agent B".to_string()),
+                },
+                repository_id: repository_b.id.clone(),
+                kind: JobKind::Read,
+                goal: "summarize repository b".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("submit b should succeed");
+
+        let status = svc
+            .get_project_status(GetProjectStatusRequest {
+                repository_id: repository_a.id.clone(),
+            })
+            .expect("project status should succeed");
+
+        assert_eq!(status.repository.id, repository_a.id);
+        let latest_event = status
+            .latest_event
+            .expect("project status should include latest event");
+        assert_eq!(latest_event.refs.job_id, Some(submitted_a.job.id));
+        assert_eq!(
+            latest_event.refs.repository_id,
+            Some(repository_a.id.clone())
+        );
+
+        let _ = fs::remove_dir_all(root_a);
+        let _ = fs::remove_dir_all(root_b);
+    }
+
+    #[test]
     fn health_updates_repository_count() {
         let svc = ready_service();
         let root_a = test_repo_dir("health-a");
