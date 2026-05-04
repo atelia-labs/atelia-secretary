@@ -23,6 +23,8 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const TOOLS_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_READ_MAX_LINES: usize = 120;
@@ -31,6 +33,10 @@ const DEFAULT_READ_MAX_SCAN_BYTES: u64 = 1024 * 1024;
 const DEFAULT_SEARCH_MAX_RESULTS: usize = 100;
 const DEFAULT_SEARCH_MAX_FILE_BYTES: u64 = 64 * 1024;
 const DEFAULT_WRITE_MAX_BYTES: usize = 32 * 1024;
+#[cfg(unix)]
+const WRITE_FILE_TMP_PREFIX: &str = "atelia-write-tmp";
+#[cfg(unix)]
+static WRITE_FILE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Path canonicalization and scope validation
@@ -337,8 +343,6 @@ fn open_no_follow_in_parent_dir(
     let mut flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     if create_new {
         flags |= libc::O_CREAT | libc::O_EXCL;
-    } else {
-        flags |= libc::O_TRUNC;
     }
 
     // SAFETY: `parent` is a live directory file descriptor and the `cstring` is valid for
@@ -1721,18 +1725,210 @@ fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> 
     })?;
 
     #[cfg(unix)]
+    let expected_metadata = if create_new {
+        None
+    } else {
+        let metadata = fs::metadata(path)?;
+        Some((metadata.dev(), metadata.ino()))
+    };
+
+    #[cfg(target_os = "linux")]
+    let expected_path = if create_new {
+        None
+    } else {
+        Some(path.canonicalize()?)
+    };
+
+    #[cfg(unix)]
     {
         let parent_dir = open_parent_no_follow(parent)?;
-        open_no_follow_in_parent_dir(&parent_dir, file_name, create_new)
+        let file = open_no_follow_in_parent_dir(&parent_dir, file_name, create_new)?;
+
+        #[cfg(unix)]
+        {
+            if let Some((expected_dev, expected_ino)) = expected_metadata {
+                let opened_metadata = file.metadata()?;
+                if opened_metadata.dev() != expected_dev || opened_metadata.ino() != expected_ino {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "opened write file did not match resolved record",
+                    ));
+                }
+            }
+
+            #[cfg(target_os = "linux")]
+            if let Some(expected_path) = expected_path {
+                let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+                let opened_path = fs::canonicalize(fd_path)?;
+                if opened_path != expected_path {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "opened write file path changed after resolution",
+                    ));
+                }
+            }
+        }
+
+        Ok(file)
     }
 
     #[cfg(not(unix))]
-    {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "filesystem write/patch is best-effort on non-Unix platforms",
-        ))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filesystem write/patch is best-effort on non-Unix platforms",
+    ))
+}
+
+#[cfg(unix)]
+fn temporary_write_file_name(file_name: &std::ffi::OsStr, attempt: u32) -> std::ffi::OsString {
+    let file_name = file_name.to_string_lossy();
+    let attempt = WRITE_FILE_TMP_COUNTER.fetch_add(1, Ordering::SeqCst) + attempt as u64;
+    format!("{WRITE_FILE_TMP_PREFIX}-{file_name}-{attempt}").into()
+}
+
+#[cfg(unix)]
+fn create_temporary_file_in_parent_dir(
+    parent: &File,
+    file_name: &std::ffi::OsStr,
+) -> io::Result<(std::ffi::OsString, File)> {
+    for attempt in 0..128u32 {
+        let temp_name = temporary_write_file_name(file_name, attempt);
+        match open_no_follow_in_parent_dir(parent, &temp_name, true) {
+            Ok(file) => return Ok((temp_name, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "failed to create temporary write file",
+    ))
+}
+
+#[cfg(unix)]
+fn rename_in_parent_dir(
+    parent: &File,
+    source: &std::ffi::OsStr,
+    destination: &std::ffi::OsStr,
+) -> io::Result<()> {
+    let source = CString::new(source.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+    let destination = CString::new(destination.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    // SAFETY: `parent` is a live directory file descriptor and both names are valid c-strings.
+    let result = unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+        )
+    };
+
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unlink_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    // SAFETY: `parent` is a live directory file descriptor and `cstring` is a valid name.
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), cstring.as_ptr(), 0) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_file_bytes_atomically_inner(
+    path: &Path,
+    bytes: &[u8],
+    create_new: bool,
+    fail_after_write: bool,
+) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+
+    let parent_dir = open_parent_no_follow(parent)?;
+    let existing_permissions = if !create_new {
+        let existing_file = open_write_file_no_follow(path, false)?;
+        let existing_metadata = existing_file.metadata()?;
+        Some(existing_metadata.permissions())
+    } else {
+        None
+    };
+
+    let (temp_name, mut temp_file) = create_temporary_file_in_parent_dir(&parent_dir, file_name)?;
+
+    let cleanup = |parent_dir: &File,
+                   temp_name: &std::ffi::OsStr,
+                   file_name: &std::ffi::OsStr,
+                   create_new: bool| {
+        let _ = unlink_in_parent_dir(parent_dir, temp_name);
+        if create_new {
+            let _ = unlink_in_parent_dir(parent_dir, file_name);
+        }
+    };
+
+    let write_result = (|| -> io::Result<()> {
+        temp_file.write_all(bytes)?;
+        temp_file.flush()?;
+        temp_file.sync_all()?;
+        if let Some(permissions) = existing_permissions {
+            temp_file.set_permissions(permissions)?;
+        }
+        if fail_after_write {
+            return Err(io::Error::other("simulated write failure"));
+        }
+        drop(temp_file);
+
+        let _destination_guard = if create_new {
+            open_write_file_no_follow(path, true)?
+        } else {
+            open_write_file_no_follow(path, false)?
+        };
+        rename_in_parent_dir(&parent_dir, &temp_name, file_name)?;
+        Ok(())
+    })();
+
+    if let Err(error) = write_result {
+        cleanup(&parent_dir, &temp_name, file_name, create_new);
+        return Err(error);
+    }
+
+    parent_dir.sync_all()?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_file_bytes_atomically(path: &Path, bytes: &[u8], create_new: bool) -> io::Result<()> {
+    write_file_bytes_atomically_inner(path, bytes, create_new, false)
+}
+
+#[cfg(not(unix))]
+fn write_file_bytes_atomically(_path: &Path, _bytes: &[u8], _create_new: bool) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filesystem write/patch is best-effort on non-Unix platforms",
+    ))
 }
 
 fn read_entire_text_file(path: &Path, max_bytes: usize) -> io::Result<String> {
@@ -1933,19 +2129,7 @@ impl crate::runtime::RuntimeTool for FsWriteTool {
             }
         }
 
-        let mut file = match open_write_file_no_follow(path, !exists) {
-            Ok(file) => file,
-            Err(err) => {
-                return failed_result(
-                    invocation,
-                    schema_ref,
-                    "write failed: cannot open scoped file".to_string(),
-                    format!("{}: {}", target.display_path(), err),
-                );
-            }
-        };
-
-        if let Err(err) = file.write_all(self.content.as_bytes()) {
+        if let Err(err) = write_file_bytes_atomically(path, self.content.as_bytes(), !exists) {
             return failed_result(
                 invocation,
                 schema_ref,
@@ -2178,19 +2362,7 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
             );
         }
 
-        let mut file = match open_write_file_no_follow(path, false) {
-            Ok(file) => file,
-            Err(err) => {
-                return failed_result(
-                    invocation,
-                    schema_ref,
-                    "patch failed: cannot open scoped file".to_string(),
-                    format!("{}: {}", target.display_path(), err),
-                );
-            }
-        };
-
-        if let Err(err) = file.write_all(updated.as_bytes()) {
+        if let Err(err) = write_file_bytes_atomically(path, updated.as_bytes(), false) {
             return failed_result(
                 invocation,
                 schema_ref,
@@ -3457,6 +3629,62 @@ mod tests {
             .find(|f| f.key == "overwritten")
             .unwrap();
         assert_eq!(StructuredValue::Bool(true), overwritten.value);
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_fails_atomically_if_rename_does_not_run() {
+        let env = TestEnv::new("write-fails-atomically");
+        env.create_file("notes.txt", "original");
+
+        let path = env.root.join("notes.txt");
+        let err =
+            write_file_bytes_atomically_inner(&path, b"replacement", false, true).unwrap_err();
+        assert_eq!(io::ErrorKind::Other, err.kind());
+        assert_eq!("original", fs::read_to_string(&path).unwrap());
+
+        let has_temp_file = fs::read_dir(&env.root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(WRITE_FILE_TMP_PREFIX)
+            });
+        assert!(
+            !has_temp_file,
+            "temporary write file should be cleaned up on failure"
+        );
+
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_create_fails_atomically_if_destination_appears() {
+        let env = TestEnv::new("write-create-fails-atomically");
+        let path = env.root.join("notes.txt");
+
+        let err = write_file_bytes_atomically_inner(&path, b"replacement", true, true).unwrap_err();
+        assert_eq!(io::ErrorKind::Other, err.kind());
+        assert!(!path.exists());
+
+        let has_temp_file = fs::read_dir(&env.root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(WRITE_FILE_TMP_PREFIX)
+            });
+        assert!(
+            !has_temp_file,
+            "temporary write file should be cleaned up on failure"
+        );
+
         env.cleanup();
     }
 
