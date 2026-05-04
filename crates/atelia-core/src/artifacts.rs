@@ -845,6 +845,12 @@ impl LocalArtifactStore {
         }
 
         if !artifact_file_name_matches(file_name, &output_ref.id) {
+            if file_name.starts_with(output_ref.id.as_str()) {
+                return Err(ArtifactError::Io(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "artifact path basename does not match expected artifact suffix",
+                )));
+            }
             return Ok(());
         }
 
