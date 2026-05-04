@@ -1788,9 +1788,7 @@ impl ProcToolConfig {
     fn args_summary(&self, request: &RuntimeJobRequest) -> String {
         let mut parts = vec![
             format!("cwd={}", request.resource_scope.value),
-            if self.include_full_argv {
-                format!("argv_full={:?}", self.argv)
-            } else if let Some(first_argv) = self.argv.first() {
+            if let Some(first_argv) = self.argv.first() {
                 format!("argv[0]={first_argv} argc={}", self.argv.len())
             } else {
                 "argv=[]".to_string()
@@ -7421,6 +7419,8 @@ exit 0
         env.create_dir("subdir");
 
         let tool = ProcRunTool::new(&env.root, vec!["pwd".to_string()]);
+        assert_eq!("proc.run", tool.tool_id());
+        assert_eq!("process.run", tool.requested_capability());
         let invocation = fake_invocation(tool.tool_id());
         let request = request_with_path("subdir");
         let result = tool.execute(&invocation, &request);
@@ -7435,6 +7435,27 @@ exit 0
         assert_eq!(env.root.join("subdir").to_string_lossy(), stdout_value);
         let exit_code = result.fields.iter().find(|f| f.key == "exit_code").unwrap();
         assert_eq!(0, integer_value(&exit_code.value));
+        env.cleanup();
+    }
+
+    #[test]
+    fn proc_args_summary_never_includes_full_argv() {
+        let env = TestEnv::new("proc-summary-redaction");
+        let tool = ProcRunTool::new(
+            &env.root,
+            vec![
+                "secret-tool".to_string(),
+                "--token".to_string(),
+                "super-secret".to_string(),
+            ],
+        )
+        .with_full_argv(true);
+        let request = request_with_path(".");
+        let summary = tool.args_summary(&request);
+
+        assert!(summary.contains("argv[0]=secret-tool argc=3"));
+        assert!(!summary.contains("argv_full"));
+        assert!(!summary.contains("super-secret"));
         env.cleanup();
     }
 
