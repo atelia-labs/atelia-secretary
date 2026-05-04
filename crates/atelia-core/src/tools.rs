@@ -3691,6 +3691,26 @@ fn ensure_named_entry_no_longer_matches(
 }
 
 #[cfg(unix)]
+fn ensure_opened_link_count_decreased(
+    file: &File,
+    before: &fs::Metadata,
+    context: &'static str,
+) -> io::Result<()> {
+    let after = file.metadata()?;
+    if after.dev() != before.dev() || after.ino() != before.ino() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "opened file identity changed after mutation",
+        ));
+    }
+    if after.nlink() >= before.nlink() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, context));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
 fn rename_between_parent_dirs(
     source_parent: &File,
     source: &std::ffi::OsStr,
@@ -3798,7 +3818,12 @@ fn unlink_validated_file_in_parent_dir(
         "delete target changed before unlink",
     )?;
 
-    unlink_in_parent_dir(parent, name)
+    unlink_in_parent_dir(parent, name)?;
+    ensure_opened_link_count_decreased(
+        &file,
+        &opened_metadata,
+        "delete target link count did not decrease after unlink",
+    )
 }
 
 #[cfg(unix)]
@@ -3842,6 +3867,12 @@ fn rename_validated_file_between_parent_dirs(
         source,
         &opened_metadata,
         "move source still referenced validated file after rename",
+    )?;
+    ensure_named_entry_matches(
+        destination_parent,
+        destination,
+        &opened_metadata,
+        "move destination did not reference validated file after rename",
     )
 }
 
