@@ -36,6 +36,8 @@ const DEFAULT_WRITE_MAX_BYTES: usize = 32 * 1024;
 #[cfg(unix)]
 const WRITE_FILE_TMP_PREFIX: &str = "atelia-write-tmp";
 #[cfg(unix)]
+const WRITE_FILE_LOCK_PREFIX: &str = "atelia-write-lock";
+#[cfg(unix)]
 static WRITE_FILE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
@@ -361,6 +363,100 @@ fn open_no_follow_in_parent_dir(
 
     // SAFETY: `fd` was returned from `openat` and is uniquely owned by this branch.
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_or_create_no_follow_in_parent_dir(
+    parent: &File,
+    name: &std::ffi::OsStr,
+) -> io::Result<File> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    // SAFETY: `parent` is a live directory file descriptor and `cstring` is valid.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            cstring.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666 as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `fd` was returned from `openat` and is uniquely owned by this branch.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn write_lock_file_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
+    // A deterministic, safe lock-file key derived from path bytes so different target
+    // names can never collide on lock identity.
+    fn stable_lock_suffix(bytes: &[u8]) -> String {
+        let mut digest: u64 = 14_695_981_039_346_655_577;
+        for byte in bytes {
+            digest ^= u64::from(*byte);
+            digest = digest.rotate_left(27).wrapping_mul(5);
+            digest = digest ^ (digest >> 32);
+        }
+        format!("{digest:x}")
+    }
+
+    format!(
+        "{WRITE_FILE_LOCK_PREFIX}-{}-{}.lock",
+        file_name.to_string_lossy(),
+        stable_lock_suffix(file_name.as_bytes())
+    )
+    .into()
+}
+
+#[cfg(unix)]
+fn lock_target_file_in_parent_dir(
+    parent_dir: &File,
+    file_name: &std::ffi::OsStr,
+) -> io::Result<File> {
+    let lock_file_name = write_lock_file_name(file_name);
+    let lock_file = open_or_create_no_follow_in_parent_dir(parent_dir, &lock_file_name)?;
+
+    // SAFETY: `lock_file` is a valid descriptor; `LOCK_EX` blocks until exclusive access
+    // for the same lock file is available.
+    let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(lock_file)
+}
+
+#[cfg(unix)]
+fn write_file_exists_in_parent_dir(parent_dir: &File, name: &std::ffi::OsStr) -> io::Result<bool> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    let fd = unsafe {
+        libc::openat(
+            parent_dir.as_raw_fd(),
+            cstring.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o0 as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+
+    let close_result = unsafe { libc::close(fd) };
+    if close_result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1811,11 +1907,56 @@ fn rename_in_parent_dir(
     parent: &File,
     source: &std::ffi::OsStr,
     destination: &std::ffi::OsStr,
+    create_new: bool,
 ) -> io::Result<()> {
     let source = CString::new(source.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
-    let destination = CString::new(destination.as_bytes())
+    let destination_name = CString::new(destination.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    if create_new {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `parent` is a live directory file descriptor and both names are valid c-strings.
+            let rename_result = unsafe {
+                libc::renameat2(
+                    parent.as_raw_fd(),
+                    source.as_ptr(),
+                    parent.as_raw_fd(),
+                    destination_name.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if rename_result == 0 {
+                return Ok(());
+            }
+
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => {
+                    // renameat2 unavailable on very old kernels or older libc/feature combinations.
+                    if write_file_exists_in_parent_dir(parent, destination)? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "destination file already exists",
+                        ));
+                    }
+                }
+                Some(libc::EEXIST) => return Err(error),
+                _ => return Err(error),
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            if write_file_exists_in_parent_dir(parent, destination)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination file already exists",
+                ));
+            }
+        }
+    }
 
     // SAFETY: `parent` is a live directory file descriptor and both names are valid c-strings.
     let result = unsafe {
@@ -1823,7 +1964,7 @@ fn rename_in_parent_dir(
             parent.as_raw_fd(),
             source.as_ptr(),
             parent.as_raw_fd(),
-            destination.as_ptr(),
+            destination_name.as_ptr(),
         )
     };
 
@@ -1867,6 +2008,7 @@ fn write_file_bytes_atomically_inner(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
 
     let parent_dir = open_parent_no_follow(parent)?;
+    let _destination_lock = lock_target_file_in_parent_dir(&parent_dir, file_name)?;
     let existing_permissions = if !create_new {
         let existing_file = open_write_file_no_follow(path, false)?;
         let existing_metadata = existing_file.metadata()?;
@@ -1877,39 +2019,28 @@ fn write_file_bytes_atomically_inner(
 
     let (temp_name, mut temp_file) = create_temporary_file_in_parent_dir(&parent_dir, file_name)?;
 
-    let cleanup = |parent_dir: &File,
-                   temp_name: &std::ffi::OsStr,
-                   file_name: &std::ffi::OsStr,
-                   create_new: bool| {
+    let cleanup = |parent_dir: &File, temp_name: &std::ffi::OsStr| {
         let _ = unlink_in_parent_dir(parent_dir, temp_name);
-        if create_new {
-            let _ = unlink_in_parent_dir(parent_dir, file_name);
-        }
     };
 
     let write_result = (|| -> io::Result<()> {
         temp_file.write_all(bytes)?;
         temp_file.flush()?;
-        temp_file.sync_all()?;
         if let Some(permissions) = existing_permissions {
             temp_file.set_permissions(permissions)?;
         }
+        temp_file.sync_all()?;
         if fail_after_write {
             return Err(io::Error::other("simulated write failure"));
         }
         drop(temp_file);
 
-        let _destination_guard = if create_new {
-            open_write_file_no_follow(path, true)?
-        } else {
-            open_write_file_no_follow(path, false)?
-        };
-        rename_in_parent_dir(&parent_dir, &temp_name, file_name)?;
+        rename_in_parent_dir(&parent_dir, &temp_name, file_name, create_new)?;
         Ok(())
     })();
 
     if let Err(error) = write_result {
-        cleanup(&parent_dir, &temp_name, file_name, create_new);
+        cleanup(&parent_dir, &temp_name);
         return Err(error);
     }
 
@@ -3657,6 +3788,127 @@ mod tests {
             !has_temp_file,
             "temporary write file should be cleaned up on failure"
         );
+
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_create_does_not_remove_destination_on_failure() {
+        use std::thread;
+        use std::time::Duration;
+
+        let env = TestEnv::new("write-create-failure-cleanup");
+        let path = env.root.join("notes.txt");
+
+        let writer_env = env.root.clone();
+        let path_for_writer = path.clone();
+        let writer_handle = thread::spawn(move || {
+            let err =
+                write_file_bytes_atomically_inner(&path_for_writer, b"replacement", true, true)
+                    .unwrap_err();
+            assert_eq!(io::ErrorKind::Other, err.kind());
+        });
+
+        let mut saw_temp_file = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            saw_temp_file = fs::read_dir(&writer_env)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(WRITE_FILE_TMP_PREFIX)
+                });
+            if saw_temp_file {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(
+            saw_temp_file,
+            "temporary write file should be created before failure"
+        );
+
+        fs::write(&path, b"racer").unwrap();
+
+        writer_handle.join().unwrap();
+        assert_eq!(
+            "racer",
+            fs::read_to_string(&path).expect("destination should remain from concurrent writer"),
+        );
+        let has_temp_file = fs::read_dir(&writer_env)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(WRITE_FILE_TMP_PREFIX)
+            });
+        assert!(
+            !has_temp_file,
+            "temporary write file should be cleaned up on failure"
+        );
+
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_create_blocks_concurrent_mutation() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let env = TestEnv::new("write-lock-block");
+        env.create_file("notes.txt", "original");
+
+        let path = env.root.join("notes.txt");
+        let path_clone = path.clone();
+        let parent_path = path.parent().unwrap();
+        let parent_dir = open_parent_no_follow(parent_path).unwrap();
+        let lock_file_name = path.file_name().unwrap();
+        let _destination_lock =
+            lock_target_file_in_parent_dir(&parent_dir, lock_file_name).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let write_handle = thread::spawn(move || {
+            let result = write_file_bytes_atomically(&path_clone, b"blocked", false);
+            done_tx.send(result).unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(120));
+        assert!(done_rx.try_recv().is_err());
+
+        drop(_destination_lock);
+        let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(result.is_ok());
+        assert_eq!("blocked", fs::read_to_string(&path).unwrap());
+
+        write_handle.join().unwrap();
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let env = TestEnv::new("write-existing-perms");
+        let path = env.root.join("notes.txt");
+        env.create_file("notes.txt", "original");
+
+        let mut permissions = path.metadata().unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        write_file_bytes_atomically(&path, b"updated", false).unwrap();
+
+        let after_permissions = path.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(0o600, after_permissions);
 
         env.cleanup();
     }
