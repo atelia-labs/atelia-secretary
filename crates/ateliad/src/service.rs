@@ -9,15 +9,15 @@ use atelia_core::{
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
     CancelJobReceipt, DefaultPolicyEngine, EventCursor, EventPage, EventQuery,
     ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, InMemoryStore,
-    InMemoryToolOutputSettingsService, InstallExtensionRequest, InstallExtensionResponse, JobId,
-    JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
+    InMemoryToolOutputSettingsService, InstallExtensionRequest, InstallExtensionResponse, JobEvent,
+    JobId, JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
     ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
-    OutputFormat, PathScope, PolicyEngine, PolicyInput, RegistryError, RenderedToolOutput,
-    RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RollbackExtensionRequest,
-    RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore,
-    StoreError, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
-    ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
-    TruncationMetadata,
+    OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput, RegistryError,
+    RenderedToolOutput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
+    RollbackExtensionRequest, RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt,
+    RuntimeJobRequest, SecretaryStore, StoreError, ToolInvocationId, ToolOutputDefaults,
+    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
+    ToolOutputSettingsScope, ToolResultId, TruncationMetadata,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -36,6 +36,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "extensions.registry.v1",
     "tool_output_settings.v1",
     "tool_output_render.v1",
+    "project_status.v1",
 ];
 const MAX_HISTORY_PAGE: usize = 1000;
 const SECRETARY_ECHO_TOOL_ID: &str = "secretary.echo";
@@ -46,6 +47,7 @@ fn daemon_capabilities() -> Vec<String> {
         .map(|capability| capability.to_string())
         .collect()
 }
+const PROJECT_STATUS_RECENT_LIMIT: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Health types
@@ -88,6 +90,21 @@ pub struct ProtocolMetadata {
     pub daemon_version: String,
     pub storage_version: String,
     pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetProjectStatusRequest {
+    pub repository_id: RepositoryId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectStatusSnapshot {
+    pub repository: RepositoryRecord,
+    pub recent_jobs: Vec<JobRecord>,
+    pub recent_policy_decisions: Vec<PolicyDecision>,
+    pub latest_event: Option<JobEvent>,
+    pub daemon_status: DaemonStatus,
+    pub storage_status: StorageStatus,
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +543,34 @@ impl SecretaryService {
         Ok(ListToolOutputSettingsHistoryPage {
             changes,
             next_page_token: Some(next_page_token),
+        })
+    }
+
+    /// Return a compact snapshot for one repository.
+    #[allow(dead_code)]
+    pub fn get_project_status(
+        &self,
+        request: GetProjectStatusRequest,
+    ) -> ServiceResult<ProjectStatusSnapshot> {
+        let repository_id = request.repository_id;
+        let repository = self.get_repository(&repository_id)?;
+        let atelia_core::ProjectStatusSnapshot {
+            recent_jobs,
+            recent_policy_decisions,
+            latest_event,
+        } = self.lifecycle.runtime().store().project_status_snapshot(
+            &repository_id,
+            PROJECT_STATUS_RECENT_LIMIT,
+            PROJECT_STATUS_RECENT_LIMIT,
+        )?;
+
+        Ok(ProjectStatusSnapshot {
+            repository,
+            recent_jobs,
+            recent_policy_decisions,
+            latest_event,
+            daemon_status: self.daemon_status,
+            storage_status: self.health().storage_status,
         })
     }
 
@@ -1182,6 +1227,9 @@ mod tests {
         assert!(health
             .capabilities
             .contains(&"tool_output_render.v1".to_string()));
+        assert!(health
+            .capabilities
+            .contains(&"project_status.v1".to_string()));
     }
 
     #[test]
@@ -1383,6 +1431,9 @@ mod tests {
         assert!(metadata
             .capabilities
             .contains(&"tool_output_render.v1".to_string()));
+        assert!(metadata
+            .capabilities
+            .contains(&"project_status.v1".to_string()));
     }
 
     // -- register / list round trip -----------------------------------------
@@ -1635,6 +1686,52 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn get_project_status_returns_repository_jobs_policies_and_latest_event() {
+        let svc = ready_service();
+        let root = test_repo_dir("project-status");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "project-status-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let submitted = svc
+            .submit_job(SubmitJobRequest {
+                requester: Actor::Agent {
+                    id: "agent:test".to_string(),
+                    display_name: Some("Test Agent".to_string()),
+                },
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "summarize current repository status".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("submit should succeed");
+
+        let status = svc
+            .get_project_status(GetProjectStatusRequest {
+                repository_id: repository.id.clone(),
+            })
+            .expect("project status should succeed");
+
+        assert_eq!(status.repository.id, repository.id);
+        assert_eq!(status.recent_jobs.len(), 1);
+        assert_eq!(status.recent_jobs[0].id, submitted.job.id);
+        assert_eq!(status.recent_policy_decisions.len(), 1);
+        assert!(status.latest_event.is_some());
+        assert_eq!(status.daemon_status, DaemonStatus::Ready);
+        assert_eq!(status.storage_status, StorageStatus::Ready);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

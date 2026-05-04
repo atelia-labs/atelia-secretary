@@ -130,6 +130,13 @@ impl Error for StoreError {}
 /// append ordered events, and replay events from stable cursors. Mutation-heavy
 /// lifecycle behavior should be represented by appending records/events rather
 /// than by broad in-place updates.
+#[derive(Debug, Clone)]
+pub struct ProjectStatusSnapshot {
+    pub recent_jobs: Vec<JobRecord>,
+    pub recent_policy_decisions: Vec<PolicyDecision>,
+    pub latest_event: Option<JobEvent>,
+}
+
 pub trait SecretaryStore: Send + Sync + 'static {
     fn create_repository(&self, record: RepositoryRecord) -> StoreResult<()>;
     fn list_repositories(&self) -> StoreResult<Vec<RepositoryRecord>>;
@@ -143,6 +150,12 @@ pub trait SecretaryStore: Send + Sync + 'static {
     fn list_jobs(&self) -> StoreResult<Vec<JobRecord>>;
     fn query_jobs(&self, query: JobQuery) -> StoreResult<JobPage>;
     fn get_job(&self, id: &JobId) -> StoreResult<JobRecord>;
+    fn project_status_snapshot(
+        &self,
+        repository_id: &RepositoryId,
+        recent_job_limit: usize,
+        recent_policy_decision_limit: usize,
+    ) -> StoreResult<ProjectStatusSnapshot>;
 
     /// Append a job event and assign the next store-wide sequence number.
     fn append_job_event(&self, event: JobEvent) -> StoreResult<JobEvent>;
@@ -224,6 +237,14 @@ impl InMemoryStore {
             collection: "store",
             reason: "in-memory store lock was poisoned".to_string(),
         })
+    }
+
+    pub fn latest_job_event_for_repository(
+        &self,
+        repository_id: &RepositoryId,
+    ) -> StoreResult<Option<JobEvent>> {
+        let inner = self.lock()?;
+        latest_job_event_for_repository_with_inner(&inner, repository_id)
     }
 }
 
@@ -336,6 +357,50 @@ impl SecretaryStore for InMemoryStore {
 
     fn get_job(&self, id: &JobId) -> StoreResult<JobRecord> {
         get_record(&self.lock()?.jobs, id, "jobs")
+    }
+
+    fn project_status_snapshot(
+        &self,
+        repository_id: &RepositoryId,
+        recent_job_limit: usize,
+        recent_policy_decision_limit: usize,
+    ) -> StoreResult<ProjectStatusSnapshot> {
+        let inner = self.lock()?;
+        let mut recent_jobs = inner
+            .jobs
+            .values()
+            .filter(|job| job.repository_id == *repository_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        recent_jobs.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        recent_jobs.truncate(recent_job_limit);
+
+        let mut recent_policy_decisions = inner
+            .policy_decisions
+            .values()
+            .filter(|decision| decision.repository_id == *repository_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        recent_policy_decisions.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        recent_policy_decisions.truncate(recent_policy_decision_limit);
+
+        let latest_event = latest_job_event_for_repository_with_inner(&inner, repository_id)?;
+
+        Ok(ProjectStatusSnapshot {
+            recent_jobs,
+            recent_policy_decisions,
+            latest_event,
+        })
     }
 
     fn append_job_event(&self, mut event: JobEvent) -> StoreResult<JobEvent> {
@@ -856,6 +921,15 @@ fn event_matches_query(
     Ok(repository_matches && subject_matches && severity_matches)
 }
 
+#[cfg(test)]
+fn latest_matching_job_event<'a, I, F>(events: I, mut predicate: F) -> Option<&'a JobEvent>
+where
+    I: IntoIterator<Item = &'a JobEvent>,
+    F: FnMut(&'a JobEvent) -> bool,
+{
+    events.into_iter().find(|event| predicate(event))
+}
+
 fn event_repository_id(
     inner: &InMemoryInner,
     event: &JobEvent,
@@ -1033,6 +1107,27 @@ fn ensure_event_sequence_capacity(inner: &InMemoryInner, event_count: u64) -> St
         .checked_add(event_count)
         .map(|_| ())
         .ok_or(StoreError::SequenceOverflow)
+}
+
+fn latest_job_event_for_repository_with_inner(
+    inner: &InMemoryInner,
+    repository_id: &RepositoryId,
+) -> StoreResult<Option<JobEvent>> {
+    for (_, id) in inner.job_events_by_sequence.iter().rev() {
+        let event = inner
+            .job_events_by_id
+            .get(id)
+            .ok_or_else(|| StoreError::Conflict {
+                collection: "job_events",
+                reason: format!("sequence index references missing event {}", id_debug(id)),
+            })?;
+
+        if event_repository_id(inner, event)?.as_ref() == Some(repository_id) {
+            return Ok(Some(event.clone()));
+        }
+    }
+
+    Ok(None)
 }
 
 const fn severity_rank(severity: EventSeverity) -> u8 {
@@ -2230,6 +2325,7 @@ mod tests {
         PolicySummary, RepositoryTrustState, ResourceScope, RiskTier, StructuredValue,
         ToolResultField, ToolResultStatus,
     };
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static REPOSITORY_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3420,6 +3516,214 @@ mod tests {
                 .replay_job_events(EventCursor::AfterSequence(u64::MAX), None)
                 .unwrap(),
             Vec::<JobEvent>::new()
+        );
+    }
+
+    #[test]
+    fn latest_matching_job_event_stops_after_first_match() {
+        let repository = repository_record();
+        let other_repository = repository_record();
+        let earlier = job_event(repository.id.clone());
+        let middle = job_event(other_repository.id.clone());
+        let latest = job_event(repository.id.clone());
+        let events = [earlier, middle, latest.clone()];
+        let inspected = Cell::new(0usize);
+
+        let found = latest_matching_job_event(events.iter().rev(), |event| {
+            inspected.set(inspected.get() + 1);
+            event.id == latest.id
+        });
+
+        assert_eq!(found.map(|event| event.id.clone()), Some(latest.id));
+        assert_eq!(inspected.get(), 1);
+    }
+
+    #[test]
+    fn latest_job_event_for_repository_returns_latest_repository_event() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let other_repository = repository_record();
+
+        store.create_repository(repository.clone()).unwrap();
+        store.create_repository(other_repository.clone()).unwrap();
+
+        let first = store
+            .append_job_event(job_event(other_repository.id.clone()))
+            .unwrap();
+        let second = store
+            .append_job_event(job_event(repository.id.clone()))
+            .unwrap();
+        let third = store
+            .append_job_event(job_event(other_repository.id.clone()))
+            .unwrap();
+        let latest = store
+            .append_job_event(job_event(repository.id.clone()))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .latest_job_event_for_repository(&repository.id)
+                .unwrap(),
+            Some(latest)
+        );
+        assert_eq!(first.refs.repository_id, Some(other_repository.id.clone()));
+        assert_eq!(second.refs.repository_id, Some(repository.id.clone()));
+        assert_eq!(third.refs.repository_id, Some(other_repository.id));
+    }
+
+    #[test]
+    fn latest_job_event_for_repository_matches_subject_repository_without_ref() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let other_repository = repository_record();
+
+        store.create_repository(repository.clone()).unwrap();
+        store.create_repository(other_repository.clone()).unwrap();
+
+        store
+            .append_job_event(job_event(other_repository.id.clone()))
+            .unwrap();
+        let mut event = job_event(repository.id.clone());
+        event.refs.repository_id = None;
+        let latest = store.append_job_event(event).unwrap();
+
+        assert_eq!(
+            store
+                .latest_job_event_for_repository(&repository.id)
+                .unwrap(),
+            Some(latest)
+        );
+    }
+
+    #[test]
+    fn latest_job_event_for_repository_matches_repository_from_linked_refs() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let other_repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        store.create_repository(other_repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+
+        store
+            .append_job_event(job_event(other_repository.id.clone()))
+            .unwrap();
+        let mut event = job_event(other_repository.id.clone());
+        event.subject = EventSubject::job(&job.id);
+        event.refs.repository_id = None;
+        event.refs.job_id = Some(job.id.clone());
+        let latest = store.append_job_event(event).unwrap();
+
+        assert_eq!(
+            store
+                .latest_job_event_for_repository(&repository.id)
+                .unwrap(),
+            Some(latest)
+        );
+    }
+
+    #[test]
+    fn latest_job_event_for_repository_rejects_missing_sequence_entry() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let event = job_event(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let persisted = store.append_job_event(event).unwrap();
+
+        {
+            let mut inner = store.inner.lock().unwrap();
+            inner.job_events_by_id.remove(&persisted.id);
+        }
+
+        assert!(matches!(
+            store.latest_job_event_for_repository(&repository.id),
+            Err(StoreError::Conflict {
+                collection: "job_events",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn project_status_snapshot_uses_bound_limits() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let other_repository = repository_record();
+
+        store.create_repository(repository.clone()).unwrap();
+        store.create_repository(other_repository.clone()).unwrap();
+
+        let mut first = job_record(repository.id.clone());
+        first.updated_at = timestamp(10);
+        let _first = persist_job(&store, first);
+
+        let mut second = job_record(repository.id.clone());
+        second.updated_at = timestamp(20);
+        let second = persist_job(&store, second);
+
+        let mut other = job_record(other_repository.id.clone());
+        other.updated_at = timestamp(30);
+        let _ = persist_job(&store, other);
+
+        let mut first_decision = policy_decision(repository.id.clone());
+        first_decision.created_at = timestamp(10);
+        store
+            .create_policy_decision(first_decision.clone())
+            .unwrap();
+
+        let mut second_decision = policy_decision(repository.id.clone());
+        second_decision.created_at = timestamp(20);
+        store
+            .create_policy_decision(second_decision.clone())
+            .unwrap();
+
+        let snapshot = store
+            .project_status_snapshot(&repository.id, 1, 1)
+            .expect("snapshot should be assembled");
+
+        assert_eq!(snapshot.recent_jobs.len(), 1);
+        assert_eq!(snapshot.recent_jobs[0].id, second.id);
+        assert_eq!(snapshot.recent_policy_decisions.len(), 1);
+        assert_eq!(snapshot.recent_policy_decisions[0].id, second_decision.id);
+        assert_eq!(
+            snapshot.latest_event.unwrap().id,
+            second.latest_event_id.expect("latest event exists")
+        );
+    }
+
+    #[test]
+    fn project_status_snapshot_uses_inferred_repository_from_subject() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let other_repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        store.create_repository(other_repository.clone()).unwrap();
+
+        let job = persist_job(&store, job);
+
+        let _other_event = store
+            .append_job_event(job_event(other_repository.id.clone()))
+            .unwrap();
+
+        let mut inferred_repository_event = job_event(repository.id.clone());
+        inferred_repository_event.refs.repository_id = None;
+        inferred_repository_event.subject = EventSubject::job(&job.id);
+        inferred_repository_event.refs.job_id = Some(job.id);
+        let inferred_repository_event = store
+            .append_job_event(inferred_repository_event)
+            .expect("inferred repository event should be appended");
+
+        let snapshot = store
+            .project_status_snapshot(&repository.id, 10, 10)
+            .expect("snapshot should be assembled");
+
+        assert_eq!(
+            snapshot.latest_event.unwrap().id,
+            inferred_repository_event.id
         );
     }
 

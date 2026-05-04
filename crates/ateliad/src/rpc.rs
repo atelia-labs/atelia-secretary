@@ -9,6 +9,7 @@
 
 use crate::service::{
     CheckPolicyRequest as ServiceCheckPolicyRequest, DaemonHealth, DaemonStatus,
+    GetProjectStatusRequest as ServiceGetProjectStatusRequest,
     ListRepositoriesRequest as ServiceListRepositoriesRequest,
     ListToolOutputSettingsHistoryRequest as ServiceListToolOutputSettingsHistoryRequest,
     ProtocolMetadata as ServiceProtocolMetadata,
@@ -17,14 +18,15 @@ use crate::service::{
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
 };
 use atelia_core::{
-    Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState, EventCursor,
-    EventQuery, EventSeverity, EventSubjectType, ExtensionInstallRecord, ExtensionStatusRequest,
-    InstallExtensionRequest, JobEvent, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
-    ListBlocklistRequest, ListExtensionsRequest, OutputFormat, OversizeOutputPolicy, PathScope,
-    PolicyOutcome, ProjectId, RenderOptions, RepositoryId, RepositoryRecord, RepositoryTrustState,
-    ResourceScope, RiskTier, RollbackExtensionRequest, StoreError, ToolOutputDefaults,
-    ToolOutputGranularity, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsScope,
-    ToolOutputVerbosity, ToolResultId, TruncationMetadata,
+    Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState,
+    EventCursor as CoreEventCursor, EventQuery, EventSeverity, EventSubjectType,
+    ExtensionInstallRecord, ExtensionStatusRequest, InstallExtensionRequest, JobEvent,
+    JobEventKind, JobId, JobKind, JobRecord, JobStatus, ListBlocklistRequest,
+    ListExtensionsRequest, OutputFormat, OversizeOutputPolicy, PathScope, PolicyOutcome, ProjectId,
+    RenderOptions, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier,
+    RollbackExtensionRequest, StoreError, ToolOutputDefaults, ToolOutputGranularity,
+    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity,
+    ToolResultId, TruncationMetadata,
 };
 use std::convert::TryFrom;
 
@@ -102,6 +104,35 @@ impl SecretaryRpcServer {
             metadata: self.metadata(),
             repositories,
             next_page_token: page.next_page_token,
+        })
+    }
+
+    pub fn get_project_status(
+        &self,
+        request: GetProjectStatusRequest,
+    ) -> RpcResult<GetProjectStatusResponse> {
+        let repository_id = parse_repository_id(&request.repository_id)?;
+        let snapshot = self
+            .service
+            .get_project_status(ServiceGetProjectStatusRequest {
+                repository_id: repository_id.clone(),
+            })?;
+
+        Ok(GetProjectStatusResponse {
+            metadata: self.metadata(),
+            repository: Repository::from(snapshot.repository),
+            recent_jobs: snapshot.recent_jobs.into_iter().map(Job::from).collect(),
+            recent_policy_decisions: snapshot
+                .recent_policy_decisions
+                .into_iter()
+                .map(policy_decision_to_rpc)
+                .collect(),
+            latest_cursor: snapshot
+                .latest_event
+                .as_ref()
+                .map(event_cursor_from_job_event),
+            daemon_status: daemon_status_label(snapshot.daemon_status).to_string(),
+            storage_status: storage_status_label(snapshot.storage_status).to_string(),
         })
     }
 
@@ -583,6 +614,28 @@ pub struct RegisterRepositoryResponse {
     pub metadata: ProtocolMetadata,
     pub repository: Repository,
     pub policy: Option<PolicyDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EventCursor {
+    pub sequence: u64,
+    pub event_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetProjectStatusRequest {
+    pub repository_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetProjectStatusResponse {
+    pub metadata: ProtocolMetadata,
+    pub repository: Repository,
+    pub recent_jobs: Vec<Job>,
+    pub recent_policy_decisions: Vec<PolicyDecision>,
+    pub latest_cursor: Option<EventCursor>,
+    pub daemon_status: String,
+    pub storage_status: String,
 }
 
 // Mirrors proto's `ListRepositoriesRequest` contract.
@@ -1360,10 +1413,10 @@ fn parse_event_query(request: ListEventsRequest) -> RpcResult<EventQuery> {
         .map(parse_repository_id)
         .transpose()?;
     let cursor = match request.cursor.unwrap_or(EventCursorRequest::Beginning) {
-        EventCursorRequest::Beginning => EventCursor::Beginning,
-        EventCursorRequest::AfterSequence(sequence) => EventCursor::AfterSequence(sequence),
+        EventCursorRequest::Beginning => CoreEventCursor::Beginning,
+        EventCursorRequest::AfterSequence(sequence) => CoreEventCursor::AfterSequence(sequence),
         EventCursorRequest::AfterEventId(event_id) => {
-            EventCursor::AfterEventId(parse_event_id(&event_id)?)
+            CoreEventCursor::AfterEventId(parse_event_id(&event_id)?)
         }
     };
 
@@ -1377,12 +1430,12 @@ fn parse_event_query(request: ListEventsRequest) -> RpcResult<EventQuery> {
     })
 }
 
-fn parse_event_cursor(cursor: EventCursorRequest) -> RpcResult<EventCursor> {
+fn parse_event_cursor(cursor: EventCursorRequest) -> RpcResult<CoreEventCursor> {
     Ok(match cursor {
-        EventCursorRequest::Beginning => EventCursor::Beginning,
-        EventCursorRequest::AfterSequence(sequence) => EventCursor::AfterSequence(sequence),
+        EventCursorRequest::Beginning => CoreEventCursor::Beginning,
+        EventCursorRequest::AfterSequence(sequence) => CoreEventCursor::AfterSequence(sequence),
         EventCursorRequest::AfterEventId(event_id) => {
-            EventCursor::AfterEventId(parse_event_id(&event_id)?)
+            CoreEventCursor::AfterEventId(parse_event_id(&event_id)?)
         }
     })
 }
@@ -1678,6 +1731,13 @@ fn policy_decision_to_rpc(decision: atelia_core::PolicyDecision) -> PolicyDecisi
         audit_ref: decision
             .audit_ref
             .map(|audit_ref| audit_ref.as_str().to_string()),
+    }
+}
+
+fn event_cursor_from_job_event(event: &JobEvent) -> EventCursor {
+    EventCursor {
+        sequence: event.sequence_number,
+        event_id: event.id.as_str().to_string(),
     }
 }
 
@@ -2196,6 +2256,13 @@ mod tests {
             .capabilities
             .contains(&"tool_output_render.v1".to_string()));
         assert!(response.capabilities.contains(&"events.v1".to_string()));
+        assert!(response
+            .capabilities
+            .contains(&"project_status.v1".to_string()));
+        assert!(response.capabilities.contains(&"events.v1".to_string()));
+        assert!(response
+            .capabilities
+            .contains(&"project_status.v1".to_string()));
     }
 
     #[test]
@@ -2701,7 +2768,7 @@ mod tests {
 
         let jobs = server
             .list_jobs(ListJobsRequest {
-                repository_id: Some(registered.repository.repository_id),
+                repository_id: Some(registered.repository.repository_id.clone()),
                 status: Some(RpcJobStatus::Succeeded),
                 requester: None,
                 page_size: None,
@@ -2710,6 +2777,27 @@ mod tests {
             .expect("list jobs should succeed");
         assert_eq!(jobs.jobs.len(), 1);
         assert_eq!(jobs.jobs[0].job_id, submitted.job.job_id);
+
+        let status = server
+            .get_project_status(GetProjectStatusRequest {
+                repository_id: submitted.job.repository_id.clone(),
+            })
+            .expect("project status should succeed");
+        assert_eq!(
+            status.repository.repository_id,
+            registered.repository.repository_id
+        );
+        assert_eq!(status.recent_jobs.len(), 1);
+        assert_eq!(status.recent_jobs[0].job_id, submitted.job.job_id);
+        assert_eq!(status.recent_policy_decisions.len(), 1);
+        assert!(
+            status
+                .latest_cursor
+                .as_ref()
+                .expect("latest cursor exists")
+                .sequence
+                > 0
+        );
 
         let _ = fs::remove_dir_all(root);
     }
