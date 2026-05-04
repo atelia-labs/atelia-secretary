@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, BufRead, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, ErrorKind, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
@@ -1524,39 +1524,28 @@ impl TempCaptureFile {
         self.file.try_clone()
     }
 
-    fn read(&self) -> io::Result<Vec<u8>> {
+    fn read_retained_and_original(&self, max_output_bytes: usize) -> io::Result<(Vec<u8>, usize)> {
         let mut file = self.file.try_clone()?;
         file.seek(SeekFrom::Start(0))?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-        Ok(buffer)
-    }
 
-    fn capture<R: Read + Send>(
-        mut reader: R,
-        max_output_bytes: usize,
-        mut writer: File,
-    ) -> io::Result<(usize, bool)> {
+        let mut retained = Vec::new();
         let mut buffer = [0u8; 8192];
         let mut original_bytes = 0usize;
-        let mut retained_bytes = 0usize;
 
         loop {
-            let read = reader.read(&mut buffer)?;
+            let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
-            original_bytes = original_bytes.saturating_add(read);
 
-            let budget = max_output_bytes.saturating_sub(retained_bytes);
+            original_bytes = original_bytes.saturating_add(read);
+            let budget = max_output_bytes.saturating_sub(retained.len());
             if budget > 0 {
-                let take = budget.min(read);
-                writer.write_all(&buffer[..take])?;
-                retained_bytes = retained_bytes.saturating_add(take);
+                retained.extend_from_slice(&buffer[..budget.min(read)]);
             }
         }
 
-        Ok((original_bytes, original_bytes > max_output_bytes))
+        Ok((retained, original_bytes))
     }
 }
 
@@ -1574,46 +1563,6 @@ fn capture_text_output(bytes: Vec<u8>, original_bytes: usize) -> CapturedStream 
         original_bytes,
         truncated: original_bytes > bytes.len(),
     }
-}
-
-fn join_capture_task<T>(
-    label: &str,
-    task: thread::JoinHandle<io::Result<T>>,
-    timeout: Duration,
-) -> io::Result<Option<T>> {
-    let deadline = Instant::now() + timeout;
-
-    while !task.is_finished() {
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-
-    let captured = task
-        .join()
-        .map_err(|_| io::Error::other(format!("{label} capture thread panicked")))?;
-    Ok(Some(captured?))
-}
-
-#[cfg(unix)]
-fn spawn_capture_task<R: Read + Send + 'static>(
-    label: &'static str,
-    stream: R,
-    max_output_bytes: usize,
-    writer: File,
-) -> io::Result<thread::JoinHandle<io::Result<(usize, bool)>>> {
-    thread::Builder::new()
-        .name(format!("proc-exec-{label}-capture"))
-        .spawn(move || {
-            TempCaptureFile::capture(stream, max_output_bytes, writer)
-                .map_err(|error| io::Error::other(format!("{label} capture failed: {error}")))
-        })
-}
-
-fn terminate_child(child: &mut std::process::Child) {
-    let _ = kill_process_tree(child);
-    let _ = child.wait();
 }
 
 #[cfg(unix)]
@@ -1672,8 +1621,18 @@ fn execute_explicit_argv_process(
     command.args(&argv[1..]);
     command.current_dir(&canonical_cwd.canonical);
     command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
+    let stdout_capture = TempCaptureFile::create("stdout")
+        .map_err(|error| format!("failed to create stdout capture file: {error}"))?;
+    let stderr_capture = TempCaptureFile::create("stderr")
+        .map_err(|error| format!("failed to create stderr capture file: {error}"))?;
+    let stdout_writer = stdout_capture
+        .writer()
+        .map_err(|error| format!("failed to clone stdout capture writer: {error}"))?;
+    let stderr_writer = stderr_capture
+        .writer()
+        .map_err(|error| format!("failed to clone stderr capture writer: {error}"))?;
+    command.stdout(Stdio::from(stdout_writer));
+    command.stderr(Stdio::from(stderr_writer));
     command.env_clear();
     #[cfg(unix)]
     command.process_group(0);
@@ -1688,73 +1647,16 @@ fn execute_explicit_argv_process(
         command.env(key, value);
     }
 
-    let stdout_capture = TempCaptureFile::create("stdout")
-        .map_err(|error| format!("failed to create stdout capture file: {error}"))?;
-    let stderr_capture = TempCaptureFile::create("stderr")
-        .map_err(|error| format!("failed to create stderr capture file: {error}"))?;
-    let stdout_writer = stdout_capture
-        .writer()
-        .map_err(|error| format!("failed to clone stdout capture writer: {error}"))?;
-    let stderr_writer = stderr_capture
-        .writer()
-        .map_err(|error| format!("failed to clone stderr capture writer: {error}"))?;
-
     let start = Instant::now();
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to spawn process: {error}"))?;
 
-    let stdout_stream = child.stdout.take().ok_or_else(|| {
-        terminate_child(&mut child);
-        "child stdout unavailable".to_string()
-    })?;
-    let stderr_stream = child.stderr.take().ok_or_else(|| {
-        terminate_child(&mut child);
-        "child stderr unavailable".to_string()
-    })?;
-
-    let stdout_capture_task =
-        spawn_capture_task("stdout", stdout_stream, max_output_bytes, stdout_writer).map_err(
-            |error| {
-                terminate_child(&mut child);
-                format!("failed to start stdout capture thread: {error}")
-            },
-        )?;
-    let stderr_capture_task =
-        spawn_capture_task("stderr", stderr_stream, max_output_bytes, stderr_writer).map_err(
-            |error| {
-                terminate_child(&mut child);
-                format!("failed to start stderr capture thread: {error}")
-            },
-        )?;
-
     let (status, timed_out, process_tree_handled) = wait_for_child(&mut child, timeout)
         .map_err(|error| format!("process wait failed: {error}"))?;
 
-    let mut capture_timed_out = false;
+    let capture_timed_out = timed_out;
     let mut process_tree_handled = process_tree_handled;
-
-    let (stdout_original_bytes, stdout_truncated) =
-        match join_capture_task("stdout", stdout_capture_task, CAPTURE_THREAD_JOIN_TIMEOUT)
-            .map_err(|error| format!("stdout capture thread failed: {error}"))?
-        {
-            Some((original_bytes, truncated)) => (original_bytes, truncated),
-            None => {
-                capture_timed_out = true;
-                (0usize, true)
-            }
-        };
-
-    let (stderr_original_bytes, stderr_truncated) =
-        match join_capture_task("stderr", stderr_capture_task, CAPTURE_THREAD_JOIN_TIMEOUT)
-            .map_err(|error| format!("stderr capture thread failed: {error}"))?
-        {
-            Some((original_bytes, truncated)) => (original_bytes, truncated),
-            None => {
-                capture_timed_out = true;
-                (0usize, true)
-            }
-        };
 
     if capture_timed_out {
         process_tree_handled = process_tree_handled || kill_process_tree(&mut child);
@@ -1762,32 +1664,18 @@ fn execute_explicit_argv_process(
 
     let timed_out = timed_out || capture_timed_out;
 
-    let stdout_bytes = stdout_capture
-        .read()
+    let (stdout_bytes, stdout_original_bytes) = stdout_capture
+        .read_retained_and_original(max_output_bytes)
         .map_err(|error| format!("stdout read failed: {error}"))?;
-    let stderr_bytes = stderr_capture
-        .read()
+    let (stderr_bytes, stderr_original_bytes) = stderr_capture
+        .read_retained_and_original(max_output_bytes)
         .map_err(|error| format!("stderr read failed: {error}"))?;
-
-    let stdout_original_bytes = if capture_timed_out {
-        stdout_bytes.len()
-    } else {
-        stdout_original_bytes
-    };
-    let stderr_original_bytes = if capture_timed_out {
-        stderr_bytes.len()
-    } else {
-        stderr_original_bytes
-    };
 
     let mut stdout = capture_text_output(stdout_bytes, stdout_original_bytes);
     let mut stderr = capture_text_output(stderr_bytes, stderr_original_bytes);
     if capture_timed_out {
         stdout.truncated = true;
         stderr.truncated = true;
-    } else {
-        stdout.truncated = stdout_truncated;
-        stderr.truncated = stderr_truncated;
     }
 
     let duration_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
@@ -4959,7 +4847,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn proc_exec_hard_bounded_capture_join_without_terminating_child() {
+    fn proc_exec_hard_bounded_capture_no_threads_when_background_streaming() {
         let env = TestEnv::new("proc-timeout-hardened-capture-join");
         let start = Instant::now();
 
@@ -4973,17 +4861,13 @@ mod tests {
         let result = tool.execute(&invocation, &request);
         let elapsed = start.elapsed();
 
-        assert_eq!(ToolResultStatus::TimedOut, result.status);
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
         assert!(
             elapsed < Duration::from_secs(1),
-            "capture thread join did not hard-stop on background stream"
+            "background process escaped after-capture was not bounded"
         );
         let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
-        assert_eq!(StructuredValue::Bool(true), timed_out.value);
-        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
-        assert!(string_value(&summary.value)
-            .to_lowercase()
-            .contains("output capture streams did not finish draining"));
+        assert_eq!(StructuredValue::Bool(false), timed_out.value);
         env.cleanup();
     }
 
