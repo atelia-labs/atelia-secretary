@@ -3100,28 +3100,23 @@ fn rename_in_parent_dir(
 
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
-                Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => {
-                    // renameat2 unavailable on very old kernels or older libc/feature combinations.
-                    if write_file_exists_in_parent_dir(parent, destination)? {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            "destination file already exists",
-                        ));
-                    }
-                }
                 Some(libc::EEXIST) => return Err(error),
+                Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "filesystem does not support atomic create_new renames",
+                    ));
+                }
                 _ => return Err(error),
             }
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            if write_file_exists_in_parent_dir(parent, destination)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "destination file already exists",
-                ));
-            }
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "create_new writes are supported only with renameat2(RENAME_NOREPLACE)",
+            ));
         }
     }
 
