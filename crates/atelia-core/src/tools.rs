@@ -1855,6 +1855,7 @@ fn resolve_mutation_target(
     })
 }
 
+#[cfg(test)]
 fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
@@ -2123,6 +2124,7 @@ fn write_file_bytes_atomically(_path: &Path, _bytes: &[u8], _create_new: bool) -
     ))
 }
 
+#[cfg(test)]
 fn read_entire_text_file(path: &Path, max_bytes: usize) -> io::Result<String> {
     let mut file = open_file_no_follow(path)?;
     let mut content = Vec::new();
