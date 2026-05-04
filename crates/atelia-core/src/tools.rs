@@ -3644,6 +3644,53 @@ fn ensure_named_entry_matches(
 }
 
 #[cfg(unix)]
+fn named_entry_matches_metadata(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    expected: &fs::Metadata,
+) -> io::Result<bool> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+
+    // SAFETY: `parent` is a live directory fd, `cstring` is valid, and `stat` points to writable
+    // memory for the kernel to initialize.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            cstring.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+
+    // SAFETY: `fstatat` returned success and initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.st_dev == expected.dev() && stat.st_ino == expected.ino())
+}
+
+#[cfg(unix)]
+fn ensure_named_entry_no_longer_matches(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    expected: &fs::Metadata,
+    context: &'static str,
+) -> io::Result<()> {
+    if named_entry_matches_metadata(parent, name, expected)? {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, context));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
 fn rename_between_parent_dirs(
     source_parent: &File,
     source: &std::ffi::OsStr,
@@ -3789,6 +3836,12 @@ fn rename_validated_file_between_parent_dirs(
         destination_parent,
         destination,
         create_new,
+    )?;
+    ensure_named_entry_no_longer_matches(
+        source_parent,
+        source,
+        &opened_metadata,
+        "move source still referenced validated file after rename",
     )
 }
 
@@ -7047,6 +7100,36 @@ mod tests {
         assert_eq!("replacement", fs::read_to_string(&source).unwrap());
         assert_eq!("validated", fs::read_to_string(&backup).unwrap());
         assert!(!destination.exists());
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_move_rejects_noop_hardlink_rename_after_validation() {
+        let env = TestEnv::new("move-hardlink-postcheck");
+        env.create_file("from.txt", "source");
+        env.create_dir("archive");
+
+        let source = env.root.join("from.txt");
+        let destination = env.root.join("archive/from.txt");
+        let expected_metadata = fs::symlink_metadata(&source).unwrap();
+        let source_parent = open_parent_no_follow(source.parent().unwrap()).unwrap();
+        let destination_parent = open_parent_no_follow(destination.parent().unwrap()).unwrap();
+
+        fs::hard_link(&source, &destination).unwrap();
+        let result = rename_validated_file_between_parent_dirs(
+            &source_parent,
+            source.file_name().unwrap(),
+            &destination_parent,
+            destination.file_name().unwrap(),
+            false,
+            &expected_metadata,
+        )
+        .unwrap_err();
+
+        assert_eq!(io::ErrorKind::PermissionDenied, result.kind());
+        assert_eq!("source", fs::read_to_string(&source).unwrap());
+        assert_eq!("source", fs::read_to_string(&destination).unwrap());
         env.cleanup();
     }
 
