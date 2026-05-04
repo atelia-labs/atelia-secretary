@@ -15,16 +15,17 @@ use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, ErrorKind, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use uuid::Uuid;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -1472,41 +1473,118 @@ struct ProcessExecutionOutcome {
 }
 
 struct TempCaptureFile {
-    path: PathBuf,
+    path: Option<PathBuf>,
+    file: File,
 }
 
 impl TempCaptureFile {
-    fn create(label: &str) -> io::Result<(Self, File)> {
-        static CAPTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let pid = std::process::id();
-        let seq = CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!("atelia-proc-exec-{pid}-{seq}-{label}.out"));
+    fn create(label: &str) -> io::Result<Self> {
+        let safe_label = label
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let sanitized_label = if safe_label.is_empty() {
+            "stream".to_string()
+        } else {
+            safe_label
+        };
 
-        let file = File::create(&path)?;
-        Ok((Self { path }, file))
+        let (path, file) = loop {
+            let filename = format!(
+                "atelia-proc-exec-{uuid}-{sanitized_label}.out",
+                uuid = Uuid::new_v4()
+            );
+            let path = std::env::temp_dir().join(filename);
+
+            let mut options = fs::OpenOptions::new();
+            options.write(true).read(true).create_new(true);
+            #[cfg(unix)]
+            {
+                options.mode(0o600);
+            }
+
+            match options.open(&path) {
+                Ok(file) => break (path, file),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
+
+        #[cfg(unix)]
+        {
+            let _ = fs::remove_file(&path);
+        }
+        let path = {
+            #[cfg(unix)]
+            {
+                None
+            }
+            #[cfg(not(unix))]
+            {
+                Some(path)
+            }
+        };
+
+        Ok(Self { path, file })
     }
 
     fn read(&self) -> io::Result<Vec<u8>> {
-        fs::read(&self.path)
+        let mut file = self.file.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    }
+
+    fn capture<R: Read + Send>(
+        mut self,
+        mut reader: R,
+        max_output_bytes: usize,
+    ) -> io::Result<(Self, usize, bool)> {
+        let mut buffer = [0u8; 8192];
+        let mut original_bytes = 0usize;
+        let mut retained_bytes = 0usize;
+
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            original_bytes = original_bytes.saturating_add(read);
+
+            let budget = max_output_bytes.saturating_sub(retained_bytes);
+            if budget > 0 {
+                let take = budget.min(read);
+                self.file.write_all(&buffer[..take])?;
+                retained_bytes = retained_bytes.saturating_add(take);
+            }
+        }
+
+        Ok((self, original_bytes, original_bytes > max_output_bytes))
     }
 }
 
 impl Drop for TempCaptureFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if let Some(path) = &self.path {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
-fn capture_text_output(bytes: Vec<u8>, max_output_bytes: usize) -> CapturedStream {
-    let original_bytes = bytes.len();
-    let retained_bytes = original_bytes.min(max_output_bytes);
-    let text = String::from_utf8_lossy(&bytes[..retained_bytes]).into_owned();
+fn capture_text_output(bytes: Vec<u8>, original_bytes: usize) -> CapturedStream {
+    let text = String::from_utf8_lossy(&bytes).into_owned();
     CapturedStream {
-        retained_bytes,
+        retained_bytes: bytes.len(),
         text,
         original_bytes,
-        truncated: original_bytes > max_output_bytes,
+        truncated: original_bytes > bytes.len(),
     }
 }
 
@@ -1566,12 +1644,8 @@ fn execute_explicit_argv_process(
     command.args(&argv[1..]);
     command.current_dir(&canonical_cwd.canonical);
     command.stdin(Stdio::null());
-    let (stdout_capture, stdout_file) = TempCaptureFile::create("stdout")
-        .map_err(|error| format!("failed to create stdout capture file: {error}"))?;
-    let (stderr_capture, stderr_file) = TempCaptureFile::create("stderr")
-        .map_err(|error| format!("failed to create stderr capture file: {error}"))?;
-    command.stdout(Stdio::from(stdout_file));
-    command.stderr(Stdio::from(stderr_file));
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
     command.env_clear();
     #[cfg(unix)]
     command.process_group(0);
@@ -1590,8 +1664,43 @@ fn execute_explicit_argv_process(
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to spawn process: {error}"))?;
+
+    let stdout_stream = child
+        .stdout
+        .take()
+        .ok_or_else(|| "child stdout unavailable".to_string())?;
+    let stderr_stream = child
+        .stderr
+        .take()
+        .ok_or_else(|| "child stderr unavailable".to_string())?;
+
+    let stdout_capture = TempCaptureFile::create("stdout")
+        .map_err(|error| format!("failed to create stdout capture file: {error}"))?;
+    let stderr_capture = TempCaptureFile::create("stderr")
+        .map_err(|error| format!("failed to create stderr capture file: {error}"))?;
+
+    let stdout_capture_task = thread::spawn(move || {
+        stdout_capture
+            .capture(stdout_stream, max_output_bytes)
+            .map_err(|error| format!("stdout capture failed: {error}"))
+    });
+
+    let stderr_capture_task = thread::spawn(move || {
+        stderr_capture
+            .capture(stderr_stream, max_output_bytes)
+            .map_err(|error| format!("stderr capture failed: {error}"))
+    });
+
     let (status, timed_out, process_tree_handled) = wait_for_child(&mut child, timeout)
         .map_err(|error| format!("process wait failed: {error}"))?;
+
+    let (stdout_capture, stdout_original_bytes, _) = stdout_capture_task
+        .join()
+        .map_err(|_| "stdout capture thread panicked".to_string())??;
+    let (stderr_capture, stderr_original_bytes, _) = stderr_capture_task
+        .join()
+        .map_err(|_| "stderr capture thread panicked".to_string())??;
+
     let stdout_bytes = stdout_capture
         .read()
         .map_err(|error| format!("stdout read failed: {error}"))?;
@@ -1599,8 +1708,9 @@ fn execute_explicit_argv_process(
         .read()
         .map_err(|error| format!("stderr read failed: {error}"))?;
 
-    let stdout = capture_text_output(stdout_bytes, max_output_bytes);
-    let stderr = capture_text_output(stderr_bytes, max_output_bytes);
+    let stdout = capture_text_output(stdout_bytes, stdout_original_bytes);
+    let stderr = capture_text_output(stderr_bytes, stderr_original_bytes);
+
     let duration_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
     let exit_code = status.and_then(|exit_status| exit_status.code().map(i64::from));
 
@@ -4768,7 +4878,7 @@ mod tests {
     #[test]
     fn capture_text_output_tracks_retained_bytes_before_utf8_lossy() {
         let bytes = vec![0xff, 0xfe, b'a', b'b', b'c'];
-        let stream = capture_text_output(bytes, 10);
+        let stream = capture_text_output(bytes, 5);
 
         assert_eq!(5, stream.original_bytes);
         assert_eq!(5, stream.retained_bytes);
