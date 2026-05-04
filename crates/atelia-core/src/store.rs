@@ -244,21 +244,7 @@ impl InMemoryStore {
         repository_id: &RepositoryId,
     ) -> StoreResult<Option<JobEvent>> {
         let inner = self.lock()?;
-        for (_, id) in inner.job_events_by_sequence.iter().rev() {
-            let event = inner
-                .job_events_by_id
-                .get(id)
-                .ok_or_else(|| StoreError::Conflict {
-                    collection: "job_events",
-                    reason: format!("sequence index references missing event {}", id_debug(id)),
-                })?;
-
-            if event_repository_id(&inner, event)?.as_ref() == Some(repository_id) {
-                return Ok(Some(event.clone()));
-            }
-        }
-
-        Ok(None)
+        latest_job_event_for_repository_with_inner(&inner, repository_id)
     }
 }
 
@@ -408,25 +394,7 @@ impl SecretaryStore for InMemoryStore {
         });
         recent_policy_decisions.truncate(recent_policy_decision_limit);
 
-        let mut latest_event = None;
-        for (_, event_id) in inner.job_events_by_sequence.iter().rev() {
-            let event =
-                inner
-                    .job_events_by_id
-                    .get(event_id)
-                    .ok_or_else(|| StoreError::Conflict {
-                        collection: "job_events",
-                        reason: format!(
-                            "sequence index references missing event {}",
-                            id_debug(event_id)
-                        ),
-                    })?;
-
-            if event.refs.repository_id.as_ref() == Some(repository_id) {
-                latest_event = Some(event.clone());
-                break;
-            }
-        }
+        let latest_event = latest_job_event_for_repository_with_inner(&inner, repository_id)?;
 
         Ok(ProjectStatusSnapshot {
             recent_jobs,
@@ -1139,6 +1107,27 @@ fn ensure_event_sequence_capacity(inner: &InMemoryInner, event_count: u64) -> St
         .checked_add(event_count)
         .map(|_| ())
         .ok_or(StoreError::SequenceOverflow)
+}
+
+fn latest_job_event_for_repository_with_inner(
+    inner: &InMemoryInner,
+    repository_id: &RepositoryId,
+) -> StoreResult<Option<JobEvent>> {
+    for (_, id) in inner.job_events_by_sequence.iter().rev() {
+        let event = inner
+            .job_events_by_id
+            .get(id)
+            .ok_or_else(|| StoreError::Conflict {
+                collection: "job_events",
+                reason: format!("sequence index references missing event {}", id_debug(id)),
+            })?;
+
+        if event_repository_id(inner, event)?.as_ref() == Some(repository_id) {
+            return Ok(Some(event.clone()));
+        }
+    }
+
+    Ok(None)
 }
 
 const fn severity_rank(severity: EventSeverity) -> u8 {
@@ -3701,6 +3690,40 @@ mod tests {
         assert_eq!(
             snapshot.latest_event.unwrap().id,
             second.latest_event_id.expect("latest event exists")
+        );
+    }
+
+    #[test]
+    fn project_status_snapshot_uses_inferred_repository_from_subject() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let other_repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        store.create_repository(other_repository.clone()).unwrap();
+
+        let job = persist_job(&store, job);
+
+        let _other_event = store
+            .append_job_event(job_event(other_repository.id.clone()))
+            .unwrap();
+
+        let mut inferred_repository_event = job_event(repository.id.clone());
+        inferred_repository_event.refs.repository_id = None;
+        inferred_repository_event.subject = EventSubject::job(&job.id);
+        inferred_repository_event.refs.job_id = Some(job.id);
+        let inferred_repository_event = store
+            .append_job_event(inferred_repository_event)
+            .expect("inferred repository event should be appended");
+
+        let snapshot = store
+            .project_status_snapshot(&repository.id, 10, 10)
+            .expect("snapshot should be assembled");
+
+        assert_eq!(
+            snapshot.latest_event.unwrap().id,
+            inferred_repository_event.id
         );
     }
 
