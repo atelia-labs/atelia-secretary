@@ -642,7 +642,7 @@ impl LocalArtifactStore {
                         });
                     }
 
-                    if let Some(candidate_path) = validate_record_path(
+                    if let Some(candidate_path) = validate_expiration_record_path(
                         &self.config.root_dir,
                         &scope,
                         &record.id,
@@ -1484,6 +1484,63 @@ fn validate_record_path(
     }
 
     if !artifact_file_name_matches(candidate_file_name, record_id) {
+        return None;
+    }
+
+    let canonical_parent = match path.parent() {
+        Some(parent) => match parent.canonicalize() {
+            Ok(dir) => dir,
+            Err(_) => return None,
+        },
+        None => canonical_scope_dir.clone(),
+    };
+
+    if !canonical_parent.starts_with(&canonical_scope_dir) {
+        return None;
+    }
+
+    Some(candidate_path)
+}
+
+fn validate_expiration_record_path(
+    root_dir: &Path,
+    sanitized_scope: &str,
+    record_id: &OutputRefId,
+    record_path: &str,
+) -> Option<PathBuf> {
+    let path = Path::new(record_path);
+
+    let expected_scope_dir = root_dir.join(sanitized_scope);
+    let canonical_scope_dir = match expected_scope_dir.canonicalize() {
+        Ok(dir) => dir,
+        Err(_) => return None,
+    };
+
+    let scope_relative_path = match path.strip_prefix(&canonical_scope_dir) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => match path.file_name() {
+            Some(file_name) => PathBuf::from(file_name),
+            None => return None,
+        },
+    };
+
+    let candidate_path = canonical_scope_dir.join(scope_relative_path);
+    let candidate_file_name = candidate_path.file_name().and_then(|name| name.to_str())?;
+    let debug_tmp_file = format!("{}-debug.tmp", record_id.as_str());
+
+    if candidate_file_name == DEFAULT_ARTIFACT_INDEX_FILE {
+        return None;
+    }
+
+    if candidate_file_name == ".index.lock" {
+        return None;
+    }
+
+    if candidate_file_name == debug_tmp_file {
+        return None;
+    }
+
+    if !candidate_file_name.starts_with(record_id.as_str()) {
         return None;
     }
 
