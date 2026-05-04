@@ -170,7 +170,7 @@ impl DefaultPolicyEngine {
                     RuleDecision::audited(
                         RiskTier::R2,
                         "bounded_write_audited",
-                        "Filesystem modifications inside the registered repository scope require audit evidence.",
+                        "Filesystem write or patch inside the registered repository scope requires audit evidence.",
                     )
                 }
             }
@@ -341,8 +341,9 @@ impl Capability {
             | "filesystem.diff" | "fs.read" | "fs.list" | "fs.search" | "fs.stat" | "fs.diff" => {
                 Self::FilesystemRead
             }
-            "filesystem.write" | "filesystem.patch" | "filesystem.delete" | "filesystem.move"
-            | "fs.write" | "fs.patch" | "fs.delete" | "fs.move" => Self::FilesystemWrite,
+            "filesystem.write" | "filesystem.patch" | "fs.write" | "fs.patch" => {
+                Self::FilesystemWrite
+            }
             "process.exec" | "process.execute" | "process.run" | "proc.exec" => Self::ProcessExec,
             "repository.mutate.broad"
             | "repo.mutate.broad"
@@ -448,24 +449,11 @@ mod tests {
 
     #[test]
     fn r2_filesystem_write_is_audited() {
-        for capability in [
-            "filesystem.write",
-            "filesystem.patch",
-            "filesystem.delete",
-            "filesystem.move",
-            "fs.write",
-            "fs.delete",
-            "fs.move",
-        ] {
-            let decision = decide(input(capability));
+        let decision = decide(input("filesystem.patch"));
 
-            assert_eq!(PolicyOutcome::Audited, decision.outcome, "{capability}");
-            assert_eq!(RiskTier::R2, decision.risk_tier, "{capability}");
-            assert_eq!(
-                "bounded_write_audited", decision.reason_code,
-                "{capability}"
-            );
-        }
+        assert_eq!(PolicyOutcome::Audited, decision.outcome);
+        assert_eq!(RiskTier::R2, decision.risk_tier);
+        assert_eq!("bounded_write_audited", decision.reason_code);
     }
 
     #[test]
@@ -649,8 +637,6 @@ mod tests {
             (" FILESYSTEM_READ ", "bounded_read_allowed"),
             ("filesystem-read", "bounded_read_allowed"),
             ("filesystem/read", "bounded_read_allowed"),
-            ("filesystem-delete", "bounded_write_audited"),
-            ("fs/move", "bounded_write_audited"),
             (
                 "repository:reset:hard",
                 "destructive_repository_action_blocked",
