@@ -1,9 +1,9 @@
-//! Built-in filesystem read tools for Atelia Secretary.
+//! Built-in filesystem tools for Atelia Secretary.
 //!
-//! Provides repository-scoped `fs.list`, `fs.stat`, `fs.read`, and `fs.search`
-//! tools that implement [`crate::runtime::RuntimeTool`] and enforce path
-//! canonicalization with symlink escape rejection per
-//! `docs/execution-semantics.md`.
+//! Provides repository-scoped `fs.list`, `fs.stat`, `fs.read`, `fs.search`,
+//! `fs.write`, and `fs.patch` tools that implement
+//! [`crate::runtime::RuntimeTool`] and enforce path canonicalization with
+//! symlink escape rejection per `docs/execution-semantics.md`.
 
 use crate::artifacts::{ArtifactLookupDenyReason, ArtifactLookupResult, LocalArtifactStore};
 use crate::domain::{
@@ -12,16 +12,21 @@ use crate::domain::{
 };
 use crate::runtime::RuntimeJobRequest;
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead, Read, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const TOOLS_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_READ_MAX_LINES: usize = 120;
@@ -29,6 +34,13 @@ const DEFAULT_READ_MAX_CHARS: usize = 32 * 1024;
 const DEFAULT_READ_MAX_SCAN_BYTES: u64 = 1024 * 1024;
 const DEFAULT_SEARCH_MAX_RESULTS: usize = 100;
 const DEFAULT_SEARCH_MAX_FILE_BYTES: u64 = 64 * 1024;
+const DEFAULT_WRITE_MAX_BYTES: usize = 32 * 1024;
+#[cfg(unix)]
+const WRITE_FILE_TMP_PREFIX: &str = "atelia-write-tmp";
+#[cfg(unix)]
+const WRITE_FILE_LOCK_PREFIX: &str = "atelia-write-lock";
+#[cfg(unix)]
+static WRITE_FILE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Path canonicalization and scope validation
@@ -275,6 +287,224 @@ fn open_file_no_follow(path: &Path) -> io::Result<File> {
     }
 
     fs::File::open(path)
+}
+
+#[cfg(unix)]
+fn open_parent_no_follow(path: &Path) -> io::Result<File> {
+    use std::path::Component;
+
+    let mut dir = if path.is_absolute() {
+        File::open("/")?
+    } else {
+        File::open(".")?
+    };
+
+    for component in path.components() {
+        let segment = match component {
+            Component::RootDir => continue,
+            Component::CurDir => continue,
+            Component::Normal(segment) => segment,
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsupported path component for write operations",
+                ));
+            }
+        };
+
+        let cstring = CString::new(segment.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+        // SAFETY: `dir` is a live directory file descriptor and the `cstring` is valid
+        // and nul-terminated for the `openat` syscall.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                cstring.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: `fd` was returned from `openat` and is uniquely owned by this branch.
+        dir = unsafe { File::from_raw_fd(fd) };
+    }
+
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn open_no_follow_in_parent_dir(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    create_new: bool,
+) -> io::Result<File> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    let mut flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    if create_new {
+        flags |= libc::O_CREAT | libc::O_EXCL;
+    }
+
+    // SAFETY: `parent` is a live directory file descriptor and the `cstring` is valid for
+    // `openat`; mode is only consulted when creating a new file.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            cstring.as_ptr(),
+            flags,
+            0o666 as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `fd` was returned from `openat` and is uniquely owned by this branch.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_read_no_follow_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    // SAFETY: `parent` is a live directory file descriptor and `cstring` is valid for
+    // `openat`; mode is only consulted when creating a new file.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            cstring.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666 as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `fd` was returned from `openat` and is uniquely owned by this branch.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_or_create_no_follow_in_parent_dir(
+    parent: &File,
+    name: &std::ffi::OsStr,
+) -> io::Result<File> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    // SAFETY: `parent` is a live directory file descriptor and `cstring` is valid.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            cstring.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666 as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `fd` was returned from `openat` and is uniquely owned by this branch.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn write_lock_file_name_for_path(path: &Path) -> std::ffi::OsString {
+    // A deterministic, safe lock-file key derived from path bytes so different target
+    // names can never collide on lock identity.
+    fn stable_lock_suffix(bytes: &[u8]) -> String {
+        let mut digest: u64 = 14_695_981_039_346_655_577;
+        for byte in bytes {
+            digest ^= u64::from(*byte);
+            digest = digest.rotate_left(27).wrapping_mul(5);
+            digest = digest ^ (digest >> 32);
+        }
+        format!("{digest:x}")
+    }
+
+    format!(
+        "{WRITE_FILE_LOCK_PREFIX}-{}.lock",
+        stable_lock_suffix(path.as_os_str().as_bytes())
+    )
+    .into()
+}
+
+#[cfg(unix)]
+fn write_lock_directory() -> io::Result<PathBuf> {
+    let lock_directory = std::env::temp_dir().join("atelia-secretary").join("locks");
+    fs::create_dir_all(&lock_directory)?;
+    Ok(lock_directory)
+}
+
+#[cfg(unix)]
+fn acquire_write_lock(path: &Path) -> io::Result<File> {
+    let lock_directory = write_lock_directory()?;
+    let lock_parent = open_parent_no_follow(&lock_directory)?;
+    let lock_file_name = write_lock_file_name_for_path(path);
+    let lock_file = open_or_create_no_follow_in_parent_dir(&lock_parent, &lock_file_name)?;
+
+    // SAFETY: `lock_file` is a valid descriptor; `LOCK_EX` blocks until exclusive access
+    // for the same lock file is available.
+    let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(lock_file)
+}
+
+#[cfg(unix)]
+fn lock_target_for_patch(path: &Path) -> io::Result<(File, File)> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
+    })?;
+    let parent_dir = open_parent_no_follow(parent)?;
+    let destination_lock = acquire_write_lock(path)?;
+
+    Ok((parent_dir, destination_lock))
+}
+
+#[cfg(unix)]
+fn read_entire_text_file_in_parent_dir(
+    parent: &File,
+    file_name: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> io::Result<String> {
+    let mut file = open_read_no_follow_in_parent_dir(parent, file_name)?;
+    let mut content = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut total_bytes = 0usize;
+
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+
+        total_bytes += n;
+        if total_bytes > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "file exceeds configured byte limit",
+            ));
+        }
+
+        content.extend_from_slice(&buffer[..n]);
+    }
+
+    String::from_utf8(content).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid UTF-8 content: {error}"),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1531,6 +1761,923 @@ fn search_file(
 }
 
 // ---------------------------------------------------------------------------
+// FsWriteTool
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MutationTarget {
+    canonical: PathBuf,
+    display_path: String,
+}
+
+impl MutationTarget {
+    fn path(&self) -> &Path {
+        &self.canonical
+    }
+
+    fn display_path(&self) -> &str {
+        &self.display_path
+    }
+}
+
+fn resolve_mutation_target(
+    repository_root: &Path,
+    relative_path: &Path,
+) -> Result<MutationTarget, PathResolutionError> {
+    let canonical_root = repository_root
+        .canonicalize()
+        .map_err(|_| PathResolutionError::RootNotFound)?;
+
+    let target = if relative_path.is_absolute() {
+        relative_path.to_path_buf()
+    } else {
+        canonical_root.join(relative_path)
+    };
+
+    if target.exists() {
+        let canonical_target =
+            target
+                .canonicalize()
+                .map_err(|_| PathResolutionError::TargetNotFound {
+                    requested: target.clone(),
+                })?;
+
+        if !canonical_target.starts_with(&canonical_root) {
+            return Err(PathResolutionError::OutsideRepositoryScope {
+                resolved: canonical_target,
+                root: canonical_root,
+            });
+        }
+
+        let display_path = canonical_target
+            .strip_prefix(&canonical_root)
+            .unwrap_or(&canonical_target)
+            .to_string_lossy()
+            .to_string();
+
+        return Ok(MutationTarget {
+            canonical: canonical_target,
+            display_path,
+        });
+    }
+
+    let file_name = target
+        .file_name()
+        .ok_or(PathResolutionError::TargetNotFound {
+            requested: target.clone(),
+        })?;
+    if file_name == "." || file_name == ".." {
+        return Err(PathResolutionError::TargetNotFound {
+            requested: target.clone(),
+        });
+    }
+
+    let parent = target.parent().ok_or(PathResolutionError::TargetNotFound {
+        requested: target.clone(),
+    })?;
+    let canonical_parent = canonicalize_within_scope(repository_root, parent)?;
+    let canonical_target = canonical_parent.canonical.join(file_name);
+
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err(PathResolutionError::OutsideRepositoryScope {
+            resolved: canonical_target,
+            root: canonical_root,
+        });
+    }
+
+    let display_path = canonical_target
+        .strip_prefix(&canonical_root)
+        .unwrap_or(&canonical_target)
+        .to_string_lossy()
+        .to_string();
+
+    Ok(MutationTarget {
+        canonical: canonical_target,
+        display_path,
+    })
+}
+
+#[cfg(test)]
+fn open_write_file_no_follow(path: &Path, create_new: bool) -> io::Result<File> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path does not name a file in its parent",
+        )
+    })?;
+
+    #[cfg(unix)]
+    let expected_metadata = if create_new {
+        None
+    } else {
+        let metadata = fs::metadata(path)?;
+        Some((metadata.dev(), metadata.ino()))
+    };
+
+    #[cfg(target_os = "linux")]
+    let expected_path = if create_new {
+        None
+    } else {
+        Some(path.canonicalize()?)
+    };
+
+    #[cfg(unix)]
+    {
+        let parent_dir = open_parent_no_follow(parent)?;
+        let file = open_no_follow_in_parent_dir(&parent_dir, file_name, create_new)?;
+
+        #[cfg(unix)]
+        {
+            if let Some((expected_dev, expected_ino)) = expected_metadata {
+                let opened_metadata = file.metadata()?;
+                if opened_metadata.dev() != expected_dev || opened_metadata.ino() != expected_ino {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "opened write file did not match resolved record",
+                    ));
+                }
+            }
+
+            #[cfg(target_os = "linux")]
+            if let Some(expected_path) = expected_path {
+                let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+                let opened_path = fs::canonicalize(fd_path)?;
+                if opened_path != expected_path {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "opened write file path changed after resolution",
+                    ));
+                }
+            }
+        }
+
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filesystem write/patch is best-effort on non-Unix platforms",
+    ))
+}
+
+#[cfg(unix)]
+fn temporary_write_file_name(file_name: &std::ffi::OsStr, attempt: u32) -> std::ffi::OsString {
+    let file_name = file_name.to_string_lossy();
+    let attempt = WRITE_FILE_TMP_COUNTER.fetch_add(1, Ordering::SeqCst) + attempt as u64;
+    format!("{WRITE_FILE_TMP_PREFIX}-{file_name}-{attempt}").into()
+}
+
+#[cfg(unix)]
+fn create_temporary_file_in_parent_dir(
+    parent: &File,
+    file_name: &std::ffi::OsStr,
+) -> io::Result<(std::ffi::OsString, File)> {
+    for attempt in 0..128u32 {
+        let temp_name = temporary_write_file_name(file_name, attempt);
+        match open_no_follow_in_parent_dir(parent, &temp_name, true) {
+            Ok(file) => return Ok((temp_name, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "failed to create temporary write file",
+    ))
+}
+
+#[cfg(unix)]
+fn rename_in_parent_dir(
+    parent: &File,
+    source: &std::ffi::OsStr,
+    destination: &std::ffi::OsStr,
+    create_new: bool,
+) -> io::Result<()> {
+    let source = CString::new(source.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+    let destination_name = CString::new(destination.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    if create_new {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `parent` is a live directory file descriptor and both names are valid c-strings.
+            let rename_result = unsafe {
+                libc::renameat2(
+                    parent.as_raw_fd(),
+                    source.as_ptr(),
+                    parent.as_raw_fd(),
+                    destination_name.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if rename_result == 0 {
+                return Ok(());
+            }
+
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EEXIST) => return Err(error),
+                Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "filesystem does not support atomic create_new renames",
+                    ));
+                }
+                _ => return Err(error),
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "create_new writes are supported only with renameat2(RENAME_NOREPLACE)",
+            ));
+        }
+    }
+
+    // SAFETY: `parent` is a live directory file descriptor and both names are valid c-strings.
+    let result = unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination_name.as_ptr(),
+        )
+    };
+
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unlink_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    // SAFETY: `parent` is a live directory file descriptor and `cstring` is a valid name.
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), cstring.as_ptr(), 0) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_file_bytes_atomically_inner(
+    path: &Path,
+    bytes: &[u8],
+    create_new: bool,
+    fail_after_write: bool,
+) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+
+    let parent_dir = open_parent_no_follow(parent)?;
+    let destination_lock = acquire_write_lock(path)?;
+
+    write_file_bytes_atomically_inner_locked(
+        &parent_dir,
+        file_name,
+        bytes,
+        create_new,
+        fail_after_write,
+        destination_lock,
+    )
+}
+
+#[cfg(unix)]
+fn write_file_bytes_atomically_inner_locked(
+    parent_dir: &File,
+    file_name: &std::ffi::OsStr,
+    bytes: &[u8],
+    create_new: bool,
+    fail_after_write: bool,
+    _destination_lock: File,
+) -> io::Result<()> {
+    let existing_permissions = if !create_new {
+        let existing_file = open_read_no_follow_in_parent_dir(parent_dir, file_name)?;
+        let existing_metadata = existing_file.metadata()?;
+        Some(existing_metadata.permissions())
+    } else {
+        None
+    };
+
+    let (temp_name, mut temp_file) = create_temporary_file_in_parent_dir(parent_dir, file_name)?;
+
+    let cleanup = |parent_dir: &File, temp_name: &std::ffi::OsStr| {
+        let _ = unlink_in_parent_dir(parent_dir, temp_name);
+    };
+
+    let write_result = (|| -> io::Result<()> {
+        temp_file.write_all(bytes)?;
+        temp_file.flush()?;
+        if let Some(permissions) = existing_permissions {
+            temp_file.set_permissions(permissions)?;
+        }
+        temp_file.sync_all()?;
+        if fail_after_write {
+            return Err(io::Error::other("simulated write failure"));
+        }
+        drop(temp_file);
+
+        rename_in_parent_dir(parent_dir, &temp_name, file_name, create_new)?;
+        Ok(())
+    })();
+
+    if let Err(error) = write_result {
+        cleanup(parent_dir, &temp_name);
+        return Err(error);
+    }
+
+    parent_dir.sync_all()?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_file_bytes_atomically(path: &Path, bytes: &[u8], create_new: bool) -> io::Result<()> {
+    write_file_bytes_atomically_inner(path, bytes, create_new, false)
+}
+
+#[cfg(not(unix))]
+fn write_file_bytes_atomically(_path: &Path, _bytes: &[u8], _create_new: bool) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filesystem write/patch is best-effort on non-Unix platforms",
+    ))
+}
+
+#[cfg(any(test, not(unix)))]
+fn read_entire_text_file(path: &Path, max_bytes: usize) -> io::Result<String> {
+    let mut file = open_file_no_follow(path)?;
+    let mut content = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut total_bytes = 0usize;
+
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+
+        total_bytes += n;
+        if total_bytes > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "file exceeds configured byte limit",
+            ));
+        }
+
+        content.extend_from_slice(&buffer[..n]);
+    }
+
+    String::from_utf8(content).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid UTF-8 content: {error}"),
+        )
+    })
+}
+
+fn count_overlapping_matches(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.len() > haystack.len() {
+        return 0;
+    }
+
+    let mut count = 0usize;
+    let mut index = 0usize;
+    while index + needle.len() <= haystack.len() {
+        if &haystack[index..index + needle.len()] == needle {
+            count += 1;
+        }
+        index += 1;
+    }
+    count
+}
+
+#[derive(Debug, Clone)]
+pub struct FsWriteTool {
+    repository_root: PathBuf,
+    content: String,
+    allow_create: bool,
+    allow_overwrite: bool,
+    max_bytes: usize,
+}
+
+impl FsWriteTool {
+    pub fn new(repository_root: impl Into<PathBuf>, content: impl Into<String>) -> Self {
+        Self {
+            repository_root: repository_root.into(),
+            content: content.into(),
+            allow_create: true,
+            allow_overwrite: false,
+            max_bytes: DEFAULT_WRITE_MAX_BYTES,
+        }
+    }
+
+    pub fn with_allow_create(mut self, allow_create: bool) -> Self {
+        self.allow_create = allow_create;
+        self
+    }
+
+    pub fn with_allow_overwrite(mut self, allow_overwrite: bool) -> Self {
+        self.allow_overwrite = allow_overwrite;
+        self
+    }
+
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+}
+
+impl crate::runtime::RuntimeTool for FsWriteTool {
+    fn tool_id(&self) -> &'static str {
+        "fs.write"
+    }
+
+    fn requested_capability(&self) -> &'static str {
+        "filesystem.write"
+    }
+
+    fn declared_effect(&self) -> &'static str {
+        "write UTF-8 text within the registered repository scope"
+    }
+
+    fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+        let mut parts = vec![format!("path={}", request.resource_scope.value)];
+        parts.push(format!("bytes={}", self.content.len()));
+        if self.allow_create {
+            parts.push("create=true".to_string());
+        }
+        if self.allow_overwrite {
+            parts.push("overwrite=true".to_string());
+        }
+        if self.max_bytes != DEFAULT_WRITE_MAX_BYTES {
+            parts.push(format!("limit={}", self.max_bytes));
+        }
+        parts.join(" ")
+    }
+
+    fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
+        match resolve_mutation_target(&self.repository_root, &target_from_request(request)) {
+            Ok(target) => vec![ResolvedPath {
+                requested_path: request.resource_scope.value.clone(),
+                resolved_path: target.path().to_string_lossy().to_string(),
+                display_path: target.display_path().to_string(),
+            }],
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
+        let schema_ref = "tool_result.fs.write.v1";
+        let relative = target_from_request(request);
+
+        if self.content.len() > self.max_bytes {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "write failed: content exceeds configured byte limit".to_string(),
+                format!(
+                    "content is {} bytes; limit is {} bytes",
+                    self.content.len(),
+                    self.max_bytes
+                ),
+            );
+        }
+
+        let target = match resolve_mutation_target(&self.repository_root, &relative) {
+            Ok(target) => target,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "write failed: path rejected".to_string(),
+                    err.to_string(),
+                );
+            }
+        };
+
+        let path = target.path();
+        let exists = path.exists();
+        if exists && !self.allow_overwrite {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "write failed: overwrite disabled".to_string(),
+                format!("{}: overwrite disabled", target.display_path()),
+            );
+        }
+        if !exists && !self.allow_create {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "write failed: create disabled".to_string(),
+                format!("{}: create disabled", target.display_path()),
+            );
+        }
+
+        if exists {
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    return failed_result(
+                        invocation,
+                        schema_ref,
+                        "write failed: cannot read target metadata".to_string(),
+                        format!("{}: {}", target.display_path(), err),
+                    );
+                }
+            };
+            if !metadata.is_file() {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "write failed: target is not a file".to_string(),
+                    target.display_path().to_string(),
+                );
+            }
+        }
+
+        if let Err(err) = write_file_bytes_atomically(path, self.content.as_bytes(), !exists) {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "write failed: cannot write UTF-8 text".to_string(),
+                format!("{}: {}", target.display_path(), err),
+            );
+        }
+
+        let summary = if exists {
+            format!(
+                "overwrote {} bytes in {}",
+                self.content.len(),
+                target.display_path()
+            )
+        } else {
+            format!(
+                "created {} bytes at {}",
+                self.content.len(),
+                target.display_path()
+            )
+        };
+
+        make_tool_result(
+            invocation,
+            ToolResultStatus::Succeeded,
+            schema_ref,
+            vec![
+                ToolResultField {
+                    key: "summary".to_string(),
+                    value: StructuredValue::String(summary),
+                },
+                ToolResultField {
+                    key: "path".to_string(),
+                    value: StructuredValue::String(target.display_path().to_string()),
+                },
+                ToolResultField {
+                    key: "bytes_written".to_string(),
+                    value: StructuredValue::Integer(self.content.len() as i64),
+                },
+                ToolResultField {
+                    key: "created".to_string(),
+                    value: StructuredValue::Bool(!exists),
+                },
+                ToolResultField {
+                    key: "overwritten".to_string(),
+                    value: StructuredValue::Bool(exists),
+                },
+            ],
+            None,
+            Vec::new(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FsPatchTool
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct FsPatchTool {
+    repository_root: PathBuf,
+    find_text: String,
+    replacement_text: String,
+    max_bytes: usize,
+}
+
+impl FsPatchTool {
+    pub fn new(
+        repository_root: impl Into<PathBuf>,
+        find_text: impl Into<String>,
+        replacement_text: impl Into<String>,
+    ) -> Self {
+        Self {
+            repository_root: repository_root.into(),
+            find_text: find_text.into(),
+            replacement_text: replacement_text.into(),
+            max_bytes: DEFAULT_WRITE_MAX_BYTES,
+        }
+    }
+
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+}
+
+impl crate::runtime::RuntimeTool for FsPatchTool {
+    fn tool_id(&self) -> &'static str {
+        "fs.patch"
+    }
+
+    fn requested_capability(&self) -> &'static str {
+        "filesystem.patch"
+    }
+
+    fn declared_effect(&self) -> &'static str {
+        "apply an exact-match text replacement within the registered repository scope"
+    }
+
+    fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+        let mut parts = vec![format!("path={}", request.resource_scope.value)];
+        parts.push(format!("find={}", self.find_text.len()));
+        parts.push(format!("replace={}", self.replacement_text.len()));
+        if self.max_bytes != DEFAULT_WRITE_MAX_BYTES {
+            parts.push(format!("limit={}", self.max_bytes));
+        }
+        parts.join(" ")
+    }
+
+    fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
+        match resolve_mutation_target(&self.repository_root, &target_from_request(request)) {
+            Ok(target) => vec![ResolvedPath {
+                requested_path: request.resource_scope.value.clone(),
+                resolved_path: target.path().to_string_lossy().to_string(),
+                display_path: target.display_path().to_string(),
+            }],
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
+        let schema_ref = "tool_result.fs.patch.v1";
+        let relative = target_from_request(request);
+
+        if self.find_text.is_empty() {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "patch failed: empty match text".to_string(),
+                "exact-match replacement requires a non-empty find string".to_string(),
+            );
+        }
+
+        let target = match resolve_mutation_target(&self.repository_root, &relative) {
+            Ok(target) => target,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: path rejected".to_string(),
+                    err.to_string(),
+                );
+            }
+        };
+
+        let path = target.path();
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: cannot read target metadata".to_string(),
+                    format!("{}: {}", target.display_path(), err),
+                );
+            }
+        };
+
+        if !metadata.is_file() {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "patch failed: target is not a file".to_string(),
+                target.display_path().to_string(),
+            );
+        }
+
+        #[cfg(unix)]
+        let (parent_dir, destination_lock) = match lock_target_for_patch(path) {
+            Ok(values) => values,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: cannot write UTF-8 text".to_string(),
+                    format!("{}: {}", target.display_path(), err),
+                );
+            }
+        };
+        #[cfg(unix)]
+        let file_name = path
+            .file_name()
+            .expect("resolved target path must include a file name");
+
+        #[cfg(unix)]
+        let content =
+            match read_entire_text_file_in_parent_dir(&parent_dir, file_name, self.max_bytes) {
+                Ok(content) => content,
+                Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
+                    return failed_result(
+                        invocation,
+                        schema_ref,
+                        "patch failed: file exceeds configured byte limit".to_string(),
+                        format!(
+                            "{} is larger than {} bytes",
+                            target.display_path(),
+                            self.max_bytes
+                        ),
+                    );
+                }
+                Err(err) => {
+                    return failed_result(
+                        invocation,
+                        schema_ref,
+                        "patch failed: cannot read UTF-8 text".to_string(),
+                        format!("{}: {}", target.display_path(), err),
+                    );
+                }
+            };
+
+        #[cfg(not(unix))]
+        let content = match read_entire_text_file(path, self.max_bytes) {
+            Ok(content) => content,
+            Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: file exceeds configured byte limit".to_string(),
+                    format!(
+                        "{} is larger than {} bytes",
+                        target.display_path(),
+                        self.max_bytes
+                    ),
+                );
+            }
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: cannot read UTF-8 text".to_string(),
+                    format!("{}: {}", target.display_path(), err),
+                );
+            }
+        };
+
+        let match_count = count_overlapping_matches(&content, &self.find_text);
+        if match_count == 0 {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "patch failed: exact text not found".to_string(),
+                format!(
+                    "needle {:?} was not found in {}",
+                    self.find_text,
+                    target.display_path()
+                ),
+            );
+        }
+        if match_count > 1 {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "patch failed: exact text matched multiple times".to_string(),
+                format!(
+                    "needle {:?} matched {} times in {}",
+                    self.find_text,
+                    match_count,
+                    target.display_path()
+                ),
+            );
+        }
+
+        let updated = content.replacen(&self.find_text, &self.replacement_text, 1);
+        if updated.len() > self.max_bytes {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "patch failed: result exceeds configured byte limit".to_string(),
+                format!(
+                    "patched content is {} bytes; limit is {} bytes",
+                    updated.len(),
+                    self.max_bytes
+                ),
+            );
+        }
+
+        #[cfg(unix)]
+        if let Err(err) = write_file_bytes_atomically_inner_locked(
+            &parent_dir,
+            file_name,
+            updated.as_bytes(),
+            false,
+            false,
+            destination_lock,
+        ) {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "patch failed: cannot write UTF-8 text".to_string(),
+                format!("{}: {}", target.display_path(), err),
+            );
+        }
+
+        #[cfg(not(unix))]
+        if let Err(err) = write_file_bytes_atomically(path, updated.as_bytes(), false) {
+            return failed_result(
+                invocation,
+                schema_ref,
+                "patch failed: cannot write UTF-8 text".to_string(),
+                format!("{}: {}", target.display_path(), err),
+            );
+        }
+
+        let summary = if updated == content {
+            format!(
+                "patched {} with no net content change",
+                target.display_path()
+            )
+        } else {
+            format!(
+                "patched {} with one exact replacement",
+                target.display_path()
+            )
+        };
+
+        make_tool_result(
+            invocation,
+            ToolResultStatus::Succeeded,
+            schema_ref,
+            vec![
+                ToolResultField {
+                    key: "summary".to_string(),
+                    value: StructuredValue::String(summary),
+                },
+                ToolResultField {
+                    key: "path".to_string(),
+                    value: StructuredValue::String(target.display_path().to_string()),
+                },
+                ToolResultField {
+                    key: "matches".to_string(),
+                    value: StructuredValue::Integer(match_count as i64),
+                },
+                ToolResultField {
+                    key: "before_bytes".to_string(),
+                    value: StructuredValue::Integer(content.len() as i64),
+                },
+                ToolResultField {
+                    key: "after_bytes".to_string(),
+                    value: StructuredValue::Integer(updated.len() as i64),
+                },
+                ToolResultField {
+                    key: "changed".to_string(),
+                    value: StructuredValue::Bool(updated != content),
+                },
+            ],
+            None,
+            Vec::new(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1584,6 +2731,11 @@ mod tests {
 
     fn request_with_path(path: &str) -> RuntimeJobRequest {
         RuntimeJobRequest::new(actor(), RepositoryId::new(), JobKind::Read, "test goal")
+            .with_resource_scope("path", path)
+    }
+
+    fn request_with_mutation_path(path: &str) -> RuntimeJobRequest {
+        RuntimeJobRequest::new(actor(), RepositoryId::new(), JobKind::Mutate, "test goal")
             .with_resource_scope("path", path)
     }
 
@@ -1642,6 +2794,32 @@ mod tests {
 
         fn cleanup(&self) {
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_no_lock_files_in_repo(root: &Path) {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            let entries = fs::read_dir(&directory).unwrap();
+            for entry in entries.flatten() {
+                let metadata = entry.file_type().unwrap();
+                if metadata.is_dir() {
+                    stack.push(entry.path());
+                    continue;
+                }
+                if metadata.is_file()
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(WRITE_FILE_LOCK_PREFIX)
+                {
+                    panic!(
+                        "found repo-visible write lock sidecar: {}",
+                        entry.path().display()
+                    );
+                }
+            }
         }
     }
 
@@ -2671,6 +3849,536 @@ mod tests {
         env.cleanup();
     }
 
+    // -- FsWriteTool tests --
+
+    #[test]
+    fn fs_write_creates_text_file_within_scope() {
+        let env = TestEnv::new("write-create");
+
+        let tool = FsWriteTool::new(&env.root, "hello\nworld");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            "hello\nworld",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        let created = result.fields.iter().find(|f| f.key == "created").unwrap();
+        assert_eq!(StructuredValue::Bool(true), created.value);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_write_rejects_overwrite_without_permission() {
+        let env = TestEnv::new("write-overwrite-blocked");
+        env.create_file("notes.txt", "original");
+
+        let tool = FsWriteTool::new(&env.root, "replacement");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        assert_eq!(
+            "original",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("overwrite disabled"));
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_write_overwrites_existing_file_when_allowed() {
+        let env = TestEnv::new("write-overwrite");
+        env.create_file("notes.txt", "original");
+
+        let tool = FsWriteTool::new(&env.root, "replacement")
+            .with_allow_overwrite(true)
+            .with_allow_create(false);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            "replacement",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        let overwritten = result
+            .fields
+            .iter()
+            .find(|f| f.key == "overwritten")
+            .unwrap();
+        assert_eq!(StructuredValue::Bool(true), overwritten.value);
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_fails_atomically_if_rename_does_not_run() {
+        let env = TestEnv::new("write-fails-atomically");
+        env.create_file("notes.txt", "original");
+
+        let path = env.root.join("notes.txt");
+        let err =
+            write_file_bytes_atomically_inner(&path, b"replacement", false, true).unwrap_err();
+        assert_eq!(io::ErrorKind::Other, err.kind());
+        assert_eq!("original", fs::read_to_string(&path).unwrap());
+
+        let has_temp_file = fs::read_dir(&env.root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(WRITE_FILE_TMP_PREFIX)
+            });
+        assert!(
+            !has_temp_file,
+            "temporary write file should be cleaned up on failure"
+        );
+
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_create_does_not_remove_destination_on_failure() {
+        use std::thread;
+        use std::time::Duration;
+
+        let env = TestEnv::new("write-create-failure-cleanup");
+        let path = env.root.join("notes.txt");
+
+        let writer_env = env.root.clone();
+        let path_for_writer = path.clone();
+        let writer_handle = thread::spawn(move || {
+            let err =
+                write_file_bytes_atomically_inner(&path_for_writer, b"replacement", true, true)
+                    .unwrap_err();
+            assert_eq!(io::ErrorKind::Other, err.kind());
+        });
+
+        let mut saw_temp_file = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            saw_temp_file = fs::read_dir(&writer_env)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(WRITE_FILE_TMP_PREFIX)
+                });
+            if saw_temp_file {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(
+            saw_temp_file,
+            "temporary write file should be created before failure"
+        );
+
+        fs::write(&path, b"racer").unwrap();
+
+        writer_handle.join().unwrap();
+        assert_eq!(
+            "racer",
+            fs::read_to_string(&path).expect("destination should remain from concurrent writer"),
+        );
+        let has_temp_file = fs::read_dir(&writer_env)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(WRITE_FILE_TMP_PREFIX)
+            });
+        assert!(
+            !has_temp_file,
+            "temporary write file should be cleaned up on failure"
+        );
+
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_create_blocks_concurrent_mutation() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let env = TestEnv::new("write-lock-block");
+        env.create_file("notes.txt", "original");
+
+        let path = env.root.join("notes.txt");
+        let path_clone = path.clone();
+        let _destination_lock = acquire_write_lock(&path).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let write_handle = thread::spawn(move || {
+            let result = write_file_bytes_atomically(&path_clone, b"blocked", false);
+            done_tx.send(result).unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(120));
+        assert!(done_rx.try_recv().is_err());
+
+        drop(_destination_lock);
+        let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(result.is_ok());
+        assert_eq!("blocked", fs::read_to_string(&path).unwrap());
+
+        write_handle.join().unwrap();
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let env = TestEnv::new("write-existing-perms");
+        let path = env.root.join("notes.txt");
+        env.create_file("notes.txt", "original");
+
+        let mut permissions = path.metadata().unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        write_file_bytes_atomically(&path, b"updated", false).unwrap();
+
+        let after_permissions = path.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(0o600, after_permissions);
+
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_create_fails_atomically_if_destination_appears() {
+        let env = TestEnv::new("write-create-fails-atomically");
+        let path = env.root.join("notes.txt");
+
+        let err = write_file_bytes_atomically_inner(&path, b"replacement", true, true).unwrap_err();
+        assert_eq!(io::ErrorKind::Other, err.kind());
+        assert!(!path.exists());
+
+        let has_temp_file = fs::read_dir(&env.root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(WRITE_FILE_TMP_PREFIX)
+            });
+        assert!(
+            !has_temp_file,
+            "temporary write file should be cleaned up on failure"
+        );
+
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_rename_create_new_fails_if_destination_exists() {
+        let env = TestEnv::new("write-create-rename-no-replace");
+        let path = env.root.join("notes.txt");
+        env.create_file("notes.txt", "original");
+
+        let parent = open_parent_no_follow(path.parent().unwrap()).unwrap();
+        let (temp_name, temp_file) =
+            create_temporary_file_in_parent_dir(&parent, path.file_name().unwrap()).unwrap();
+        drop(temp_file);
+
+        let rename_result =
+            rename_in_parent_dir(&parent, &temp_name, path.file_name().unwrap(), true).unwrap_err();
+        assert_eq!(io::ErrorKind::AlreadyExists, rename_result.kind());
+
+        assert_eq!("original", fs::read_to_string(&path).unwrap());
+        assert!(
+            fs::read_dir(&env.root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().as_os_str() == temp_name),
+            "temporary file should remain when no-replace rename fails",
+        );
+        unlink_in_parent_dir(&parent, &temp_name).unwrap();
+        env.cleanup();
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn fs_rename_create_new_unsupported_without_renameat2() {
+        let env = TestEnv::new("write-create-rename-unsupported");
+        let path = env.root.join("notes.txt");
+
+        let parent = open_parent_no_follow(path.parent().unwrap()).unwrap();
+        let (temp_name, temp_file) =
+            create_temporary_file_in_parent_dir(&parent, path.file_name().unwrap()).unwrap();
+        drop(temp_file);
+
+        let rename_result =
+            rename_in_parent_dir(&parent, &temp_name, path.file_name().unwrap(), true).unwrap_err();
+        assert_eq!(io::ErrorKind::Unsupported, rename_result.kind());
+
+        unlink_in_parent_dir(&parent, &temp_name).unwrap();
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_write_rejects_byte_limit_overrun() {
+        let env = TestEnv::new("write-limit");
+
+        let tool = FsWriteTool::new(&env.root, "too long").with_max_bytes(4);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        assert!(!env.root.join("notes.txt").exists());
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_write_rejects_out_of_scope_target() {
+        let env = TestEnv::new("write-reject");
+
+        let tool = FsWriteTool::new(&env.root, "hello");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("../../etc/passwd");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("outside repository root"));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_does_not_emit_repo_visible_lock_file() {
+        let env = TestEnv::new("write-no-lock-sidecar");
+        let tool = FsWriteTool::new(&env.root, "hello");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            "hello",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        assert_no_lock_files_in_repo(&env.root);
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_rejects_parent_directory_swap_after_scope_validation() {
+        let env = TestEnv::new("write-parent-swap");
+        let outside = unique_test_dir("write-parent-swap-outside");
+        let backup_path = env.root.join("notes_backup");
+
+        env.create_file("notes/note.txt", "inside");
+        fs::create_dir_all(outside.join("notes")).unwrap();
+        fs::write(outside.join("notes").join("note.txt"), "outside").unwrap();
+
+        let target = resolve_mutation_target(&env.root, Path::new("notes/note.txt")).unwrap();
+
+        let parent = env.root.join("notes");
+        fs::rename(&parent, &backup_path).unwrap();
+        std::os::unix::fs::symlink(outside.join("notes"), &parent).unwrap();
+
+        let open_result = open_write_file_no_follow(target.path(), false);
+        assert!(open_result.is_err());
+
+        assert_eq!(
+            "outside",
+            fs::read_to_string(outside.join("notes").join("note.txt")).unwrap()
+        );
+        assert_eq!(
+            "inside",
+            fs::read_to_string(backup_path.join("note.txt")).unwrap()
+        );
+
+        env.cleanup();
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    // -- FsPatchTool tests --
+
+    #[test]
+    fn fs_patch_applies_single_exact_replacement() {
+        let env = TestEnv::new("patch-exact");
+        env.create_file("notes.txt", "alpha\nbeta\ngamma");
+
+        let tool = FsPatchTool::new(&env.root, "beta", "delta");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            "alpha\ndelta\ngamma",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        let changed = result.fields.iter().find(|f| f.key == "changed").unwrap();
+        assert_eq!(StructuredValue::Bool(true), changed.value);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_patch_rejects_ambiguous_match() {
+        let env = TestEnv::new("patch-ambiguous");
+        env.create_file("notes.txt", "beta\nbeta");
+
+        let tool = FsPatchTool::new(&env.root, "beta", "delta");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("matched 2 times"));
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_patch_rejects_overlapping_match() {
+        let env = TestEnv::new("patch-overlapping");
+        env.create_file("notes.txt", "aaa");
+
+        let tool = FsPatchTool::new(&env.root, "aa", "b");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("matched 2 times"));
+        assert_eq!(
+            "aaa",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_patch_rejects_missing_match() {
+        let env = TestEnv::new("patch-missing");
+        env.create_file("notes.txt", "alpha");
+
+        let tool = FsPatchTool::new(&env.root, "beta", "delta");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("was not found"));
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_patch_rejects_byte_limit_overrun() {
+        let env = TestEnv::new("patch-limit");
+        env.create_file("notes.txt", "alpha\nbeta");
+
+        let tool = FsPatchTool::new(&env.root, "beta", "replacement").with_max_bytes(8);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        assert_eq!(
+            "alpha\nbeta",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_patch_does_not_emit_repo_visible_lock_file() {
+        let env = TestEnv::new("patch-no-lock-sidecar");
+        env.create_file("notes.txt", "alpha\nbeta");
+
+        let tool = FsPatchTool::new(&env.root, "beta", "delta");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            "alpha\ndelta",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        assert_no_lock_files_in_repo(&env.root);
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_patch_reads_from_locked_parent_directory_when_parent_is_swapped() {
+        let env = TestEnv::new("patch-parent-swap-read");
+        let outside = unique_test_dir("patch-parent-swap-outside");
+        let backup_path = env.root.join("notes_backup");
+
+        env.create_file("notes/note.txt", "inside");
+        fs::create_dir_all(outside.join("notes")).unwrap();
+        fs::write(outside.join("notes").join("note.txt"), "outside").unwrap();
+
+        let target = resolve_mutation_target(&env.root, Path::new("notes/note.txt")).unwrap();
+        let (parent_dir, destination_lock) =
+            lock_target_for_patch(target.path()).expect("failed to acquire patch lock");
+
+        let parent_path = env.root.join("notes");
+        fs::rename(&parent_path, &backup_path).unwrap();
+        std::os::unix::fs::symlink(outside.join("notes"), &parent_path).unwrap();
+
+        let content = read_entire_text_file_in_parent_dir(
+            &parent_dir,
+            target.path().file_name().unwrap(),
+            1024,
+        )
+        .unwrap();
+
+        drop(destination_lock);
+        assert_eq!("inside", content);
+        assert_eq!(
+            "outside",
+            fs::read_to_string(outside.join("notes").join("note.txt")).unwrap()
+        );
+        assert_eq!(
+            "inside",
+            fs::read_to_string(backup_path.join("note.txt")).unwrap()
+        );
+        env.cleanup();
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn fs_patch_read_rejects_content_exceeding_byte_cap() {
+        let env = TestEnv::new("patch-read-limit");
+        let large_path = env.root.join("notes.txt");
+        env.create_file("notes.txt", &"a".repeat(1200));
+
+        let err = read_entire_text_file(&large_path, 1024).unwrap_err();
+        assert_eq!(io::ErrorKind::FileTooLarge, err.kind());
+        env.cleanup();
+    }
+
     // -- Rendering compatibility --
 
     #[test]
@@ -2848,6 +4556,65 @@ mod tests {
             .find(|f| f.key == "match_count")
             .unwrap();
         assert_eq!(StructuredValue::Integer(2), count.value);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_write_and_patch_integrate_with_secretary_runtime() {
+        let env = TestEnv::new("runtime-mutate");
+
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = RepositoryRecord::new(
+            "test-repo",
+            env.root.to_string_lossy(),
+            RepositoryTrustState::Trusted,
+            LedgerTimestamp::now(),
+        );
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let write_tool = FsWriteTool::new(&env.root, "hello")
+            .with_allow_create(true)
+            .with_allow_overwrite(true);
+        let write_request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Mutate,
+            "write repository file",
+        )
+        .with_resource_scope("path", "note.txt")
+        .with_requested_capabilities(vec!["filesystem.write".to_string()]);
+        let write_receipt = runtime.run_tool_job(write_request, &write_tool).unwrap();
+        assert_eq!(
+            crate::domain::JobStatus::Succeeded,
+            write_receipt.job.status
+        );
+        assert_eq!(
+            "hello",
+            fs::read_to_string(env.root.join("note.txt")).unwrap()
+        );
+
+        let patch_tool = FsPatchTool::new(&env.root, "hello", "world");
+        let patch_request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Mutate,
+            "patch repository file",
+        )
+        .with_resource_scope("path", "note.txt")
+        .with_requested_capabilities(vec!["filesystem.patch".to_string()]);
+        let patch_receipt = runtime.run_tool_job(patch_request, &patch_tool).unwrap();
+
+        assert_eq!(
+            crate::domain::JobStatus::Succeeded,
+            patch_receipt.job.status
+        );
+        assert_eq!(
+            "world",
+            fs::read_to_string(env.root.join("note.txt")).unwrap()
+        );
         env.cleanup();
     }
 }
