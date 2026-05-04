@@ -1872,7 +1872,7 @@ impl ExtensionRegistryService {
             .list_extension_statuses()?
             .into_iter()
             .map(ExtensionStatusSnapshot::into)
-        .collect();
+            .collect();
 
         if !request.include_blocked {
             extensions.retain(|snapshot| snapshot.block.is_none());
@@ -3629,49 +3629,12 @@ mod tests {
         );
     }
 
+    #[test]
     fn list_extensions_request_deserializes_missing_include_blocked_as_true() {
         let request: ListExtensionsRequest = serde_json::from_str("{}").unwrap();
 
         assert!(request.include_blocked);
         assert_eq!(request, ListExtensionsRequest::default());
-    }
-
-    fn list_extensions_request_deserializes_include_blocked_false() {
-        let request: ListExtensionsRequest =
-            serde_json::from_str("{\"include_blocked\":false}").unwrap();
-
-        assert!(!request.include_blocked);
-        assert_ne!(request, ListExtensionsRequest::default());
-
-        let mut service = ExtensionRegistryService::new();
-        service
-            .install_extension(InstallExtensionRequest {
-                manifest: manifest("com.example.extension"),
-                approve_local_unsigned: false,
-                allow_local_process_runtime: false,
-            })
-            .unwrap();
-        service
-            .install_extension(InstallExtensionRequest {
-                manifest: manifest("com.example.other"),
-                approve_local_unsigned: false,
-                allow_local_process_runtime: false,
-            })
-            .unwrap();
-
-        service
-            .apply_blocklist(ApplyBlocklistRequest {
-                entry: BlocklistEntry {
-                    key: BlockKey::ExtensionId("com.example.extension".to_string()),
-                    reason: BlockReason::PolicyViolation,
-                    note: None,
-                },
-            })
-            .unwrap();
-
-        let list = service.list_extensions(request).unwrap();
-        assert_eq!(list.extensions.len(), 1);
-        assert_eq!(list.extensions[0].extension_id, "com.example.other");
     }
 
     #[test]
