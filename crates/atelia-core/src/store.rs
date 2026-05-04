@@ -788,7 +788,7 @@ impl SecretaryStore for InMemoryStore {
         let lock_record = lock.migration_lock.as_mut().unwrap();
         lock_record.status = MigrationLockStatus::Released;
         lock_record.released_at = Some(released_at);
-        lock.updated_at = released_at;
+        lock.updated_at = std::cmp::max(released_at, lock.updated_at);
         Ok(lock.clone())
     }
 
@@ -3272,6 +3272,36 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn schema_migration_lock_release_preserves_updated_at_monotonicity() {
+        let store = InMemoryStore::new();
+        let first = store
+            .acquire_schema_migration_lock("daemon-a".to_string(), true, 5_000, timestamp(10))
+            .unwrap();
+
+        {
+            let mut inner = store.lock().unwrap();
+            let stored = inner
+                .schema_migrations
+                .get_mut(&first.id)
+                .expect("acquired lock must be stored");
+            stored.updated_at = timestamp(25);
+        }
+
+        let released = store
+            .release_schema_migration_lock(&first.id, "daemon-a", timestamp(20))
+            .unwrap();
+
+        assert_eq!(released.updated_at, timestamp(25));
+        assert_eq!(
+            released
+                .migration_lock
+                .expect("released lock must include metadata")
+                .released_at,
+            Some(timestamp(20))
+        );
     }
 
     #[test]
