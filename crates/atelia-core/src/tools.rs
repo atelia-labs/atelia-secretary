@@ -54,6 +54,7 @@ const WRITE_FILE_LOCK_PREFIX: &str = "atelia-write-lock";
 #[cfg(unix)]
 static WRITE_FILE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const CAPTURE_THREAD_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
+const CAPTURE_THREAD_QUIESCE_TIMEOUT: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // Path canonicalization and scope validation
@@ -1696,13 +1697,22 @@ fn join_capture_thread<T>(
     timeout: Duration,
 ) -> io::Result<Option<T>> {
     let deadline = Instant::now() + timeout;
-
     while !task.is_finished() {
         if Instant::now() >= deadline {
             stop_immediately.store(true, Ordering::Release);
-            return Ok(None);
+            break;
         }
         thread::sleep(Duration::from_millis(5));
+    }
+
+    if !task.is_finished() {
+        let quiesce_deadline = Instant::now() + CAPTURE_THREAD_QUIESCE_TIMEOUT;
+        while !task.is_finished() {
+            if Instant::now() >= quiesce_deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     let captured = task
@@ -5206,6 +5216,8 @@ mod tests {
             move || -> io::Result<usize> {
                 loop {
                     if stop_immediately.load(Ordering::Acquire) {
+                        thread::sleep(CAPTURE_THREAD_QUIESCE_TIMEOUT * 2);
+                        blocking_original_counter.fetch_add(1, Ordering::Release);
                         return Ok(0);
                     }
                     blocking_original_counter.fetch_add(1, Ordering::Release);
