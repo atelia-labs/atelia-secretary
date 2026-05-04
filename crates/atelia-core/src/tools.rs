@@ -1597,6 +1597,26 @@ fn join_capture_task<T>(
 }
 
 #[cfg(unix)]
+fn spawn_capture_task<R: Read + Send + 'static>(
+    label: &'static str,
+    stream: R,
+    max_output_bytes: usize,
+    writer: File,
+) -> io::Result<thread::JoinHandle<io::Result<(usize, bool)>>> {
+    thread::Builder::new()
+        .name(format!("proc-exec-{label}-capture"))
+        .spawn(move || {
+            TempCaptureFile::capture(stream, max_output_bytes, writer)
+                .map_err(|error| io::Error::other(format!("{label} capture failed: {error}")))
+        })
+}
+
+fn terminate_child(child: &mut std::process::Child) {
+    let _ = kill_process_tree(child);
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
 fn kill_process_tree(child: &mut std::process::Child) -> bool {
     let pid = child.id() as i32;
     let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
@@ -1668,20 +1688,6 @@ fn execute_explicit_argv_process(
         command.env(key, value);
     }
 
-    let start = Instant::now();
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("failed to spawn process: {error}"))?;
-
-    let stdout_stream = child
-        .stdout
-        .take()
-        .ok_or_else(|| "child stdout unavailable".to_string())?;
-    let stderr_stream = child
-        .stderr
-        .take()
-        .ok_or_else(|| "child stderr unavailable".to_string())?;
-
     let stdout_capture = TempCaptureFile::create("stdout")
         .map_err(|error| format!("failed to create stdout capture file: {error}"))?;
     let stderr_capture = TempCaptureFile::create("stderr")
@@ -1693,15 +1699,34 @@ fn execute_explicit_argv_process(
         .writer()
         .map_err(|error| format!("failed to clone stderr capture writer: {error}"))?;
 
-    let stdout_capture_task = thread::spawn(move || {
-        TempCaptureFile::capture(stdout_stream, max_output_bytes, stdout_writer)
-            .map_err(|error| io::Error::other(format!("stdout capture failed: {error}")))
-    });
+    let start = Instant::now();
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn process: {error}"))?;
 
-    let stderr_capture_task = thread::spawn(move || {
-        TempCaptureFile::capture(stderr_stream, max_output_bytes, stderr_writer)
-            .map_err(|error| io::Error::other(format!("stderr capture failed: {error}")))
-    });
+    let stdout_stream = child.stdout.take().ok_or_else(|| {
+        terminate_child(&mut child);
+        "child stdout unavailable".to_string()
+    })?;
+    let stderr_stream = child.stderr.take().ok_or_else(|| {
+        terminate_child(&mut child);
+        "child stderr unavailable".to_string()
+    })?;
+
+    let stdout_capture_task =
+        spawn_capture_task("stdout", stdout_stream, max_output_bytes, stdout_writer).map_err(
+            |error| {
+                terminate_child(&mut child);
+                format!("failed to start stdout capture thread: {error}")
+            },
+        )?;
+    let stderr_capture_task =
+        spawn_capture_task("stderr", stderr_stream, max_output_bytes, stderr_writer).map_err(
+            |error| {
+                terminate_child(&mut child);
+                format!("failed to start stderr capture thread: {error}")
+            },
+        )?;
 
     let (status, timed_out, process_tree_handled) = wait_for_child(&mut child, timeout)
         .map_err(|error| format!("process wait failed: {error}"))?;
@@ -1785,6 +1810,10 @@ fn execute_explicit_argv_process(
     if timed_out && !process_tree_handled {
         summary.push_str(
             " process tree cleanup is unsupported on this platform (best-effort child kill only)",
+        );
+    } else if timed_out && capture_timed_out {
+        summary.push_str(
+            " output capture stream timeout may indicate escaped descendants with inherited stdio; detached process-tree cleanup is unsupported",
         );
     }
     summary.push_str(&format!(" in {}", canonical_cwd.display_path()));
@@ -4897,6 +4926,34 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "timed out execution did not hard-stop"
         );
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_times_out_with_detached_descendant_is_reported() {
+        let env = TestEnv::new("proc-timeout-detached-descendant");
+
+        let tool = ProcExecTool::new(
+            &env.root,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "setsid sh -c 'sleep 5' & sleep 1".to_string(),
+            ],
+        )
+        .with_timeout(Duration::from_millis(50));
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::TimedOut, result.status);
+        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
+        assert_eq!(StructuredValue::Bool(true), timed_out.value);
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        let summary = string_value(&summary.value);
+        assert!(summary.contains("timed out"));
+        assert!(summary.contains("detached"));
         env.cleanup();
     }
 
