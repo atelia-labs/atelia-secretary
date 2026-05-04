@@ -1521,6 +1521,86 @@ impl ExtensionRegistry {
         Ok(previous_record.clone())
     }
 
+    pub fn disable(&mut self, extension_id: &str) -> RegistryResult<ExtensionInstallRecord> {
+        let version = self
+            .active_versions
+            .get(extension_id)
+            .cloned()
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+        let record = self
+            .records
+            .get_mut(extension_id)
+            .and_then(|records| records.get_mut(&version))
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+
+        record.status = ExtensionInstallStatus::Disabled;
+        Ok(record.clone())
+    }
+
+    pub fn enable(&mut self, extension_id: &str) -> RegistryResult<ExtensionInstallRecord> {
+        let version = self
+            .active_versions
+            .get(extension_id)
+            .cloned()
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+        let manifest = self
+            .manifests
+            .get(extension_id)
+            .and_then(|records| records.get(&version))
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+        self.ensure_not_blocked(manifest)?;
+
+        let record = self
+            .records
+            .get_mut(extension_id)
+            .and_then(|records| records.get_mut(&version))
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+
+        record.status = ExtensionInstallStatus::Installed;
+        Ok(record.clone())
+    }
+
+    pub fn remove(&mut self, extension_id: &str) -> RegistryResult<ExtensionInstallRecord> {
+        let version = self
+            .active_versions
+            .get(extension_id)
+            .cloned()
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+
+        if self
+            .records
+            .get(extension_id)
+            .and_then(|records| records.get(&version))
+            .is_none()
+        {
+            return Err(RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            });
+        }
+
+        self.active_versions.remove(extension_id);
+        let record = self
+            .records
+            .get_mut(extension_id)
+            .and_then(|records| records.get_mut(&version))
+            .expect("record existence checked before active version removal");
+
+        record.status = ExtensionInstallStatus::Disabled;
+        Ok(record.clone())
+    }
+
     pub fn active_record(&self, extension_id: &str) -> Option<ExtensionInstallRecord> {
         let version = self.active_versions.get(extension_id)?;
         self.records.get(extension_id)?.get(version).cloned()
@@ -1570,6 +1650,9 @@ impl ExtensionRegistry {
         &self,
         request: ServiceCallRequest,
     ) -> RegistryResult<ServiceCallGrant> {
+        self.ensure_active_record_enabled(&request.caller_extension_id, "caller")?;
+        self.ensure_active_record_enabled(&request.callee_extension_id, "callee")?;
+
         let caller_manifest = self
             .active_manifest(&request.caller_extension_id)
             .ok_or_else(|| RegistryError::NotInstalled {
@@ -1656,6 +1739,32 @@ impl ExtensionRegistry {
             schema_version: request.schema_version,
             required_permission: required_permission.to_string(),
         })
+    }
+
+    fn ensure_active_record_enabled(&self, extension_id: &str, role: &str) -> RegistryResult<()> {
+        let record =
+            self.active_record(extension_id)
+                .ok_or_else(|| RegistryError::NotInstalled {
+                    extension_id: extension_id.to_string(),
+                })?;
+
+        match record.status {
+            ExtensionInstallStatus::Installed
+            | ExtensionInstallStatus::InstalledPreviousVersion => Ok(()),
+            ExtensionInstallStatus::Disabled => Err(RegistryError::ServiceDenied {
+                reason: format!("{role} extension {extension_id} is disabled"),
+            }),
+            ExtensionInstallStatus::Blocked => Err(RegistryError::ServiceDenied {
+                reason: format!("{role} extension {extension_id} is blocked"),
+            }),
+            ExtensionInstallStatus::Updating | ExtensionInstallStatus::RollbackInProgress => {
+                Err(RegistryError::ServiceDenied {
+                    reason: format!(
+                        "{role} extension {extension_id} is not ready for service calls"
+                    ),
+                })
+            }
+        }
     }
 
     fn active_manifest(&self, extension_id: &str) -> Option<&ExtensionManifest> {
@@ -1763,6 +1872,39 @@ pub struct InstallExtensionResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateExtensionRequest {
+    pub manifest: ExtensionManifest,
+    #[serde(default)]
+    pub approve_local_unsigned: bool,
+    #[serde(default)]
+    pub allow_local_process_runtime: bool,
+}
+
+impl From<UpdateExtensionRequest> for InstallOptions {
+    fn from(request: UpdateExtensionRequest) -> Self {
+        Self::from(&request)
+    }
+}
+
+impl From<&UpdateExtensionRequest> for InstallOptions {
+    fn from(request: &UpdateExtensionRequest) -> Self {
+        let mut options = InstallOptions::default();
+        if request.approve_local_unsigned {
+            options = options.approve_local_unsigned();
+        }
+        if request.allow_local_process_runtime {
+            options = options.allow_local_process_runtime();
+        }
+        options
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateExtensionResponse {
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtensionStatusRequest {
     pub extension_id: String,
 }
@@ -1806,6 +1948,36 @@ pub struct RollbackExtensionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RollbackExtensionResponse {
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisableExtensionRequest {
+    pub extension_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisableExtensionResponse {
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnableExtensionRequest {
+    pub extension_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnableExtensionResponse {
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoveExtensionRequest {
+    pub extension_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoveExtensionResponse {
     pub record: ExtensionInstallRecord,
 }
 
@@ -1854,6 +2026,18 @@ impl ExtensionRegistryService {
         Ok(record)
     }
 
+    pub fn update_extension(
+        &mut self,
+        request: UpdateExtensionRequest,
+    ) -> RegistryResult<UpdateExtensionResponse> {
+        let options = InstallOptions::from(&request);
+        let record = self
+            .registry
+            .install(request.manifest, options)
+            .map(|record| UpdateExtensionResponse { record })?;
+        Ok(record)
+    }
+
     pub fn extension_status(
         &self,
         request: ExtensionStatusRequest,
@@ -1889,6 +2073,39 @@ impl ExtensionRegistryService {
             .registry
             .rollback(&request.extension_id)
             .map(|record| RollbackExtensionResponse { record })?;
+        Ok(record)
+    }
+
+    pub fn disable_extension(
+        &mut self,
+        request: DisableExtensionRequest,
+    ) -> RegistryResult<DisableExtensionResponse> {
+        let record = self
+            .registry
+            .disable(&request.extension_id)
+            .map(|record| DisableExtensionResponse { record })?;
+        Ok(record)
+    }
+
+    pub fn enable_extension(
+        &mut self,
+        request: EnableExtensionRequest,
+    ) -> RegistryResult<EnableExtensionResponse> {
+        let record = self
+            .registry
+            .enable(&request.extension_id)
+            .map(|record| EnableExtensionResponse { record })?;
+        Ok(record)
+    }
+
+    pub fn remove_extension(
+        &mut self,
+        request: RemoveExtensionRequest,
+    ) -> RegistryResult<RemoveExtensionResponse> {
+        let record = self
+            .registry
+            .remove(&request.extension_id)
+            .map(|record| RemoveExtensionResponse { record })?;
         Ok(record)
     }
 
@@ -3036,6 +3253,35 @@ mod tests {
     }
 
     #[test]
+    fn registry_enable_disable_and_remove_manage_active_record() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let disabled = registry.disable("com.example.extension").unwrap();
+        assert_eq!(disabled.status, ExtensionInstallStatus::Disabled);
+        assert_eq!(
+            registry
+                .active_record("com.example.extension")
+                .unwrap()
+                .status,
+            ExtensionInstallStatus::Disabled
+        );
+
+        let enabled = registry.enable("com.example.extension").unwrap();
+        assert_eq!(enabled.status, ExtensionInstallStatus::Installed);
+
+        let removed = registry.remove("com.example.extension").unwrap();
+        assert_eq!(removed.status, ExtensionInstallStatus::Disabled);
+        assert!(registry.active_record("com.example.extension").is_none());
+        assert!(matches!(
+            registry.disable("com.example.extension"),
+            Err(RegistryError::NotInstalled { .. })
+        ));
+    }
+
+    #[test]
     fn same_version_different_digest_is_rejected() {
         let mut registry = ExtensionRegistry::in_memory();
         registry
@@ -3108,6 +3354,40 @@ mod tests {
             .authorize_service_call(service_call(consumer_id, provider_id))
             .unwrap();
         assert_eq!(grant.required_permission, permission_name);
+    }
+
+    #[test]
+    fn disabled_extension_cannot_participate_in_service_calls() {
+        let permission_name = "service.review.comments";
+        let provider_id = "com.example.provider";
+        let consumer_id = "com.example.consumer";
+        let mut registry = ExtensionRegistry::in_memory();
+
+        registry
+            .install(
+                service_provider(provider_id, permission_name),
+                InstallOptions::default(),
+            )
+            .unwrap();
+        registry
+            .install(
+                service_consumer(consumer_id, provider_id, permission_name),
+                InstallOptions::default(),
+            )
+            .unwrap();
+
+        registry.disable(provider_id).unwrap();
+        let provider_err = registry
+            .authorize_service_call(service_call(consumer_id, provider_id))
+            .unwrap_err();
+        assert!(matches!(provider_err, RegistryError::ServiceDenied { .. }));
+
+        registry.enable(provider_id).unwrap();
+        registry.disable(consumer_id).unwrap();
+        let consumer_err = registry
+            .authorize_service_call(service_call(consumer_id, provider_id))
+            .unwrap_err();
+        assert!(matches!(consumer_err, RegistryError::ServiceDenied { .. }));
     }
 
     #[test]

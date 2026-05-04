@@ -19,14 +19,15 @@ use crate::service::{
 };
 use atelia_core::{
     Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState,
-    EventCursor as CoreEventCursor, EventQuery, EventSeverity, EventSubjectType,
-    ExtensionInstallRecord, ExtensionStatusRequest, InstallExtensionRequest, JobEvent,
-    JobEventKind, JobId, JobKind, JobRecord, JobStatus, ListBlocklistRequest,
-    ListExtensionsRequest, OutputFormat, OversizeOutputPolicy, PathScope, PolicyOutcome, ProjectId,
-    RenderOptions, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier,
-    RollbackExtensionRequest, StoreError, ToolInvocationId, ToolOutputDefaults,
-    ToolOutputGranularity, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsScope,
-    ToolOutputVerbosity, ToolResultId, TruncationMetadata,
+    DisableExtensionRequest, EnableExtensionRequest, EventCursor as CoreEventCursor, EventQuery,
+    EventSeverity, EventSubjectType, ExtensionInstallRecord, ExtensionStatusRequest,
+    InstallExtensionRequest, JobEvent, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
+    ListBlocklistRequest, ListExtensionsRequest, OutputFormat, OversizeOutputPolicy, PathScope,
+    PolicyOutcome, ProjectId, RemoveExtensionRequest, RenderOptions, RepositoryId,
+    RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier, RollbackExtensionRequest,
+    StoreError, ToolInvocationId, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
+    ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity, ToolResultId,
+    TruncationMetadata, UpdateExtensionRequest,
 };
 use std::convert::TryFrom;
 
@@ -259,6 +260,17 @@ impl SecretaryRpcServer {
         })
     }
 
+    pub fn update_extension(
+        &self,
+        request: UpdateExtensionRequest,
+    ) -> RpcResult<UpdateExtensionResponse> {
+        let response = self.service.update_extension(request)?;
+        Ok(UpdateExtensionResponse {
+            metadata: self.metadata(),
+            record: response.record,
+        })
+    }
+
     pub fn extension_status(
         &self,
         request: ExtensionStatusRequest,
@@ -287,6 +299,39 @@ impl SecretaryRpcServer {
     ) -> RpcResult<RollbackExtensionResponse> {
         let response = self.service.rollback_extension(request)?;
         Ok(RollbackExtensionResponse {
+            metadata: self.metadata(),
+            record: response.record,
+        })
+    }
+
+    pub fn disable_extension(
+        &self,
+        request: DisableExtensionRequest,
+    ) -> RpcResult<DisableExtensionResponse> {
+        let response = self.service.disable_extension(request)?;
+        Ok(DisableExtensionResponse {
+            metadata: self.metadata(),
+            record: response.record,
+        })
+    }
+
+    pub fn enable_extension(
+        &self,
+        request: EnableExtensionRequest,
+    ) -> RpcResult<EnableExtensionResponse> {
+        let response = self.service.enable_extension(request)?;
+        Ok(EnableExtensionResponse {
+            metadata: self.metadata(),
+            record: response.record,
+        })
+    }
+
+    pub fn remove_extension(
+        &self,
+        request: RemoveExtensionRequest,
+    ) -> RpcResult<RemoveExtensionResponse> {
+        let response = self.service.remove_extension(request)?;
+        Ok(RemoveExtensionResponse {
             metadata: self.metadata(),
             record: response.record,
         })
@@ -1206,6 +1251,12 @@ pub struct InstallExtensionResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateExtensionResponse {
+    pub metadata: ProtocolMetadata,
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionStatusResponse {
     pub metadata: ProtocolMetadata,
     pub extension: atelia_core::ExtensionStatusResponse,
@@ -1219,6 +1270,24 @@ pub struct ListExtensionsResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackExtensionResponse {
+    pub metadata: ProtocolMetadata,
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisableExtensionResponse {
+    pub metadata: ProtocolMetadata,
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnableExtensionResponse {
+    pub metadata: ProtocolMetadata,
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveExtensionResponse {
     pub metadata: ProtocolMetadata,
     pub record: ExtensionInstallRecord,
 }
@@ -3891,13 +3960,15 @@ mod tests {
             .expect("install should succeed");
         assert_eq!(install.record.version, "1.0.0");
 
-        server
-            .install_extension(InstallExtensionRequest {
+        let updated = server
+            .update_extension(UpdateExtensionRequest {
                 manifest: manifest_v2,
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
             })
             .expect("update should succeed");
+        assert_eq!(updated.metadata.protocol_version, "1.0.0");
+        assert_eq!(updated.record.version, "2.0.0");
 
         let status = server
             .extension_status(ExtensionStatusRequest {
@@ -3916,6 +3987,26 @@ mod tests {
             })
             .expect("list should succeed");
         assert_eq!(list.extensions.len(), 1);
+
+        let disabled = server
+            .disable_extension(DisableExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("disable should succeed");
+        assert_eq!(
+            disabled.record.status,
+            atelia_core::ExtensionInstallStatus::Disabled
+        );
+
+        let enabled = server
+            .enable_extension(EnableExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("enable should succeed");
+        assert_eq!(
+            enabled.record.status,
+            atelia_core::ExtensionInstallStatus::Installed
+        );
 
         let rolled_back = server
             .rollback_extension(RollbackExtensionRequest {
@@ -3949,6 +4040,23 @@ mod tests {
             .list_blocklist(ListBlocklistRequest {})
             .expect("list blocklist should succeed");
         assert_eq!(blocklist.entries.len(), 1);
+
+        let removed = server
+            .remove_extension(RemoveExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("remove should succeed");
+        assert_eq!(
+            removed.record.status,
+            atelia_core::ExtensionInstallStatus::Disabled
+        );
+
+        let missing_after_remove = server
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect_err("removed extension should not have active status");
+        assert_eq!(missing_after_remove.code, RpcErrorCode::NotFound);
     }
 
     #[test]

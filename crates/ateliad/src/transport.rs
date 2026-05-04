@@ -36,9 +36,13 @@ enum Route {
     UpdateToolOutputDefaults,
     ListToolOutputSettingsHistory,
     InstallExtension,
+    UpdateExtension,
     ListExtensions,
     ExtensionStatus { extension_id: String },
     RollbackExtension { extension_id: String },
+    DisableExtension { extension_id: String },
+    EnableExtension { extension_id: String },
+    RemoveExtension { extension_id: String },
     ApplyBlocklist,
     ListBlocklist,
     RenderToolOutput,
@@ -65,6 +69,33 @@ fn route_for_path(path: &str) -> Route {
             extension_id: extension_id.to_string(),
         };
     }
+    if let Some(extension_id) = path
+        .strip_prefix("/v1/extensions/")
+        .and_then(|path| path.strip_suffix("/disable"))
+        .and_then(valid_extension_id)
+    {
+        return Route::DisableExtension {
+            extension_id: extension_id.to_string(),
+        };
+    }
+    if let Some(extension_id) = path
+        .strip_prefix("/v1/extensions/")
+        .and_then(|path| path.strip_suffix("/enable"))
+        .and_then(valid_extension_id)
+    {
+        return Route::EnableExtension {
+            extension_id: extension_id.to_string(),
+        };
+    }
+    if let Some(extension_id) = path
+        .strip_prefix("/v1/extensions/")
+        .and_then(|path| path.strip_suffix("/remove"))
+        .and_then(valid_extension_id)
+    {
+        return Route::RemoveExtension {
+            extension_id: extension_id.to_string(),
+        };
+    }
     match path {
         "/v1/health" => Route::Health,
         "/v1/repositories:list" => Route::ListRepositories,
@@ -74,6 +105,7 @@ fn route_for_path(path: &str) -> Route {
         "/v1/tool-output/settings/update" => Route::UpdateToolOutputDefaults,
         "/v1/tool-output/settings/history:list" => Route::ListToolOutputSettingsHistory,
         "/v1/extensions/install" => Route::InstallExtension,
+        "/v1/extensions/update" => Route::UpdateExtension,
         "/v1/extensions/list" => Route::ListExtensions,
         "/v1/extensions/blocklist/apply" => Route::ApplyBlocklist,
         "/v1/extensions/blocklist/list" => Route::ListBlocklist,
@@ -755,6 +787,15 @@ fn serialize_install_extension_response(
     })
 }
 
+fn serialize_update_extension_response(
+    response: rpc::UpdateExtensionResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "record": response.record,
+    })
+}
+
 fn serialize_extension_status_response(
     response: rpc::ExtensionStatusResponse,
 ) -> serde_json::Value {
@@ -773,6 +814,33 @@ fn serialize_list_extensions_response(response: rpc::ListExtensionsResponse) -> 
 
 fn serialize_rollback_extension_response(
     response: rpc::RollbackExtensionResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "record": response.record,
+    })
+}
+
+fn serialize_disable_extension_response(
+    response: rpc::DisableExtensionResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "record": response.record,
+    })
+}
+
+fn serialize_enable_extension_response(
+    response: rpc::EnableExtensionResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "record": response.record,
+    })
+}
+
+fn serialize_remove_extension_response(
+    response: rpc::RemoveExtensionResponse,
 ) -> serde_json::Value {
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
@@ -1297,6 +1365,33 @@ async fn dispatch_install_extension(state: RpcServerState, request: Request<Body
     }
 }
 
+async fn dispatch_update_extension(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<atelia_core::UpdateExtensionRequest>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.update_extension(payload) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_update_extension_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
 async fn dispatch_project_status(state: RpcServerState, request: Request<Body>) -> Response {
     let payload = match body_or_empty_json::<GetProjectStatusRequestPayload>(request).await {
         Ok(payload) => payload,
@@ -1437,6 +1532,90 @@ async fn dispatch_rollback_extension(
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_rollback_extension_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_disable_extension(
+    state: RpcServerState,
+    extension_id: String,
+    request: Request<Body>,
+) -> Response {
+    if let Err(error) = body_or_empty_json::<serde_json::Value>(request).await {
+        let rpc_server = state.read().await;
+        let next_state = rpc_next_state(&rpc_server);
+        return error.into_response(next_state);
+    }
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.disable_extension(atelia_core::DisableExtensionRequest { extension_id }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_disable_extension_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_enable_extension(
+    state: RpcServerState,
+    extension_id: String,
+    request: Request<Body>,
+) -> Response {
+    if let Err(error) = body_or_empty_json::<serde_json::Value>(request).await {
+        let rpc_server = state.read().await;
+        let next_state = rpc_next_state(&rpc_server);
+        return error.into_response(next_state);
+    }
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.enable_extension(atelia_core::EnableExtensionRequest { extension_id }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_enable_extension_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_remove_extension(
+    state: RpcServerState,
+    extension_id: String,
+    request: Request<Body>,
+) -> Response {
+    if let Err(error) = body_or_empty_json::<serde_json::Value>(request).await {
+        let rpc_server = state.read().await;
+        let next_state = rpc_next_state(&rpc_server);
+        return error.into_response(next_state);
+    }
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.remove_extension(atelia_core::RemoveExtensionRequest { extension_id }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_remove_extension_response(
                 response,
             ))),
         )
@@ -1664,6 +1843,26 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                 dispatch_install_extension(state, request).await
             }
         }
+        Route::UpdateExtension => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_update_extension(state, request).await
+            }
+        }
         Route::ListExtensions => {
             if method != Method::POST {
                 let mut response = make_error_response(
@@ -1742,6 +1941,66 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                 response
             } else {
                 dispatch_rollback_extension(state, extension_id, request).await
+            }
+        }
+        Route::DisableExtension { extension_id } => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_disable_extension(state, extension_id, request).await
+            }
+        }
+        Route::EnableExtension { extension_id } => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_enable_extension(state, extension_id, request).await
+            }
+        }
+        Route::RemoveExtension { extension_id } => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_remove_extension(state, extension_id, request).await
             }
         }
         Route::ApplyBlocklist => {
@@ -1841,6 +2100,7 @@ pub fn build_router(rpc_server: RpcServerState) -> Router {
         .route("/v1/tool-output/settings/update", any(dispatch_route))
         .route("/v1/tool-output/settings/history:list", any(dispatch_route))
         .route("/v1/extensions/install", any(dispatch_route))
+        .route("/v1/extensions/update", any(dispatch_route))
         .route("/v1/extensions/list", any(dispatch_route))
         .route("/v1/extensions/blocklist/apply", any(dispatch_route))
         .route("/v1/extensions/blocklist/list", any(dispatch_route))
@@ -2059,6 +2319,10 @@ mod tests {
             route_for_path("/v1/extensions/install"),
             Route::InstallExtension
         );
+        assert_eq!(
+            route_for_path("/v1/extensions/update"),
+            Route::UpdateExtension
+        );
         assert_eq!(route_for_path("/v1/extensions/list"), Route::ListExtensions);
         assert_eq!(
             route_for_path("/v1/extensions/blocklist/apply"),
@@ -2077,6 +2341,24 @@ mod tests {
         assert_eq!(
             route_for_path("/v1/extensions/com.example.extension/rollback"),
             Route::RollbackExtension {
+                extension_id: "com.example.extension".to_string()
+            }
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/com.example.extension/disable"),
+            Route::DisableExtension {
+                extension_id: "com.example.extension".to_string()
+            }
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/com.example.extension/enable"),
+            Route::EnableExtension {
+                extension_id: "com.example.extension".to_string()
+            }
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/com.example.extension/remove"),
+            Route::RemoveExtension {
                 extension_id: "com.example.extension".to_string()
             }
         );
@@ -2548,7 +2830,7 @@ mod tests {
         let update_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/install",
+            "/v1/extensions/update",
             serde_json::json!({
                 "manifest": manifest_v2,
                 "approve_local_unsigned": false,
@@ -2590,6 +2872,32 @@ mod tests {
             .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
             .expect("response bytes");
         assert_eq!(rollback_payload["data"]["record"]["version"], "1.0.0");
+
+        let disable_response = send_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/disable",
+        )
+        .await;
+        assert_eq!(disable_response.status(), StatusCode::OK);
+        let disable_payload = to_bytes(disable_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(disable_payload["data"]["record"]["status"], "disabled");
+
+        let enable_response = send_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/enable",
+        )
+        .await;
+        assert_eq!(enable_response.status(), StatusCode::OK);
+        let enable_payload = to_bytes(enable_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(enable_payload["data"]["record"]["status"], "installed");
 
         let block_response = send_json_request(
             &rpc_server,
@@ -2638,6 +2946,27 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+
+        let remove_response = send_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/remove",
+        )
+        .await;
+        assert_eq!(remove_response.status(), StatusCode::OK);
+        let remove_payload = to_bytes(remove_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(remove_payload["data"]["record"]["status"], "disabled");
+
+        let removed_status_response = send_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/status",
+        )
+        .await;
+        assert_eq!(removed_status_response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

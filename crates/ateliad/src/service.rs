@@ -7,17 +7,19 @@
 use atelia_core::{
     canonicalize_job_requested_capability, canonicalize_within_scope,
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
-    CancelJobReceipt, DefaultPolicyEngine, EventCursor, EventPage, EventQuery,
+    CancelJobReceipt, DefaultPolicyEngine, DisableExtensionRequest, DisableExtensionResponse,
+    EnableExtensionRequest, EnableExtensionResponse, EventCursor, EventPage, EventQuery,
     ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, InMemoryStore,
     InMemoryToolOutputSettingsService, InstallExtensionRequest, InstallExtensionResponse, JobEvent,
     JobId, JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
     ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
     OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput, RegistryError,
-    RenderedToolOutput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
-    RollbackExtensionRequest, RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt,
-    RuntimeJobRequest, SecretaryStore, StoreError, ToolInvocationId, ToolOutputDefaults,
-    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
-    ToolOutputSettingsScope, ToolResultId, TruncationMetadata,
+    RemoveExtensionRequest, RemoveExtensionResponse, RenderedToolOutput, RepositoryId,
+    RepositoryRecord, RepositoryTrustState, ResourceScope, RollbackExtensionRequest,
+    RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore,
+    StoreError, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
+    ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
+    TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -819,6 +821,15 @@ impl SecretaryService {
             .map_err(ServiceError::from)
     }
 
+    pub fn update_extension(
+        &self,
+        request: UpdateExtensionRequest,
+    ) -> ServiceResult<UpdateExtensionResponse> {
+        self.lock_extension_registry()?
+            .update_extension(request)
+            .map_err(ServiceError::from)
+    }
+
     pub fn extension_status(
         &self,
         request: ExtensionStatusRequest,
@@ -843,6 +854,33 @@ impl SecretaryService {
     ) -> ServiceResult<RollbackExtensionResponse> {
         self.lock_extension_registry()?
             .rollback_extension(request)
+            .map_err(ServiceError::from)
+    }
+
+    pub fn disable_extension(
+        &self,
+        request: DisableExtensionRequest,
+    ) -> ServiceResult<DisableExtensionResponse> {
+        self.lock_extension_registry()?
+            .disable_extension(request)
+            .map_err(ServiceError::from)
+    }
+
+    pub fn enable_extension(
+        &self,
+        request: EnableExtensionRequest,
+    ) -> ServiceResult<EnableExtensionResponse> {
+        self.lock_extension_registry()?
+            .enable_extension(request)
+            .map_err(ServiceError::from)
+    }
+
+    pub fn remove_extension(
+        &self,
+        request: RemoveExtensionRequest,
+    ) -> ServiceResult<RemoveExtensionResponse> {
+        self.lock_extension_registry()?
+            .remove_extension(request)
             .map_err(ServiceError::from)
     }
 
@@ -1298,6 +1336,26 @@ mod tests {
             .expect("rollback should succeed");
         assert_eq!(rolled_back.record.version, "1.0.0");
 
+        let disabled = svc
+            .disable_extension(DisableExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("disable should succeed");
+        assert_eq!(
+            disabled.record.status,
+            atelia_core::ExtensionInstallStatus::Disabled
+        );
+
+        let enabled = svc
+            .enable_extension(EnableExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("enable should succeed");
+        assert_eq!(
+            enabled.record.status,
+            atelia_core::ExtensionInstallStatus::Installed
+        );
+
         let block = svc
             .apply_blocklist(ApplyBlocklistRequest {
                 entry: atelia_core::BlocklistEntry {
@@ -1320,6 +1378,16 @@ mod tests {
             atelia_core::ExtensionInstallStatus::Blocked
         );
 
+        let blocked_enable = svc
+            .enable_extension(EnableExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect_err("enable should fail while extension is blocklisted");
+        assert!(matches!(
+            blocked_enable,
+            ServiceError::ExtensionRegistry(RegistryError::Blocked { .. })
+        ));
+
         let blocked_list = svc
             .list_extensions(ListExtensionsRequest {
                 include_blocked: false,
@@ -1338,6 +1406,26 @@ mod tests {
             })
             .expect("final status should succeed");
         assert_eq!(final_status.record.as_ref().unwrap().version, "1.0.0");
+
+        let removed = svc
+            .remove_extension(RemoveExtensionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect("remove should succeed");
+        assert_eq!(
+            removed.record.status,
+            atelia_core::ExtensionInstallStatus::Disabled
+        );
+
+        let missing_after_remove = svc
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect_err("removed extension should not have active status");
+        assert!(matches!(
+            missing_after_remove,
+            ServiceError::ExtensionRegistry(RegistryError::NotInstalled { .. })
+        ));
     }
 
     #[test]
