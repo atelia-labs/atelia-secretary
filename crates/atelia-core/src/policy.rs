@@ -417,11 +417,13 @@ mod tests {
 
     #[test]
     fn r1_bounded_filesystem_read_is_allowed() {
-        let decision = decide(input("filesystem.read"));
+        for capability in ["filesystem.read", "filesystem.diff", "fs.diff"] {
+            let decision = decide(input(capability));
 
-        assert_eq!(PolicyOutcome::Allowed, decision.outcome);
-        assert_eq!(RiskTier::R1, decision.risk_tier);
-        assert_eq!("bounded_read_allowed", decision.reason_code);
+            assert_eq!(PolicyOutcome::Allowed, decision.outcome, "{capability}");
+            assert_eq!(RiskTier::R1, decision.risk_tier, "{capability}");
+            assert_eq!("bounded_read_allowed", decision.reason_code, "{capability}");
+        }
     }
 
     #[test]
