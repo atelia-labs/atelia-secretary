@@ -765,12 +765,7 @@ impl SecretaryStore for InMemoryStore {
             });
         }
 
-        if lock_record.status != MigrationLockStatus::Held {
-            return Err(StoreError::Conflict {
-                collection: "schema_migrations",
-                reason: "migration lock is not held".to_string(),
-            });
-        }
+        debug_assert_eq!(lock_record.status, MigrationLockStatus::Held);
 
         let lock_record = lock.migration_lock.as_mut().unwrap();
         lock_record.status = MigrationLockStatus::Released;
