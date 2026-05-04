@@ -7,16 +7,17 @@
 use atelia_core::{
     canonicalize_job_requested_capability, canonicalize_within_scope,
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
-    CancelJobReceipt, DefaultPolicyEngine, ExtensionRegistryService, ExtensionStatusRequest,
-    ExtensionStatusResponse, InMemoryStore, InMemoryToolOutputSettingsService,
-    InstallExtensionRequest, InstallExtensionResponse, JobId, JobKind, JobLifecycleService,
-    JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest,
-    ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse, OutputFormat, PathScope,
-    PolicyEngine, PolicyInput, RegistryError, RenderedToolOutput, RepositoryId, RepositoryRecord,
-    RepositoryTrustState, ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse,
-    RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
-    ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange,
-    ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId, TruncationMetadata,
+    CancelJobReceipt, DefaultPolicyEngine, EventCursor, EventPage, EventQuery,
+    ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, InMemoryStore,
+    InMemoryToolOutputSettingsService, InstallExtensionRequest, InstallExtensionResponse, JobEvent,
+    JobId, JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
+    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
+    OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput, RegistryError,
+    RenderedToolOutput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
+    RollbackExtensionRequest, RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt,
+    RuntimeJobRequest, SecretaryStore, StoreError, ToolInvocationId, ToolOutputDefaults,
+    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
+    ToolOutputSettingsScope, ToolResultId, TruncationMetadata,
 };
 use std::collections::HashMap;
 use std::path::Path;
