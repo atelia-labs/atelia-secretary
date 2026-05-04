@@ -2500,21 +2500,47 @@ mod tests {
     #[test]
     fn render_tool_output_rejects_invalid_tool_result_ref_fields() {
         let server = ready_server();
+        let valid_ref = ToolResultRef {
+            tool_result_id: ToolResultId::new().as_str().to_string(),
+            tool_invocation_id: ToolInvocationId::new().as_str().to_string(),
+            job_id: JobId::new().as_str().to_string(),
+            repository_id: RepositoryId::new().as_str().to_string(),
+            content_type: "application/json".to_string(),
+        };
 
-        let error = server
-            .render_tool_output(RenderToolOutputRequest {
-                tool_result: ToolResultRef {
-                    tool_result_id: "tool_result_id".to_string(),
-                    tool_invocation_id: "   ".to_string(),
-                    job_id: "job_id".to_string(),
-                    repository_id: "repository_id".to_string(),
-                    content_type: "".to_string(),
-                },
-                format: RpcOutputFormat::Json,
-            })
-            .unwrap_err();
+        let cases = vec![
+            ToolResultRef {
+                tool_result_id: "tool_result_id".to_string(),
+                ..valid_ref.clone()
+            },
+            ToolResultRef {
+                tool_invocation_id: "   ".to_string(),
+                ..valid_ref.clone()
+            },
+            ToolResultRef {
+                job_id: "job_id".to_string(),
+                ..valid_ref.clone()
+            },
+            ToolResultRef {
+                repository_id: "repository_id".to_string(),
+                ..valid_ref.clone()
+            },
+            ToolResultRef {
+                content_type: "".to_string(),
+                ..valid_ref
+            },
+        ];
 
-        assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+        for tool_result in cases {
+            let error = server
+                .render_tool_output(RenderToolOutputRequest {
+                    tool_result,
+                    format: RpcOutputFormat::Json,
+                })
+                .unwrap_err();
+
+            assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+        }
     }
 
     #[test]
