@@ -1717,6 +1717,50 @@ fn join_capture_thread<T>(
     Ok(Some(captured?))
 }
 
+trait ChildTimeoutProbe {
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>>;
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus>;
+    fn handle_timeout(&mut self) -> bool;
+}
+
+impl ChildTimeoutProbe for std::process::Child {
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.try_wait()
+    }
+
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.wait()
+    }
+
+    fn handle_timeout(&mut self) -> bool {
+        kill_process_tree(self)
+    }
+}
+
+fn wait_for_child_with_recheck<C: ChildTimeoutProbe>(
+    child: &mut C,
+    timeout: Duration,
+) -> io::Result<(Option<std::process::ExitStatus>, bool, bool)> {
+    let start = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok((Some(status), false, false));
+        }
+
+        if start.elapsed() >= timeout {
+            if let Some(status) = child.try_wait()? {
+                return Ok((Some(status), false, false));
+            }
+            let process_tree_handled = child.handle_timeout();
+            let status = child.wait()?;
+            return Ok((Some(status), true, process_tree_handled));
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(unix)]
 fn kill_process_tree(child: &mut std::process::Child) -> bool {
     let pid = child.id() as i32;
@@ -1736,24 +1780,7 @@ fn wait_for_child(
     child: &mut std::process::Child,
     timeout: Duration,
 ) -> io::Result<(Option<std::process::ExitStatus>, bool, bool)> {
-    let start = Instant::now();
-
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok((Some(status), false, false));
-        }
-
-        if start.elapsed() >= timeout {
-            if let Some(status) = child.try_wait()? {
-                return Ok((Some(status), false, false));
-            }
-            let process_tree_handled = kill_process_tree(child);
-            let status = child.wait()?;
-            return Ok((Some(status), true, process_tree_handled));
-        }
-
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_child_with_recheck(child, timeout)
 }
 
 fn cleanup_spawned_child(child: &mut std::process::Child) {
@@ -1894,16 +1921,20 @@ fn execute_explicit_argv_process(
         stdout_handle,
         stop_immediately.clone(),
         CAPTURE_THREAD_JOIN_TIMEOUT,
-    )
-    .map_err(|error| format!("stdout capture thread failed: {error}"))?
-    {
-        Some(result) => result,
-        None => {
+    ) {
+        Ok(Some(result)) => result,
+        Ok(None) => {
             stdout_capture_timed_out = true;
             StreamCaptureResult {
                 original_bytes: stdout_capture_stats.read_original_bytes(),
                 retained_bytes: 0,
             }
+        }
+        Err(error) => {
+            capture_timeout.store(true, Ordering::Release);
+            stop_immediately.store(true, Ordering::Release);
+            cleanup_spawned_child(&mut child);
+            return Err(format!("stdout capture thread failed: {error}"));
         }
     };
 
@@ -1912,16 +1943,20 @@ fn execute_explicit_argv_process(
         stderr_handle,
         stop_immediately.clone(),
         CAPTURE_THREAD_JOIN_TIMEOUT,
-    )
-    .map_err(|error| format!("stderr capture thread failed: {error}"))?
-    {
-        Some(result) => result,
-        None => {
+    ) {
+        Ok(Some(result)) => result,
+        Ok(None) => {
             stderr_capture_timed_out = true;
             StreamCaptureResult {
                 original_bytes: stderr_capture_stats.read_original_bytes(),
                 retained_bytes: 0,
             }
+        }
+        Err(error) => {
+            capture_timeout.store(true, Ordering::Release);
+            stop_immediately.store(true, Ordering::Release);
+            cleanup_spawned_child(&mut child);
+            return Err(format!("stderr capture thread failed: {error}"));
         }
     };
     let capture_thread_aborted = stop_immediately.load(Ordering::Acquire);
@@ -3496,6 +3531,7 @@ mod tests {
     use crate::runtime::{RuntimeTool, SecretaryRuntime, RUNTIME_SCHEMA_VERSION};
     use crate::store::SecretaryStore;
     use crate::tool_output::{render_tool_result, OutputFormat, RenderOptions};
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -5084,6 +5120,56 @@ mod tests {
         let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
         assert!(string_value(&summary.value).contains("timed out"));
         env.cleanup();
+    }
+
+    #[cfg(unix)]
+    struct FakeChildForBoundaryRecheck {
+        try_wait_results: VecDeque<io::Result<Option<std::process::ExitStatus>>>,
+        wait_result: Option<io::Result<std::process::ExitStatus>>,
+        handle_timeout_result: bool,
+        timeout_handled: bool,
+    }
+
+    #[cfg(unix)]
+    impl ChildTimeoutProbe for FakeChildForBoundaryRecheck {
+        fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+            self.try_wait_results.pop_front().unwrap_or(Ok(None))
+        }
+
+        fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+            self.wait_result
+                .take()
+                .expect("fake child did not have wait result")
+        }
+
+        fn handle_timeout(&mut self) -> bool {
+            self.timeout_handled = true;
+            self.handle_timeout_result
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_child_rechecks_at_timeout_boundary_before_kill() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut fake = FakeChildForBoundaryRecheck {
+            try_wait_results: VecDeque::from([
+                Ok(None),
+                Ok(Some(std::process::ExitStatus::from_raw(0))),
+            ]),
+            wait_result: Some(Ok(std::process::ExitStatus::from_raw(0))),
+            handle_timeout_result: true,
+            timeout_handled: false,
+        };
+
+        let (status, timed_out, process_tree_handled) =
+            wait_for_child_with_recheck(&mut fake, Duration::from_millis(0)).unwrap();
+
+        assert_eq!(Some(0), status.and_then(|result| result.code()));
+        assert!(!timed_out);
+        assert!(!process_tree_handled);
+        assert!(!fake.timeout_handled);
     }
 
     #[cfg(unix)]
