@@ -1484,6 +1484,7 @@ struct CapturedStream {
     original_bytes: usize,
     retained_bytes: usize,
     truncated: bool,
+    timed_out: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1586,6 +1587,7 @@ fn capture_text_output(bytes: Vec<u8>, original_bytes: usize) -> CapturedStream 
         text,
         original_bytes,
         truncated: original_bytes > bytes.len(),
+        timed_out: false,
     }
 }
 
@@ -1646,22 +1648,43 @@ fn capture_stream_to_file<R: Read + AsRawFd + Send + 'static>(
     let mut buffer = [0u8; 8192];
     let mut original_bytes = 0usize;
     let mut retained_bytes = 0usize;
+    let mut poll_fds = [libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
 
     loop {
         if stop_immediately.load(Ordering::Acquire) {
             break;
         }
 
+        let timeout_ms: libc::c_int = if stop_after_timeout.load(Ordering::Acquire) {
+            10
+        } else {
+            100
+        };
+        poll_fds[0].revents = 0;
+        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 1, timeout_ms) };
+        if poll_result < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        if poll_result == 0 {
+            if stop_after_timeout.load(Ordering::Acquire) {
+                break;
+            }
+            continue;
+        }
+
         let read = match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if stop_after_timeout.load(Ordering::Acquire) {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(1));
-                continue;
-            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
 
@@ -2009,6 +2032,8 @@ fn execute_explicit_argv_process(
 
     let mut stdout = capture_text_output(stdout_bytes, 0);
     let mut stderr = capture_text_output(stderr_bytes, 0);
+    stdout.timed_out = stdout_capture_timed_out;
+    stderr.timed_out = stderr_capture_timed_out;
     stdout.original_bytes = stdout_capture_result.original_bytes;
     stdout.retained_bytes = if stdout_capture_timed_out {
         stdout_retained_bytes
@@ -2022,10 +2047,16 @@ fn execute_explicit_argv_process(
         stderr_capture_result.retained_bytes
     };
 
-    stdout.truncated = stdout_capture_timed_out
-        || stdout_capture_result.original_bytes > stdout_capture_result.retained_bytes;
-    stderr.truncated = stderr_capture_timed_out
-        || stderr_capture_result.original_bytes > stderr_capture_result.retained_bytes;
+    stdout.truncated = stdout_capture_result.original_bytes > stdout_capture_result.retained_bytes;
+    stderr.truncated = stderr_capture_result.original_bytes > stderr_capture_result.retained_bytes;
+    if capture_thread_aborted {
+        if stdout.truncated {
+            stdout.timed_out = true;
+        }
+        if stderr.truncated {
+            stderr.timed_out = true;
+        }
+    }
 
     let duration_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
     let exit_code = status.and_then(|exit_status| exit_status.code().map(i64::from));
@@ -2160,11 +2191,17 @@ impl crate::runtime::RuntimeTool for ProcExecTool {
         };
 
         let mut truncation_reasons = Vec::new();
+        if outcome.stdout.timed_out {
+            truncation_reasons.push("stdout capture timed out".to_string());
+        }
         if outcome.stdout.truncated {
             truncation_reasons.push(format!(
                 "stdout truncated at {} bytes",
                 self.max_output_bytes
             ));
+        }
+        if outcome.stderr.timed_out {
+            truncation_reasons.push("stderr capture timed out".to_string());
         }
         if outcome.stderr.truncated {
             truncation_reasons.push(format!(
@@ -5269,7 +5306,7 @@ mod tests {
         env.cleanup();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn proc_exec_normal_exit_with_background_descendants_is_cleaned_up() {
         let env = TestEnv::new("proc-normal-exit-descendant-cleanup");
@@ -5522,7 +5559,7 @@ exec 'sleep', '9999';
         assert_eq!(StructuredValue::Bool(true), stdout_truncated.value);
         assert_eq!(StructuredValue::Bool(false), stderr_truncated.value);
         let trunc = result.truncation.unwrap();
-        assert!(trunc.reason.contains("stdout truncated at 128 bytes"));
+        assert!(trunc.reason.contains("stdout capture timed out"));
         assert!(!trunc.reason.contains("stderr truncated at 128 bytes"));
         let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
         assert!(string_value(&summary.value).contains("output capture stream timeout"));
