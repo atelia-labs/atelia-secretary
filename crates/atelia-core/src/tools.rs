@@ -4929,7 +4929,7 @@ mod tests {
         env.cleanup();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn proc_exec_times_out_with_detached_descendant_is_reported() {
         let env = TestEnv::new("proc-timeout-detached-descendant");
