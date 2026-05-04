@@ -2166,7 +2166,15 @@ fn execute_explicit_argv_process(
     let capture_thread_aborted = stop_immediately.load(Ordering::Acquire);
 
     let capture_timed_out = stdout_capture_timed_out || stderr_capture_timed_out;
+    #[cfg(unix)]
+    let mut group_cleanup_attempted = false;
+    #[cfg(not(unix))]
+    let group_cleanup_attempted = false;
     if capture_timed_out || capture_thread_aborted {
+        #[cfg(unix)]
+        {
+            group_cleanup_attempted = true;
+        }
         process_tree_handled = process_tree_handled || kill_process_group(child_pgid);
     }
     #[cfg(target_os = "linux")]
@@ -2175,10 +2183,18 @@ fn execute_explicit_argv_process(
             .map(|cutoff| process_group_has_live_member_from_before_exit(child_pgid, cutoff))
             .unwrap_or(false)
     {
+        #[cfg(unix)]
+        {
+            group_cleanup_attempted = true;
+        }
         process_tree_handled = process_tree_handled || kill_process_group(child_pgid);
     }
     #[cfg(not(target_os = "linux"))]
     if !process_timed_out && process_group_has_live_member_from_before_exit(child_pgid, 0) {
+        #[cfg(unix)]
+        {
+            group_cleanup_attempted = true;
+        }
         process_tree_handled = process_tree_handled || kill_process_group(child_pgid);
     }
 
@@ -2238,9 +2254,15 @@ fn execute_explicit_argv_process(
         }
     }
     if capture_thread_aborted || stdout_capture_timed_out || stderr_capture_timed_out {
-        summary.push_str(
-            " output capture stream timeout may indicate escaped descendants with inherited stdio; detached process-tree cleanup is unsupported",
-        );
+        if group_cleanup_attempted {
+            summary.push_str(
+                " output capture stream timeout may indicate escaped descendants with inherited stdio; group cleanup was attempted but some descendants may have escaped with inherited stdio",
+            );
+        } else {
+            summary.push_str(
+                " output capture stream timeout may indicate escaped descendants with inherited stdio; detached process-tree cleanup is unsupported",
+            );
+        }
     }
     summary.push_str(&format!(" in {}", canonical_cwd.display_path()));
 
@@ -5465,36 +5487,18 @@ mod tests {
     fn proc_exec_normal_exit_with_background_descendants_is_cleaned_up() {
         let env = TestEnv::new("proc-normal-exit-descendant-cleanup");
         let background_pid_file = env.root.join("background-child.pid");
-        let parent_info_file = env.root.join("parent.info");
         let script = format!(
             r#"
-use POSIX qw(setpgid getpgrp);
-setpgid(0, 0);
-my $parent_pgid = getpgrp();
-open my $parent_info, '>', '{}'
-    or die "failed to record parent process info";
-print $parent_info "$$:$parent_pgid\n";
-close $parent_info;
-my $child = fork();
-if ($child) {{
-    open my $child_pid, '>', '{}'
-        or die "failed to record child process id";
-    print $child_pid "$child\n";
-    close $child_pid;
-    exit 0;
-}}
-setpgid(0, $parent_pgid) if $parent_pgid;
-exec 'sleep', '9999';
+trap '' HUP
+sleep 9999 &
+printf '%s\n' "$!" > '{}'
+exit 0
 "#,
-            parent_info_file.to_string_lossy(),
             background_pid_file.to_string_lossy()
         );
 
-        let tool = ProcExecTool::new(
-            &env.root,
-            vec!["perl".to_string(), "-e".to_string(), script],
-        )
-        .with_timeout(Duration::from_millis(250));
+        let tool = ProcExecTool::new(&env.root, vec!["sh".to_string(), "-c".to_string(), script])
+            .with_timeout(Duration::from_millis(250));
 
         let invocation = fake_invocation(tool.tool_id());
         let request = request_with_path(".");
@@ -5504,7 +5508,10 @@ exec 'sleep', '9999';
         let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
         assert_eq!(StructuredValue::Bool(false), timed_out.value);
         let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
-        assert!(string_value(&summary.value).contains("output capture stream timeout"));
+        let summary = string_value(&summary.value);
+        assert!(summary.contains("output capture stream timeout"));
+        assert!(summary.contains("group cleanup was attempted"));
+        assert!(!summary.contains("detached process-tree cleanup is unsupported"));
 
         let child_pid: u32 = (0..20)
             .find_map(|_| {
@@ -5513,15 +5520,6 @@ exec 'sleep', '9999';
                     .and_then(|text| text.trim().parse::<u32>().ok())
             })
             .unwrap_or_else(|| panic!("missing child pid file {}", background_pid_file.display()));
-
-        let parent_info = std::fs::read_to_string(&parent_info_file)
-            .unwrap_or_else(|_| panic!("missing parent info file {}", parent_info_file.display()));
-        let expected_parent_pgid: u32 = parent_info
-            .trim()
-            .split(':')
-            .nth(1)
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap();
 
         let mut attempts = 20;
         let mut child_still_running = true;
@@ -5550,10 +5548,6 @@ exec 'sleep', '9999';
                 .get(4)
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(0);
-            assert_eq!(
-                expected_parent_pgid, child_pgid,
-                "expected background descendant to remain in parent process group"
-            );
         }
 
         let _ = std::process::Command::new("kill")
@@ -5563,7 +5557,7 @@ exec 'sleep', '9999';
 
         assert!(
             !child_still_running,
-            "background descendant should be cleaned up when parent exits normally (pid={child_pid}, pgrp={child_pgid}, parent_pgid={expected_parent_pgid})"
+            "background descendant should be cleaned up when parent exits normally (pid={child_pid}, pgrp={child_pgid})"
         );
         env.cleanup();
     }
