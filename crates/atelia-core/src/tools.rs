@@ -1,7 +1,7 @@
 //! Built-in filesystem tools for Atelia Secretary.
 //!
 //! Provides repository-scoped `fs.list`, `fs.stat`, `fs.read`, `fs.search`,
-//! `fs.write`, and `fs.patch` tools that implement
+//! `fs.diff`, `fs.write`, and `fs.patch` tools that implement
 //! [`crate::runtime::RuntimeTool`] and enforce path canonicalization with
 //! symlink escape rejection per `docs/execution-semantics.md`.
 
@@ -43,6 +43,8 @@ const DEFAULT_READ_MAX_CHARS: usize = 32 * 1024;
 const DEFAULT_READ_MAX_SCAN_BYTES: u64 = 1024 * 1024;
 const DEFAULT_SEARCH_MAX_RESULTS: usize = 100;
 const DEFAULT_SEARCH_MAX_FILE_BYTES: u64 = 64 * 1024;
+const DEFAULT_DIFF_MAX_BYTES: usize = 64 * 1024;
+const DEFAULT_DIFF_MAX_CHARS: usize = 32 * 1024;
 const DEFAULT_WRITE_MAX_BYTES: usize = 32 * 1024;
 #[cfg(unix)]
 const WRITE_FILE_TMP_PREFIX: &str = "atelia-write-tmp";
@@ -1211,6 +1213,274 @@ impl crate::runtime::RuntimeTool for FsReadTool {
         )
     }
 }
+
+// ---------------------------------------------------------------------------
+// FsDiffTool
+// ---------------------------------------------------------------------------
+
+/// Produces a bounded line-oriented diff between two files in repository scope.
+#[derive(Debug, Clone)]
+pub struct FsDiffTool {
+    repository_root: PathBuf,
+    comparison_path: PathBuf,
+    max_bytes: usize,
+    max_chars: usize,
+}
+
+impl FsDiffTool {
+    pub fn new(repository_root: impl Into<PathBuf>, comparison_path: impl Into<PathBuf>) -> Self {
+        Self {
+            repository_root: repository_root.into(),
+            comparison_path: comparison_path.into(),
+            max_bytes: DEFAULT_DIFF_MAX_BYTES,
+            max_chars: DEFAULT_DIFF_MAX_CHARS,
+        }
+    }
+
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    pub fn with_max_chars(mut self, max_chars: usize) -> Self {
+        self.max_chars = max_chars;
+        self
+    }
+
+    fn resolve_diff_paths(
+        &self,
+        request: &RuntimeJobRequest,
+    ) -> Result<(CanonicalPath, CanonicalPath), String> {
+        let left = canonicalize_within_scope(&self.repository_root, &target_from_request(request))
+            .map_err(|error| error.to_string())?;
+        let right = canonicalize_within_scope(&self.repository_root, &self.comparison_path)
+            .map_err(|error| error.to_string())?;
+        Ok((left, right))
+    }
+}
+
+impl crate::runtime::RuntimeTool for FsDiffTool {
+    fn tool_id(&self) -> &'static str {
+        "fs.diff"
+    }
+
+    fn requested_capability(&self) -> &'static str {
+        "filesystem.diff"
+    }
+
+    fn declared_effect(&self) -> &'static str {
+        "compare two bounded UTF-8 files within the registered repository scope"
+    }
+
+    fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+        let mut parts = vec![
+            format!("left={}", request.resource_scope.value),
+            format!("right={}", self.comparison_path.display()),
+        ];
+        if self.max_bytes != DEFAULT_DIFF_MAX_BYTES {
+            parts.push(format!("bytes={}", self.max_bytes));
+        }
+        if self.max_chars != DEFAULT_DIFF_MAX_CHARS {
+            parts.push(format!("chars={}", self.max_chars));
+        }
+        parts.join(" ")
+    }
+
+    fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
+        match self.resolve_diff_paths(request) {
+            Ok((left, right)) => vec![
+                ResolvedPath {
+                    requested_path: request.resource_scope.value.clone(),
+                    resolved_path: left.canonical.to_string_lossy().to_string(),
+                    display_path: left.display_path(),
+                },
+                ResolvedPath {
+                    requested_path: self.comparison_path.to_string_lossy().to_string(),
+                    resolved_path: right.canonical.to_string_lossy().to_string(),
+                    display_path: right.display_path(),
+                },
+            ],
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
+        let schema_ref = "tool_result.fs.diff.v1";
+        let (left, right) = match self.resolve_diff_paths(request) {
+            Ok(paths) => paths,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "diff failed: path rejected".to_string(),
+                    err,
+                );
+            }
+        };
+
+        let left_content = match read_canonical_text_file(&left, self.max_bytes) {
+            Ok(content) => content,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "diff failed: cannot read left file".to_string(),
+                    format!("{}: {}", left.display_path(), err),
+                );
+            }
+        };
+        let right_content = match read_canonical_text_file(&right, self.max_bytes) {
+            Ok(content) => content,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "diff failed: cannot read right file".to_string(),
+                    format!("{}: {}", right.display_path(), err),
+                );
+            }
+        };
+
+        let raw_diff = render_line_diff(
+            &left.display_path(),
+            &right.display_path(),
+            &left_content,
+            &right_content,
+        );
+        let (diff, retained_bytes, truncated) = truncate_utf8_by_chars(&raw_diff, self.max_chars);
+        let changed = left_content != right_content;
+        let summary = if changed {
+            format!(
+                "diffed {} against {}",
+                left.display_path(),
+                right.display_path()
+            )
+        } else {
+            format!(
+                "{} and {} have identical UTF-8 content",
+                left.display_path(),
+                right.display_path()
+            )
+        };
+
+        make_tool_result(
+            invocation,
+            ToolResultStatus::Succeeded,
+            schema_ref,
+            vec![
+                ToolResultField {
+                    key: "summary".to_string(),
+                    value: StructuredValue::String(summary),
+                },
+                ToolResultField {
+                    key: "left_path".to_string(),
+                    value: StructuredValue::String(left.display_path()),
+                },
+                ToolResultField {
+                    key: "right_path".to_string(),
+                    value: StructuredValue::String(right.display_path()),
+                },
+                ToolResultField {
+                    key: "diff".to_string(),
+                    value: StructuredValue::String(diff),
+                },
+                ToolResultField {
+                    key: "changed".to_string(),
+                    value: StructuredValue::Bool(changed),
+                },
+                ToolResultField {
+                    key: "left_bytes".to_string(),
+                    value: StructuredValue::Integer(left_content.len() as i64),
+                },
+                ToolResultField {
+                    key: "right_bytes".to_string(),
+                    value: StructuredValue::Integer(right_content.len() as i64),
+                },
+            ],
+            truncated.then(|| TruncationMetadata {
+                original_bytes: raw_diff.len() as u64,
+                retained_bytes,
+                reason: format!("diff output truncated at {} characters", self.max_chars),
+            }),
+            Vec::new(),
+        )
+    }
+}
+
+fn read_canonical_text_file(canonical: &CanonicalPath, max_bytes: usize) -> io::Result<String> {
+    let mut file = open_canonical_file_within_scope(canonical)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target is not a file",
+        ));
+    }
+    read_entire_text_file_from_open_file(&mut file, max_bytes)
+}
+
+fn render_line_diff(left_path: &str, right_path: &str, left: &str, right: &str) -> String {
+    if left == right {
+        return String::new();
+    }
+
+    let left_lines: Vec<&str> = left.lines().collect();
+    let right_lines: Vec<&str> = right.lines().collect();
+    let mut output = format!("--- {left_path}\n+++ {right_path}\n");
+    let max_len = left_lines.len().max(right_lines.len());
+
+    for index in 0..max_len {
+        match (left_lines.get(index), right_lines.get(index)) {
+            (Some(left_line), Some(right_line)) if left_line == right_line => {
+                output.push(' ');
+                output.push_str(left_line);
+                output.push('\n');
+            }
+            (Some(left_line), Some(right_line)) => {
+                output.push('-');
+                output.push_str(left_line);
+                output.push('\n');
+                output.push('+');
+                output.push_str(right_line);
+                output.push('\n');
+            }
+            (Some(left_line), None) => {
+                output.push('-');
+                output.push_str(left_line);
+                output.push('\n');
+            }
+            (None, Some(right_line)) => {
+                output.push('+');
+                output.push_str(right_line);
+                output.push('\n');
+            }
+            (None, None) => {}
+        }
+    }
+
+    output
+}
+
+fn truncate_utf8_by_chars(value: &str, max_chars: usize) -> (String, u64, bool) {
+    if max_chars == 0 && !value.is_empty() {
+        return (String::new(), 0, true);
+    }
+
+    let mut end = value.len();
+    let mut truncated = false;
+
+    for (count, (index, _)) in value.char_indices().enumerate() {
+        if count == max_chars {
+            end = index;
+            truncated = true;
+            break;
+        }
+    }
+
+    let retained = &value[..end];
+    (retained.to_string(), retained.len() as u64, truncated)
+}
+
 // ---------------------------------------------------------------------------
 // FsSearchTool
 // ---------------------------------------------------------------------------
@@ -4790,6 +5060,91 @@ mod tests {
         let _ = fs::remove_dir_all(&artifact_store_root);
     }
 
+    // -- FsDiffTool tests --
+
+    #[test]
+    fn fs_diff_reports_changed_lines_between_scoped_files() {
+        let env = TestEnv::new("diff-changed");
+        env.create_file("before.txt", "alpha\nbeta\ngamma\n");
+        env.create_file("after.txt", "alpha\nBETA\ngamma\nnew\n");
+
+        let tool = FsDiffTool::new(&env.root, "after.txt");
+        let invocation = fake_invocation(tool.tool_id());
+        let result = tool.execute(&invocation, &request_with_path("before.txt"));
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            Some("tool_result.fs.diff.v1".to_string()),
+            result.schema_ref
+        );
+        let diff = result.fields.iter().find(|f| f.key == "diff").unwrap();
+        let diff = string_value(&diff.value);
+        assert!(diff.contains("--- before.txt"));
+        assert!(diff.contains("+++ after.txt"));
+        assert!(diff.contains("-beta"));
+        assert!(diff.contains("+BETA"));
+        assert!(diff.contains("+new"));
+        let changed = result.fields.iter().find(|f| f.key == "changed").unwrap();
+        assert_eq!(StructuredValue::Bool(true), changed.value);
+        assert!(result.truncation.is_none());
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_diff_returns_empty_diff_for_identical_files() {
+        let env = TestEnv::new("diff-identical");
+        env.create_file("left.txt", "same\ncontent\n");
+        env.create_file("right.txt", "same\ncontent\n");
+
+        let tool = FsDiffTool::new(&env.root, "right.txt");
+        let invocation = fake_invocation(tool.tool_id());
+        let result = tool.execute(&invocation, &request_with_path("left.txt"));
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let diff = result.fields.iter().find(|f| f.key == "diff").unwrap();
+        assert_eq!("", string_value(&diff.value));
+        let changed = result.fields.iter().find(|f| f.key == "changed").unwrap();
+        assert_eq!(StructuredValue::Bool(false), changed.value);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_diff_truncates_output_on_character_boundary() {
+        let env = TestEnv::new("diff-truncate");
+        env.create_file("left.txt", "ééé\nleft\n");
+        env.create_file("right.txt", "ééé\nright\n");
+
+        let tool = FsDiffTool::new(&env.root, "right.txt").with_max_chars(12);
+        let invocation = fake_invocation(tool.tool_id());
+        let result = tool.execute(&invocation, &request_with_path("left.txt"));
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let diff = result.fields.iter().find(|f| f.key == "diff").unwrap();
+        assert!(string_value(&diff.value).is_char_boundary(string_value(&diff.value).len()));
+        let truncation = result.truncation.unwrap();
+        assert!(truncation.reason.contains("12 characters"));
+        assert!(truncation.retained_bytes <= truncation.original_bytes);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_diff_rejects_out_of_scope_comparison_path() {
+        let env = TestEnv::new("diff-outside");
+        env.create_file("left.txt", "left");
+
+        let tool = FsDiffTool::new(&env.root, "../../outside.txt");
+        let invocation = fake_invocation(tool.tool_id());
+        let result = tool.execute(&invocation, &request_with_path("left.txt"));
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(
+            string_value(&error.value).contains("outside repository root")
+                || string_value(&error.value).contains("not found")
+        );
+        env.cleanup();
+    }
+
     // -- FsSearchTool tests --
 
     #[test]
@@ -6243,6 +6598,57 @@ exit 0
         let result = receipt.tool_result.unwrap();
         let content = result.fields.iter().find(|f| f.key == "content").unwrap();
         assert_eq!("# hello\nbody", string_value(&content.value));
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_diff_integrates_with_secretary_runtime() {
+        let env = TestEnv::new("runtime-diff");
+        env.create_file("before.txt", "alpha\nbeta\n");
+        env.create_file("after.txt", "alpha\nBETA\n");
+
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = RepositoryRecord::new(
+            "test-repo",
+            env.root.to_string_lossy(),
+            RepositoryTrustState::Trusted,
+            LedgerTimestamp::now(),
+        );
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let tool = FsDiffTool::new(&env.root, "after.txt");
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "diff repository files",
+        )
+        .with_resource_scope("path", "before.txt");
+
+        let receipt = runtime.run_tool_job(request, &tool).unwrap();
+
+        assert_eq!(crate::domain::JobStatus::Succeeded, receipt.job.status);
+        assert_eq!("fs.diff", receipt.tool_invocation.as_ref().unwrap().tool_id);
+        assert_eq!(
+            crate::domain::PolicyOutcome::Allowed,
+            receipt.policy_decision.outcome
+        );
+        assert_eq!(
+            2,
+            receipt
+                .tool_invocation
+                .as_ref()
+                .unwrap()
+                .resolved_paths
+                .len()
+        );
+        let result = receipt.tool_result.unwrap();
+        let diff = result.fields.iter().find(|f| f.key == "diff").unwrap();
+        assert!(string_value(&diff.value).contains("-beta"));
+        assert!(string_value(&diff.value).contains("+BETA"));
         env.cleanup();
     }
 
