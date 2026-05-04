@@ -289,8 +289,9 @@ pub struct ToolOutputDefaults {
     /// the runtime render and oversize-handling paths.
     pub max_inline_bytes: u64,
     pub max_inline_lines: u32,
-    /// Reserved for future renderer policy rollout; currently persisted and
-    /// validated but not yet enforced by runtime output rendering.
+    /// Validated and enforced by runtime output rendering via
+    /// `render_policy_with_render_options` -> `apply_verbosity_constraints`
+    /// -> `render_tool_result_with_policy`.
     pub verbosity: ToolOutputVerbosity,
     pub granularity: ToolOutputGranularity,
     /// Runtime oversize behavior carried into `ToolOutputRenderPolicy` and
