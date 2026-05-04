@@ -18,7 +18,7 @@ use crate::policy::{
 use crate::settings::{OversizeOutputPolicy, ToolOutputDefaults};
 use crate::store::{EventCursor, InMemoryStore, JobPage, JobQuery, SecretaryStore, StoreError};
 use crate::tool_output::{
-    render_tool_result, OutputFormat, RenderOptions, RenderedToolOutput, ToolOutputRenderError,
+    render_tool_result_with_policy, RenderOptions, RenderedToolOutput, ToolOutputRenderError,
 };
 use std::error::Error;
 use std::fmt;
@@ -34,7 +34,7 @@ pub struct RuntimeJobRequest {
     pub resource_scope: ResourceScope,
     pub requested_capabilities: Vec<String>,
     pub approval_available: bool,
-    pub render_options: RenderOptions,
+    pub render_options: Option<RenderOptions>,
     pub tool_output_defaults: ToolOutputDefaults,
     pub artifact_spillover: Option<RuntimeArtifactSpillover>,
 }
@@ -57,7 +57,7 @@ impl RuntimeJobRequest {
             },
             requested_capabilities: Vec::new(),
             approval_available: true,
-            render_options: RenderOptions::new(OutputFormat::Toon),
+            render_options: None,
             tool_output_defaults: ToolOutputDefaults::default(),
             artifact_spillover: None,
         }
@@ -86,7 +86,7 @@ impl RuntimeJobRequest {
     }
 
     pub fn with_render_options(mut self, render_options: RenderOptions) -> Self {
-        self.render_options = render_options;
+        self.render_options = Some(render_options);
         self
     }
 
@@ -444,46 +444,102 @@ where
             )?;
             return Err(error);
         }
-        if let Some(spillover) = &request.artifact_spillover {
-            let artifact_store = LocalArtifactStore::new(spillover.store_config.clone());
-            if let Err(error) = spill_large_tool_result_fields(
-                &mut result,
-                &artifact_store,
-                repository.id.as_str(),
-                &spillover.options,
-            ) {
+
+        let render_policy = request
+            .tool_output_defaults
+            .render_policy_with_render_options(request.render_options.as_ref());
+
+        if matches!(
+            request.tool_output_defaults.oversize_policy,
+            OversizeOutputPolicy::RejectOversize
+        ) {
+            if let Some(reason) =
+                reject_oversized_tool_result(&result, &request.tool_output_defaults)
+            {
                 let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
                 append_failed_job_event(
                     &self.store,
                     &mut job,
                     &mut events,
-                    "artifact spillover failed",
+                    "tool result exceeded output size limits",
                     failure_refs,
                 )?;
-                return Err(error.into());
+                return Err(RuntimeError::ToolOutputTooLarge { reason });
+            }
+        }
+
+        let rendered_output = match render_tool_result_with_policy(&result, &render_policy) {
+            Ok(rendered_output) => rendered_output,
+            Err(error) => {
+                let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
+                append_failed_job_event(
+                    &self.store,
+                    &mut job,
+                    &mut events,
+                    "tool output rendering failed",
+                    failure_refs,
+                )?;
+                return Err(RuntimeError::ToolOutputRender(error));
+            }
+        };
+
+        let mut should_rerender_output = false;
+        let max_inline_bytes =
+            max_inline_bytes_as_usize(request.tool_output_defaults.max_inline_bytes);
+
+        if let Some(spillover) = &request.artifact_spillover {
+            let artifact_store = LocalArtifactStore::new(spillover.store_config.clone());
+            let report = spill_large_tool_result_fields(
+                &mut result,
+                &artifact_store,
+                repository.id.as_str(),
+                &spillover.options,
+            );
+            match report {
+                Ok(Some(_)) => {
+                    should_rerender_output = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
+                    append_failed_job_event(
+                        &self.store,
+                        &mut job,
+                        &mut events,
+                        "artifact spillover failed",
+                        failure_refs,
+                    )?;
+                    return Err(error.into());
+                }
             }
         } else {
-            let max_inline_bytes =
-                max_inline_bytes_as_usize(request.tool_output_defaults.max_inline_bytes);
             match request.tool_output_defaults.oversize_policy {
                 OversizeOutputPolicy::SpillToArtifactRef => {
                     let spillover = RuntimeArtifactSpillover::local_default(max_inline_bytes);
                     let artifact_store = LocalArtifactStore::new(spillover.store_config.clone());
-                    if let Err(error) = spill_large_tool_result_fields(
+                    let report = spill_large_tool_result_fields(
                         &mut result,
                         &artifact_store,
                         repository.id.as_str(),
                         &spillover.options,
-                    ) {
-                        let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
-                        append_failed_job_event(
-                            &self.store,
-                            &mut job,
-                            &mut events,
-                            "artifact spillover failed",
-                            failure_refs,
-                        )?;
-                        return Err(error.into());
+                    );
+                    match report {
+                        Ok(Some(_)) => {
+                            should_rerender_output = true;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let failure_refs =
+                                refs_for_invocation(&job, &policy_decision, &invocation);
+                            append_failed_job_event(
+                                &self.store,
+                                &mut job,
+                                &mut events,
+                                "artifact spillover failed",
+                                failure_refs,
+                            )?;
+                            return Err(error.into());
+                        }
                     }
                 }
                 OversizeOutputPolicy::RejectOversize => {
@@ -505,6 +561,7 @@ where
                     if let Some(report) =
                         truncate_oversized_tool_result_fields(&mut result, max_inline_bytes)
                     {
+                        should_rerender_output = true;
                         result.truncation = Some(merge_runtime_truncation(
                             result.truncation.take(),
                             report.original_bytes,
@@ -580,7 +637,24 @@ where
         );
         job.latest_event_id = events.last().map(|event| event.id.clone());
 
-        let rendered_output = render_tool_result(&result, &request.render_options)?;
+        let rendered_output = if should_rerender_output {
+            match render_tool_result_with_policy(&result, &render_policy) {
+                Ok(rendered_output) => rendered_output,
+                Err(error) => {
+                    let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
+                    append_failed_job_event(
+                        &self.store,
+                        &mut job,
+                        &mut events,
+                        "tool output rendering failed",
+                        failure_refs,
+                    )?;
+                    return Err(RuntimeError::ToolOutputRender(error));
+                }
+            }
+        } else {
+            rendered_output
+        };
 
         Ok(RuntimeJobReceipt {
             job,
@@ -1087,9 +1161,10 @@ fn tool_result_event_severity(status: ToolResultStatus) -> EventSeverity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{RepositoryRecord, RepositoryTrustState};
+    use crate::domain::{OutputRef, OutputRefId, RepositoryRecord, RepositoryTrustState};
     use crate::settings::{OversizeOutputPolicy, ToolOutputDefaults};
     use crate::store::EventCursor;
+    use crate::tool_output::OutputFormat;
     use std::ffi::OsString;
     use std::sync::{LazyLock, Mutex};
 
@@ -1420,6 +1495,236 @@ mod tests {
     }
 
     #[test]
+    fn runtime_uses_settings_render_options_when_request_does_not_override() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "prove settings drive rendering",
+        )
+        .with_tool_output_defaults(ToolOutputDefaults {
+            render_options: RenderOptions {
+                format: OutputFormat::Json,
+                include_policy: true,
+                include_diagnostics: true,
+                include_cost: true,
+            },
+            max_inline_bytes: 16 * 1024,
+            max_inline_lines: 8,
+            verbosity: crate::settings::ToolOutputVerbosity::Normal,
+            granularity: crate::settings::ToolOutputGranularity::Full,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        });
+
+        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+        let rendered = receipt.rendered_output.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Json);
+        assert_eq!(json["tool_id"], "secretary.echo");
+        assert!(!json["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field["key"] == "policy.state"));
+    }
+
+    #[test]
+    fn runtime_honors_per_request_render_options_as_an_explicit_override() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "prove settings drive rendering",
+        )
+        .with_render_options(RenderOptions {
+            format: OutputFormat::Json,
+            include_policy: true,
+            include_diagnostics: true,
+            include_cost: true,
+        })
+        .with_tool_output_defaults(ToolOutputDefaults {
+            render_options: RenderOptions {
+                format: OutputFormat::Text,
+                include_policy: false,
+                include_diagnostics: false,
+                include_cost: false,
+            },
+            max_inline_bytes: 16 * 1024,
+            max_inline_lines: 8,
+            verbosity: crate::settings::ToolOutputVerbosity::Normal,
+            granularity: crate::settings::ToolOutputGranularity::Full,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        });
+
+        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+        let rendered = receipt.rendered_output.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Json);
+        assert_eq!(json["tool_id"], "secretary.echo");
+        assert!(!json["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field["key"] == "policy.state"));
+    }
+
+    #[test]
+    fn runtime_uses_compact_json_without_unnecessary_truncation() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        struct JsonFallbackTool;
+
+        impl RuntimeTool for JsonFallbackTool {
+            fn tool_id(&self) -> &'static str {
+                "secretary.json_fallback_fixture"
+            }
+
+            fn requested_capability(&self) -> &'static str {
+                "capability.discovery"
+            }
+
+            fn declared_effect(&self) -> &'static str {
+                "return a structured output that exceeds the JSON line budget"
+            }
+
+            fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+                format!("goal={}", request.goal)
+            }
+
+            fn execute(
+                &self,
+                invocation: &ToolInvocation,
+                _request: &RuntimeJobRequest,
+            ) -> ToolResult {
+                ToolResult {
+                    id: ToolResultId::new(),
+                    schema_version: RUNTIME_SCHEMA_VERSION,
+                    created_at: LedgerTimestamp::now(),
+                    invocation_id: invocation.id.clone(),
+                    tool_id: invocation.tool_id.clone(),
+                    status: ToolResultStatus::Succeeded,
+                    schema_ref: Some("tool_result.json_fallback_fixture.v1".to_string()),
+                    fields: vec![
+                        ToolResultField {
+                            key: "summary".to_string(),
+                            value: StructuredValue::String("json fallback probe".to_string()),
+                        },
+                        ToolResultField {
+                            key: "detail".to_string(),
+                            value: StructuredValue::String("first detail".to_string()),
+                        },
+                        ToolResultField {
+                            key: "secondary".to_string(),
+                            value: StructuredValue::String("second detail".to_string()),
+                        },
+                    ],
+                    evidence_refs: Vec::new(),
+                    output_refs: vec![OutputRef {
+                        id: OutputRefId::new(),
+                        uri: "artifact://json-fallback/output".to_string(),
+                        media_type: "text/plain".to_string(),
+                        label: Some("fallback output".to_string()),
+                        digest: None,
+                    }],
+                    truncation: None,
+                    redactions: Vec::new(),
+                }
+            }
+        }
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "surface render fallback",
+        )
+        .with_render_options(RenderOptions {
+            format: OutputFormat::Json,
+            include_policy: true,
+            include_diagnostics: true,
+            include_cost: true,
+        })
+        .with_tool_output_defaults(ToolOutputDefaults {
+            render_options: RenderOptions::new(OutputFormat::Toon),
+            max_inline_bytes: 16 * 1024,
+            max_inline_lines: 2,
+            verbosity: crate::settings::ToolOutputVerbosity::Normal,
+            granularity: crate::settings::ToolOutputGranularity::Full,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        });
+
+        let receipt = runtime.run_tool_job(request, &JsonFallbackTool).unwrap();
+        let rendered = receipt.rendered_output.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Json);
+        assert_eq!(rendered.body.lines().count(), 1);
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("json rendering switched from pretty to compact"));
+        assert_eq!(json["output_refs"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn runtime_exposes_toon_render_fallback_reason_in_rendered_output() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "surface toon render fallback",
+        )
+        .with_tool_output_defaults(ToolOutputDefaults {
+            render_options: RenderOptions::new(OutputFormat::Toon),
+            max_inline_bytes: 16 * 1024,
+            max_inline_lines: 8,
+            verbosity: crate::settings::ToolOutputVerbosity::Normal,
+            granularity: crate::settings::ToolOutputGranularity::Summary,
+            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        });
+
+        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+        let rendered = receipt.rendered_output.unwrap();
+
+        assert_eq!(rendered.format, OutputFormat::Toon);
+        assert!(rendered
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("render policy compacted output"));
+        assert!(rendered.body.contains("rendering_truncation_reason"));
+    }
+
+    #[test]
     fn blocked_policy_stops_before_tool_invocation() {
         let runtime = SecretaryRuntime::in_memory();
         let mut repository = repository();
@@ -1565,6 +1870,11 @@ mod tests {
         let error = runtime.run_tool_job(request, &tool).unwrap_err();
 
         assert!(matches!(error, RuntimeError::ToolOutputTooLarge { .. }));
+        let reason = match error {
+            RuntimeError::ToolOutputTooLarge { reason } => reason,
+            _ => unreachable!(),
+        };
+        assert!(reason.contains("tool output field(s) exceed max_inline_bytes=8"));
         assert!(runtime.store().list_tool_results().unwrap().is_empty());
         let jobs = runtime.store().list_jobs().unwrap();
         assert_eq!(1, jobs.len());
@@ -1753,6 +2063,53 @@ mod tests {
         let jobs = runtime.store().list_jobs().unwrap();
         assert_eq!(1, jobs.len());
         assert_eq!(JobStatus::Failed, jobs[0].status);
+    }
+
+    #[test]
+    fn runtime_renders_tool_output_before_artifact_spillover() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+        let artifact_root = std::env::temp_dir().join(format!(
+            "atelia-runtime-artifacts-render-fail-{}",
+            LedgerTimestamp::now().unix_millis
+        ));
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "render fails before spill",
+        )
+        .with_artifact_spillover(RuntimeArtifactSpillover::new(
+            ArtifactStoreConfig::new(&artifact_root),
+            ToolResultSpilloverOptions::new(8),
+        ))
+        .with_tool_output_defaults(ToolOutputDefaults {
+            max_inline_bytes: 8,
+            oversize_policy: OversizeOutputPolicy::RejectOversize,
+            ..ToolOutputDefaults::default()
+        });
+        let tool = LargeOutputTool {
+            content: "0123456789abcdef".to_string(),
+        };
+
+        let error = runtime.run_tool_job(request, &tool).unwrap_err();
+
+        assert!(matches!(error, RuntimeError::ToolOutputTooLarge { .. }));
+        let reason = match error {
+            RuntimeError::ToolOutputTooLarge { reason } => reason,
+            _ => unreachable!(),
+        };
+        assert!(reason.contains("tool output field(s) exceed max_inline_bytes=8"));
+        assert!(runtime.store().list_tool_results().unwrap().is_empty());
+        assert!(!artifact_root.exists());
+        let jobs = runtime.store().list_jobs().unwrap();
+        assert_eq!(1, jobs.len());
+        assert_eq!(JobStatus::Failed, jobs[0].status);
+        assert!(jobs[0].completed_at.is_some());
     }
 
     #[test]

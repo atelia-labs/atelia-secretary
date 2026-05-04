@@ -1942,6 +1942,7 @@ mod tests {
                 requester: None,
             })
             .expect("repository registration should succeed");
+        let long_goal = "x".repeat(300);
 
         let receipt = server
             .service_mut()
@@ -1949,7 +1950,7 @@ mod tests {
                 requester: actor_record(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "render tool output".to_string(),
+                goal: long_goal.clone(),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -1963,6 +1964,8 @@ mod tests {
                 actor_record(),
                 ToolOutputSettingsScope::workspace().for_tool(tool_result.tool_id.clone()),
                 ToolOutputOverrides {
+                    max_inline_bytes: Some(256),
+                    verbosity: Some(ToolOutputVerbosity::Debug),
                     include_policy: Some(true),
                     ..ToolOutputOverrides::default()
                 },
@@ -1994,13 +1997,22 @@ mod tests {
         assert_eq!(response.tool_result.repository_id, repository_id);
         assert_eq!(response.tool_result.content_type, "application/json");
         assert!(response.rendered_output.contains("policy.state"));
-        assert!(response.rendered_output.contains("render tool output"));
-        assert!(!response.rendered_output_metadata.degraded);
-        assert!(response.rendered_output_metadata.fallback_reason.is_none());
-        assert_eq!(
-            response.rendered_output_metadata.truncation,
-            tool_result.truncation.clone()
-        );
+        assert!(response.rendered_output.contains("echoed goal"));
+        assert!(response.rendered_output_metadata.degraded);
+        assert!(response
+            .rendered_output_metadata
+            .truncation
+            .as_ref()
+            .unwrap()
+            .reason
+            .contains("max_inline_bytes=256"));
+        assert!(response.rendered_output_metadata.degraded);
+        assert!(response
+            .rendered_output_metadata
+            .fallback_reason
+            .as_ref()
+            .unwrap()
+            .contains("max_inline_bytes=256"));
         std::fs::remove_dir_all(root).expect("temporary repository should be removed");
     }
 
@@ -2041,6 +2053,7 @@ mod tests {
                 ToolOutputSettingsScope::repository(repository.id.clone())
                     .for_tool(tool_result.tool_id.clone()),
                 ToolOutputOverrides {
+                    verbosity: Some(ToolOutputVerbosity::Debug),
                     include_policy: Some(true),
                     ..ToolOutputOverrides::default()
                 },
