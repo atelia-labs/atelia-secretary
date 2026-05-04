@@ -3327,10 +3327,12 @@ fn search_file(
 // FsWriteTool
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 struct MutationTarget {
     canonical: PathBuf,
     display_path: String,
+    #[cfg(unix)]
+    resolved_fd: Option<File>,
 }
 
 impl MutationTarget {
@@ -3340,6 +3342,11 @@ impl MutationTarget {
 
     fn display_path(&self) -> &str {
         &self.display_path
+    }
+
+    #[cfg(unix)]
+    fn resolved_fd(&self) -> Option<&File> {
+        self.resolved_fd.as_ref()
     }
 }
 
@@ -3384,10 +3391,22 @@ fn resolve_mutation_target(
                 .unwrap_or(&canonical_target)
                 .to_string_lossy()
                 .to_string();
+            // Open an O_PATH fd on the validated target so mutation helpers can
+            // verify identity without reopening by name, closing the inode-reuse window.
+            #[cfg(unix)]
+            let resolved_fd = (|| {
+                let ct = &canonical_target;
+                let parent = ct.parent()?;
+                let name = ct.file_name()?;
+                let dir = open_parent_no_follow(parent).ok()?;
+                open_path_no_follow_in_parent_dir(&dir, name).ok()
+            })();
 
             return Ok(MutationTarget {
                 canonical: canonical_target,
                 display_path,
+                #[cfg(unix)]
+                resolved_fd,
             });
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -3432,6 +3451,8 @@ fn resolve_mutation_target(
     Ok(MutationTarget {
         canonical: canonical_target,
         display_path,
+        #[cfg(unix)]
+        resolved_fd: None,
     })
 }
 
@@ -3806,17 +3827,26 @@ fn unlink_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<()>
 // Multi-link targets (nlink > 1) are rejected because a concurrent removal of
 // a different hardlink would decrease nlink independently, masking a leaf swap.
 //
-// Known residual risk: dev/ino identity can be spoofed by inode reuse on fast-
-// cycling filesystems (e.g. tmpfs).  Fully closing this window requires carrying
-// the fd from the initial resolution step through to mutation, which is a larger
-// architectural change tracked for a follow-up iteration.
+// When `resolved_fd` is `Some`, the reopen-by-name is skipped entirely and the
+// carried fd is used directly for identity checks, closing the inode-reuse
+// window that exists when the file must be reopened by name.
 fn unlink_validated_file_in_parent_dir(
     parent: &File,
     name: &std::ffi::OsStr,
     expected_metadata: &fs::Metadata,
+    resolved_fd: Option<&File>,
 ) -> io::Result<()> {
-    let file = open_path_no_follow_in_parent_dir(parent, name)?;
-    let opened_metadata = file.metadata()?;
+    let (file, opened_metadata) = match resolved_fd {
+        Some(fd) => {
+            let md = fd.metadata()?;
+            (None, md)
+        }
+        None => {
+            let f = open_path_no_follow_in_parent_dir(parent, name)?;
+            let md = f.metadata()?;
+            (Some(f), md)
+        }
+    };
     if !opened_metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3842,8 +3872,9 @@ fn unlink_validated_file_in_parent_dir(
     )?;
 
     unlink_in_parent_dir(parent, name)?;
+    let check_fd = resolved_fd.or(file.as_ref()).unwrap();
     ensure_opened_link_count_decreased(
-        &file,
+        check_fd,
         &opened_metadata,
         "delete target link count did not decrease after unlink",
     )
@@ -3856,6 +3887,10 @@ fn unlink_validated_file_in_parent_dir(
 // by name because fd-based renameat with AT_EMPTY_PATH requires privileged
 // capabilities.  Post-rename checks on both source and destination entries
 // detect a leaf swap and return PermissionDenied.
+//
+// When `resolved_fd` is `Some`, the reopen-by-name is skipped entirely and the
+// carried fd is used directly for identity checks, closing the inode-reuse
+// window that exists when the file must be reopened by name.
 fn rename_validated_file_between_parent_dirs(
     source_parent: &File,
     source: &std::ffi::OsStr,
@@ -3863,9 +3898,15 @@ fn rename_validated_file_between_parent_dirs(
     destination: &std::ffi::OsStr,
     create_new: bool,
     expected_metadata: &fs::Metadata,
+    resolved_fd: Option<&File>,
 ) -> io::Result<()> {
-    let file = open_path_no_follow_in_parent_dir(source_parent, source)?;
-    let opened_metadata = file.metadata()?;
+    let opened_metadata = match resolved_fd {
+        Some(fd) => fd.metadata()?,
+        None => {
+            let file = open_path_no_follow_in_parent_dir(source_parent, source)?;
+            file.metadata()?
+        }
+    };
     if !opened_metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -4437,8 +4478,13 @@ impl crate::runtime::RuntimeTool for FsDeleteTool {
                     let destination_lock = acquire_write_lock(path);
                     match (parent_dir, destination_lock) {
                         (Ok(parent_dir), Ok(_destination_lock)) => {
-                            unlink_validated_file_in_parent_dir(&parent_dir, file_name, &metadata)
-                                .and_then(|_| parent_dir.sync_all())
+                            unlink_validated_file_in_parent_dir(
+                                &parent_dir,
+                                file_name,
+                                &metadata,
+                                target.resolved_fd(),
+                            )
+                            .and_then(|_| parent_dir.sync_all())
                         }
                         (Err(error), _) | (_, Err(error)) => Err(error),
                     }
@@ -4742,6 +4788,7 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
                                 destination_name,
                                 !self.allow_overwrite,
                                 &source_metadata,
+                                source.resolved_fd(),
                             )
                             .and_then(|_| source_parent_dir.sync_all())
                             .and_then(|_| destination_parent_dir.sync_all());
@@ -6950,8 +6997,9 @@ mod tests {
         fs::rename(&path, &backup).unwrap();
         fs::write(&path, "replacement").unwrap();
 
-        let result = unlink_validated_file_in_parent_dir(&parent, file_name, &expected_metadata)
-            .unwrap_err();
+        let result =
+            unlink_validated_file_in_parent_dir(&parent, file_name, &expected_metadata, None)
+                .unwrap_err();
         assert_eq!(io::ErrorKind::PermissionDenied, result.kind());
         assert_eq!("replacement", fs::read_to_string(&path).unwrap());
         assert_eq!("validated", fs::read_to_string(&backup).unwrap());
@@ -6970,8 +7018,9 @@ mod tests {
         let parent = open_parent_no_follow(path.parent().unwrap()).unwrap();
         let file_name = path.file_name().unwrap();
 
-        let result = unlink_validated_file_in_parent_dir(&parent, file_name, &expected_metadata)
-            .unwrap_err();
+        let result =
+            unlink_validated_file_in_parent_dir(&parent, file_name, &expected_metadata, None)
+                .unwrap_err();
         assert_eq!(io::ErrorKind::InvalidInput, result.kind());
         assert!(result.to_string().contains("single-link"));
         assert!(env.root.join("notes.txt").exists());
@@ -7174,6 +7223,7 @@ mod tests {
             destination.file_name().unwrap(),
             true,
             &expected_metadata,
+            None,
         )
         .unwrap_err();
 
@@ -7205,6 +7255,7 @@ mod tests {
             destination.file_name().unwrap(),
             false,
             &expected_metadata,
+            None,
         )
         .unwrap_err();
 
