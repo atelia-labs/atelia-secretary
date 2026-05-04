@@ -518,6 +518,35 @@ fn read_entire_text_file_in_parent_dir(
     })
 }
 
+#[cfg(unix)]
+fn write_file_exists_in_parent_dir(parent_dir: &File, name: &std::ffi::OsStr) -> io::Result<bool> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    let fd = unsafe {
+        libc::openat(
+            parent_dir.as_raw_fd(),
+            cstring.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o0 as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+
+    let close_result = unsafe { libc::close(fd) };
+    if close_result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // FsListTool
 // ---------------------------------------------------------------------------
@@ -3071,23 +3100,28 @@ fn rename_in_parent_dir(
 
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
-                Some(libc::EEXIST) => return Err(error),
                 Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "filesystem does not support atomic create_new renames",
-                    ));
+                    // renameat2 unavailable on very old kernels or older libc/feature combinations.
+                    if write_file_exists_in_parent_dir(parent, destination)? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "destination file already exists",
+                        ));
+                    }
                 }
+                Some(libc::EEXIST) => return Err(error),
                 _ => return Err(error),
             }
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "create_new writes are supported only with renameat2(RENAME_NOREPLACE)",
-            ));
+            if write_file_exists_in_parent_dir(parent, destination)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination file already exists",
+                ));
+            }
         }
     }
 
