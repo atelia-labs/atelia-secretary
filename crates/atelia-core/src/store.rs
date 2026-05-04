@@ -633,6 +633,7 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn create_schema_migration(&self, record: SchemaMigrationRecord) -> StoreResult<()> {
+        validate_schema_migration_record(&record)?;
         let mut inner = self.lock()?;
         insert_record(
             &mut inner.schema_migrations,
@@ -643,7 +644,14 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn list_schema_migrations(&self) -> StoreResult<Vec<SchemaMigrationRecord>> {
-        Ok(list_records(&self.lock()?.schema_migrations))
+        let mut migrations = list_records(&self.lock()?.schema_migrations);
+        migrations.sort_by(|left, right| {
+            left.migration_version
+                .cmp(&right.migration_version)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(migrations)
     }
 
     fn get_schema_migration(&self, id: &SchemaMigrationId) -> StoreResult<SchemaMigrationRecord> {
@@ -846,6 +854,24 @@ fn validate_repository_record(record: &RepositoryRecord) -> StoreResult<()> {
         return Err(StoreError::InvalidRecord {
             collection: "repositories",
             reason: "allowed_path_scope must include at least one path".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_schema_migration_record(record: &SchemaMigrationRecord) -> StoreResult<()> {
+    if record.migration_name.trim().is_empty() {
+        return Err(StoreError::InvalidRecord {
+            collection: "schema_migrations",
+            reason: "migration_name must not be empty".to_string(),
+        });
+    }
+
+    if record.updated_at < record.created_at {
+        return Err(StoreError::InvalidRecord {
+            collection: "schema_migrations",
+            reason: "updated_at must not be earlier than created_at".to_string(),
         });
     }
 
@@ -2480,6 +2506,22 @@ mod tests {
         }
     }
 
+    fn schema_migration_record_with(
+        id: &str,
+        migration_name: &str,
+        migration_version: u32,
+        created_at: i64,
+        updated_at: i64,
+    ) -> SchemaMigrationRecord {
+        let mut record = schema_migration_record();
+        record.id = SchemaMigrationId::try_from_string(id).unwrap();
+        record.migration_name = migration_name.to_string();
+        record.migration_version = migration_version;
+        record.created_at = timestamp(created_at);
+        record.updated_at = timestamp(updated_at);
+        record
+    }
+
     fn tool_invocation(
         repository_id: RepositoryId,
         job_id: JobId,
@@ -2565,6 +2607,93 @@ mod tests {
             migration
         );
         assert_eq!(store.list_schema_migrations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn schema_migration_records_reject_invalid_name() {
+        let store = InMemoryStore::new();
+        let mut migration = schema_migration_record();
+        migration.migration_name = "   ".to_string();
+
+        assert!(matches!(
+            store.create_schema_migration(migration),
+            Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn schema_migration_records_reject_non_monotonic_timestamps() {
+        let store = InMemoryStore::new();
+        let migration = schema_migration_record_with(
+            "mig_00000000-0000-0000-0000-000000000001",
+            "bad migration",
+            10,
+            10,
+            9,
+        );
+
+        assert!(matches!(
+            store.create_schema_migration(migration),
+            Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn schema_migration_list_is_deterministic_by_version_created_at_and_id() {
+        let store = InMemoryStore::new();
+        let migration_202 = schema_migration_record_with(
+            "mig_00000000-0000-0000-0000-000000000004",
+            "migration c",
+            2,
+            10,
+            10,
+        );
+        let migration_101 = schema_migration_record_with(
+            "mig_00000000-0000-0000-0000-000000000002",
+            "migration b",
+            1,
+            40,
+            40,
+        );
+        let migration_100 = schema_migration_record_with(
+            "mig_00000000-0000-0000-0000-000000000001",
+            "migration a",
+            1,
+            30,
+            30,
+        );
+        let migration_200 = schema_migration_record_with(
+            "mig_00000000-0000-0000-0000-000000000003",
+            "migration a",
+            1,
+            30,
+            30,
+        );
+
+        // Insert out of order to prove order is enforced by list_schema_migrations.
+        store
+            .create_schema_migration(migration_202.clone())
+            .unwrap();
+        store
+            .create_schema_migration(migration_101.clone())
+            .unwrap();
+        store
+            .create_schema_migration(migration_100.clone())
+            .unwrap();
+        store
+            .create_schema_migration(migration_200.clone())
+            .unwrap();
+
+        assert_eq!(
+            store.list_schema_migrations().unwrap(),
+            vec![migration_100, migration_200, migration_101, migration_202]
+        );
     }
 
     #[test]
