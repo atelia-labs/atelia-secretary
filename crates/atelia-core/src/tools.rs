@@ -4029,6 +4029,45 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
             );
         }
 
+        if updated == content {
+            return make_tool_result(
+                invocation,
+                ToolResultStatus::Succeeded,
+                schema_ref,
+                vec![
+                    ToolResultField {
+                        key: "summary".to_string(),
+                        value: StructuredValue::String(format!(
+                            "patched {} with no net content change",
+                            target.display_path()
+                        )),
+                    },
+                    ToolResultField {
+                        key: "path".to_string(),
+                        value: StructuredValue::String(target.display_path().to_string()),
+                    },
+                    ToolResultField {
+                        key: "matches".to_string(),
+                        value: StructuredValue::Integer(match_count as i64),
+                    },
+                    ToolResultField {
+                        key: "before_bytes".to_string(),
+                        value: StructuredValue::Integer(content.len() as i64),
+                    },
+                    ToolResultField {
+                        key: "after_bytes".to_string(),
+                        value: StructuredValue::Integer(updated.len() as i64),
+                    },
+                    ToolResultField {
+                        key: "changed".to_string(),
+                        value: StructuredValue::Bool(false),
+                    },
+                ],
+                None,
+                Vec::new(),
+            );
+        }
+
         #[cfg(unix)]
         if let Err(err) = write_file_bytes_atomically_inner_locked(
             &parent_dir,
@@ -4055,17 +4094,10 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
             );
         }
 
-        let summary = if updated == content {
-            format!(
-                "patched {} with no net content change",
-                target.display_path()
-            )
-        } else {
-            format!(
-                "patched {} with one exact replacement",
-                target.display_path()
-            )
-        };
+        let summary = format!(
+            "patched {} with one exact replacement",
+            target.display_path()
+        );
 
         make_tool_result(
             invocation,
@@ -6462,6 +6494,39 @@ exit 0
         let result = tool.execute(&invocation, &request);
 
         assert_eq!(ToolResultStatus::Failed, result.status);
+        assert_eq!(
+            "alpha\nbeta",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_patch_noop_does_not_write_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let env = TestEnv::new("patch-noop-no-write");
+        env.create_file("notes.txt", "alpha\nbeta");
+
+        let mut readonly_permissions = env.root.metadata().unwrap().permissions();
+        readonly_permissions.set_mode(0o500);
+        fs::set_permissions(&env.root, readonly_permissions).unwrap();
+
+        let tool = FsPatchTool::new(&env.root, "beta", "beta");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        let mut writable_permissions = env.root.metadata().unwrap().permissions();
+        writable_permissions.set_mode(0o700);
+        fs::set_permissions(&env.root, writable_permissions).unwrap();
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        assert!(string_value(&summary.value).contains("no net content change"));
+        let changed = result.fields.iter().find(|f| f.key == "changed").unwrap();
+        assert_eq!(StructuredValue::Bool(false), changed.value);
         assert_eq!(
             "alpha\nbeta",
             fs::read_to_string(env.root.join("notes.txt")).unwrap()
