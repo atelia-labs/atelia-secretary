@@ -1817,15 +1817,15 @@ fn execute_explicit_argv_process(
         }
     };
 
-    let (status, timed_out, process_tree_handled) =
-        wait_for_child(&mut child, timeout).map_err(|error| {
+    let (status, process_timed_out, mut process_tree_handled) = wait_for_child(&mut child, timeout)
+        .map_err(|error| {
             cleanup_spawned_child(&mut child);
             format!("process wait failed: {error}")
         })?;
     capture_timeout.store(true, Ordering::Release);
 
-    let mut process_tree_handled = process_tree_handled;
-    let mut capture_thread_timed_out = false;
+    let mut stdout_capture_timed_out = false;
+    let mut stderr_capture_timed_out = false;
 
     let stdout_capture_result =
         match join_capture_thread("stdout", stdout_handle, CAPTURE_THREAD_JOIN_TIMEOUT)
@@ -1833,7 +1833,7 @@ fn execute_explicit_argv_process(
         {
             Some(result) => result,
             None => {
-                capture_thread_timed_out = true;
+                stdout_capture_timed_out = true;
                 StreamCaptureResult {
                     original_bytes: 0,
                     retained_bytes: 0,
@@ -1847,7 +1847,7 @@ fn execute_explicit_argv_process(
         {
             Some(result) => result,
             None => {
-                capture_thread_timed_out = true;
+                stderr_capture_timed_out = true;
                 StreamCaptureResult {
                     original_bytes: 0,
                     retained_bytes: 0,
@@ -1855,8 +1855,7 @@ fn execute_explicit_argv_process(
             }
         };
 
-    let timed_out = timed_out || capture_thread_timed_out;
-    if timed_out {
+    if process_timed_out {
         process_tree_handled = process_tree_handled || kill_process_tree(&mut child);
     }
 
@@ -1869,26 +1868,36 @@ fn execute_explicit_argv_process(
 
     let mut stdout = capture_text_output(stdout_bytes, 0);
     let mut stderr = capture_text_output(stderr_bytes, 0);
-    if capture_thread_timed_out {
-        stdout.original_bytes = stdout_original_bytes;
-        stderr.original_bytes = stderr_original_bytes;
+    stdout.original_bytes = if stdout_capture_timed_out {
+        stdout_original_bytes
     } else {
-        stdout.original_bytes = stdout_capture_result.original_bytes;
-        stderr.original_bytes = stderr_capture_result.original_bytes;
-        stdout.retained_bytes = stdout_capture_result.retained_bytes;
-        stderr.retained_bytes = stderr_capture_result.retained_bytes;
-    }
-    stdout.truncated = capture_thread_timed_out
-        || stdout_capture_result.original_bytes > stdout_capture_result.retained_bytes
-        || timed_out;
-    stderr.truncated = capture_thread_timed_out
-        || stderr_capture_result.original_bytes > stderr_capture_result.retained_bytes
-        || timed_out;
+        stdout_capture_result.original_bytes
+    };
+    stdout.retained_bytes = if stdout_capture_timed_out {
+        stdout.text.len()
+    } else {
+        stdout_capture_result.retained_bytes
+    };
+    stderr.original_bytes = if stderr_capture_timed_out {
+        stderr_original_bytes
+    } else {
+        stderr_capture_result.original_bytes
+    };
+    stderr.retained_bytes = if stderr_capture_timed_out {
+        stderr.text.len()
+    } else {
+        stderr_capture_result.retained_bytes
+    };
+
+    stdout.truncated = stdout_capture_timed_out
+        || stdout_capture_result.original_bytes > stdout_capture_result.retained_bytes;
+    stderr.truncated = stderr_capture_timed_out
+        || stderr_capture_result.original_bytes > stderr_capture_result.retained_bytes;
 
     let duration_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
     let exit_code = status.and_then(|exit_status| exit_status.code().map(i64::from));
 
-    let mut summary = match (timed_out, exit_code) {
+    let mut summary = match (process_timed_out, exit_code) {
         (true, _) => format!("process timed out after {} ms", duration_ms),
         (false, Some(0)) => format!("process exited successfully after {} ms", duration_ms),
         (false, Some(code)) => {
@@ -1899,18 +1908,25 @@ fn execute_explicit_argv_process(
             duration_ms
         ),
     };
-    if timed_out && !process_tree_handled {
-        summary.push_str(
-            " process tree cleanup is unsupported on this platform (best-effort child kill only)",
-        );
-    } else if capture_thread_timed_out {
+    if process_timed_out {
+        if process_tree_handled {
+            summary.push_str(
+                " process timeout may leave detached descendants with inherited stdio; detached cleanup is best-effort",
+            );
+        } else {
+            summary.push_str(
+                " process tree cleanup is unsupported on this platform (best-effort child kill only)",
+            );
+        }
+    }
+    if stdout_capture_timed_out || stderr_capture_timed_out {
         summary.push_str(
             " output capture stream timeout may indicate escaped descendants with inherited stdio; detached process-tree cleanup is unsupported",
         );
     }
     summary.push_str(&format!(" in {}", canonical_cwd.display_path()));
 
-    let status = if timed_out {
+    let status = if process_timed_out {
         ToolResultStatus::TimedOut
     } else if exit_code == Some(0) {
         ToolResultStatus::Succeeded
@@ -1925,7 +1941,7 @@ fn execute_explicit_argv_process(
         duration_ms,
         stdout,
         stderr,
-        timed_out,
+        timed_out: process_timed_out,
     })
 }
 
@@ -5058,7 +5074,7 @@ mod tests {
         let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
         let summary = string_value(&summary.value);
         assert!(summary.contains("timed out"));
-        assert!(!summary.contains("detached"));
+        assert!(summary.contains("detached"));
         env.cleanup();
     }
 
