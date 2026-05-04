@@ -1416,6 +1416,7 @@ pub struct ProcExecTool {
     env_overrides: HashMap<String, String>,
     timeout: Duration,
     max_output_bytes: usize,
+    include_full_argv: bool,
 }
 
 impl ProcExecTool {
@@ -1427,6 +1428,7 @@ impl ProcExecTool {
             env_overrides: HashMap::new(),
             timeout: Duration::from_secs(30),
             max_output_bytes: 64 * 1024,
+            include_full_argv: false,
         }
     }
 
@@ -1452,6 +1454,27 @@ impl ProcExecTool {
     pub fn with_env_override(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env_overrides.insert(key.into(), value.into());
         self
+    }
+
+    pub fn with_full_argv(mut self, include_full_argv: bool) -> Self {
+        self.include_full_argv = include_full_argv;
+        self
+    }
+
+    fn argv_preview(&self) -> Vec<String> {
+        self.argv
+            .first()
+            .cloned()
+            .map(|first| vec![first, format!("argc={}", self.argv.len())])
+            .unwrap_or_default()
+    }
+
+    fn argv_field_value(&self) -> StructuredValue {
+        if self.include_full_argv {
+            StructuredValue::StringList(self.argv.clone())
+        } else {
+            StructuredValue::StringList(self.argv_preview())
+        }
     }
 }
 
@@ -1854,7 +1877,7 @@ fn execute_explicit_argv_process(
         }
     };
 
-    let capture_timeout = Arc::new(AtomicBool::new(false));
+    let capture_after_timeout = Arc::new(AtomicBool::new(false));
     let stop_immediately = Arc::new(AtomicBool::new(false));
 
     let stdout_reader = match child.stdout.take() {
@@ -1879,13 +1902,13 @@ fn execute_explicit_argv_process(
         stdout_reader,
         stdout_writer,
         max_output_bytes,
-        capture_timeout.clone(),
+        capture_after_timeout.clone(),
         stop_immediately.clone(),
         stdout_capture_stats.clone(),
     ) {
         Ok(handle) => handle,
         Err(error) => {
-            capture_timeout.store(true, Ordering::Release);
+            capture_after_timeout.store(true, Ordering::Release);
             cleanup_spawned_child(&mut child);
             return Err(format!("failed to start stdout capture thread: {error}"));
         }
@@ -1894,13 +1917,13 @@ fn execute_explicit_argv_process(
         stderr_reader,
         stderr_writer,
         max_output_bytes,
-        capture_timeout.clone(),
+        capture_after_timeout.clone(),
         stop_immediately.clone(),
         stderr_capture_stats.clone(),
     ) {
         Ok(handle) => handle,
         Err(error) => {
-            capture_timeout.store(true, Ordering::Release);
+            capture_after_timeout.store(true, Ordering::Release);
             cleanup_spawned_child(&mut child);
             return Err(format!("failed to start stderr capture thread: {error}"));
         }
@@ -1911,7 +1934,9 @@ fn execute_explicit_argv_process(
             cleanup_spawned_child(&mut child);
             format!("process wait failed: {error}")
         })?;
-    capture_timeout.store(true, Ordering::Release);
+    if process_timed_out {
+        capture_after_timeout.store(true, Ordering::Release);
+    }
 
     let mut stdout_capture_timed_out = false;
     let mut stderr_capture_timed_out = false;
@@ -1931,7 +1956,7 @@ fn execute_explicit_argv_process(
             }
         }
         Err(error) => {
-            capture_timeout.store(true, Ordering::Release);
+            capture_after_timeout.store(true, Ordering::Release);
             stop_immediately.store(true, Ordering::Release);
             cleanup_spawned_child(&mut child);
             return Err(format!("stdout capture thread failed: {error}"));
@@ -1953,7 +1978,7 @@ fn execute_explicit_argv_process(
             }
         }
         Err(error) => {
-            capture_timeout.store(true, Ordering::Release);
+            capture_after_timeout.store(true, Ordering::Release);
             stop_immediately.store(true, Ordering::Release);
             cleanup_spawned_child(&mut child);
             return Err(format!("stderr capture thread failed: {error}"));
@@ -2076,7 +2101,13 @@ impl crate::runtime::RuntimeTool for ProcExecTool {
     fn args_summary(&self, request: &RuntimeJobRequest) -> String {
         let mut parts = vec![
             format!("cwd={}", request.resource_scope.value),
-            format!("argv={:?}", self.argv),
+            if self.include_full_argv {
+                format!("argv_full={:?}", self.argv)
+            } else if let Some(first_argv) = self.argv.first() {
+                format!("argv[0]={first_argv} argc={}", self.argv.len())
+            } else {
+                "argv=[]".to_string()
+            },
             format!("timeout={}ms", self.timeout.as_millis()),
             format!("max_output_bytes={}", self.max_output_bytes),
         ];
@@ -2158,7 +2189,7 @@ impl crate::runtime::RuntimeTool for ProcExecTool {
             },
             ToolResultField {
                 key: "argv".to_string(),
-                value: StructuredValue::StringList(self.argv.clone()),
+                value: self.argv_field_value(),
             },
             ToolResultField {
                 key: "status".to_string(),
