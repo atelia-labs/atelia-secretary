@@ -24,9 +24,9 @@ use atelia_core::{
     JobEventKind, JobId, JobKind, JobRecord, JobStatus, ListBlocklistRequest,
     ListExtensionsRequest, OutputFormat, OversizeOutputPolicy, PathScope, PolicyOutcome, ProjectId,
     RenderOptions, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier,
-    RollbackExtensionRequest, StoreError, ToolOutputDefaults, ToolOutputGranularity,
-    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity,
-    ToolResultId, TruncationMetadata,
+    RollbackExtensionRequest, StoreError, ToolInvocationId, ToolOutputDefaults,
+    ToolOutputGranularity, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsScope,
+    ToolOutputVerbosity, ToolResultId, TruncationMetadata,
 };
 use std::convert::TryFrom;
 
@@ -1471,14 +1471,46 @@ fn rpc_event_kind_label(kind: &JobEventKind) -> &'static str {
     }
 }
 
-fn validate_tool_result_ref(tool_result: ToolResultRef) -> RpcResult<ToolResultRef> {
-    if tool_result.tool_result_id.trim().is_empty() {
-        return Err(RpcError::invalid_argument(
-            "tool_result.tool_result_id must not be empty",
-        ));
-    }
+#[derive(Debug, Clone)]
+struct ParsedToolResultRef {
+    tool_result_id: ToolResultId,
+    tool_invocation_id: ToolInvocationId,
+    job_id: JobId,
+    repository_id: RepositoryId,
+    content_type: String,
+}
 
-    Ok(tool_result)
+fn parse_tool_result_ref(tool_result: ToolResultRef) -> RpcResult<ParsedToolResultRef> {
+    let tool_result_id = parse_tool_result_id(&parse_non_empty_field(
+        "tool_result.tool_result_id",
+        tool_result.tool_result_id,
+    )?)?;
+    let tool_invocation_id = ToolInvocationId::try_from_string(parse_non_empty_field(
+        "tool_result.tool_invocation_id",
+        tool_result.tool_invocation_id,
+    )?)
+    .map_err(|_| {
+        RpcError::invalid_argument(
+            "tool_result.tool_invocation_id must be a valid tool invocation id",
+        )
+    })?;
+    let job_id = parse_job_id(&parse_non_empty_field(
+        "tool_result.job_id",
+        tool_result.job_id,
+    )?)?;
+    let repository_id = parse_repository_id(&parse_non_empty_field(
+        "tool_result.repository_id",
+        tool_result.repository_id,
+    )?)?;
+    let content_type = parse_non_empty_field("tool_result.content_type", tool_result.content_type)?;
+
+    Ok(ParsedToolResultRef {
+        tool_result_id,
+        tool_invocation_id,
+        job_id,
+        repository_id,
+        content_type,
+    })
 }
 
 fn tool_result_ref_from_canonical(
@@ -1508,12 +1540,11 @@ struct ParsedRenderToolOutputRequest {
 fn parse_render_tool_output_request(
     request: RenderToolOutputRequest,
 ) -> RpcResult<ParsedRenderToolOutputRequest> {
-    let tool_result = validate_tool_result_ref(request.tool_result)?;
-    let tool_result_id = parse_tool_result_id(&tool_result.tool_result_id)?;
+    let tool_result = parse_tool_result_ref(request.tool_result)?;
     let format = request.format.try_into()?;
 
     Ok(ParsedRenderToolOutputRequest {
-        tool_result_id,
+        tool_result_id: tool_result.tool_result_id,
         format,
     })
 }
@@ -2464,6 +2495,56 @@ mod tests {
         assert_eq!(response.tool_result.content_type, "application/json");
         assert!(response.rendered_output.contains("policy.state"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn render_tool_output_rejects_invalid_tool_result_ref_fields() {
+        let server = ready_server();
+        let valid_ref = ToolResultRef {
+            tool_result_id: ToolResultId::new().as_str().to_string(),
+            tool_invocation_id: ToolInvocationId::new().as_str().to_string(),
+            job_id: JobId::new().as_str().to_string(),
+            repository_id: RepositoryId::new().as_str().to_string(),
+            content_type: "application/json".to_string(),
+        };
+
+        let cases = vec![
+            ToolResultRef {
+                tool_result_id: "tool_result_id".to_string(),
+                ..valid_ref.clone()
+            },
+            ToolResultRef {
+                tool_invocation_id: "   ".to_string(),
+                ..valid_ref.clone()
+            },
+            ToolResultRef {
+                tool_invocation_id: "not-a-tool-invocation-id".to_string(),
+                ..valid_ref.clone()
+            },
+            ToolResultRef {
+                job_id: "job_id".to_string(),
+                ..valid_ref.clone()
+            },
+            ToolResultRef {
+                repository_id: "repository_id".to_string(),
+                ..valid_ref.clone()
+            },
+            ToolResultRef {
+                content_type: "".to_string(),
+                ..valid_ref
+            },
+        ];
+
+        for tool_result in cases {
+            let error = server
+                .render_tool_output(RenderToolOutputRequest {
+                    tool_result,
+                    format: RpcOutputFormat::Json,
+                })
+                .unwrap_err();
+
+            assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+        }
     }
 
     #[test]
