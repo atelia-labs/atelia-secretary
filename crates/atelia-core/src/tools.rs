@@ -3198,6 +3198,11 @@ fn resolve_mutation_target(
             .unwrap_or(&canonical_target)
             .to_string_lossy()
             .to_string();
+        let display_path = if display_path.is_empty() {
+            ".".to_string()
+        } else {
+            display_path
+        };
 
         return Ok(MutationTarget {
             canonical: canonical_target,
@@ -5689,6 +5694,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn fs_write_allows_safe_in_scope_symlink_target() {
+        let env = TestEnv::new("write-safe-symlink");
+        env.create_file("real.txt", "original");
+        env.create_symlink("link.txt", &env.root.join("real.txt"));
+
+        let target = resolve_mutation_target(&env.root, Path::new("link.txt")).unwrap();
+        assert_eq!(
+            env.root.join("real.txt").canonicalize().unwrap(),
+            target.canonical
+        );
+        assert_eq!("real.txt", target.display_path);
+
+        let tool = FsWriteTool::new(&env.root, "updated")
+            .with_allow_create(false)
+            .with_allow_overwrite(true);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("link.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            "updated",
+            fs::read_to_string(env.root.join("real.txt")).unwrap()
+        );
+        env.cleanup();
+    }
+
+    #[test]
+    fn resolve_mutation_target_displays_repository_root_as_dot() {
+        let env = TestEnv::new("mutation-root-display");
+
+        let target = resolve_mutation_target(&env.root, Path::new(".")).unwrap();
+
+        assert_eq!(env.root.canonicalize().unwrap(), target.canonical);
+        assert_eq!(".", target.display_path);
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn fs_write_does_not_emit_repo_visible_lock_file() {
         let env = TestEnv::new("write-no-lock-sidecar");
         let tool = FsWriteTool::new(&env.root, "hello");
@@ -6441,6 +6486,33 @@ exit 0
             fs::read_to_string(env.root.join("notes.txt")).unwrap()
         );
         assert_no_lock_files_in_repo(&env.root);
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_patch_allows_safe_in_scope_symlink_parent() {
+        let env = TestEnv::new("patch-safe-symlink-parent");
+        env.create_file("real/note.txt", "alpha\nbeta");
+        env.create_symlink("linked", &env.root.join("real"));
+
+        let target = resolve_mutation_target(&env.root, Path::new("linked/note.txt")).unwrap();
+        assert_eq!(
+            env.root.join("real/note.txt").canonicalize().unwrap(),
+            target.canonical
+        );
+        assert_eq!("real/note.txt", target.display_path);
+
+        let tool = FsPatchTool::new(&env.root, "beta", "delta");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("linked/note.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            "alpha\ndelta",
+            fs::read_to_string(env.root.join("real/note.txt")).unwrap()
+        );
         env.cleanup();
     }
 

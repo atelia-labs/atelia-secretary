@@ -457,6 +457,29 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_write_aliases_are_pinned() {
+        let patch = decide(input("fs.patch"));
+        assert_eq!(PolicyOutcome::Audited, patch.outcome);
+        assert_eq!(RiskTier::R2, patch.risk_tier);
+        assert_eq!("bounded_write_audited", patch.reason_code);
+
+        for capability in [
+            "filesystem.delete",
+            "filesystem.move",
+            "fs.delete",
+            "fs.move",
+        ] {
+            let decision = decide(input(capability));
+            assert_eq!(PolicyOutcome::Blocked, decision.outcome, "{capability}");
+            assert_eq!(RiskTier::R4, decision.risk_tier, "{capability}");
+            assert_eq!(
+                "unsupported_capability_blocked", decision.reason_code,
+                "{capability}"
+            );
+        }
+    }
+
+    #[test]
     fn r3_broad_filesystem_write_needs_approval() {
         let decision = decide(input("filesystem.write").broad_or_unbounded());
 
