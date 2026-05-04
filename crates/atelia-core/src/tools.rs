@@ -1347,7 +1347,8 @@ impl crate::runtime::RuntimeTool for FsDiffTool {
             &left_content,
             &right_content,
         );
-        let (diff, retained_bytes, truncated) = truncate_utf8_by_chars(&raw_diff, self.max_chars);
+        let (diff, retained_bytes, truncated) =
+            truncate_utf8_by_chars_and_bytes(&raw_diff, self.max_chars, self.max_bytes);
         let changed = left_content != right_content;
         let summary = if changed {
             format!(
@@ -1400,7 +1401,10 @@ impl crate::runtime::RuntimeTool for FsDiffTool {
             truncated.then(|| TruncationMetadata {
                 original_bytes: raw_diff.len() as u64,
                 retained_bytes,
-                reason: format!("diff output truncated at {} characters", self.max_chars),
+                reason: format!(
+                    "diff output truncated at {} characters or {} bytes",
+                    self.max_chars, self.max_bytes
+                ),
             }),
             Vec::new(),
         )
@@ -1479,6 +1483,22 @@ fn truncate_utf8_by_chars(value: &str, max_chars: usize) -> (String, u64, bool) 
 
     let retained = &value[..end];
     (retained.to_string(), retained.len() as u64, truncated)
+}
+
+fn truncate_utf8_by_chars_and_bytes(
+    value: &str,
+    max_chars: usize,
+    max_bytes: usize,
+) -> (String, u64, bool) {
+    let (char_limited, _, char_truncated) = truncate_utf8_by_chars(value, max_chars);
+    if char_limited.len() <= max_bytes {
+        let retained_bytes = char_limited.len() as u64;
+        return (char_limited, retained_bytes, char_truncated);
+    }
+
+    let byte_limited = truncate_utf8_to_byte_boundary(&char_limited, max_bytes).to_string();
+    let retained_bytes = byte_limited.len() as u64;
+    (byte_limited, retained_bytes, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -5114,17 +5134,32 @@ mod tests {
         env.create_file("left.txt", "ééé\nleft\n");
         env.create_file("right.txt", "ééé\nright\n");
 
-        let tool = FsDiffTool::new(&env.root, "right.txt").with_max_chars(12);
+        let tool = FsDiffTool::new(&env.root, "right.txt")
+            .with_max_chars(12)
+            .with_max_bytes(32);
         let invocation = fake_invocation(tool.tool_id());
         let result = tool.execute(&invocation, &request_with_path("left.txt"));
 
         assert_eq!(ToolResultStatus::Succeeded, result.status);
         let diff = result.fields.iter().find(|f| f.key == "diff").unwrap();
-        assert!(string_value(&diff.value).is_char_boundary(string_value(&diff.value).len()));
+        let diff = string_value(&diff.value);
+        assert!(diff.is_char_boundary(diff.len()));
         let truncation = result.truncation.unwrap();
         assert!(truncation.reason.contains("12 characters"));
+        assert!(truncation.reason.contains("32 bytes"));
         assert!(truncation.retained_bytes <= truncation.original_bytes);
         env.cleanup();
+    }
+
+    #[test]
+    fn fs_diff_truncation_helper_enforces_byte_limit_on_character_boundary() {
+        let (diff, retained_bytes, truncated) =
+            truncate_utf8_by_chars_and_bytes("éééabcdef", 16, 5);
+
+        assert_eq!("éé", diff);
+        assert_eq!(4, retained_bytes);
+        assert!(truncated);
+        assert!(diff.is_char_boundary(diff.len()));
     }
 
     #[test]
