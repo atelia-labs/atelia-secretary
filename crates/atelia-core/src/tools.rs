@@ -3577,6 +3577,19 @@ fn rename_in_parent_dir(
 }
 
 #[cfg(unix)]
+fn ensure_opened_metadata_matches(
+    expected: &fs::Metadata,
+    opened: &fs::Metadata,
+    context: &'static str,
+) -> io::Result<()> {
+    if opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, context));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
 fn rename_between_parent_dirs(
     source_parent: &File,
     source: &std::ffi::OsStr,
@@ -3621,26 +3634,10 @@ fn rename_between_parent_dirs(
 
         #[cfg(not(target_os = "linux"))]
         {
-            // Callers hold the destination write lock before reaching this helper. On
-            // platforms without renameat2(RENAME_NOREPLACE), that lock makes the
-            // existence check and rename safe within the daemon's mutation protocol.
-            // SAFETY: `destination_parent` is live and `destination` is a valid c-string.
-            let exists = unsafe {
-                libc::faccessat(
-                    destination_parent.as_raw_fd(),
-                    destination.as_ptr(),
-                    libc::F_OK,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if exists == 0 {
-                return Err(io::Error::from_raw_os_error(libc::EEXIST));
-            }
-
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::NotFound {
-                return Err(error);
-            }
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "create_new moves are supported only with renameat2(RENAME_NOREPLACE)",
+            ));
         }
     }
 
@@ -3672,6 +3669,61 @@ fn unlink_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<()>
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn unlink_validated_file_in_parent_dir(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    expected_metadata: &fs::Metadata,
+) -> io::Result<()> {
+    let file = open_read_no_follow_in_parent_dir(parent, name)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target is not a file",
+        ));
+    }
+    ensure_opened_metadata_matches(
+        expected_metadata,
+        &opened_metadata,
+        "opened delete target did not match resolved record",
+    )?;
+
+    unlink_in_parent_dir(parent, name)
+}
+
+#[cfg(unix)]
+fn rename_validated_file_between_parent_dirs(
+    source_parent: &File,
+    source: &std::ffi::OsStr,
+    destination_parent: &File,
+    destination: &std::ffi::OsStr,
+    create_new: bool,
+    expected_metadata: &fs::Metadata,
+) -> io::Result<()> {
+    let file = open_read_no_follow_in_parent_dir(source_parent, source)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source is not a file",
+        ));
+    }
+    ensure_opened_metadata_matches(
+        expected_metadata,
+        &opened_metadata,
+        "opened move source did not match resolved record",
+    )?;
+
+    rename_between_parent_dirs(
+        source_parent,
+        source,
+        destination_parent,
+        destination,
+        create_new,
+    )
 }
 
 #[cfg(unix)]
@@ -4206,24 +4258,15 @@ impl crate::runtime::RuntimeTool for FsDeleteTool {
                     let destination_lock = acquire_write_lock(path);
                     match (parent_dir, destination_lock) {
                         (Ok(parent_dir), Ok(_destination_lock)) => {
-                            match open_read_no_follow_in_parent_dir(&parent_dir, file_name) {
-                                Ok(file) => match file.metadata() {
-                                    Ok(opened_metadata) if opened_metadata.is_file() => {
-                                        drop(file);
-                                        let result = unlink_in_parent_dir(&parent_dir, file_name);
-                                        if result.is_ok() {
-                                            let _ = parent_dir.sync_all();
-                                        }
-                                        result
-                                    }
-                                    Ok(_) => Err(io::Error::new(
-                                        io::ErrorKind::InvalidInput,
-                                        "target is not a file",
-                                    )),
-                                    Err(error) => Err(error),
-                                },
-                                Err(error) => Err(error),
+                            let result = unlink_validated_file_in_parent_dir(
+                                &parent_dir,
+                                file_name,
+                                &metadata,
+                            );
+                            if result.is_ok() {
+                                let _ = parent_dir.sync_all();
                             }
+                            result
                         }
                         (Err(error), _) | (_, Err(error)) => Err(error),
                     }
@@ -4502,32 +4545,19 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
                                 );
                             }
 
-                            match open_read_no_follow_in_parent_dir(&source_parent_dir, source_name)
-                            {
-                                Ok(file) => match file.metadata() {
-                                    Ok(opened_metadata) if opened_metadata.is_file() => {
-                                        drop(file);
-                                        let result = rename_between_parent_dirs(
-                                            &source_parent_dir,
-                                            source_name,
-                                            &destination_parent_dir,
-                                            destination_name,
-                                            !self.allow_overwrite,
-                                        );
-                                        if result.is_ok() {
-                                            let _ = source_parent_dir.sync_all();
-                                            let _ = destination_parent_dir.sync_all();
-                                        }
-                                        result.map(|_| destination_exists)
-                                    }
-                                    Ok(_) => Err(io::Error::new(
-                                        io::ErrorKind::InvalidInput,
-                                        "source is not a file",
-                                    )),
-                                    Err(error) => Err(error),
-                                },
-                                Err(error) => Err(error),
+                            let result = rename_validated_file_between_parent_dirs(
+                                &source_parent_dir,
+                                source_name,
+                                &destination_parent_dir,
+                                destination_name,
+                                !self.allow_overwrite,
+                                &source_metadata,
+                            );
+                            if result.is_ok() {
+                                let _ = source_parent_dir.sync_all();
+                                let _ = destination_parent_dir.sync_all();
                             }
+                            result.map(|_| destination_exists)
                         }
                         (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
                     }
@@ -6515,6 +6545,34 @@ mod tests {
         unlink_in_parent_dir(&parent, &temp_name).unwrap();
         env.cleanup();
     }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn fs_move_create_new_unsupported_without_renameat2() {
+        let env = TestEnv::new("move-create-rename-unsupported");
+        env.create_file("from.txt", "source");
+        env.create_dir("archive");
+
+        let source_parent = open_parent_no_follow(&env.root).unwrap();
+        let destination_parent = open_parent_no_follow(&env.root.join("archive")).unwrap();
+        let rename_result = rename_between_parent_dirs(
+            &source_parent,
+            std::ffi::OsStr::new("from.txt"),
+            &destination_parent,
+            std::ffi::OsStr::new("from.txt"),
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(io::ErrorKind::Unsupported, rename_result.kind());
+        assert_eq!(
+            "source",
+            fs::read_to_string(env.root.join("from.txt")).unwrap()
+        );
+        assert!(!env.root.join("archive/from.txt").exists());
+        env.cleanup();
+    }
+
     #[test]
     fn fs_write_rejects_byte_limit_overrun() {
         let env = TestEnv::new("write-limit");
@@ -6689,6 +6747,29 @@ mod tests {
         env.cleanup();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fs_delete_rejects_leaf_swap_before_unlink() {
+        let env = TestEnv::new("delete-leaf-swap");
+        let path = env.root.join("notes.txt");
+        env.create_file("notes.txt", "validated");
+
+        let expected_metadata = fs::symlink_metadata(&path).unwrap();
+        let parent = open_parent_no_follow(path.parent().unwrap()).unwrap();
+        let file_name = path.file_name().unwrap();
+
+        let backup = env.root.join("validated-backup.txt");
+        fs::rename(&path, &backup).unwrap();
+        fs::write(&path, "replacement").unwrap();
+
+        let result = unlink_validated_file_in_parent_dir(&parent, file_name, &expected_metadata)
+            .unwrap_err();
+        assert_eq!(io::ErrorKind::PermissionDenied, result.kind());
+        assert_eq!("replacement", fs::read_to_string(&path).unwrap());
+        assert_eq!("validated", fs::read_to_string(&backup).unwrap());
+        env.cleanup();
+    }
+
     // -- FsMoveTool tests --
 
     #[test]
@@ -6831,6 +6912,40 @@ mod tests {
         );
         let error = result.fields.iter().find(|f| f.key == "error").unwrap();
         assert!(string_value(&error.value).contains("symlink"));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_move_rejects_source_leaf_swap_before_rename() {
+        let env = TestEnv::new("move-source-leaf-swap");
+        env.create_file("from.txt", "validated");
+        env.create_dir("archive");
+
+        let source = env.root.join("from.txt");
+        let destination = env.root.join("archive/from.txt");
+        let expected_metadata = fs::symlink_metadata(&source).unwrap();
+        let source_parent = open_parent_no_follow(source.parent().unwrap()).unwrap();
+        let destination_parent = open_parent_no_follow(destination.parent().unwrap()).unwrap();
+
+        let backup = env.root.join("validated-backup.txt");
+        fs::rename(&source, &backup).unwrap();
+        fs::write(&source, "replacement").unwrap();
+
+        let result = rename_validated_file_between_parent_dirs(
+            &source_parent,
+            source.file_name().unwrap(),
+            &destination_parent,
+            destination.file_name().unwrap(),
+            true,
+            &expected_metadata,
+        )
+        .unwrap_err();
+
+        assert_eq!(io::ErrorKind::PermissionDenied, result.kind());
+        assert_eq!("replacement", fs::read_to_string(&source).unwrap());
+        assert_eq!("validated", fs::read_to_string(&backup).unwrap());
+        assert!(!destination.exists());
         env.cleanup();
     }
 
