@@ -1872,9 +1872,8 @@ fn execute_explicit_argv_process(
     #[cfg(unix)]
     command.process_group(0);
 
-    let current_env: HashMap<String, String> = std::env::vars().collect();
     for key in env_allowlist {
-        if let Some(value) = current_env.get(key) {
+        if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }
     }
@@ -2194,7 +2193,7 @@ impl crate::runtime::RuntimeTool for ProcExecTool {
         if outcome.stdout.timed_out {
             truncation_reasons.push("stdout capture timed out".to_string());
         }
-        if outcome.stdout.truncated {
+        if outcome.stdout.truncated && outcome.stdout.retained_bytes >= self.max_output_bytes {
             truncation_reasons.push(format!(
                 "stdout truncated at {} bytes",
                 self.max_output_bytes
@@ -2203,7 +2202,7 @@ impl crate::runtime::RuntimeTool for ProcExecTool {
         if outcome.stderr.timed_out {
             truncation_reasons.push("stderr capture timed out".to_string());
         }
-        if outcome.stderr.truncated {
+        if outcome.stderr.truncated && outcome.stderr.retained_bytes >= self.max_output_bytes {
             truncation_reasons.push(format!(
                 "stderr truncated at {} bytes",
                 self.max_output_bytes
