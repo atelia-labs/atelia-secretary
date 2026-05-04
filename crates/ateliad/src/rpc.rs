@@ -18,14 +18,15 @@ use crate::service::{
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
 };
 use atelia_core::{
-    Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState, EventCursor,
-    EventQuery, EventSeverity, EventSubjectType, ExtensionInstallRecord, ExtensionStatusRequest,
-    InstallExtensionRequest, JobEvent, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
-    ListBlocklistRequest, ListExtensionsRequest, OutputFormat, OversizeOutputPolicy, PathScope,
-    PolicyOutcome, ProjectId, RenderOptions, RepositoryId, RepositoryRecord, RepositoryTrustState,
-    ResourceScope, RiskTier, RollbackExtensionRequest, StoreError, ToolOutputDefaults,
-    ToolOutputGranularity, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsScope,
-    ToolOutputVerbosity, ToolResultId, TruncationMetadata,
+    Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState,
+    EventCursor as CoreEventCursor, EventQuery, EventSeverity, EventSubjectType,
+    ExtensionInstallRecord, ExtensionStatusRequest, InstallExtensionRequest, JobEvent,
+    JobEventKind, JobId, JobKind, JobRecord, JobStatus, ListBlocklistRequest,
+    ListExtensionsRequest, OutputFormat, OversizeOutputPolicy, PathScope, PolicyOutcome, ProjectId,
+    RenderOptions, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier,
+    RollbackExtensionRequest, StoreError, ToolOutputDefaults, ToolOutputGranularity,
+    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity,
+    ToolResultId, TruncationMetadata,
 };
 use std::convert::TryFrom;
 
@@ -126,7 +127,10 @@ impl SecretaryRpcServer {
                 .into_iter()
                 .map(policy_decision_to_rpc)
                 .collect(),
-            latest_cursor: snapshot.latest_event.as_ref().map(event_cursor_from_job_event),
+            latest_cursor: snapshot
+                .latest_event
+                .as_ref()
+                .map(event_cursor_from_job_event),
             daemon_status: daemon_status_label(snapshot.daemon_status).to_string(),
             storage_status: storage_status_label(snapshot.storage_status).to_string(),
         })
@@ -1409,10 +1413,10 @@ fn parse_event_query(request: ListEventsRequest) -> RpcResult<EventQuery> {
         .map(parse_repository_id)
         .transpose()?;
     let cursor = match request.cursor.unwrap_or(EventCursorRequest::Beginning) {
-        EventCursorRequest::Beginning => EventCursor::Beginning,
-        EventCursorRequest::AfterSequence(sequence) => EventCursor::AfterSequence(sequence),
+        EventCursorRequest::Beginning => CoreEventCursor::Beginning,
+        EventCursorRequest::AfterSequence(sequence) => CoreEventCursor::AfterSequence(sequence),
         EventCursorRequest::AfterEventId(event_id) => {
-            EventCursor::AfterEventId(parse_event_id(&event_id)?)
+            CoreEventCursor::AfterEventId(parse_event_id(&event_id)?)
         }
     };
 
@@ -1426,12 +1430,12 @@ fn parse_event_query(request: ListEventsRequest) -> RpcResult<EventQuery> {
     })
 }
 
-fn parse_event_cursor(cursor: EventCursorRequest) -> RpcResult<EventCursor> {
+fn parse_event_cursor(cursor: EventCursorRequest) -> RpcResult<CoreEventCursor> {
     Ok(match cursor {
-        EventCursorRequest::Beginning => EventCursor::Beginning,
-        EventCursorRequest::AfterSequence(sequence) => EventCursor::AfterSequence(sequence),
+        EventCursorRequest::Beginning => CoreEventCursor::Beginning,
+        EventCursorRequest::AfterSequence(sequence) => CoreEventCursor::AfterSequence(sequence),
         EventCursorRequest::AfterEventId(event_id) => {
-            EventCursor::AfterEventId(parse_event_id(&event_id)?)
+            CoreEventCursor::AfterEventId(parse_event_id(&event_id)?)
         }
     })
 }

@@ -554,19 +554,15 @@ impl SecretaryService {
     ) -> ServiceResult<ProjectStatusSnapshot> {
         let repository_id = request.repository_id;
         let repository = self.get_repository(&repository_id)?;
-        let ProjectStatusSnapshot {
+        let atelia_core::ProjectStatusSnapshot {
             recent_jobs,
             recent_policy_decisions,
             latest_event,
-        } = self
-            .lifecycle
-            .runtime()
-            .store()
-            .project_status_snapshot(
-                &repository_id,
-                PROJECT_STATUS_RECENT_LIMIT,
-                PROJECT_STATUS_RECENT_LIMIT,
-            )?;
+        } = self.lifecycle.runtime().store().project_status_snapshot(
+            &repository_id,
+            PROJECT_STATUS_RECENT_LIMIT,
+            PROJECT_STATUS_RECENT_LIMIT,
+        )?;
 
         Ok(ProjectStatusSnapshot {
             repository,

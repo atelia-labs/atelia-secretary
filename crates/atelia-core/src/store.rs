@@ -410,13 +410,17 @@ impl SecretaryStore for InMemoryStore {
 
         let mut latest_event = None;
         for (_, event_id) in inner.job_events_by_sequence.iter().rev() {
-            let event = inner
-                .job_events_by_id
-                .get(event_id)
-                .ok_or_else(|| StoreError::Conflict {
-                    collection: "job_events",
-                    reason: format!("sequence index references missing event {}", id_debug(event_id)),
-                })?;
+            let event =
+                inner
+                    .job_events_by_id
+                    .get(event_id)
+                    .ok_or_else(|| StoreError::Conflict {
+                        collection: "job_events",
+                        reason: format!(
+                            "sequence index references missing event {}",
+                            id_debug(event_id)
+                        ),
+                    })?;
 
             if event.refs.repository_id.as_ref() == Some(repository_id) {
                 latest_event = Some(event.clone());
@@ -3664,7 +3668,7 @@ mod tests {
 
         let mut first = job_record(repository.id.clone());
         first.updated_at = timestamp(10);
-        let first = persist_job(&store, first);
+        let _first = persist_job(&store, first);
 
         let mut second = job_record(repository.id.clone());
         second.updated_at = timestamp(20);
@@ -3676,11 +3680,15 @@ mod tests {
 
         let mut first_decision = policy_decision(repository.id.clone());
         first_decision.created_at = timestamp(10);
-        store.create_policy_decision(first_decision.clone()).unwrap();
+        store
+            .create_policy_decision(first_decision.clone())
+            .unwrap();
 
         let mut second_decision = policy_decision(repository.id.clone());
         second_decision.created_at = timestamp(20);
-        store.create_policy_decision(second_decision.clone()).unwrap();
+        store
+            .create_policy_decision(second_decision.clone())
+            .unwrap();
 
         let snapshot = store
             .project_status_snapshot(&repository.id, 1, 1)
@@ -3691,10 +3699,7 @@ mod tests {
         assert_eq!(snapshot.recent_policy_decisions.len(), 1);
         assert_eq!(snapshot.recent_policy_decisions[0].id, second_decision.id);
         assert_eq!(
-            snapshot
-                .latest_event
-                .unwrap()
-                .id,
+            snapshot.latest_event.unwrap().id,
             second.latest_event_id.expect("latest event exists")
         );
     }

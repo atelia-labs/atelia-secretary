@@ -2820,11 +2820,9 @@ mod tests {
         );
         assert!(payload["data"]["repository"]["repository_id"].is_string());
         assert!(payload["data"]["latest_cursor"].is_object());
-        assert!(
-            payload["data"]["latest_cursor"]["sequence"]
-                .as_i64()
-                .is_some_and(|sequence| sequence > 0)
-        );
+        assert!(payload["data"]["latest_cursor"]["sequence"]
+            .as_i64()
+            .is_some_and(|sequence| sequence > 0));
         let _ = fs::remove_dir_all(root);
     }
 
