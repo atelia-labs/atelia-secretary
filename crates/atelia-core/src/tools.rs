@@ -11,23 +11,31 @@ use crate::domain::{
     ToolResult, ToolResultField, ToolResultId, ToolResultStatus, TruncationMetadata,
 };
 use crate::runtime::RuntimeJobRequest;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, ErrorKind, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    Arc,
+};
+use std::thread;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use std::sync::atomic::{AtomicU64, Ordering};
-
+use std::os::unix::process::CommandExt;
 const TOOLS_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_READ_MAX_LINES: usize = 120;
 const DEFAULT_READ_MAX_CHARS: usize = 32 * 1024;
@@ -41,6 +49,8 @@ const WRITE_FILE_TMP_PREFIX: &str = "atelia-write-tmp";
 const WRITE_FILE_LOCK_PREFIX: &str = "atelia-write-lock";
 #[cfg(unix)]
 static WRITE_FILE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const CAPTURE_THREAD_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
+const CAPTURE_THREAD_QUIESCE_TIMEOUT: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // Path canonicalization and scope validation
@@ -1393,6 +1403,1085 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ProcExecTool
+// ---------------------------------------------------------------------------
+
+/// Executes a bounded explicit-argv process within the registered repository scope.
+#[derive(Debug, Clone)]
+pub struct ProcExecTool {
+    repository_root: PathBuf,
+    argv: Vec<String>,
+    env_allowlist: HashSet<String>,
+    env_overrides: HashMap<String, String>,
+    timeout: Duration,
+    max_output_bytes: usize,
+    include_full_argv: bool,
+}
+
+impl ProcExecTool {
+    pub fn new(repository_root: impl Into<PathBuf>, argv: Vec<String>) -> Self {
+        Self {
+            repository_root: repository_root.into(),
+            argv,
+            env_allowlist: HashSet::new(),
+            env_overrides: HashMap::new(),
+            timeout: Duration::from_secs(30),
+            max_output_bytes: 64 * 1024,
+            include_full_argv: false,
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+        self.max_output_bytes = max_output_bytes;
+        self
+    }
+
+    pub fn with_env_allowlist<I, S>(mut self, allowlist: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.env_allowlist = allowlist.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_env_override(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env_overrides.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn with_full_argv(mut self, include_full_argv: bool) -> Self {
+        self.include_full_argv = include_full_argv;
+        self
+    }
+
+    fn argv_preview(&self) -> Vec<String> {
+        self.argv
+            .first()
+            .cloned()
+            .map(|first| vec![first, format!("argc={}", self.argv.len())])
+            .unwrap_or_default()
+    }
+
+    fn argv_field_value(&self) -> StructuredValue {
+        if self.include_full_argv {
+            StructuredValue::StringList(self.argv.clone())
+        } else {
+            StructuredValue::StringList(self.argv_preview())
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CapturedStream {
+    text: String,
+    original_bytes: usize,
+    retained_bytes: usize,
+    truncated: bool,
+    timed_out: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessExecutionOutcome {
+    status: ToolResultStatus,
+    summary: String,
+    exit_code: Option<i64>,
+    duration_ms: i64,
+    stdout: CapturedStream,
+    stderr: CapturedStream,
+    timed_out: bool,
+}
+
+struct TempCaptureFile {
+    path: PathBuf,
+    file: File,
+}
+
+impl TempCaptureFile {
+    fn create(label: &str) -> io::Result<Self> {
+        let safe_label = label
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let sanitized_label = if safe_label.is_empty() {
+            "stream".to_string()
+        } else {
+            safe_label
+        };
+
+        let (path, file) = loop {
+            let filename = format!(
+                "atelia-proc-exec-{uuid}-{sanitized_label}.out",
+                uuid = Uuid::new_v4()
+            );
+            let path = std::env::temp_dir().join(filename);
+
+            let mut options = fs::OpenOptions::new();
+            options.write(true).read(true).create_new(true);
+            #[cfg(unix)]
+            {
+                options.mode(0o600);
+            }
+
+            match options.open(&path) {
+                Ok(file) => break (path, file),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
+
+        Ok(Self { path, file })
+    }
+
+    fn writer(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
+    fn read_retained_and_original(&self, max_output_bytes: usize) -> io::Result<(Vec<u8>, usize)> {
+        let mut file = self.file.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
+
+        let mut retained = Vec::new();
+        let mut buffer = [0u8; 8192];
+        let mut original_bytes = 0usize;
+
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+
+            original_bytes = original_bytes.saturating_add(read);
+            let budget = max_output_bytes.saturating_sub(retained.len());
+            if budget > 0 {
+                retained.extend_from_slice(&buffer[..budget.min(read)]);
+            }
+        }
+
+        Ok((retained, original_bytes))
+    }
+}
+
+impl Drop for TempCaptureFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn capture_text_output(bytes: Vec<u8>, original_bytes: usize) -> CapturedStream {
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    CapturedStream {
+        retained_bytes: bytes.len(),
+        text,
+        original_bytes,
+        truncated: original_bytes > bytes.len(),
+        timed_out: false,
+    }
+}
+
+fn finalize_captured_stream(
+    bytes: Vec<u8>,
+    original_bytes: usize,
+    retained_bytes: usize,
+    timed_out: bool,
+) -> CapturedStream {
+    let mut stream = capture_text_output(bytes, original_bytes);
+    stream.retained_bytes = retained_bytes;
+    stream.truncated = stream.original_bytes > stream.retained_bytes;
+    stream.timed_out = timed_out;
+    stream
+}
+
+#[derive(Debug)]
+struct StreamCaptureResult {
+    original_bytes: usize,
+    retained_bytes: usize,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct StreamCaptureStats {
+    original_bytes: AtomicUsize,
+}
+
+#[cfg(unix)]
+impl StreamCaptureStats {
+    fn new() -> Self {
+        Self {
+            original_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn read_original_bytes(&self) -> usize {
+        self.original_bytes.load(Ordering::Acquire)
+    }
+
+    fn sync(&self, original_bytes: usize) {
+        self.original_bytes.store(original_bytes, Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+fn capture_stream_to_file<R: Read + AsRawFd + Send + 'static>(
+    mut stream: R,
+    mut output_file: File,
+    max_output_bytes: usize,
+    stop_after_timeout: Arc<AtomicBool>,
+    stop_immediately: Arc<AtomicBool>,
+    capture_stats: Arc<StreamCaptureStats>,
+) -> io::Result<StreamCaptureResult> {
+    #[cfg(unix)]
+    {
+        let raw_fd = stream.as_raw_fd();
+        // SAFETY: `raw_fd` is a valid file descriptor borrowed for the lifetime of the reader.
+        let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL, 0) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: `raw_fd` is valid and `flags` were returned by `F_GETFL` above.
+        let result = unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    let mut buffer = [0u8; 8192];
+    let mut original_bytes = 0usize;
+    let mut retained_bytes = 0usize;
+    let mut poll_fds = [libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+
+    loop {
+        if stop_immediately.load(Ordering::Acquire) {
+            break;
+        }
+
+        let timeout_ms: libc::c_int = if stop_after_timeout.load(Ordering::Acquire) {
+            10
+        } else {
+            100
+        };
+        poll_fds[0].revents = 0;
+        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 1, timeout_ms) };
+        if poll_result < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        if poll_result == 0 {
+            if stop_after_timeout.load(Ordering::Acquire) {
+                break;
+            }
+            continue;
+        }
+
+        let read = match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+
+        original_bytes = original_bytes.saturating_add(read);
+        capture_stats.sync(original_bytes);
+        let budget = max_output_bytes.saturating_sub(retained_bytes);
+        if budget > 0 {
+            let bytes_to_store = budget.min(read);
+            output_file.write_all(&buffer[..bytes_to_store])?;
+            retained_bytes = retained_bytes.saturating_add(bytes_to_store);
+        }
+
+        if stop_after_timeout.load(Ordering::Acquire)
+            && original_bytes >= max_output_bytes
+            && retained_bytes >= max_output_bytes
+        {
+            break;
+        }
+
+        if stop_immediately.load(Ordering::Acquire) {
+            break;
+        }
+    }
+
+    Ok(StreamCaptureResult {
+        original_bytes,
+        retained_bytes,
+    })
+}
+
+#[cfg(unix)]
+fn spawn_capture_thread<R>(
+    stream: R,
+    writer: File,
+    max_output_bytes: usize,
+    stop_after_timeout: Arc<AtomicBool>,
+    stop_immediately: Arc<AtomicBool>,
+    capture_stats: Arc<StreamCaptureStats>,
+) -> io::Result<thread::JoinHandle<io::Result<StreamCaptureResult>>>
+where
+    R: Read + AsRawFd + Send + 'static,
+{
+    thread::Builder::new().spawn(move || {
+        capture_stream_to_file(
+            stream,
+            writer,
+            max_output_bytes,
+            stop_after_timeout,
+            stop_immediately,
+            capture_stats,
+        )
+    })
+}
+
+fn join_capture_thread<T>(
+    label: &str,
+    task: thread::JoinHandle<io::Result<T>>,
+    stop_immediately: Arc<AtomicBool>,
+    timeout: Duration,
+) -> io::Result<Option<T>> {
+    let deadline = Instant::now() + timeout;
+    while !task.is_finished() {
+        if Instant::now() >= deadline {
+            stop_immediately.store(true, Ordering::Release);
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    if !task.is_finished() {
+        let quiesce_deadline = Instant::now() + CAPTURE_THREAD_QUIESCE_TIMEOUT;
+        while !task.is_finished() {
+            if Instant::now() >= quiesce_deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    let captured = task
+        .join()
+        .map_err(|_| io::Error::other(format!("{label} capture thread panicked")))?;
+    Ok(Some(captured?))
+}
+
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+trait ChildTimeoutProbe {
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>>;
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus>;
+    fn handle_timeout(&mut self) -> bool;
+}
+
+impl ChildTimeoutProbe for std::process::Child {
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.try_wait()
+    }
+
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.wait()
+    }
+
+    fn handle_timeout(&mut self) -> bool {
+        kill_process_tree(self)
+    }
+}
+
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn wait_for_child_with_recheck<C: ChildTimeoutProbe>(
+    child: &mut C,
+    timeout: Duration,
+) -> io::Result<(Option<std::process::ExitStatus>, bool, bool)> {
+    let start = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok((Some(status), false, false));
+        }
+
+        if start.elapsed() >= timeout {
+            if let Some(status) = child.try_wait()? {
+                return Ok((Some(status), false, false));
+            }
+            let process_tree_handled = child.handle_timeout();
+            let status = child.wait()?;
+            return Ok((Some(status), true, process_tree_handled));
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_tree(child: &mut std::process::Child) -> bool {
+    let pid = child.id() as i32;
+    let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    let _ = child.kill();
+    true
+}
+
+#[cfg(unix)]
+fn kill_process_group(pgid: i32) -> bool {
+    let _ = unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL) };
+    true
+}
+
+#[cfg(unix)]
+fn child_process_group_id(child: &std::process::Child) -> i32 {
+    let pid = child.id() as libc::pid_t;
+    let pgid = unsafe { libc::getpgid(pid) };
+    if pgid >= 0 {
+        pgid as i32
+    } else {
+        pid as i32
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_uptime_jiffies() -> io::Result<u64> {
+    let uptime = fs::read_to_string("/proc/uptime")?;
+    let uptime_seconds = uptime
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "missing uptime value"))?
+        .parse::<f64>()
+        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return Err(io::Error::other("clock tick rate unavailable"));
+    }
+    Ok((uptime_seconds * ticks_per_second as f64).floor() as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn child_exited_without_reaping(child: &std::process::Child) -> io::Result<bool> {
+    let mut siginfo = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    let pid = child.id() as libc::id_t;
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            siginfo.as_mut_ptr(),
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let siginfo = unsafe { siginfo.assume_init() };
+    Ok(unsafe { siginfo.si_pid() } == pid as libc::pid_t)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_child_with_exit_cutoff(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> io::Result<(Option<std::process::ExitStatus>, bool, bool, Option<u64>)> {
+    let start = Instant::now();
+
+    loop {
+        if child_exited_without_reaping(child)? {
+            let process_exit_cutoff = current_uptime_jiffies().ok();
+            let status = child.wait()?;
+            return Ok((Some(status), false, false, process_exit_cutoff));
+        }
+
+        if start.elapsed() >= timeout {
+            if child_exited_without_reaping(child)? {
+                let process_exit_cutoff = current_uptime_jiffies().ok();
+                let status = child.wait()?;
+                return Ok((Some(status), false, false, process_exit_cutoff));
+            }
+
+            let process_tree_handled = kill_process_tree(child);
+            let status = child.wait()?;
+            return Ok((Some(status), true, process_tree_handled, None));
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn proc_stat_process_group_and_starttime(stat: &str) -> Option<(i32, u64)> {
+    let end_comm = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[end_comm + 1..].split_whitespace().collect();
+    let pgrp = fields.get(2)?.parse::<i32>().ok()?;
+    let starttime = fields.get(19)?.parse::<u64>().ok()?;
+    Some((pgrp, starttime))
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_has_live_member_from_before_exit(pgid: i32, cutoff: u64) -> bool {
+    let entries = match fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+
+    for entry in entries.flatten() {
+        let stat_path = entry.path().join("stat");
+        let stat = match fs::read_to_string(stat_path) {
+            Ok(stat) => stat,
+            Err(_) => continue,
+        };
+        let Some((entry_pgid, starttime)) = proc_stat_process_group_and_starttime(&stat) else {
+            continue;
+        };
+        if entry_pgid == pgid && starttime <= cutoff {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_group_has_live_member_from_before_exit(_pgid: i32, _cutoff: u64) -> bool {
+    true
+}
+
+#[cfg(not(unix))]
+fn kill_process_tree(child: &mut std::process::Child) -> bool {
+    let _ = child.kill();
+    false
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: i32) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wait_for_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> io::Result<(Option<std::process::ExitStatus>, bool, bool)> {
+    wait_for_child_with_recheck(child, timeout)
+}
+
+fn cleanup_spawned_child(child: &mut std::process::Child) {
+    let _ = kill_process_tree(child);
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn execute_explicit_argv_process(
+    repository_root: &Path,
+    cwd_request: &str,
+    argv: &[String],
+    env_allowlist: &HashSet<String>,
+    env_overrides: &HashMap<String, String>,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<ProcessExecutionOutcome, String> {
+    if argv.is_empty() {
+        return Err("argv must not be empty".to_string());
+    }
+
+    let canonical_cwd = canonicalize_within_scope(repository_root, Path::new(cwd_request))
+        .map_err(|error| format!("cwd rejected: {error}"))?;
+
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    command.current_dir(&canonical_cwd.canonical);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let stdout_capture = TempCaptureFile::create("stdout")
+        .map_err(|error| format!("failed to create stdout capture file: {error}"))?;
+    let stderr_capture = TempCaptureFile::create("stderr")
+        .map_err(|error| format!("failed to create stderr capture file: {error}"))?;
+    command.env_clear();
+    #[cfg(unix)]
+    command.process_group(0);
+
+    for key in env_allowlist {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    for (key, value) in env_overrides {
+        command.env(key, value);
+    }
+
+    let start = Instant::now();
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn process: {error}"))?;
+    let child_pgid = child_process_group_id(&child);
+
+    let stdout_writer = match stdout_capture.writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            cleanup_spawned_child(&mut child);
+            return Err(format!(
+                "failed to clone stdout capture writer for stream reader: {error}"
+            ));
+        }
+    };
+
+    let stderr_writer = match stderr_capture.writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            cleanup_spawned_child(&mut child);
+            return Err(format!(
+                "failed to clone stderr capture writer for stream reader: {error}"
+            ));
+        }
+    };
+
+    let capture_after_timeout = Arc::new(AtomicBool::new(false));
+    let stop_immediately = Arc::new(AtomicBool::new(false));
+
+    let stdout_reader = match child.stdout.take() {
+        Some(reader) => reader,
+        None => {
+            cleanup_spawned_child(&mut child);
+            return Err("child process did not provide stdout".to_string());
+        }
+    };
+    let stderr_reader = match child.stderr.take() {
+        Some(reader) => reader,
+        None => {
+            cleanup_spawned_child(&mut child);
+            return Err("child process did not provide stderr".to_string());
+        }
+    };
+
+    let stdout_capture_stats = Arc::new(StreamCaptureStats::new());
+    let stderr_capture_stats = Arc::new(StreamCaptureStats::new());
+
+    let stdout_handle = match spawn_capture_thread(
+        stdout_reader,
+        stdout_writer,
+        max_output_bytes,
+        capture_after_timeout.clone(),
+        stop_immediately.clone(),
+        stdout_capture_stats.clone(),
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            capture_after_timeout.store(true, Ordering::Release);
+            cleanup_spawned_child(&mut child);
+            return Err(format!("failed to start stdout capture thread: {error}"));
+        }
+    };
+    let stderr_handle = match spawn_capture_thread(
+        stderr_reader,
+        stderr_writer,
+        max_output_bytes,
+        capture_after_timeout.clone(),
+        stop_immediately.clone(),
+        stderr_capture_stats.clone(),
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            capture_after_timeout.store(true, Ordering::Release);
+            cleanup_spawned_child(&mut child);
+            return Err(format!("failed to start stderr capture thread: {error}"));
+        }
+    };
+
+    #[cfg(target_os = "linux")]
+    let (status, process_timed_out, mut process_tree_handled, process_exit_cutoff) =
+        wait_for_child_with_exit_cutoff(&mut child, timeout).map_err(|error| {
+            cleanup_spawned_child(&mut child);
+            format!("process wait failed: {error}")
+        })?;
+    #[cfg(not(target_os = "linux"))]
+    let (status, process_timed_out, mut process_tree_handled) = wait_for_child(&mut child, timeout)
+        .map_err(|error| {
+            cleanup_spawned_child(&mut child);
+            format!("process wait failed: {error}")
+        })?;
+    if process_timed_out {
+        capture_after_timeout.store(true, Ordering::Release);
+    }
+
+    let mut stdout_capture_timed_out = false;
+    let mut stderr_capture_timed_out = false;
+
+    let stdout_capture_result = match join_capture_thread(
+        "stdout",
+        stdout_handle,
+        stop_immediately.clone(),
+        CAPTURE_THREAD_JOIN_TIMEOUT,
+    ) {
+        Ok(Some(result)) => result,
+        Ok(None) => {
+            stdout_capture_timed_out = true;
+            StreamCaptureResult {
+                original_bytes: stdout_capture_stats.read_original_bytes(),
+                retained_bytes: 0,
+            }
+        }
+        Err(error) => {
+            capture_after_timeout.store(true, Ordering::Release);
+            stop_immediately.store(true, Ordering::Release);
+            cleanup_spawned_child(&mut child);
+            return Err(format!("stdout capture thread failed: {error}"));
+        }
+    };
+
+    let stderr_capture_result = match join_capture_thread(
+        "stderr",
+        stderr_handle,
+        stop_immediately.clone(),
+        CAPTURE_THREAD_JOIN_TIMEOUT,
+    ) {
+        Ok(Some(result)) => result,
+        Ok(None) => {
+            stderr_capture_timed_out = true;
+            StreamCaptureResult {
+                original_bytes: stderr_capture_stats.read_original_bytes(),
+                retained_bytes: 0,
+            }
+        }
+        Err(error) => {
+            capture_after_timeout.store(true, Ordering::Release);
+            stop_immediately.store(true, Ordering::Release);
+            cleanup_spawned_child(&mut child);
+            return Err(format!("stderr capture thread failed: {error}"));
+        }
+    };
+    let capture_thread_aborted = stop_immediately.load(Ordering::Acquire);
+
+    let capture_timed_out = stdout_capture_timed_out || stderr_capture_timed_out;
+    #[cfg(unix)]
+    let mut group_cleanup_attempted = false;
+    #[cfg(not(unix))]
+    let group_cleanup_attempted = false;
+    if capture_timed_out || capture_thread_aborted {
+        #[cfg(unix)]
+        {
+            group_cleanup_attempted = true;
+        }
+        process_tree_handled = process_tree_handled || kill_process_group(child_pgid);
+    }
+    #[cfg(target_os = "linux")]
+    if !process_timed_out
+        && process_exit_cutoff
+            .map(|cutoff| process_group_has_live_member_from_before_exit(child_pgid, cutoff))
+            .unwrap_or(false)
+    {
+        #[cfg(unix)]
+        {
+            group_cleanup_attempted = true;
+        }
+        process_tree_handled = process_tree_handled || kill_process_group(child_pgid);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if !process_timed_out && process_group_has_live_member_from_before_exit(child_pgid, 0) {
+        #[cfg(unix)]
+        {
+            group_cleanup_attempted = true;
+        }
+        process_tree_handled = process_tree_handled || kill_process_group(child_pgid);
+    }
+
+    let (stdout_bytes, _stdout_original_bytes) = stdout_capture
+        .read_retained_and_original(max_output_bytes)
+        .map_err(|error| format!("stdout read failed: {error}"))?;
+    let (stderr_bytes, _stderr_original_bytes) = stderr_capture
+        .read_retained_and_original(max_output_bytes)
+        .map_err(|error| format!("stderr read failed: {error}"))?;
+    let stdout_retained_bytes = stdout_bytes.len();
+    let stderr_retained_bytes = stderr_bytes.len();
+
+    let stdout = finalize_captured_stream(
+        stdout_bytes,
+        stdout_capture_result.original_bytes,
+        if stdout_capture_timed_out {
+            stdout_retained_bytes
+        } else {
+            stdout_capture_result.retained_bytes
+        },
+        stdout_capture_timed_out,
+    );
+    let stderr = finalize_captured_stream(
+        stderr_bytes,
+        stderr_capture_result.original_bytes,
+        if stderr_capture_timed_out {
+            stderr_retained_bytes
+        } else {
+            stderr_capture_result.retained_bytes
+        },
+        stderr_capture_timed_out,
+    );
+
+    let duration_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    let exit_code = status.and_then(|exit_status| exit_status.code().map(i64::from));
+
+    let mut summary = match (process_timed_out, exit_code) {
+        (true, _) => format!("process timed out after {} ms", duration_ms),
+        (false, Some(0)) => format!("process exited successfully after {} ms", duration_ms),
+        (false, Some(code)) => {
+            format!("process exited with code {} after {} ms", code, duration_ms)
+        }
+        (false, None) => format!(
+            "process terminated without exit code after {} ms",
+            duration_ms
+        ),
+    };
+    if process_timed_out {
+        if process_tree_handled {
+            summary.push_str(
+                " process timeout may leave detached descendants with inherited stdio; detached cleanup is best-effort",
+            );
+        } else {
+            summary.push_str(
+                " process tree cleanup is unsupported on this platform (best-effort child kill only)",
+            );
+        }
+    }
+    if capture_thread_aborted || stdout_capture_timed_out || stderr_capture_timed_out {
+        if group_cleanup_attempted {
+            summary.push_str(
+                " output capture stream timeout may indicate escaped descendants with inherited stdio; group cleanup was attempted but some descendants may have escaped with inherited stdio",
+            );
+        } else {
+            summary.push_str(
+                " output capture stream timeout may indicate escaped descendants with inherited stdio; detached process-tree cleanup is unsupported",
+            );
+        }
+    }
+    summary.push_str(&format!(" in {}", canonical_cwd.display_path()));
+
+    let status = if process_timed_out {
+        ToolResultStatus::TimedOut
+    } else if exit_code == Some(0) {
+        ToolResultStatus::Succeeded
+    } else {
+        ToolResultStatus::Failed
+    };
+
+    Ok(ProcessExecutionOutcome {
+        status,
+        summary,
+        exit_code,
+        duration_ms,
+        stdout,
+        stderr,
+        timed_out: process_timed_out,
+    })
+}
+
+#[cfg(not(unix))]
+fn execute_explicit_argv_process(
+    _repository_root: &Path,
+    _cwd_request: &str,
+    _argv: &[String],
+    _env_allowlist: &HashSet<String>,
+    _env_overrides: &HashMap<String, String>,
+    _timeout: Duration,
+    _max_output_bytes: usize,
+) -> Result<ProcessExecutionOutcome, String> {
+    Err("proc.exec is unsupported on non-Unix platforms".to_string())
+}
+
+impl crate::runtime::RuntimeTool for ProcExecTool {
+    fn tool_id(&self) -> &'static str {
+        "proc.exec"
+    }
+
+    fn requested_capability(&self) -> &'static str {
+        "process.exec"
+    }
+
+    fn declared_effect(&self) -> &'static str {
+        "run an explicit argv process within the registered repository scope"
+    }
+
+    fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+        let mut parts = vec![
+            format!("cwd={}", request.resource_scope.value),
+            if self.include_full_argv {
+                format!("argv_full={:?}", self.argv)
+            } else if let Some(first_argv) = self.argv.first() {
+                format!("argv[0]={first_argv} argc={}", self.argv.len())
+            } else {
+                "argv=[]".to_string()
+            },
+            format!("timeout={}ms", self.timeout.as_millis()),
+            format!("max_output_bytes={}", self.max_output_bytes),
+        ];
+
+        let mut allowlist: Vec<_> = self.env_allowlist.iter().cloned().collect();
+        allowlist.sort();
+        if !allowlist.is_empty() {
+            parts.push(format!("env_allowlist=[{}]", allowlist.join(",")));
+        }
+
+        let mut overrides: Vec<_> = self.env_overrides.keys().cloned().collect();
+        overrides.sort();
+        if !overrides.is_empty() {
+            parts.push(format!("env_overrides=[{}]", overrides.join(",")));
+        }
+
+        parts.join(" ")
+    }
+
+    fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
+        resolved_path_for_request(&self.repository_root, request)
+    }
+
+    fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
+        let schema_ref = "tool_result.proc.exec.v1";
+        let outcome = match execute_explicit_argv_process(
+            &self.repository_root,
+            &request.resource_scope.value,
+            &self.argv,
+            &self.env_allowlist,
+            &self.env_overrides,
+            self.timeout,
+            self.max_output_bytes,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "process execution failed".to_string(),
+                    error,
+                );
+            }
+        };
+
+        let mut truncation_reasons = Vec::new();
+        if outcome.stdout.timed_out {
+            truncation_reasons.push("stdout capture timed out".to_string());
+        }
+        if outcome.stdout.truncated && outcome.stdout.retained_bytes >= self.max_output_bytes {
+            truncation_reasons.push(format!(
+                "stdout truncated at {} bytes",
+                self.max_output_bytes
+            ));
+        }
+        if outcome.stderr.timed_out {
+            truncation_reasons.push("stderr capture timed out".to_string());
+        }
+        if outcome.stderr.truncated && outcome.stderr.retained_bytes >= self.max_output_bytes {
+            truncation_reasons.push(format!(
+                "stderr truncated at {} bytes",
+                self.max_output_bytes
+            ));
+        }
+        let truncation = if truncation_reasons.is_empty() {
+            None
+        } else {
+            Some(TruncationMetadata {
+                original_bytes: (outcome.stdout.original_bytes + outcome.stderr.original_bytes)
+                    as u64,
+                retained_bytes: (outcome.stdout.retained_bytes + outcome.stderr.retained_bytes)
+                    as u64,
+                reason: truncation_reasons.join("; "),
+            })
+        };
+
+        let mut fields = vec![
+            ToolResultField {
+                key: "summary".to_string(),
+                value: StructuredValue::String(outcome.summary),
+            },
+            ToolResultField {
+                key: "cwd".to_string(),
+                value: StructuredValue::String(request.resource_scope.value.clone()),
+            },
+            ToolResultField {
+                key: "argv".to_string(),
+                value: self.argv_field_value(),
+            },
+            ToolResultField {
+                key: "status".to_string(),
+                value: StructuredValue::String(
+                    match outcome.status {
+                        ToolResultStatus::Succeeded => "succeeded",
+                        ToolResultStatus::Failed => "failed",
+                        ToolResultStatus::Canceled => "canceled",
+                        ToolResultStatus::TimedOut => "timed_out",
+                    }
+                    .to_string(),
+                ),
+            },
+            ToolResultField {
+                key: "duration_ms".to_string(),
+                value: StructuredValue::Integer(outcome.duration_ms),
+            },
+            ToolResultField {
+                key: "stdout".to_string(),
+                value: StructuredValue::String(outcome.stdout.text),
+            },
+            ToolResultField {
+                key: "stdout_bytes".to_string(),
+                value: StructuredValue::Integer(outcome.stdout.original_bytes as i64),
+            },
+            ToolResultField {
+                key: "stdout_retained_bytes".to_string(),
+                value: StructuredValue::Integer(outcome.stdout.retained_bytes as i64),
+            },
+            ToolResultField {
+                key: "stdout_truncated".to_string(),
+                value: StructuredValue::Bool(outcome.stdout.truncated),
+            },
+            ToolResultField {
+                key: "stderr".to_string(),
+                value: StructuredValue::String(outcome.stderr.text),
+            },
+            ToolResultField {
+                key: "stderr_bytes".to_string(),
+                value: StructuredValue::Integer(outcome.stderr.original_bytes as i64),
+            },
+            ToolResultField {
+                key: "stderr_retained_bytes".to_string(),
+                value: StructuredValue::Integer(outcome.stderr.retained_bytes as i64),
+            },
+            ToolResultField {
+                key: "stderr_truncated".to_string(),
+                value: StructuredValue::Bool(outcome.stderr.truncated),
+            },
+        ];
+
+        if let Some(exit_code) = outcome.exit_code {
+            fields.push(ToolResultField {
+                key: "exit_code".to_string(),
+                value: StructuredValue::Integer(exit_code),
+            });
+        }
+        fields.push(ToolResultField {
+            key: "timed_out".to_string(),
+            value: StructuredValue::Bool(outcome.timed_out),
+        });
+
+        make_tool_result(
+            invocation,
+            outcome.status,
+            schema_ref,
+            fields,
+            truncation,
+            Vec::new(),
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn search_recursive(
     dir: &Path,
@@ -2692,7 +3781,9 @@ mod tests {
     use crate::runtime::{RuntimeTool, SecretaryRuntime, RUNTIME_SCHEMA_VERSION};
     use crate::store::SecretaryStore;
     use crate::tool_output::{render_tool_result, OutputFormat, RenderOptions};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -4216,6 +5307,582 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    // -- ProcExecTool tests --
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_runs_successfully_with_repo_scoped_cwd() {
+        let env = TestEnv::new("proc-success");
+        env.create_dir("subdir");
+
+        let tool = ProcExecTool::new(&env.root, vec!["pwd".to_string()]);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("subdir");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            Some("tool_result.proc.exec.v1".to_string()),
+            result.schema_ref
+        );
+        let stdout = result.fields.iter().find(|f| f.key == "stdout").unwrap();
+        let stdout_value = string_value(&stdout.value).trim_end_matches('\n');
+        assert_eq!(env.root.join("subdir").to_string_lossy(), stdout_value);
+        let exit_code = result.fields.iter().find(|f| f.key == "exit_code").unwrap();
+        assert_eq!(0, integer_value(&exit_code.value));
+        let cwd = result.fields.iter().find(|f| f.key == "cwd").unwrap();
+        assert_eq!("subdir", string_value(&cwd.value));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_reports_nonzero_exit() {
+        let env = TestEnv::new("proc-nonzero");
+
+        let tool = ProcExecTool::new(&env.root, vec!["false".to_string()]);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let exit_code = result.fields.iter().find(|f| f.key == "exit_code").unwrap();
+        assert_eq!(1, integer_value(&exit_code.value));
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        assert!(string_value(&summary.value).contains("exited with code 1"));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_times_out() {
+        let env = TestEnv::new("proc-timeout");
+
+        let tool = ProcExecTool::new(&env.root, vec!["sleep".to_string(), "2".to_string()])
+            .with_timeout(Duration::from_millis(50));
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::TimedOut, result.status);
+        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
+        assert_eq!(StructuredValue::Bool(true), timed_out.value);
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        assert!(string_value(&summary.value).contains("timed out"));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    struct FakeChildForBoundaryRecheck {
+        try_wait_results: VecDeque<io::Result<Option<std::process::ExitStatus>>>,
+        wait_result: Option<io::Result<std::process::ExitStatus>>,
+        handle_timeout_result: bool,
+        timeout_handled: bool,
+    }
+
+    #[cfg(unix)]
+    impl ChildTimeoutProbe for FakeChildForBoundaryRecheck {
+        fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+            self.try_wait_results.pop_front().unwrap_or(Ok(None))
+        }
+
+        fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+            self.wait_result
+                .take()
+                .expect("fake child did not have wait result")
+        }
+
+        fn handle_timeout(&mut self) -> bool {
+            self.timeout_handled = true;
+            self.handle_timeout_result
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_child_rechecks_at_timeout_boundary_before_kill() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut fake = FakeChildForBoundaryRecheck {
+            try_wait_results: VecDeque::from([
+                Ok(None),
+                Ok(Some(std::process::ExitStatus::from_raw(0))),
+            ]),
+            wait_result: Some(Ok(std::process::ExitStatus::from_raw(0))),
+            handle_timeout_result: true,
+            timeout_handled: false,
+        };
+
+        let (status, timed_out, process_tree_handled) =
+            wait_for_child_with_recheck(&mut fake, Duration::from_millis(0)).unwrap();
+
+        assert_eq!(Some(0), status.and_then(|result| result.code()));
+        assert!(!timed_out);
+        assert!(!process_tree_handled);
+        assert!(!fake.timeout_handled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_times_out_with_child_process_descendants() {
+        let env = TestEnv::new("proc-timeout-descendant");
+        let start = Instant::now();
+
+        let tool = ProcExecTool::new(
+            &env.root,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 5 & sleep 5".to_string(),
+            ],
+        )
+        .with_timeout(Duration::from_millis(50));
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+        let elapsed = start.elapsed();
+
+        assert_eq!(ToolResultStatus::TimedOut, result.status);
+        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
+        assert_eq!(StructuredValue::Bool(true), timed_out.value);
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        assert!(string_value(&summary.value).contains("timed out"));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "timed out execution did not hard-stop"
+        );
+        env.cleanup();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_exec_times_out_with_detached_descendant_is_reported() {
+        let env = TestEnv::new("proc-timeout-detached-descendant");
+
+        let tool = ProcExecTool::new(
+            &env.root,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "setsid sh -c 'sleep 5' & sleep 1".to_string(),
+            ],
+        )
+        .with_timeout(Duration::from_millis(50));
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::TimedOut, result.status);
+        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
+        assert_eq!(StructuredValue::Bool(true), timed_out.value);
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        let summary = string_value(&summary.value);
+        assert!(summary.contains("timed out"));
+        assert!(summary.contains("detached"));
+        env.cleanup();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_exec_normal_exit_with_background_descendants_is_cleaned_up() {
+        let env = TestEnv::new("proc-normal-exit-descendant-cleanup");
+        let background_pid_file = env.root.join("background-child.pid");
+        let script = format!(
+            r#"
+trap '' HUP
+sleep 9999 &
+printf '%s\n' "$!" > '{}'
+exit 0
+"#,
+            background_pid_file.to_string_lossy()
+        );
+
+        let tool = ProcExecTool::new(&env.root, vec!["sh".to_string(), "-c".to_string(), script])
+            .with_timeout(Duration::from_millis(250));
+
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
+        assert_eq!(StructuredValue::Bool(false), timed_out.value);
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        let summary = string_value(&summary.value);
+        assert!(summary.contains("output capture stream timeout"));
+        assert!(summary.contains("group cleanup was attempted"));
+        assert!(!summary.contains("detached process-tree cleanup is unsupported"));
+
+        let child_pid: u32 = (0..20)
+            .find_map(|_| {
+                std::fs::read_to_string(&background_pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+            })
+            .unwrap_or_else(|| panic!("missing child pid file {}", background_pid_file.display()));
+
+        let mut attempts = 20;
+        let mut child_still_running = true;
+        while attempts > 0 && child_still_running {
+            let still_running = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(child_pid.to_string())
+                .output()
+                .map(|status| status.status.success())
+                .unwrap_or(false);
+
+            if !still_running {
+                child_still_running = false;
+            } else {
+                thread::sleep(Duration::from_millis(20));
+                attempts -= 1;
+            }
+        }
+
+        let mut child_pgid = 0u32;
+        if child_still_running {
+            let child_stat =
+                std::fs::read_to_string(format!("/proc/{}/stat", child_pid)).unwrap_or_default();
+            let fields: Vec<&str> = child_stat.split_whitespace().collect();
+            child_pgid = fields
+                .get(4)
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(0);
+        }
+
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(child_pid.to_string())
+            .output();
+
+        assert!(
+            !child_still_running,
+            "background descendant should be cleaned up when parent exits normally (pid={child_pid}, pgrp={child_pgid})"
+        );
+        env.cleanup();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_group_cleanup_skips_empty_group_after_normal_exit() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .process_group(0)
+            .spawn()
+            .expect("failed to spawn child");
+        let pgid = child_process_group_id(&child);
+        let status = child.wait().expect("failed to reap child");
+        let cutoff = current_uptime_jiffies().expect("failed to read current uptime");
+
+        assert_eq!(Some(0), status.code());
+        assert!(
+            !process_group_has_live_member_from_before_exit(pgid, cutoff),
+            "empty process group should not be eligible for post-wait cleanup"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_exit_probe_with_wnowait_does_not_reap_child() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("failed to spawn child");
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        while Instant::now() < deadline {
+            if child_exited_without_reaping(&child).expect("failed to probe child exit") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            child_exited_without_reaping(&child).expect("failed to probe child exit"),
+            "child should be visible as exited without being reaped"
+        );
+        assert!(
+            Path::new(&format!("/proc/{pid}")).exists(),
+            "WNOWAIT probe should leave the child as a zombie until it is explicitly reaped"
+        );
+
+        let status = child.wait().expect("failed to reap child");
+        assert_eq!(Some(0), status.code());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_group_cleanup_respects_cutoff_for_live_member_identity() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 1")
+            .process_group(0)
+            .spawn()
+            .expect("failed to spawn child");
+        let pgid = child_process_group_id(&child);
+        let stat_path = format!("/proc/{}/stat", child.id());
+        let stat = std::fs::read_to_string(&stat_path).expect("failed to read child stat");
+        let (_, starttime) =
+            proc_stat_process_group_and_starttime(&stat).expect("failed to parse child stat");
+
+        assert!(
+            process_group_has_live_member_from_before_exit(pgid, starttime),
+            "live member should be recognized when the cutoff is not earlier than its start time"
+        );
+        assert!(
+            !process_group_has_live_member_from_before_exit(pgid, starttime.saturating_sub(1)),
+            "live member should not be treated as pre-exit work when the cutoff is earlier than its start time"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_exec_normal_exit_with_redirected_background_descendant_is_cleaned_up() {
+        let env = TestEnv::new("proc-normal-exit-redirected-descendant-cleanup");
+        let background_pid_file = env.root.join("background-child.pid");
+        let script = format!(
+            "sleep 9999 >/dev/null 2>&1 & printf '%s\\n' $! > '{}' ; exit 0",
+            background_pid_file.to_string_lossy()
+        );
+
+        let tool = ProcExecTool::new(&env.root, vec!["sh".to_string(), "-c".to_string(), script])
+            .with_timeout(Duration::from_secs(1));
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
+        assert_eq!(StructuredValue::Bool(false), timed_out.value);
+
+        let child_pid: u32 = (0..50)
+            .find_map(|_| {
+                std::fs::read_to_string(&background_pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                    .or_else(|| {
+                        thread::sleep(Duration::from_millis(10));
+                        None
+                    })
+            })
+            .unwrap_or_else(|| panic!("missing child pid file {}", background_pid_file.display()));
+
+        let mut child_gone = false;
+        for _ in 0..50 {
+            match std::fs::read_to_string(format!("/proc/{}/stat", child_pid)) {
+                Ok(stat) => {
+                    let state = stat.split_whitespace().nth(2).unwrap_or_default();
+                    if state == "Z" {
+                        child_gone = true;
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    child_gone = true;
+                    break;
+                }
+                Err(_) => {}
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            child_gone,
+            "background descendant should be cleaned up after normal exit (pid={child_pid})"
+        );
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_hard_bounded_capture_no_threads_when_background_streaming() {
+        let stop_immediately = Arc::new(AtomicBool::new(false));
+        let blocking_handle = std::thread::spawn({
+            let stop_immediately = stop_immediately.clone();
+            move || loop {
+                if stop_immediately.load(Ordering::Acquire) {
+                    thread::sleep(CAPTURE_THREAD_QUIESCE_TIMEOUT * 2);
+                    return Ok::<(), io::Error>(());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let join_result = join_capture_thread(
+            "stdout",
+            blocking_handle,
+            stop_immediately.clone(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+
+        assert!(join_result.is_none());
+        assert!(stop_immediately.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_large_output_does_not_misclassify_timeout() {
+        let env = TestEnv::new("proc-large-output");
+        let tool = ProcExecTool::new(
+            &env.root,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "yes x | head -c 64000000".to_string(),
+            ],
+        )
+        .with_timeout(Duration::from_secs(10))
+        .with_max_output_bytes(32);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
+        assert_eq!(StructuredValue::Bool(false), timed_out.value);
+        let stdout_retained = result
+            .fields
+            .iter()
+            .find(|f| f.key == "stdout_retained_bytes")
+            .unwrap();
+        assert_eq!(32, integer_value(&stdout_retained.value));
+        let stdout = result.fields.iter().find(|f| f.key == "stdout").unwrap();
+        assert_eq!(32, string_value(&stdout.value).len());
+        env.cleanup();
+    }
+
+    #[test]
+    fn join_capture_thread_timed_out_stream_forces_sibling_truncated() {
+        let stop_immediately = Arc::new(AtomicBool::new(false));
+        let blocking_original_counter = Arc::new(AtomicUsize::new(0));
+
+        let blocking_handle = std::thread::spawn({
+            let stop_immediately = stop_immediately.clone();
+            let blocking_original_counter = blocking_original_counter.clone();
+            move || -> io::Result<usize> {
+                loop {
+                    if stop_immediately.load(Ordering::Acquire) {
+                        thread::sleep(CAPTURE_THREAD_QUIESCE_TIMEOUT * 2);
+                        blocking_original_counter.fetch_add(1, Ordering::Release);
+                        return Ok(0);
+                    }
+                    blocking_original_counter.fetch_add(1, Ordering::Release);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        });
+        let quick_handle = std::thread::spawn(|| -> io::Result<usize> { Ok(1) });
+
+        let mut blocking_timed_out = false;
+        let blocking_capture_result = match join_capture_thread(
+            "stdout",
+            blocking_handle,
+            stop_immediately.clone(),
+            Duration::from_millis(50),
+        )
+        .unwrap()
+        {
+            Some(result) => result,
+            None => {
+                blocking_timed_out = true;
+                0
+            }
+        };
+
+        let quick_capture_result = join_capture_thread(
+            "stderr",
+            quick_handle,
+            stop_immediately.clone(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+
+        assert!(blocking_timed_out);
+        assert_eq!(0, blocking_capture_result);
+        assert!(quick_capture_result.is_some());
+        assert_eq!(Some(1), quick_capture_result);
+        assert!(blocking_original_counter.load(Ordering::Acquire) > 0);
+        assert!(stop_immediately.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn finalize_captured_stream_keeps_timeout_local() {
+        let stream = finalize_captured_stream(vec![b'a', b'b', b'c'], 5, 3, false);
+
+        assert_eq!(5, stream.original_bytes);
+        assert_eq!(3, stream.retained_bytes);
+        assert!(stream.truncated);
+        assert!(!stream.timed_out);
+    }
+
+    #[test]
+    fn capture_text_output_tracks_retained_bytes_before_utf8_lossy() {
+        let bytes = vec![0xff, 0xfe, b'a', b'b', b'c'];
+        let stream = capture_text_output(bytes, 5);
+
+        assert_eq!(5, stream.original_bytes);
+        assert_eq!(5, stream.retained_bytes);
+        assert_eq!("��abc", stream.text);
+        assert!(!stream.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_rejects_cwd_escape() {
+        let env = TestEnv::new("proc-cwd-escape");
+
+        let tool = ProcExecTool::new(&env.root, vec!["pwd".to_string()]);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path("../../etc");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("cwd rejected"));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_truncates_output_at_max_bytes() {
+        let env = TestEnv::new("proc-output-bounds");
+
+        let tool = ProcExecTool::new(
+            &env.root,
+            vec![
+                "printf".to_string(),
+                "%s".to_string(),
+                "abcdefghij".to_string(),
+            ],
+        )
+        .with_max_output_bytes(4);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let stdout = result.fields.iter().find(|f| f.key == "stdout").unwrap();
+        assert_eq!("abcd", string_value(&stdout.value));
+        let stdout_truncated = result
+            .fields
+            .iter()
+            .find(|f| f.key == "stdout_truncated")
+            .unwrap();
+        assert_eq!(StructuredValue::Bool(true), stdout_truncated.value);
+        let trunc = result.truncation.unwrap();
+        assert!(trunc.reason.contains("stdout truncated at 4 bytes"));
+        assert_eq!(10, trunc.original_bytes);
+        assert_eq!(4, trunc.retained_bytes);
+        env.cleanup();
+    }
+
     // -- FsPatchTool tests --
 
     #[test]
@@ -4378,8 +6045,6 @@ mod tests {
         assert_eq!(io::ErrorKind::FileTooLarge, err.kind());
         env.cleanup();
     }
-
-    // -- Rendering compatibility --
 
     #[test]
     fn read_tool_results_render_in_all_formats() {
