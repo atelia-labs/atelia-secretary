@@ -448,11 +448,22 @@ mod tests {
 
     #[test]
     fn r2_filesystem_write_is_audited() {
-        let decision = decide(input("filesystem.patch"));
+        for capability in [
+            "filesystem.patch",
+            "filesystem.delete",
+            "filesystem.move",
+            "fs.delete",
+            "fs.move",
+        ] {
+            let decision = decide(input(capability));
 
-        assert_eq!(PolicyOutcome::Audited, decision.outcome);
-        assert_eq!(RiskTier::R2, decision.risk_tier);
-        assert_eq!("bounded_write_audited", decision.reason_code);
+            assert_eq!(PolicyOutcome::Audited, decision.outcome, "{capability}");
+            assert_eq!(RiskTier::R2, decision.risk_tier, "{capability}");
+            assert_eq!(
+                "bounded_write_audited", decision.reason_code,
+                "{capability}"
+            );
+        }
     }
 
     #[test]
@@ -636,6 +647,8 @@ mod tests {
             (" FILESYSTEM_READ ", "bounded_read_allowed"),
             ("filesystem-read", "bounded_read_allowed"),
             ("filesystem/read", "bounded_read_allowed"),
+            ("filesystem-delete", "bounded_write_audited"),
+            ("fs/move", "bounded_write_audited"),
             (
                 "repository:reset:hard",
                 "destructive_repository_action_blocked",

@@ -91,6 +91,7 @@ impl CanonicalPath {
 pub enum PathResolutionError {
     RootNotFound,
     TargetNotFound { requested: PathBuf },
+    MetadataFailure { requested: PathBuf, reason: String },
     SymlinkRejected { requested: PathBuf },
     OutsideRepositoryScope { resolved: PathBuf, root: PathBuf },
 }
@@ -101,6 +102,14 @@ impl std::fmt::Display for PathResolutionError {
             Self::RootNotFound => write!(f, "repository root not found"),
             Self::TargetNotFound { requested } => {
                 write!(f, "target path not found: {}", requested.display())
+            }
+            Self::MetadataFailure { requested, reason } => {
+                write!(
+                    f,
+                    "target path metadata unavailable for {}: {}",
+                    requested.display(),
+                    reason
+                )
             }
             Self::SymlinkRejected { requested } => {
                 write!(f, "target path is a symlink: {}", requested.display())
@@ -3216,9 +3225,10 @@ fn resolve_mutation_target(
             });
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => {
-            return Err(PathResolutionError::TargetNotFound {
+        Err(error) => {
+            return Err(PathResolutionError::MetadataFailure {
                 requested: target.clone(),
+                reason: error.to_string(),
             });
         }
     }
@@ -3465,10 +3475,26 @@ fn rename_between_parent_dirs(
 
         #[cfg(not(target_os = "linux"))]
         {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "create_new moves are supported only with renameat2(RENAME_NOREPLACE)",
-            ));
+            // Callers hold the destination write lock before reaching this helper. On
+            // platforms without renameat2(RENAME_NOREPLACE), that lock makes the
+            // existence check and rename safe within the daemon's mutation protocol.
+            // SAFETY: `destination_parent` is live and `destination` is a valid c-string.
+            let exists = unsafe {
+                libc::faccessat(
+                    destination_parent.as_raw_fd(),
+                    destination.as_ptr(),
+                    libc::F_OK,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if exists == 0 {
+                return Err(io::Error::from_raw_os_error(libc::EEXIST));
+            }
+
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(error);
+            }
         }
     }
 
@@ -7706,6 +7732,100 @@ exit 0
             "world",
             fs::read_to_string(env.root.join("note.txt")).unwrap()
         );
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_delete_integrates_with_secretary_runtime() {
+        let env = TestEnv::new("runtime-delete");
+        env.create_file("stale.txt", "delete me");
+
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = RepositoryRecord::new(
+            "test-repo",
+            env.root.to_string_lossy(),
+            RepositoryTrustState::Trusted,
+            LedgerTimestamp::now(),
+        );
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let tool = FsDeleteTool::new(&env.root);
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Mutate,
+            "delete repository file",
+        )
+        .with_resource_scope("path", "stale.txt")
+        .with_requested_capabilities(vec!["filesystem.delete".to_string()]);
+        let receipt = runtime.run_tool_job(request, &tool).unwrap();
+
+        assert_eq!(crate::domain::JobStatus::Succeeded, receipt.job.status);
+        assert_eq!(
+            crate::domain::PolicyOutcome::Audited,
+            receipt.policy_decision.outcome
+        );
+        assert_eq!(
+            "fs.delete",
+            receipt.tool_invocation.as_ref().unwrap().tool_id
+        );
+        assert!(!env.root.join("stale.txt").exists());
+        let result = receipt.tool_result.unwrap();
+        let deleted = result.fields.iter().find(|f| f.key == "deleted").unwrap();
+        assert_eq!(StructuredValue::Bool(true), deleted.value);
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_move_integrates_with_secretary_runtime() {
+        let env = TestEnv::new("runtime-move");
+        env.create_file("draft.txt", "move me");
+        env.create_dir("archive");
+
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = RepositoryRecord::new(
+            "test-repo",
+            env.root.to_string_lossy(),
+            RepositoryTrustState::Trusted,
+            LedgerTimestamp::now(),
+        );
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let tool = FsMoveTool::new(&env.root, "archive/draft.txt");
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Mutate,
+            "move repository file",
+        )
+        .with_resource_scope("path", "draft.txt")
+        .with_requested_capabilities(vec!["filesystem.move".to_string()]);
+        let receipt = runtime.run_tool_job(request, &tool).unwrap();
+
+        assert_eq!(crate::domain::JobStatus::Succeeded, receipt.job.status);
+        assert_eq!(
+            crate::domain::PolicyOutcome::Audited,
+            receipt.policy_decision.outcome
+        );
+        assert_eq!("fs.move", receipt.tool_invocation.as_ref().unwrap().tool_id);
+        assert!(!env.root.join("draft.txt").exists());
+        assert_eq!(
+            "move me",
+            fs::read_to_string(env.root.join("archive/draft.txt")).unwrap()
+        );
+        let result = receipt.tool_result.unwrap();
+        let overwritten = result
+            .fields
+            .iter()
+            .find(|f| f.key == "overwritten")
+            .unwrap();
+        assert_eq!(StructuredValue::Bool(false), overwritten.value);
         env.cleanup();
     }
 }
