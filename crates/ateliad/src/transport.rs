@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::rpc;
 use anyhow::{anyhow, Context, Result};
 use atelia_core::{
-    Actor, LedgerTimestamp, OutputFormat, OversizeOutputPolicy, ProjectId, RenderOptions,
+    Actor, JobId, LedgerTimestamp, OutputFormat, OversizeOutputPolicy, ProjectId, RenderOptions,
     RepositoryId, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity,
 };
@@ -29,6 +29,11 @@ pub type RpcServerState = Arc<RwLock<rpc::SecretaryRpcServer>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Route {
     Health,
+    SubmitJob,
+    GetJob { job_id: String },
+    ListJobs,
+    ListJobEvents { job_id: String },
+    CancelJob { job_id: String },
     ListRepositories,
     ListEvents,
     ReplayEvents,
@@ -51,6 +56,29 @@ enum Route {
 }
 
 fn route_for_path(path: &str) -> Route {
+    if let Some(job_id) = path
+        .strip_prefix("/v1/jobs/")
+        .and_then(|path| path.strip_suffix("/cancel"))
+        .and_then(valid_path_id)
+    {
+        return Route::CancelJob {
+            job_id: job_id.to_string(),
+        };
+    }
+    if let Some(job_id) = path
+        .strip_prefix("/v1/jobs/")
+        .and_then(|path| path.strip_suffix("/events"))
+        .and_then(valid_job_id)
+    {
+        return Route::ListJobEvents {
+            job_id: job_id.to_string(),
+        };
+    }
+    if let Some(job_id) = path.strip_prefix("/v1/jobs/").and_then(valid_job_id) {
+        return Route::GetJob {
+            job_id: job_id.to_string(),
+        };
+    }
     if let Some(extension_id) = path
         .strip_prefix("/v1/extensions/")
         .and_then(|path| path.strip_suffix("/status"))
@@ -98,6 +126,8 @@ fn route_for_path(path: &str) -> Route {
     }
     match path {
         "/v1/health" => Route::Health,
+        "/v1/jobs/submit" => Route::SubmitJob,
+        "/v1/jobs/list" => Route::ListJobs,
         "/v1/repositories:list" => Route::ListRepositories,
         "/v1/events/list" => Route::ListEvents,
         "/v1/events/replay" => Route::ReplayEvents,
@@ -115,12 +145,22 @@ fn route_for_path(path: &str) -> Route {
     }
 }
 
-fn valid_extension_id(extension_id: &str) -> Option<&str> {
-    if extension_id.is_empty() || extension_id.contains('/') {
+fn valid_path_id(id: &str) -> Option<&str> {
+    if id.is_empty() || id.contains('/') {
         None
     } else {
-        Some(extension_id)
+        Some(id)
     }
+}
+
+fn valid_extension_id(extension_id: &str) -> Option<&str> {
+    valid_path_id(extension_id)
+}
+
+fn valid_job_id(job_id: &str) -> Option<&str> {
+    JobId::try_from_string(job_id.to_string())
+        .is_ok()
+        .then_some(job_id)
 }
 
 #[derive(Debug, Serialize)]
@@ -168,6 +208,40 @@ struct ListRepositoriesRequestPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct SubmitJobRequestPayload {
+    repository_id: String,
+    requester: Actor,
+    kind: String,
+    goal: String,
+    path_scope: Option<PathScopePayload>,
+    requested_capabilities: Option<Vec<String>>,
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListJobsRequestPayload {
+    repository_id: Option<String>,
+    status: Option<String>,
+    requester: Option<Actor>,
+    page_size: Option<usize>,
+    page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelJobRequestPayload {
+    requester: Actor,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PathScopePayload {
+    kind: Option<String>,
+    roots: Option<Vec<String>>,
+    include_patterns: Option<Vec<String>>,
+    exclude_patterns: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ToolResultRefPayload {
     tool_result_id: String,
     tool_invocation_id: String,
@@ -187,6 +261,15 @@ struct ListEventsRequestPayload {
     repository_id: Option<String>,
     cursor: Option<EventCursorPayload>,
     subject_ids: Option<Vec<String>>,
+    min_severity: Option<String>,
+    page_size: Option<usize>,
+    page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListJobEventsRequestPayload {
+    repository_id: Option<String>,
+    cursor: Option<EventCursorPayload>,
     min_severity: Option<String>,
     page_size: Option<usize>,
     page_token: Option<String>,
@@ -284,6 +367,75 @@ fn parse_list_repositories_payload(
     })
 }
 
+fn parse_path_scope_kind(value: Option<String>) -> Result<rpc::RpcPathScopeKind, String> {
+    let Some(value) = value else {
+        return Ok(rpc::RpcPathScopeKind::Repository);
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "repository" => Ok(rpc::RpcPathScopeKind::Repository),
+        "explicit_paths" | "explicit" => Ok(rpc::RpcPathScopeKind::ExplicitPaths),
+        "read_only" | "readonly" => Ok(rpc::RpcPathScopeKind::ReadOnly),
+        "unspecified" => Ok(rpc::RpcPathScopeKind::Unspecified),
+        unknown => Err(format!("unknown path_scope.kind '{unknown}'")),
+    }
+}
+
+fn parse_path_scope_payload(payload: PathScopePayload) -> Result<rpc::RpcPathScope, String> {
+    Ok(rpc::RpcPathScope {
+        kind: parse_path_scope_kind(payload.kind)?,
+        roots: payload.roots.unwrap_or_default(),
+        include_patterns: payload.include_patterns.unwrap_or_default(),
+        exclude_patterns: payload.exclude_patterns.unwrap_or_default(),
+    })
+}
+
+fn parse_job_status(value: Option<String>) -> Result<Option<rpc::RpcJobStatus>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "unspecified" => Ok(None),
+        "queued" => Ok(Some(rpc::RpcJobStatus::Queued)),
+        "running" => Ok(Some(rpc::RpcJobStatus::Running)),
+        "succeeded" => Ok(Some(rpc::RpcJobStatus::Succeeded)),
+        "failed" => Ok(Some(rpc::RpcJobStatus::Failed)),
+        "blocked" => Ok(Some(rpc::RpcJobStatus::Blocked)),
+        "canceled" | "cancelled" => Ok(Some(rpc::RpcJobStatus::Canceled)),
+        unknown => Err(format!("unknown job status '{unknown}'")),
+    }
+}
+
+fn parse_submit_job_payload(
+    payload: SubmitJobRequestPayload,
+) -> Result<rpc::SubmitJobRequest, String> {
+    Ok(rpc::SubmitJobRequest {
+        repository_id: payload.repository_id,
+        requester: rpc::RpcActorDto::from(payload.requester),
+        kind: payload.kind,
+        goal: payload.goal,
+        path_scope: payload
+            .path_scope
+            .map(parse_path_scope_payload)
+            .transpose()?,
+        requested_capabilities: payload.requested_capabilities.unwrap_or_default(),
+        idempotency_key: payload.idempotency_key,
+    })
+}
+
+fn parse_list_jobs_payload(
+    payload: ListJobsRequestPayload,
+) -> Result<rpc::ListJobsRequest, String> {
+    Ok(rpc::ListJobsRequest {
+        repository_id: payload.repository_id,
+        status: parse_job_status(payload.status)?,
+        requester: payload.requester.map(rpc::RpcActorDto::from),
+        page_size: payload.page_size,
+        page_token: payload.page_token,
+    })
+}
+
 fn parse_output_format(value: String) -> Result<rpc::RpcOutputFormat, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "toon" => Ok(rpc::RpcOutputFormat::Toon),
@@ -367,6 +519,20 @@ fn parse_list_events_payload(
             None => None,
         },
         subject_ids: payload.subject_ids.unwrap_or_default(),
+        min_severity: parse_event_severity(payload.min_severity)?,
+        page_size: payload.page_size,
+        page_token: payload.page_token,
+    })
+}
+
+fn parse_list_job_events_payload(
+    job_id: String,
+    payload: ListJobEventsRequestPayload,
+) -> Result<rpc::ListEventsRequest, String> {
+    Ok(rpc::ListEventsRequest {
+        repository_id: payload.repository_id,
+        cursor: payload.cursor.map(parse_event_cursor_payload).transpose()?,
+        subject_ids: vec![job_id],
         min_severity: parse_event_severity(payload.min_severity)?,
         page_size: payload.page_size,
         page_token: payload.page_token,
@@ -778,6 +944,37 @@ fn serialize_list_repositories_response(
     })
 }
 
+fn serialize_submit_job_response(response: rpc::SubmitJobResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "job": serialize_job(&response.job),
+        "policy": serialize_policy_decision(&response.policy),
+    })
+}
+
+fn serialize_get_job_response(response: rpc::GetJobResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "job": serialize_job(&response.job),
+    })
+}
+
+fn serialize_list_jobs_response(response: rpc::ListJobsResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "jobs": response.jobs.iter().map(serialize_job).collect::<Vec<_>>(),
+        "next_page_token": response.next_page_token,
+    })
+}
+
+fn serialize_cancel_job_response(response: rpc::CancelJobResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "job": serialize_job(&response.job),
+        "cancellation": serialize_job_cancellation(&response.cancellation),
+    })
+}
+
 fn serialize_install_extension_response(
     response: rpc::InstallExtensionResponse,
 ) -> serde_json::Value {
@@ -1109,6 +1306,135 @@ async fn dispatch_health(state: RpcServerState) -> Response {
         .into_response()
 }
 
+async fn dispatch_submit_job(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<SubmitJobRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let parsed = match parse_submit_job_payload(payload) {
+        Ok(request) => request,
+        Err(reason) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                reason,
+                false,
+                next_state,
+            );
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.submit_job(parsed) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_submit_job_response(response))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_get_job(state: RpcServerState, job_id: String) -> Response {
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.get_job(rpc::GetJobRequest { job_id }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_get_job_response(response))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_list_jobs(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<ListJobsRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let parsed = match parse_list_jobs_payload(payload) {
+        Ok(request) => request,
+        Err(reason) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                reason,
+                false,
+                next_state,
+            );
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.list_jobs(parsed) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_list_jobs_response(response))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_cancel_job(
+    state: RpcServerState,
+    job_id: String,
+    request: Request<Body>,
+) -> Response {
+    let payload = match body_or_empty_json::<CancelJobRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.cancel_job(rpc::CancelJobRequest {
+        job_id,
+        requester: rpc::RpcActorDto::from(payload.requester),
+        reason: payload.reason,
+    }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_cancel_job_response(response))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
 async fn dispatch_list_repositories(state: RpcServerState, request: Request<Body>) -> Response {
     let payload = match body_or_empty_json::<ListRepositoriesRequestPayload>(request).await {
         Ok(payload) => payload,
@@ -1162,6 +1488,50 @@ async fn dispatch_list_events(state: RpcServerState, request: Request<Body>) -> 
     };
 
     let parsed = match parse_list_events_payload(payload) {
+        Ok(request) => request,
+        Err(reason) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                reason,
+                false,
+                next_state,
+            );
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.list_events(parsed) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_list_events_response(response))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_list_job_events(
+    state: RpcServerState,
+    job_id: String,
+    request: Request<Body>,
+) -> Response {
+    let payload = match body_or_empty_json::<ListJobEventsRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let parsed = match parse_list_job_events_payload(job_id, payload) {
         Ok(request) => request,
         Err(reason) => {
             let rpc_server = state.read().await;
@@ -1703,6 +2073,106 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                 dispatch_health(state).await
             }
         }
+        Route::SubmitJob => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_submit_job(state, request).await
+            }
+        }
+        Route::ListJobs => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_list_jobs(state, request).await
+            }
+        }
+        Route::GetJob { job_id } => {
+            if method != Method::GET {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("GET"));
+                response
+            } else {
+                dispatch_get_job(state, job_id).await
+            }
+        }
+        Route::ListJobEvents { job_id } => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_list_job_events(state, job_id, request).await
+            }
+        }
+        Route::CancelJob { job_id } => {
+            if method != Method::POST {
+                let mut response = make_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    format!("{} is not supported on {path}", method),
+                    false,
+                    {
+                        let rpc_server = state.read().await;
+                        rpc_next_state(&rpc_server)
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                response
+            } else {
+                dispatch_cancel_job(state, job_id, request).await
+            }
+        }
         Route::ListRepositories => {
             if method != Method::POST {
                 let mut response = make_error_response(
@@ -2093,6 +2563,9 @@ async fn fallback_route(State(state): State<RpcServerState>, request: Request<Bo
 pub fn build_router(rpc_server: RpcServerState) -> Router {
     Router::new()
         .route("/v1/health", any(dispatch_route))
+        .route("/v1/jobs/submit", any(dispatch_route))
+        .route("/v1/jobs/list", any(dispatch_route))
+        .route("/v1/jobs/*path", any(dispatch_route))
         .route("/v1/repositories:list", any(dispatch_route))
         .route("/v1/events/list", any(dispatch_route))
         .route("/v1/events/replay", any(dispatch_route))
@@ -2296,7 +2769,28 @@ mod tests {
 
     #[test]
     fn route_parser_distinguishes_supported_endpoints() {
+        let job_id = JobId::new().as_str().to_string();
         assert_eq!(route_for_path("/v1/health"), Route::Health);
+        assert_eq!(route_for_path("/v1/jobs/submit"), Route::SubmitJob);
+        assert_eq!(route_for_path("/v1/jobs/list"), Route::ListJobs);
+        assert_eq!(
+            route_for_path(&format!("/v1/jobs/{job_id}")),
+            Route::GetJob {
+                job_id: job_id.clone()
+            }
+        );
+        assert_eq!(
+            route_for_path(&format!("/v1/jobs/{job_id}/events")),
+            Route::ListJobEvents {
+                job_id: job_id.clone()
+            }
+        );
+        assert_eq!(
+            route_for_path("/v1/jobs/job_123/cancel"),
+            Route::CancelJob {
+                job_id: "job_123".to_string()
+            }
+        );
         assert_eq!(
             route_for_path("/v1/repositories:list"),
             Route::ListRepositories
@@ -2385,6 +2879,8 @@ mod tests {
         );
         assert_eq!(route_for_path("/unknown"), Route::Unsupported);
         assert_eq!(route_for_path("/v1/health/"), Route::Unsupported);
+        assert_eq!(route_for_path("/v1/jobs//cancel"), Route::Unsupported);
+        assert_eq!(route_for_path("/v1/jobs/a/b/cancel"), Route::Unsupported);
     }
 
     #[test]
@@ -2664,6 +3160,122 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(other_root);
+    }
+
+    #[tokio::test]
+    async fn job_routes_submit_list_and_report_cancel_errors() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("job-route");
+        let repository = {
+            let server = rpc_server.read().await;
+            server
+                .register_repository(rpc::RegisterRepositoryRequest {
+                    display_name: "job-route-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed")
+                .repository
+        };
+
+        let submit_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/jobs/submit",
+            serde_json::json!({
+                "repository_id": repository.repository_id,
+                "requester": {
+                    "agent": {
+                        "id": "agent:job-route",
+                        "display_name": "Job Route Agent"
+                    }
+                },
+                "kind": "read",
+                "goal": "submit over HTTP",
+                "requested_capabilities": [],
+                "idempotency_key": "job-route-1"
+            }),
+        )
+        .await;
+        assert_eq!(submit_response.status(), StatusCode::OK);
+        let submit_payload = to_bytes(submit_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(submit_payload["status"], "ok");
+        assert_eq!(submit_payload["data"]["job"]["status"], "succeeded");
+        assert_eq!(
+            submit_payload["data"]["policy"]["requested_capability"],
+            "capability.discovery"
+        );
+        let job_id = submit_payload["data"]["job"]["job_id"]
+            .as_str()
+            .expect("job id should be serialized")
+            .to_string();
+
+        let get_response =
+            send_request(&rpc_server, Method::GET, &format!("/v1/jobs/{job_id}")).await;
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_payload = to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(get_payload["data"]["job"]["job_id"], job_id);
+
+        let events_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            &format!("/v1/jobs/{job_id}/events"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(events_response.status(), StatusCode::OK);
+        let events_payload = to_bytes(events_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert!(!events_payload["data"]["events"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let list_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/jobs/list",
+            serde_json::json!({
+                "repository_id": repository.repository_id,
+                "status": "succeeded",
+                "page_size": 10,
+            }),
+        )
+        .await;
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_payload = to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(list_payload["data"]["jobs"].as_array().unwrap().len(), 1);
+
+        let cancel_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/jobs/not-a-job-id/cancel",
+            serde_json::json!({
+                "requester": {
+                    "agent": {
+                        "id": "agent:job-route",
+                        "display_name": "Job Route Agent"
+                    }
+                },
+                "reason": "exercise transport error mapping"
+            }),
+        )
+        .await;
+        assert_eq!(cancel_response.status(), StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
