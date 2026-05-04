@@ -1744,6 +1744,9 @@ fn wait_for_child(
         }
 
         if start.elapsed() >= timeout {
+            if let Some(status) = child.try_wait()? {
+                return Ok((Some(status), false, false));
+            }
             let process_tree_handled = kill_process_tree(child);
             let status = child.wait()?;
             return Ok((Some(status), true, process_tree_handled));
