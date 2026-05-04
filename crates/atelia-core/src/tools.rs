@@ -1717,7 +1717,7 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
 
 /// Executes a bounded explicit-argv process within the registered repository scope.
 #[derive(Debug, Clone)]
-pub struct ProcExecTool {
+struct ProcToolConfig {
     repository_root: PathBuf,
     argv: Vec<String>,
     env_allowlist: HashSet<String>,
@@ -1727,8 +1727,8 @@ pub struct ProcExecTool {
     include_full_argv: bool,
 }
 
-impl ProcExecTool {
-    pub fn new(repository_root: impl Into<PathBuf>, argv: Vec<String>) -> Self {
+impl ProcToolConfig {
+    fn new(repository_root: impl Into<PathBuf>, argv: Vec<String>) -> Self {
         Self {
             repository_root: repository_root.into(),
             argv,
@@ -1740,17 +1740,17 @@ impl ProcExecTool {
         }
     }
 
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+    fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
         self.max_output_bytes = max_output_bytes;
         self
     }
 
-    pub fn with_env_allowlist<I, S>(mut self, allowlist: I) -> Self
+    fn with_env_allowlist<I, S>(mut self, allowlist: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -1759,12 +1759,12 @@ impl ProcExecTool {
         self
     }
 
-    pub fn with_env_override(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    fn with_env_override(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env_overrides.insert(key.into(), value.into());
         self
     }
 
-    pub fn with_full_argv(mut self, include_full_argv: bool) -> Self {
+    fn with_full_argv(mut self, include_full_argv: bool) -> Self {
         self.include_full_argv = include_full_argv;
         self
     }
@@ -1783,41 +1783,104 @@ impl ProcExecTool {
         } else {
             StructuredValue::StringList(self.argv_preview())
         }
+    }
+
+    fn args_summary(&self, request: &RuntimeJobRequest) -> String {
+        let mut parts = vec![
+            format!("cwd={}", request.resource_scope.value),
+            if self.include_full_argv {
+                format!("argv_full={:?}", self.argv)
+            } else if let Some(first_argv) = self.argv.first() {
+                format!("argv[0]={first_argv} argc={}", self.argv.len())
+            } else {
+                "argv=[]".to_string()
+            },
+            format!("timeout={}ms", self.timeout.as_millis()),
+            format!("max_output_bytes={}", self.max_output_bytes),
+        ];
+
+        let mut allowlist: Vec<_> = self.env_allowlist.iter().cloned().collect();
+        allowlist.sort();
+        if !allowlist.is_empty() {
+            parts.push(format!("env_allowlist=[{}]", allowlist.join(",")));
+        }
+
+        let mut overrides: Vec<_> = self.env_overrides.keys().cloned().collect();
+        overrides.sort();
+        if !overrides.is_empty() {
+            parts.push(format!("env_overrides=[{}]", overrides.join(",")));
+        }
+
+        parts.join(" ")
+    }
+
+    fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
+        resolved_path_for_request(&self.repository_root, request)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcExecTool {
+    config: ProcToolConfig,
+}
+
+impl ProcExecTool {
+    pub fn new(repository_root: impl Into<PathBuf>, argv: Vec<String>) -> Self {
+        Self {
+            config: ProcToolConfig::new(repository_root, argv),
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.config = self.config.with_timeout(timeout);
+        self
+    }
+
+    pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+        self.config = self.config.with_max_output_bytes(max_output_bytes);
+        self
+    }
+
+    pub fn with_env_allowlist<I, S>(mut self, allowlist: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config = self.config.with_env_allowlist(allowlist);
+        self
+    }
+
+    pub fn with_env_override(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.config = self.config.with_env_override(key, value);
+        self
+    }
+
+    pub fn with_full_argv(mut self, include_full_argv: bool) -> Self {
+        self.config = self.config.with_full_argv(include_full_argv);
+        self
     }
 }
 
 /// Runs a bounded explicit-argv process within the registered repository scope.
 #[derive(Debug, Clone)]
 pub struct ProcRunTool {
-    repository_root: PathBuf,
-    argv: Vec<String>,
-    env_allowlist: HashSet<String>,
-    env_overrides: HashMap<String, String>,
-    timeout: Duration,
-    max_output_bytes: usize,
-    include_full_argv: bool,
+    config: ProcToolConfig,
 }
 
 impl ProcRunTool {
     pub fn new(repository_root: impl Into<PathBuf>, argv: Vec<String>) -> Self {
         Self {
-            repository_root: repository_root.into(),
-            argv,
-            env_allowlist: HashSet::new(),
-            env_overrides: HashMap::new(),
-            timeout: Duration::from_secs(30),
-            max_output_bytes: 64 * 1024,
-            include_full_argv: false,
+            config: ProcToolConfig::new(repository_root, argv),
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.config = self.config.with_timeout(timeout);
         self
     }
 
     pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
-        self.max_output_bytes = max_output_bytes;
+        self.config = self.config.with_max_output_bytes(max_output_bytes);
         self
     }
 
@@ -1826,34 +1889,18 @@ impl ProcRunTool {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.env_allowlist = allowlist.into_iter().map(Into::into).collect();
+        self.config = self.config.with_env_allowlist(allowlist);
         self
     }
 
     pub fn with_env_override(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env_overrides.insert(key.into(), value.into());
+        self.config = self.config.with_env_override(key, value);
         self
     }
 
     pub fn with_full_argv(mut self, include_full_argv: bool) -> Self {
-        self.include_full_argv = include_full_argv;
+        self.config = self.config.with_full_argv(include_full_argv);
         self
-    }
-
-    fn argv_preview(&self) -> Vec<String> {
-        self.argv
-            .first()
-            .cloned()
-            .map(|first| vec![first, format!("argc={}", self.argv.len())])
-            .unwrap_or_default()
-    }
-
-    fn argv_field_value(&self) -> StructuredValue {
-        if self.include_full_argv {
-            StructuredValue::StringList(self.argv.clone())
-        } else {
-            StructuredValue::StringList(self.argv_preview())
-        }
     }
 }
 
@@ -1875,6 +1922,126 @@ struct ProcessExecutionOutcome {
     stdout: CapturedStream,
     stderr: CapturedStream,
     timed_out: bool,
+}
+
+fn make_proc_tool_result(
+    invocation: &ToolInvocation,
+    request: &RuntimeJobRequest,
+    config: &ProcToolConfig,
+    schema_ref: &str,
+    outcome: ProcessExecutionOutcome,
+) -> ToolResult {
+    let mut truncation_reasons = Vec::new();
+    if outcome.stdout.timed_out {
+        truncation_reasons.push("stdout capture timed out".to_string());
+    }
+    if outcome.stdout.truncated && outcome.stdout.retained_bytes >= config.max_output_bytes {
+        truncation_reasons.push(format!(
+            "stdout truncated at {} bytes",
+            config.max_output_bytes
+        ));
+    }
+    if outcome.stderr.timed_out {
+        truncation_reasons.push("stderr capture timed out".to_string());
+    }
+    if outcome.stderr.truncated && outcome.stderr.retained_bytes >= config.max_output_bytes {
+        truncation_reasons.push(format!(
+            "stderr truncated at {} bytes",
+            config.max_output_bytes
+        ));
+    }
+    let truncation = if truncation_reasons.is_empty() {
+        None
+    } else {
+        Some(TruncationMetadata {
+            original_bytes: (outcome.stdout.original_bytes + outcome.stderr.original_bytes) as u64,
+            retained_bytes: (outcome.stdout.retained_bytes + outcome.stderr.retained_bytes) as u64,
+            reason: truncation_reasons.join("; "),
+        })
+    };
+
+    let mut fields = vec![
+        ToolResultField {
+            key: "summary".to_string(),
+            value: StructuredValue::String(outcome.summary),
+        },
+        ToolResultField {
+            key: "cwd".to_string(),
+            value: StructuredValue::String(request.resource_scope.value.clone()),
+        },
+        ToolResultField {
+            key: "argv".to_string(),
+            value: config.argv_field_value(),
+        },
+        ToolResultField {
+            key: "status".to_string(),
+            value: StructuredValue::String(
+                match outcome.status {
+                    ToolResultStatus::Succeeded => "succeeded",
+                    ToolResultStatus::Failed => "failed",
+                    ToolResultStatus::Canceled => "canceled",
+                    ToolResultStatus::TimedOut => "timed_out",
+                }
+                .to_string(),
+            ),
+        },
+        ToolResultField {
+            key: "duration_ms".to_string(),
+            value: StructuredValue::Integer(outcome.duration_ms),
+        },
+        ToolResultField {
+            key: "stdout".to_string(),
+            value: StructuredValue::String(outcome.stdout.text),
+        },
+        ToolResultField {
+            key: "stdout_bytes".to_string(),
+            value: StructuredValue::Integer(outcome.stdout.original_bytes as i64),
+        },
+        ToolResultField {
+            key: "stdout_retained_bytes".to_string(),
+            value: StructuredValue::Integer(outcome.stdout.retained_bytes as i64),
+        },
+        ToolResultField {
+            key: "stdout_truncated".to_string(),
+            value: StructuredValue::Bool(outcome.stdout.truncated),
+        },
+        ToolResultField {
+            key: "stderr".to_string(),
+            value: StructuredValue::String(outcome.stderr.text),
+        },
+        ToolResultField {
+            key: "stderr_bytes".to_string(),
+            value: StructuredValue::Integer(outcome.stderr.original_bytes as i64),
+        },
+        ToolResultField {
+            key: "stderr_retained_bytes".to_string(),
+            value: StructuredValue::Integer(outcome.stderr.retained_bytes as i64),
+        },
+        ToolResultField {
+            key: "stderr_truncated".to_string(),
+            value: StructuredValue::Bool(outcome.stderr.truncated),
+        },
+    ];
+
+    if let Some(exit_code) = outcome.exit_code {
+        fields.push(ToolResultField {
+            key: "exit_code".to_string(),
+            value: StructuredValue::Integer(exit_code),
+        });
+    }
+    fields.push(ToolResultField {
+        key: "timed_out".to_string(),
+        value: StructuredValue::Bool(outcome.timed_out),
+    });
+
+    make_tool_result(
+        invocation,
+        outcome.status,
+        schema_ref,
+        fields,
+        truncation,
+        Vec::new(),
+    )
 }
 
 struct TempCaptureFile {
@@ -2691,48 +2858,23 @@ impl crate::runtime::RuntimeTool for ProcExecTool {
     }
 
     fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-        let mut parts = vec![
-            format!("cwd={}", request.resource_scope.value),
-            if self.include_full_argv {
-                format!("argv_full={:?}", self.argv)
-            } else if let Some(first_argv) = self.argv.first() {
-                format!("argv[0]={first_argv} argc={}", self.argv.len())
-            } else {
-                "argv=[]".to_string()
-            },
-            format!("timeout={}ms", self.timeout.as_millis()),
-            format!("max_output_bytes={}", self.max_output_bytes),
-        ];
-
-        let mut allowlist: Vec<_> = self.env_allowlist.iter().cloned().collect();
-        allowlist.sort();
-        if !allowlist.is_empty() {
-            parts.push(format!("env_allowlist=[{}]", allowlist.join(",")));
-        }
-
-        let mut overrides: Vec<_> = self.env_overrides.keys().cloned().collect();
-        overrides.sort();
-        if !overrides.is_empty() {
-            parts.push(format!("env_overrides=[{}]", overrides.join(",")));
-        }
-
-        parts.join(" ")
+        self.config.args_summary(request)
     }
 
     fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
-        resolved_path_for_request(&self.repository_root, request)
+        self.config.resolved_paths(request)
     }
 
     fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
         let schema_ref = "tool_result.proc.exec.v1";
         let outcome = match execute_explicit_argv_process(
-            &self.repository_root,
+            &self.config.repository_root,
             &request.resource_scope.value,
-            &self.argv,
-            &self.env_allowlist,
-            &self.env_overrides,
-            self.timeout,
-            self.max_output_bytes,
+            &self.config.argv,
+            &self.config.env_allowlist,
+            &self.config.env_overrides,
+            self.config.timeout,
+            self.config.max_output_bytes,
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -2745,119 +2887,7 @@ impl crate::runtime::RuntimeTool for ProcExecTool {
             }
         };
 
-        let mut truncation_reasons = Vec::new();
-        if outcome.stdout.timed_out {
-            truncation_reasons.push("stdout capture timed out".to_string());
-        }
-        if outcome.stdout.truncated && outcome.stdout.retained_bytes >= self.max_output_bytes {
-            truncation_reasons.push(format!(
-                "stdout truncated at {} bytes",
-                self.max_output_bytes
-            ));
-        }
-        if outcome.stderr.timed_out {
-            truncation_reasons.push("stderr capture timed out".to_string());
-        }
-        if outcome.stderr.truncated && outcome.stderr.retained_bytes >= self.max_output_bytes {
-            truncation_reasons.push(format!(
-                "stderr truncated at {} bytes",
-                self.max_output_bytes
-            ));
-        }
-        let truncation = if truncation_reasons.is_empty() {
-            None
-        } else {
-            Some(TruncationMetadata {
-                original_bytes: (outcome.stdout.original_bytes + outcome.stderr.original_bytes)
-                    as u64,
-                retained_bytes: (outcome.stdout.retained_bytes + outcome.stderr.retained_bytes)
-                    as u64,
-                reason: truncation_reasons.join("; "),
-            })
-        };
-
-        let mut fields = vec![
-            ToolResultField {
-                key: "summary".to_string(),
-                value: StructuredValue::String(outcome.summary),
-            },
-            ToolResultField {
-                key: "cwd".to_string(),
-                value: StructuredValue::String(request.resource_scope.value.clone()),
-            },
-            ToolResultField {
-                key: "argv".to_string(),
-                value: self.argv_field_value(),
-            },
-            ToolResultField {
-                key: "status".to_string(),
-                value: StructuredValue::String(
-                    match outcome.status {
-                        ToolResultStatus::Succeeded => "succeeded",
-                        ToolResultStatus::Failed => "failed",
-                        ToolResultStatus::Canceled => "canceled",
-                        ToolResultStatus::TimedOut => "timed_out",
-                    }
-                    .to_string(),
-                ),
-            },
-            ToolResultField {
-                key: "duration_ms".to_string(),
-                value: StructuredValue::Integer(outcome.duration_ms),
-            },
-            ToolResultField {
-                key: "stdout".to_string(),
-                value: StructuredValue::String(outcome.stdout.text),
-            },
-            ToolResultField {
-                key: "stdout_bytes".to_string(),
-                value: StructuredValue::Integer(outcome.stdout.original_bytes as i64),
-            },
-            ToolResultField {
-                key: "stdout_retained_bytes".to_string(),
-                value: StructuredValue::Integer(outcome.stdout.retained_bytes as i64),
-            },
-            ToolResultField {
-                key: "stdout_truncated".to_string(),
-                value: StructuredValue::Bool(outcome.stdout.truncated),
-            },
-            ToolResultField {
-                key: "stderr".to_string(),
-                value: StructuredValue::String(outcome.stderr.text),
-            },
-            ToolResultField {
-                key: "stderr_bytes".to_string(),
-                value: StructuredValue::Integer(outcome.stderr.original_bytes as i64),
-            },
-            ToolResultField {
-                key: "stderr_retained_bytes".to_string(),
-                value: StructuredValue::Integer(outcome.stderr.retained_bytes as i64),
-            },
-            ToolResultField {
-                key: "stderr_truncated".to_string(),
-                value: StructuredValue::Bool(outcome.stderr.truncated),
-            },
-        ];
-
-        if let Some(exit_code) = outcome.exit_code {
-            fields.push(ToolResultField {
-                key: "exit_code".to_string(),
-                value: StructuredValue::Integer(exit_code),
-            });
-        }
-        fields.push(ToolResultField {
-            key: "timed_out".to_string(),
-            value: StructuredValue::Bool(outcome.timed_out),
-        });
-
-        make_tool_result(
-            invocation,
-            outcome.status,
-            schema_ref,
-            fields,
-            truncation,
-            Vec::new(),
-        )
+        make_proc_tool_result(invocation, request, &self.config, schema_ref, outcome)
     }
 }
 
@@ -2875,48 +2905,23 @@ impl crate::runtime::RuntimeTool for ProcRunTool {
     }
 
     fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-        let mut parts = vec![
-            format!("cwd={}", request.resource_scope.value),
-            if self.include_full_argv {
-                format!("argv_full={:?}", self.argv)
-            } else if let Some(first_argv) = self.argv.first() {
-                format!("argv[0]={first_argv} argc={}", self.argv.len())
-            } else {
-                "argv=[]".to_string()
-            },
-            format!("timeout={}ms", self.timeout.as_millis()),
-            format!("max_output_bytes={}", self.max_output_bytes),
-        ];
-
-        let mut allowlist: Vec<_> = self.env_allowlist.iter().cloned().collect();
-        allowlist.sort();
-        if !allowlist.is_empty() {
-            parts.push(format!("env_allowlist=[{}]", allowlist.join(",")));
-        }
-
-        let mut overrides: Vec<_> = self.env_overrides.keys().cloned().collect();
-        overrides.sort();
-        if !overrides.is_empty() {
-            parts.push(format!("env_overrides=[{}]", overrides.join(",")));
-        }
-
-        parts.join(" ")
+        self.config.args_summary(request)
     }
 
     fn resolved_paths(&self, request: &RuntimeJobRequest) -> Vec<ResolvedPath> {
-        resolved_path_for_request(&self.repository_root, request)
+        self.config.resolved_paths(request)
     }
 
     fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
         let schema_ref = "tool_result.proc.run.v1";
         let outcome = match execute_explicit_argv_process(
-            &self.repository_root,
+            &self.config.repository_root,
             &request.resource_scope.value,
-            &self.argv,
-            &self.env_allowlist,
-            &self.env_overrides,
-            self.timeout,
-            self.max_output_bytes,
+            &self.config.argv,
+            &self.config.env_allowlist,
+            &self.config.env_overrides,
+            self.config.timeout,
+            self.config.max_output_bytes,
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -2929,119 +2934,7 @@ impl crate::runtime::RuntimeTool for ProcRunTool {
             }
         };
 
-        let mut truncation_reasons = Vec::new();
-        if outcome.stdout.timed_out {
-            truncation_reasons.push("stdout capture timed out".to_string());
-        }
-        if outcome.stdout.truncated && outcome.stdout.retained_bytes >= self.max_output_bytes {
-            truncation_reasons.push(format!(
-                "stdout truncated at {} bytes",
-                self.max_output_bytes
-            ));
-        }
-        if outcome.stderr.timed_out {
-            truncation_reasons.push("stderr capture timed out".to_string());
-        }
-        if outcome.stderr.truncated && outcome.stderr.retained_bytes >= self.max_output_bytes {
-            truncation_reasons.push(format!(
-                "stderr truncated at {} bytes",
-                self.max_output_bytes
-            ));
-        }
-        let truncation = if truncation_reasons.is_empty() {
-            None
-        } else {
-            Some(TruncationMetadata {
-                original_bytes: (outcome.stdout.original_bytes + outcome.stderr.original_bytes)
-                    as u64,
-                retained_bytes: (outcome.stdout.retained_bytes + outcome.stderr.retained_bytes)
-                    as u64,
-                reason: truncation_reasons.join("; "),
-            })
-        };
-
-        let mut fields = vec![
-            ToolResultField {
-                key: "summary".to_string(),
-                value: StructuredValue::String(outcome.summary),
-            },
-            ToolResultField {
-                key: "cwd".to_string(),
-                value: StructuredValue::String(request.resource_scope.value.clone()),
-            },
-            ToolResultField {
-                key: "argv".to_string(),
-                value: self.argv_field_value(),
-            },
-            ToolResultField {
-                key: "status".to_string(),
-                value: StructuredValue::String(
-                    match outcome.status {
-                        ToolResultStatus::Succeeded => "succeeded",
-                        ToolResultStatus::Failed => "failed",
-                        ToolResultStatus::Canceled => "canceled",
-                        ToolResultStatus::TimedOut => "timed_out",
-                    }
-                    .to_string(),
-                ),
-            },
-            ToolResultField {
-                key: "duration_ms".to_string(),
-                value: StructuredValue::Integer(outcome.duration_ms),
-            },
-            ToolResultField {
-                key: "stdout".to_string(),
-                value: StructuredValue::String(outcome.stdout.text),
-            },
-            ToolResultField {
-                key: "stdout_bytes".to_string(),
-                value: StructuredValue::Integer(outcome.stdout.original_bytes as i64),
-            },
-            ToolResultField {
-                key: "stdout_retained_bytes".to_string(),
-                value: StructuredValue::Integer(outcome.stdout.retained_bytes as i64),
-            },
-            ToolResultField {
-                key: "stdout_truncated".to_string(),
-                value: StructuredValue::Bool(outcome.stdout.truncated),
-            },
-            ToolResultField {
-                key: "stderr".to_string(),
-                value: StructuredValue::String(outcome.stderr.text),
-            },
-            ToolResultField {
-                key: "stderr_bytes".to_string(),
-                value: StructuredValue::Integer(outcome.stderr.original_bytes as i64),
-            },
-            ToolResultField {
-                key: "stderr_retained_bytes".to_string(),
-                value: StructuredValue::Integer(outcome.stderr.retained_bytes as i64),
-            },
-            ToolResultField {
-                key: "stderr_truncated".to_string(),
-                value: StructuredValue::Bool(outcome.stderr.truncated),
-            },
-        ];
-
-        if let Some(exit_code) = outcome.exit_code {
-            fields.push(ToolResultField {
-                key: "exit_code".to_string(),
-                value: StructuredValue::Integer(exit_code),
-            });
-        }
-        fields.push(ToolResultField {
-            key: "timed_out".to_string(),
-            value: StructuredValue::Bool(outcome.timed_out),
-        });
-
-        make_tool_result(
-            invocation,
-            outcome.status,
-            schema_ref,
-            fields,
-            truncation,
-            Vec::new(),
-        )
+        make_proc_tool_result(invocation, request, &self.config, schema_ref, outcome)
     }
 }
 

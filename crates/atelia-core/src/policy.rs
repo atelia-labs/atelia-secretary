@@ -492,6 +492,17 @@ mod tests {
     }
 
     #[test]
+    fn process_run_aliases_are_audited_as_process_execution() {
+        for capability in ["process.run", "proc.run"] {
+            let decision = decide(input(capability));
+
+            assert_eq!(PolicyOutcome::Audited, decision.outcome);
+            assert_eq!(RiskTier::R2, decision.risk_tier);
+            assert_eq!("bounded_process_audited", decision.reason_code);
+        }
+    }
+
+    #[test]
     fn r3_broad_process_execution_needs_approval() {
         let decision = decide(input("process.exec").broad_or_unbounded());
 
