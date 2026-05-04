@@ -3,8 +3,8 @@
 use crate::domain::{
     Actor, AuditRecord, AuditRecordId, CancellationState, EventSeverity, EventSubjectType,
     JobEvent, JobEventId, JobEventKind, JobId, JobRecord, JobStatus, LockDecision, LockDecisionId,
-    LockOwner, PolicyDecision, PolicyDecisionId, RepositoryId, RepositoryRecord, ToolInvocation,
-    ToolInvocationId, ToolResult, ToolResultId,
+    LockOwner, PolicyDecision, PolicyDecisionId, RepositoryId, RepositoryRecord, SchemaMigrationId,
+    SchemaMigrationRecord, ToolInvocation, ToolInvocationId, ToolResult, ToolResultId,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -187,6 +187,10 @@ pub trait SecretaryStore: Send + Sync + 'static {
     fn list_lock_decisions(&self) -> StoreResult<Vec<LockDecision>>;
     fn get_lock_decision(&self, id: &LockDecisionId) -> StoreResult<LockDecision>;
 
+    fn create_schema_migration(&self, record: SchemaMigrationRecord) -> StoreResult<()>;
+    fn list_schema_migrations(&self) -> StoreResult<Vec<SchemaMigrationRecord>>;
+    fn get_schema_migration(&self, id: &SchemaMigrationId) -> StoreResult<SchemaMigrationRecord>;
+
     fn create_tool_invocation(&self, record: ToolInvocation) -> StoreResult<()>;
     fn list_tool_invocations(&self) -> StoreResult<Vec<ToolInvocation>>;
     fn get_tool_invocation(&self, id: &ToolInvocationId) -> StoreResult<ToolInvocation>;
@@ -222,6 +226,7 @@ struct InMemoryInner {
     next_event_sequence: u64,
     policy_decisions: HashMap<PolicyDecisionId, PolicyDecision>,
     lock_decisions: HashMap<LockDecisionId, LockDecision>,
+    schema_migrations: HashMap<SchemaMigrationId, SchemaMigrationRecord>,
     tool_invocations: HashMap<ToolInvocationId, ToolInvocation>,
     tool_results: HashMap<ToolResultId, ToolResult>,
     audit_records: HashMap<AuditRecordId, AuditRecord>,
@@ -627,6 +632,32 @@ impl SecretaryStore for InMemoryStore {
         get_record(&self.lock()?.lock_decisions, id, "lock_decisions")
     }
 
+    fn create_schema_migration(&self, record: SchemaMigrationRecord) -> StoreResult<()> {
+        validate_schema_migration_record(&record)?;
+        let mut inner = self.lock()?;
+        insert_record(
+            &mut inner.schema_migrations,
+            record.id.clone(),
+            record,
+            "schema_migrations",
+        )
+    }
+
+    fn list_schema_migrations(&self) -> StoreResult<Vec<SchemaMigrationRecord>> {
+        let mut migrations = list_records(&self.lock()?.schema_migrations);
+        migrations.sort_by(|left, right| {
+            left.migration_version
+                .cmp(&right.migration_version)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(migrations)
+    }
+
+    fn get_schema_migration(&self, id: &SchemaMigrationId) -> StoreResult<SchemaMigrationRecord> {
+        get_record(&self.lock()?.schema_migrations, id, "schema_migrations")
+    }
+
     fn create_tool_invocation(&self, record: ToolInvocation) -> StoreResult<()> {
         let mut inner = self.lock()?;
         validate_tool_invocation_refs(&inner, &record)?;
@@ -823,6 +854,33 @@ fn validate_repository_record(record: &RepositoryRecord) -> StoreResult<()> {
         return Err(StoreError::InvalidRecord {
             collection: "repositories",
             reason: "allowed_path_scope must include at least one path".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_schema_migration_record(record: &SchemaMigrationRecord) -> StoreResult<()> {
+    if record.migration_name.trim().is_empty() {
+        return Err(StoreError::InvalidRecord {
+            collection: "schema_migrations",
+            reason: "migration_name must not be empty".to_string(),
+        });
+    }
+
+    if let Some(leader_id) = &record.leader_id {
+        if leader_id.trim().is_empty() {
+            return Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "leader_id must not be blank".to_string(),
+            });
+        }
+    }
+
+    if record.updated_at < record.created_at {
+        return Err(StoreError::InvalidRecord {
+            collection: "schema_migrations",
+            reason: "updated_at must not be earlier than created_at".to_string(),
         });
     }
 
@@ -2442,6 +2500,37 @@ mod tests {
         .unwrap()
     }
 
+    fn schema_migration_record() -> SchemaMigrationRecord {
+        SchemaMigrationRecord {
+            id: SchemaMigrationId::new(),
+            schema_version: 1,
+            created_at: timestamp(6),
+            updated_at: timestamp(6),
+            migration_name: "create_schema_migrations".to_string(),
+            migration_version: 2024050401,
+            status: crate::domain::SchemaMigrationStatus::Applied,
+            leader_id: Some("daemon-1".to_string()),
+            notes: Some("bootstrapped schema_migrations ledger".to_string()),
+            redactions: Vec::new(),
+        }
+    }
+
+    fn schema_migration_record_with(
+        id: &str,
+        migration_name: &str,
+        migration_version: u32,
+        created_at: i64,
+        updated_at: i64,
+    ) -> SchemaMigrationRecord {
+        let mut record = schema_migration_record();
+        record.id = SchemaMigrationId::try_from_string(id).unwrap();
+        record.migration_name = migration_name.to_string();
+        record.migration_version = migration_version;
+        record.created_at = timestamp(created_at);
+        record.updated_at = timestamp(updated_at);
+        record
+    }
+
     fn tool_invocation(
         repository_id: RepositoryId,
         job_id: JobId,
@@ -2513,6 +2602,122 @@ mod tests {
 
         assert_eq!(store.get_repository(&repository.id).unwrap(), repository);
         assert_eq!(store.list_repositories().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_list_get_schema_migrations() {
+        let store = InMemoryStore::new();
+        let migration = schema_migration_record();
+
+        store.create_schema_migration(migration.clone()).unwrap();
+
+        assert_eq!(
+            store.get_schema_migration(&migration.id).unwrap(),
+            migration
+        );
+        assert_eq!(store.list_schema_migrations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn schema_migration_records_reject_invalid_name() {
+        let store = InMemoryStore::new();
+        let mut migration = schema_migration_record();
+        migration.migration_name = "   ".to_string();
+
+        assert!(matches!(
+            store.create_schema_migration(migration),
+            Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn schema_migration_records_reject_blank_leader_id() {
+        let store = InMemoryStore::new();
+        let mut migration = schema_migration_record();
+        migration.leader_id = Some("   ".to_string());
+
+        assert_eq!(
+            Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                reason: "leader_id must not be blank".to_string(),
+            }),
+            store.create_schema_migration(migration)
+        );
+    }
+
+    #[test]
+    fn schema_migration_records_reject_non_monotonic_timestamps() {
+        let store = InMemoryStore::new();
+        let migration = schema_migration_record_with(
+            "mig_00000000-0000-0000-0000-000000000001",
+            "bad migration",
+            10,
+            10,
+            9,
+        );
+
+        assert!(matches!(
+            store.create_schema_migration(migration),
+            Err(StoreError::InvalidRecord {
+                collection: "schema_migrations",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn schema_migration_list_is_deterministic_by_version_created_at_and_id() {
+        let store = InMemoryStore::new();
+        let migration_202 = schema_migration_record_with(
+            "mig_00000000-0000-0000-0000-000000000004",
+            "migration c",
+            2,
+            10,
+            10,
+        );
+        let migration_101 = schema_migration_record_with(
+            "mig_00000000-0000-0000-0000-000000000002",
+            "migration b",
+            1,
+            40,
+            40,
+        );
+        let migration_100 = schema_migration_record_with(
+            "mig_00000000-0000-0000-0000-000000000001",
+            "migration a",
+            1,
+            30,
+            30,
+        );
+        let migration_200 = schema_migration_record_with(
+            "mig_00000000-0000-0000-0000-000000000003",
+            "migration a",
+            1,
+            30,
+            30,
+        );
+
+        // Insert out of order to prove order is enforced by list_schema_migrations.
+        store
+            .create_schema_migration(migration_202.clone())
+            .unwrap();
+        store
+            .create_schema_migration(migration_101.clone())
+            .unwrap();
+        store
+            .create_schema_migration(migration_100.clone())
+            .unwrap();
+        store
+            .create_schema_migration(migration_200.clone())
+            .unwrap();
+
+        assert_eq!(
+            store.list_schema_migrations().unwrap(),
+            vec![migration_100, migration_200, migration_101, migration_202]
+        );
     }
 
     #[test]
@@ -3913,6 +4118,22 @@ mod tests {
             store.create_repository(repository),
             Err(StoreError::InvalidRecord {
                 collection: "repositories",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn duplicate_schema_migration_ids_are_rejected() {
+        let store = InMemoryStore::new();
+        let migration = schema_migration_record();
+
+        store.create_schema_migration(migration.clone()).unwrap();
+
+        assert!(matches!(
+            store.create_schema_migration(migration),
+            Err(StoreError::DuplicateId {
+                collection: "schema_migrations",
                 ..
             })
         ));
