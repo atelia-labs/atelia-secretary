@@ -417,6 +417,26 @@ fn open_read_no_follow_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> i
 }
 
 #[cfg(unix)]
+fn open_path_no_follow_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    // SAFETY: `parent` is a live directory file descriptor and `cstring` is valid for `openat`.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), cstring.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `fd` was returned from `openat` and is uniquely owned by this branch.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
 fn open_or_create_no_follow_in_parent_dir(
     parent: &File,
     name: &std::ffi::OsStr,
@@ -3590,6 +3610,40 @@ fn ensure_opened_metadata_matches(
 }
 
 #[cfg(unix)]
+fn ensure_named_entry_matches(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    expected: &fs::Metadata,
+    context: &'static str,
+) -> io::Result<()> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+
+    // SAFETY: `parent` is a live directory fd, `cstring` is valid, and `stat` points to writable
+    // memory for the kernel to initialize.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            cstring.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `fstatat` returned success and initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_dev != expected.dev() || stat.st_ino != expected.ino() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, context));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
 fn rename_between_parent_dirs(
     source_parent: &File,
     source: &std::ffi::OsStr,
@@ -3677,7 +3731,7 @@ fn unlink_validated_file_in_parent_dir(
     name: &std::ffi::OsStr,
     expected_metadata: &fs::Metadata,
 ) -> io::Result<()> {
-    let file = open_read_no_follow_in_parent_dir(parent, name)?;
+    let file = open_path_no_follow_in_parent_dir(parent, name)?;
     let opened_metadata = file.metadata()?;
     if !opened_metadata.is_file() {
         return Err(io::Error::new(
@@ -3689,6 +3743,12 @@ fn unlink_validated_file_in_parent_dir(
         expected_metadata,
         &opened_metadata,
         "opened delete target did not match resolved record",
+    )?;
+    ensure_named_entry_matches(
+        parent,
+        name,
+        &opened_metadata,
+        "delete target changed before unlink",
     )?;
 
     unlink_in_parent_dir(parent, name)
@@ -3703,7 +3763,7 @@ fn rename_validated_file_between_parent_dirs(
     create_new: bool,
     expected_metadata: &fs::Metadata,
 ) -> io::Result<()> {
-    let file = open_read_no_follow_in_parent_dir(source_parent, source)?;
+    let file = open_path_no_follow_in_parent_dir(source_parent, source)?;
     let opened_metadata = file.metadata()?;
     if !opened_metadata.is_file() {
         return Err(io::Error::new(
@@ -3715,6 +3775,12 @@ fn rename_validated_file_between_parent_dirs(
         expected_metadata,
         &opened_metadata,
         "opened move source did not match resolved record",
+    )?;
+    ensure_named_entry_matches(
+        source_parent,
+        source,
+        &opened_metadata,
+        "move source changed before rename",
     )?;
 
     rename_between_parent_dirs(
@@ -4258,15 +4324,8 @@ impl crate::runtime::RuntimeTool for FsDeleteTool {
                     let destination_lock = acquire_write_lock(path);
                     match (parent_dir, destination_lock) {
                         (Ok(parent_dir), Ok(_destination_lock)) => {
-                            let result = unlink_validated_file_in_parent_dir(
-                                &parent_dir,
-                                file_name,
-                                &metadata,
-                            );
-                            if result.is_ok() {
-                                let _ = parent_dir.sync_all();
-                            }
-                            result
+                            unlink_validated_file_in_parent_dir(&parent_dir, file_name, &metadata)
+                                .and_then(|_| parent_dir.sync_all())
                         }
                         (Err(error), _) | (_, Err(error)) => Err(error),
                     }
@@ -4570,11 +4629,9 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
                                 destination_name,
                                 !self.allow_overwrite,
                                 &source_metadata,
-                            );
-                            if result.is_ok() {
-                                let _ = source_parent_dir.sync_all();
-                                let _ = destination_parent_dir.sync_all();
-                            }
+                            )
+                            .and_then(|_| source_parent_dir.sync_all())
+                            .and_then(|_| destination_parent_dir.sync_all());
                             result.map(|_| destination_exists)
                         }
                         (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
