@@ -3215,7 +3215,7 @@ fn write_file_bytes_atomically(_path: &Path, _bytes: &[u8], _create_new: bool) -
     ))
 }
 
-#[cfg(test)]
+#[cfg(any(test, not(unix)))]
 fn read_entire_text_file(path: &Path, max_bytes: usize) -> io::Result<String> {
     let mut file = open_file_no_follow(path)?;
     let mut content = Vec::new();
@@ -3637,6 +3637,31 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
                 ),
             );
         }
+
+        #[cfg(not(unix))]
+        let content = match read_entire_text_file(path, self.max_bytes) {
+            Ok(content) => content,
+            Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: file exceeds configured byte limit".to_string(),
+                    format!(
+                        "{} is larger than {} bytes",
+                        target.display_path(),
+                        self.max_bytes
+                    ),
+                );
+            }
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "patch failed: cannot read UTF-8 text".to_string(),
+                    format!("{}: {}", target.display_path(), err),
+                );
+            }
+        };
 
         let match_count = count_overlapping_matches(&content, &self.find_text);
         if match_count == 0 {
