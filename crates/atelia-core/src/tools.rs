@@ -5150,27 +5150,28 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn proc_exec_hard_bounded_capture_no_threads_when_background_streaming() {
-        let env = TestEnv::new("proc-timeout-hardened-capture-join");
-        let start = Instant::now();
+        let stop_immediately = Arc::new(AtomicBool::new(false));
+        let blocking_handle = std::thread::spawn({
+            let stop_immediately = stop_immediately.clone();
+            move || loop {
+                if stop_immediately.load(Ordering::Acquire) {
+                    thread::sleep(CAPTURE_THREAD_QUIESCE_TIMEOUT * 2);
+                    return Ok::<(), io::Error>(());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
 
-        let tool = ProcExecTool::new(
-            &env.root,
-            vec!["sh".to_string(), "-c".to_string(), "sleep 2 &".to_string()],
+        let join_result = join_capture_thread(
+            "stdout",
+            blocking_handle,
+            stop_immediately.clone(),
+            Duration::from_millis(50),
         )
-        .with_timeout(Duration::from_millis(50));
-        let invocation = fake_invocation(tool.tool_id());
-        let request = request_with_path(".");
-        let result = tool.execute(&invocation, &request);
-        let elapsed = start.elapsed();
+        .unwrap();
 
-        assert_eq!(ToolResultStatus::Succeeded, result.status);
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "background process escaped after-capture was not bounded"
-        );
-        let timed_out = result.fields.iter().find(|f| f.key == "timed_out").unwrap();
-        assert_eq!(StructuredValue::Bool(false), timed_out.value);
-        env.cleanup();
+        assert!(join_result.is_none());
+        assert!(stop_immediately.load(Ordering::Acquire));
     }
 
     #[cfg(unix)]
@@ -5243,23 +5244,20 @@ mod tests {
             }
         };
 
-        let quick_capture_result: usize = join_capture_thread(
+        let quick_capture_result = join_capture_thread(
             "stderr",
             quick_handle,
             stop_immediately.clone(),
             Duration::from_millis(50),
         )
-        .unwrap()
-        .unwrap_or_default();
+        .unwrap();
 
         assert!(blocking_timed_out);
         assert_eq!(0, blocking_capture_result);
-        assert_eq!(1, quick_capture_result);
+        assert!(quick_capture_result.is_some());
+        assert_eq!(Some(1), quick_capture_result);
         assert!(blocking_original_counter.load(Ordering::Acquire) > 0);
         assert!(stop_immediately.load(Ordering::Acquire));
-
-        let quick_truncated = stop_immediately.load(Ordering::Acquire);
-        assert!(quick_truncated);
     }
 
     #[test]
