@@ -592,6 +592,9 @@ fn truncate_string_list(values: &[String], max_inline_bytes: usize) -> (Vec<Stri
         }) else {
             break;
         };
+        if truncated.is_empty() {
+            continue;
+        }
 
         kept_bytes = kept_bytes.saturating_add(separator + truncated.len());
         kept_values.push(truncated);

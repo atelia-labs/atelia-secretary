@@ -2073,7 +2073,7 @@ mod tests {
 
         let error = runtime.run_tool_job(request, &tool).unwrap_err();
 
-        assert!(matches!(error, RuntimeError::ToolOutputRender { .. }));
+        assert!(matches!(error, RuntimeError::ToolOutputRender(_)));
         assert!(runtime.store().list_tool_results().unwrap().is_empty());
         assert!(!artifact_root.exists());
         let jobs = runtime.store().list_jobs().unwrap();
