@@ -366,6 +366,29 @@ fn open_no_follow_in_parent_dir(
 }
 
 #[cfg(unix)]
+fn open_read_no_follow_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
+    let cstring = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+
+    // SAFETY: `parent` is a live directory file descriptor and `cstring` is valid for
+    // `openat`; mode is only consulted when creating a new file.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            cstring.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666 as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `fd` was returned from `openat` and is uniquely owned by this branch.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
 fn open_or_create_no_follow_in_parent_dir(
     parent: &File,
     name: &std::ffi::OsStr,
@@ -391,7 +414,7 @@ fn open_or_create_no_follow_in_parent_dir(
 }
 
 #[cfg(unix)]
-fn write_lock_file_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
+fn write_lock_file_name_for_path(path: &Path) -> std::ffi::OsString {
     // A deterministic, safe lock-file key derived from path bytes so different target
     // names can never collide on lock identity.
     fn stable_lock_suffix(bytes: &[u8]) -> String {
@@ -405,20 +428,25 @@ fn write_lock_file_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
     }
 
     format!(
-        "{WRITE_FILE_LOCK_PREFIX}-{}-{}.lock",
-        file_name.to_string_lossy(),
-        stable_lock_suffix(file_name.as_bytes())
+        "{WRITE_FILE_LOCK_PREFIX}-{}.lock",
+        stable_lock_suffix(path.as_os_str().as_bytes())
     )
     .into()
 }
 
 #[cfg(unix)]
-fn lock_target_file_in_parent_dir(
-    parent_dir: &File,
-    file_name: &std::ffi::OsStr,
-) -> io::Result<File> {
-    let lock_file_name = write_lock_file_name(file_name);
-    let lock_file = open_or_create_no_follow_in_parent_dir(parent_dir, &lock_file_name)?;
+fn write_lock_directory() -> io::Result<PathBuf> {
+    let lock_directory = std::env::temp_dir().join("atelia-secretary").join("locks");
+    fs::create_dir_all(&lock_directory)?;
+    Ok(lock_directory)
+}
+
+#[cfg(unix)]
+fn acquire_write_lock(path: &Path) -> io::Result<File> {
+    let lock_directory = write_lock_directory()?;
+    let lock_parent = open_parent_no_follow(&lock_directory)?;
+    let lock_file_name = write_lock_file_name_for_path(path);
+    let lock_file = open_or_create_no_follow_in_parent_dir(&lock_parent, &lock_file_name)?;
 
     // SAFETY: `lock_file` is a valid descriptor; `LOCK_EX` blocks until exclusive access
     // for the same lock file is available.
@@ -435,13 +463,46 @@ fn lock_target_for_patch(path: &Path) -> io::Result<(File, File)> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
     })?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
     let parent_dir = open_parent_no_follow(parent)?;
-    let destination_lock = lock_target_file_in_parent_dir(&parent_dir, file_name)?;
+    let destination_lock = acquire_write_lock(path)?;
 
     Ok((parent_dir, destination_lock))
+}
+
+#[cfg(unix)]
+fn read_entire_text_file_in_parent_dir(
+    parent: &File,
+    file_name: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> io::Result<String> {
+    let mut file = open_read_no_follow_in_parent_dir(parent, file_name)?;
+    let mut content = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut total_bytes = 0usize;
+
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+
+        total_bytes += n;
+        if total_bytes > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "file exceeds configured byte limit",
+            ));
+        }
+
+        content.extend_from_slice(&buffer[..n]);
+    }
+
+    String::from_utf8(content).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid UTF-8 content: {error}"),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1988,10 +2049,9 @@ fn write_file_bytes_atomically_inner(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
 
     let parent_dir = open_parent_no_follow(parent)?;
-    let destination_lock = lock_target_file_in_parent_dir(&parent_dir, file_name)?;
+    let destination_lock = acquire_write_lock(path)?;
 
     write_file_bytes_atomically_inner_locked(
-        path,
         &parent_dir,
         file_name,
         bytes,
@@ -2003,7 +2063,6 @@ fn write_file_bytes_atomically_inner(
 
 #[cfg(unix)]
 fn write_file_bytes_atomically_inner_locked(
-    path: &Path,
     parent_dir: &File,
     file_name: &std::ffi::OsStr,
     bytes: &[u8],
@@ -2012,7 +2071,7 @@ fn write_file_bytes_atomically_inner_locked(
     _destination_lock: File,
 ) -> io::Result<()> {
     let existing_permissions = if !create_new {
-        let existing_file = open_write_file_no_follow(path, false)?;
+        let existing_file = open_read_no_follow_in_parent_dir(parent_dir, file_name)?;
         let existing_metadata = existing_file.metadata()?;
         Some(existing_metadata.permissions())
     } else {
@@ -2446,29 +2505,30 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
             .file_name()
             .expect("resolved target path must include a file name");
 
-        let content = match read_entire_text_file(path, self.max_bytes) {
-            Ok(content) => content,
-            Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
-                return failed_result(
-                    invocation,
-                    schema_ref,
-                    "patch failed: file exceeds configured byte limit".to_string(),
-                    format!(
-                        "{} is larger than {} bytes",
-                        target.display_path(),
-                        self.max_bytes
-                    ),
-                );
-            }
-            Err(err) => {
-                return failed_result(
-                    invocation,
-                    schema_ref,
-                    "patch failed: cannot read UTF-8 text".to_string(),
-                    format!("{}: {}", target.display_path(), err),
-                );
-            }
-        };
+        let content =
+            match read_entire_text_file_in_parent_dir(&parent_dir, file_name, self.max_bytes) {
+                Ok(content) => content,
+                Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
+                    return failed_result(
+                        invocation,
+                        schema_ref,
+                        "patch failed: file exceeds configured byte limit".to_string(),
+                        format!(
+                            "{} is larger than {} bytes",
+                            target.display_path(),
+                            self.max_bytes
+                        ),
+                    );
+                }
+                Err(err) => {
+                    return failed_result(
+                        invocation,
+                        schema_ref,
+                        "patch failed: cannot read UTF-8 text".to_string(),
+                        format!("{}: {}", target.display_path(), err),
+                    );
+                }
+            };
 
         let match_count = count_overlapping_matches(&content, &self.find_text);
         if match_count == 0 {
@@ -2513,7 +2573,6 @@ impl crate::runtime::RuntimeTool for FsPatchTool {
 
         #[cfg(unix)]
         if let Err(err) = write_file_bytes_atomically_inner_locked(
-            path,
             &parent_dir,
             file_name,
             updated.as_bytes(),
@@ -2704,6 +2763,32 @@ mod tests {
 
         fn cleanup(&self) {
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_no_lock_files_in_repo(root: &Path) {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            let entries = fs::read_dir(&directory).unwrap();
+            for entry in entries.flatten() {
+                let metadata = entry.file_type().unwrap();
+                if metadata.is_dir() {
+                    stack.push(entry.path());
+                    continue;
+                }
+                if metadata.is_file()
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(WRITE_FILE_LOCK_PREFIX)
+                {
+                    panic!(
+                        "found repo-visible write lock sidecar: {}",
+                        entry.path().display()
+                    );
+                }
+            }
         }
     }
 
@@ -3905,11 +3990,7 @@ mod tests {
 
         let path = env.root.join("notes.txt");
         let path_clone = path.clone();
-        let parent_path = path.parent().unwrap();
-        let parent_dir = open_parent_no_follow(parent_path).unwrap();
-        let lock_file_name = path.file_name().unwrap();
-        let _destination_lock =
-            lock_target_file_in_parent_dir(&parent_dir, lock_file_name).unwrap();
+        let _destination_lock = acquire_write_lock(&path).unwrap();
 
         let (done_tx, done_rx) = mpsc::channel();
         let write_handle = thread::spawn(move || {
@@ -4055,6 +4136,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn fs_write_does_not_emit_repo_visible_lock_file() {
+        let env = TestEnv::new("write-no-lock-sidecar");
+        let tool = FsWriteTool::new(&env.root, "hello");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            "hello",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        assert_no_lock_files_in_repo(&env.root);
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn fs_write_rejects_parent_directory_swap_after_scope_validation() {
         let env = TestEnv::new("write-parent-swap");
         let outside = unique_test_dir("write-parent-swap-outside");
@@ -4176,6 +4275,66 @@ mod tests {
             fs::read_to_string(env.root.join("notes.txt")).unwrap()
         );
         env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_patch_does_not_emit_repo_visible_lock_file() {
+        let env = TestEnv::new("patch-no-lock-sidecar");
+        env.create_file("notes.txt", "alpha\nbeta");
+
+        let tool = FsPatchTool::new(&env.root, "beta", "delta");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        assert_eq!(
+            "alpha\ndelta",
+            fs::read_to_string(env.root.join("notes.txt")).unwrap()
+        );
+        assert_no_lock_files_in_repo(&env.root);
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_patch_reads_from_locked_parent_directory_when_parent_is_swapped() {
+        let env = TestEnv::new("patch-parent-swap-read");
+        let outside = unique_test_dir("patch-parent-swap-outside");
+        let backup_path = env.root.join("notes_backup");
+
+        env.create_file("notes/note.txt", "inside");
+        fs::create_dir_all(outside.join("notes")).unwrap();
+        fs::write(outside.join("notes").join("note.txt"), "outside").unwrap();
+
+        let target = resolve_mutation_target(&env.root, Path::new("notes/note.txt")).unwrap();
+        let (parent_dir, destination_lock) =
+            lock_target_for_patch(target.path()).expect("failed to acquire patch lock");
+
+        let parent_path = env.root.join("notes");
+        fs::rename(&parent_path, &backup_path).unwrap();
+        std::os::unix::fs::symlink(outside.join("notes"), &parent_path).unwrap();
+
+        let content = read_entire_text_file_in_parent_dir(
+            &parent_dir,
+            target.path().file_name().unwrap(),
+            1024,
+        )
+        .unwrap();
+
+        drop(destination_lock);
+        assert_eq!("inside", content);
+        assert_eq!(
+            "outside",
+            fs::read_to_string(outside.join("notes").join("note.txt")).unwrap()
+        );
+        assert_eq!(
+            "inside",
+            fs::read_to_string(backup_path.join("note.txt")).unwrap()
+        );
+        env.cleanup();
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
