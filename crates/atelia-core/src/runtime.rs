@@ -448,6 +448,26 @@ where
         let render_policy = request
             .tool_output_defaults
             .render_policy_with_render_options(request.render_options.as_ref());
+
+        if matches!(
+            request.tool_output_defaults.oversize_policy,
+            OversizeOutputPolicy::RejectOversize
+        ) {
+            if let Some(reason) =
+                reject_oversized_tool_result(&result, &request.tool_output_defaults)
+            {
+                let failure_refs = refs_for_invocation(&job, &policy_decision, &invocation);
+                append_failed_job_event(
+                    &self.store,
+                    &mut job,
+                    &mut events,
+                    "tool result exceeded output size limits",
+                    failure_refs,
+                )?;
+                return Err(RuntimeError::ToolOutputTooLarge { reason });
+            }
+        }
+
         let rendered_output = match render_tool_result_with_policy(&result, &render_policy) {
             Ok(rendered_output) => rendered_output,
             Err(error) => {
@@ -1849,7 +1869,12 @@ mod tests {
 
         let error = runtime.run_tool_job(request, &tool).unwrap_err();
 
-        assert!(matches!(error, RuntimeError::ToolOutputRender(_)));
+        assert!(matches!(error, RuntimeError::ToolOutputTooLarge { .. }));
+        let reason = match error {
+            RuntimeError::ToolOutputTooLarge { reason } => reason,
+            _ => unreachable!(),
+        };
+        assert!(reason.contains("tool output field(s) exceed max_inline_bytes=8"));
         assert!(runtime.store().list_tool_results().unwrap().is_empty());
         let jobs = runtime.store().list_jobs().unwrap();
         assert_eq!(1, jobs.len());
@@ -2073,7 +2098,12 @@ mod tests {
 
         let error = runtime.run_tool_job(request, &tool).unwrap_err();
 
-        assert!(matches!(error, RuntimeError::ToolOutputRender(_)));
+        assert!(matches!(error, RuntimeError::ToolOutputTooLarge { .. }));
+        let reason = match error {
+            RuntimeError::ToolOutputTooLarge { reason } => reason,
+            _ => unreachable!(),
+        };
+        assert!(reason.contains("tool output field(s) exceed max_inline_bytes=8"));
         assert!(runtime.store().list_tool_results().unwrap().is_empty());
         assert!(!artifact_root.exists());
         let jobs = runtime.store().list_jobs().unwrap();
