@@ -386,6 +386,7 @@ impl SecretaryRpcServer {
         request: UpdateToolOutputDefaultsRequest,
     ) -> RpcResult<UpdateToolOutputDefaultsResponse> {
         let scope = parse_tool_output_scope(request.scope)?;
+        let rpc_scope = RpcToolOutputScope::try_from(scope.clone())?;
         let actor = Actor::try_from(request.actor)?;
         let overrides = parse_tool_output_overrides(request.overrides)?;
         let change =
@@ -394,7 +395,15 @@ impl SecretaryRpcServer {
 
         Ok(UpdateToolOutputDefaultsResponse {
             metadata: self.metadata(),
-            change: RpcToolOutputSettingsChange::try_from(change)?,
+            change: RpcToolOutputSettingsChange {
+                schema_version: change.schema_version,
+                actor: RpcActorDto::from(change.actor),
+                scope: rpc_scope,
+                old_defaults: RpcToolOutputDefaults::from(change.old_defaults),
+                new_defaults: RpcToolOutputDefaults::from(change.new_defaults),
+                reason: change.reason,
+                changed_at_unix_ms: change.changed_at.unix_millis,
+            },
         })
     }
 
