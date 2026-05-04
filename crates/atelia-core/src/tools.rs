@@ -3793,6 +3793,15 @@ fn unlink_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<()>
 }
 
 #[cfg(unix)]
+// Deletes a file after validating its identity against expected metadata.
+//
+// Race window: the final `unlink_in_parent_dir` operates by name (not by fd)
+// because `unlinkat(fd, "", AT_EMPTY_PATH)` requires `CAP_DAC_READ_SEARCH`
+// on Linux, which is a privileged capability unavailable to user-space daemons.
+// The post-unlink `ensure_opened_link_count_decreased` check detects a swapped
+// leaf and returns PermissionDenied, making this a detect-rather-than-prevent
+// defense.  The opened fd keeps the inode alive for the post-check even if
+// the directory entry is replaced between the two syscalls.
 fn unlink_validated_file_in_parent_dir(
     parent: &File,
     name: &std::ffi::OsStr,
@@ -3827,6 +3836,12 @@ fn unlink_validated_file_in_parent_dir(
 }
 
 #[cfg(unix)]
+// Renames a file after validating its identity against expected metadata.
+//
+// Same TOCTOU note as `unlink_validated_file_in_parent_dir`: the rename operates
+// by name because fd-based renameat with AT_EMPTY_PATH requires privileged
+// capabilities.  Post-rename checks on both source and destination entries
+// detect a leaf swap and return PermissionDenied.
 fn rename_validated_file_between_parent_dirs(
     source_parent: &File,
     source: &std::ffi::OsStr,
