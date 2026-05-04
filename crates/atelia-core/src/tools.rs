@@ -91,6 +91,7 @@ impl CanonicalPath {
 pub enum PathResolutionError {
     RootNotFound,
     TargetNotFound { requested: PathBuf },
+    SymlinkRejected { requested: PathBuf },
     OutsideRepositoryScope { resolved: PathBuf, root: PathBuf },
 }
 
@@ -100,6 +101,9 @@ impl std::fmt::Display for PathResolutionError {
             Self::RootNotFound => write!(f, "repository root not found"),
             Self::TargetNotFound { requested } => {
                 write!(f, "target path not found: {}", requested.display())
+            }
+            Self::SymlinkRejected { requested } => {
+                write!(f, "target path is a symlink: {}", requested.display())
             }
             Self::OutsideRepositoryScope { resolved, root } => write!(
                 f,
@@ -3178,31 +3182,45 @@ fn resolve_mutation_target(
         canonical_root.join(relative_path)
     };
 
-    if target.exists() {
-        let canonical_target =
-            target
-                .canonicalize()
-                .map_err(|_| PathResolutionError::TargetNotFound {
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(PathResolutionError::SymlinkRejected {
                     requested: target.clone(),
-                })?;
+                });
+            }
 
-        if !canonical_target.starts_with(&canonical_root) {
-            return Err(PathResolutionError::OutsideRepositoryScope {
-                resolved: canonical_target,
-                root: canonical_root,
+            let canonical_target =
+                target
+                    .canonicalize()
+                    .map_err(|_| PathResolutionError::TargetNotFound {
+                        requested: target.clone(),
+                    })?;
+
+            if !canonical_target.starts_with(&canonical_root) {
+                return Err(PathResolutionError::OutsideRepositoryScope {
+                    resolved: canonical_target,
+                    root: canonical_root,
+                });
+            }
+
+            let display_path = canonical_target
+                .strip_prefix(&canonical_root)
+                .unwrap_or(&canonical_target)
+                .to_string_lossy()
+                .to_string();
+
+            return Ok(MutationTarget {
+                canonical: canonical_target,
+                display_path,
             });
         }
-
-        let display_path = canonical_target
-            .strip_prefix(&canonical_root)
-            .unwrap_or(&canonical_target)
-            .to_string_lossy()
-            .to_string();
-
-        return Ok(MutationTarget {
-            canonical: canonical_target,
-            display_path,
-        });
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(PathResolutionError::TargetNotFound {
+                requested: target.clone(),
+            });
+        }
     }
 
     let file_name = target
@@ -4241,39 +4259,8 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
             );
         }
 
-        let destination_exists = destination.path().exists();
-        if destination_exists && !self.allow_overwrite {
-            return failed_result(
-                invocation,
-                schema_ref,
-                "move failed: overwrite disabled".to_string(),
-                format!("{}: overwrite disabled", destination.display_path()),
-            );
-        }
-        if destination_exists {
-            match fs::symlink_metadata(destination.path()) {
-                Ok(metadata) if metadata.is_file() => {}
-                Ok(_) => {
-                    return failed_result(
-                        invocation,
-                        schema_ref,
-                        "move failed: destination is not a file".to_string(),
-                        destination.display_path().to_string(),
-                    );
-                }
-                Err(err) => {
-                    return failed_result(
-                        invocation,
-                        schema_ref,
-                        "move failed: cannot read destination metadata".to_string(),
-                        format!("{}: {}", destination.display_path(), err),
-                    );
-                }
-            }
-        }
-
         #[cfg(unix)]
-        let move_result = {
+        let move_result: io::Result<bool> = {
             let source_parent = source.path().parent().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -4313,6 +4300,36 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
                     let destination_parent_dir = open_parent_no_follow(destination_parent);
                     match (locks, source_parent_dir, destination_parent_dir) {
                         (Ok(_locks), Ok(source_parent_dir), Ok(destination_parent_dir)) => {
+                            let destination_exists = match fs::symlink_metadata(destination.path())
+                            {
+                                Ok(metadata) if metadata.is_file() => true,
+                                Ok(_) => {
+                                    return failed_result(
+                                        invocation,
+                                        schema_ref,
+                                        "move failed: destination is not a file".to_string(),
+                                        destination.display_path().to_string(),
+                                    );
+                                }
+                                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                                Err(error) => {
+                                    return failed_result(
+                                        invocation,
+                                        schema_ref,
+                                        "move failed: cannot read destination metadata".to_string(),
+                                        format!("{}: {}", destination.display_path(), error),
+                                    );
+                                }
+                            };
+                            if destination_exists && !self.allow_overwrite {
+                                return failed_result(
+                                    invocation,
+                                    schema_ref,
+                                    "move failed: overwrite disabled".to_string(),
+                                    format!("{}: overwrite disabled", destination.display_path()),
+                                );
+                            }
+
                             match open_read_no_follow_in_parent_dir(&source_parent_dir, source_name)
                             {
                                 Ok(file) => match file.metadata() {
@@ -4329,7 +4346,7 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
                                             let _ = source_parent_dir.sync_all();
                                             let _ = destination_parent_dir.sync_all();
                                         }
-                                        result
+                                        result.map(|_| destination_exists)
                                     }
                                     Ok(_) => Err(io::Error::new(
                                         io::ErrorKind::InvalidInput,
@@ -4351,28 +4368,53 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
         };
 
         #[cfg(not(unix))]
-        let move_result = if !self.allow_overwrite && destination_exists {
-            Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "destination already exists",
-            ))
-        } else {
-            fs::rename(source.path(), destination.path())
+        let move_result: io::Result<bool> = {
+            let destination_exists = match fs::symlink_metadata(destination.path()) {
+                Ok(metadata) if metadata.is_file() => true,
+                Ok(_) => {
+                    return failed_result(
+                        invocation,
+                        schema_ref,
+                        "move failed: destination is not a file".to_string(),
+                        destination.display_path().to_string(),
+                    );
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return failed_result(
+                        invocation,
+                        schema_ref,
+                        "move failed: cannot read destination metadata".to_string(),
+                        format!("{}: {}", destination.display_path(), error),
+                    );
+                }
+            };
+            if destination_exists && !self.allow_overwrite {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination already exists",
+                ))
+            } else {
+                fs::rename(source.path(), destination.path()).map(|_| destination_exists)
+            }
         };
 
-        if let Err(err) = move_result {
-            return failed_result(
-                invocation,
-                schema_ref,
-                "move failed: cannot rename file".to_string(),
-                format!(
-                    "{} -> {}: {}",
-                    source.display_path(),
-                    destination.display_path(),
-                    err
-                ),
-            );
-        }
+        let overwritten = match move_result {
+            Ok(overwritten) => overwritten,
+            Err(err) => {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "move failed: cannot rename file".to_string(),
+                    format!(
+                        "{} -> {}: {}",
+                        source.display_path(),
+                        destination.display_path(),
+                        err
+                    ),
+                );
+            }
+        };
 
         make_tool_result(
             invocation,
@@ -4397,7 +4439,7 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
                 },
                 ToolResultField {
                     key: "overwritten".to_string(),
-                    value: StructuredValue::Bool(destination_exists),
+                    value: StructuredValue::Bool(overwritten),
                 },
             ],
             None,
@@ -6452,6 +6494,29 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fs_delete_rejects_in_repo_symlink() {
+        let env = TestEnv::new("delete-in-repo-symlink");
+        env.create_file("real.txt", "keep me");
+        env.create_symlink("link.txt", &env.root.join("real.txt"));
+
+        let tool = FsDeleteTool::new(&env.root);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("link.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        assert!(env.root.join("link.txt").exists());
+        assert_eq!(
+            "keep me",
+            fs::read_to_string(env.root.join("real.txt")).unwrap()
+        );
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("symlink"));
+        env.cleanup();
+    }
+
     // -- FsMoveTool tests --
 
     #[test]
@@ -6543,6 +6608,57 @@ mod tests {
         assert!(env.root.join("from.txt").exists());
         let error = result.fields.iter().find(|f| f.key == "error").unwrap();
         assert!(string_value(&error.value).contains("outside repository root"));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_move_rejects_in_repo_symlink_source() {
+        let env = TestEnv::new("move-in-repo-symlink-source");
+        env.create_file("real.txt", "keep me");
+        env.create_dir("archive");
+        env.create_symlink("link.txt", &env.root.join("real.txt"));
+
+        let tool = FsMoveTool::new(&env.root, "archive/real.txt");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("link.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        assert!(env.root.join("link.txt").exists());
+        assert_eq!(
+            "keep me",
+            fs::read_to_string(env.root.join("real.txt")).unwrap()
+        );
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("symlink"));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_move_rejects_in_repo_symlink_destination() {
+        let env = TestEnv::new("move-in-repo-symlink-destination");
+        env.create_file("from.txt", "source");
+        env.create_file("real-destination.txt", "destination");
+        env.create_symlink("link.txt", &env.root.join("real-destination.txt"));
+
+        let tool = FsMoveTool::new(&env.root, "link.txt").with_allow_overwrite(true);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("from.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        assert_eq!(
+            "source",
+            fs::read_to_string(env.root.join("from.txt")).unwrap()
+        );
+        assert_eq!(
+            "destination",
+            fs::read_to_string(env.root.join("real-destination.txt")).unwrap()
+        );
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("symlink"));
         env.cleanup();
     }
 
