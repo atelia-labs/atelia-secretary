@@ -1479,7 +1479,11 @@ fn validate_record_path(
         return None;
     }
 
-    if !candidate_file_name.starts_with(record_id.as_str()) {
+    if candidate_file_name == ".index.lock" {
+        return None;
+    }
+
+    if !artifact_file_name_matches(candidate_file_name, record_id) {
         return None;
     }
 
@@ -2336,6 +2340,59 @@ mod tests {
         assert!(
             mismatched_file.exists(),
             "file with mismatched name must not be deleted"
+        );
+
+        let records = store.list_records(None).unwrap();
+        assert_eq!(1, records.len());
+        assert_eq!(
+            Some("retention policy"),
+            records[0].tombstone.as_ref().map(|t| t.reason.as_str())
+        );
+    }
+
+    #[test]
+    fn safe_expire_artifact_records_rejects_debug_tmp_filename() {
+        let root = temp_root("expire-debug-tmp-filename");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let record_id = OutputRefId::new();
+        let debug_tmp_file = scope_dir.join(format!("{}-debug.tmp", record_id.as_str()));
+        fs::write(&debug_tmp_file, b"stale").unwrap();
+        let record = LocalArtifactRecord {
+            id: record_id.clone(),
+            scope: "repo_example".to_string(),
+            project_id: None,
+            repository_id: None,
+            path: debug_tmp_file.to_string_lossy().into_owned(),
+            uri: debug_tmp_file.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("debug".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+        store.write_scope_records(&scope_dir, vec![record]).unwrap();
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let report = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap();
+
+        assert_eq!(1, report.requested);
+        assert_eq!(1, report.matched);
+        assert_eq!(1, report.tombstoned);
+        assert_eq!(0, report.deleted_files);
+        assert!(
+            debug_tmp_file.exists(),
+            "debug tmp file must not be deleted"
         );
 
         let records = store.list_records(None).unwrap();
