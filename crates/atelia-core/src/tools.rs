@@ -12,11 +12,13 @@ use crate::domain::{
 };
 use crate::runtime::RuntimeJobRequest;
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, BufRead, Read, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
