@@ -2022,11 +2022,9 @@ fn execute_explicit_argv_process(
         stderr_capture_result.retained_bytes
     };
 
-    stdout.truncated = capture_thread_aborted
-        || stdout_capture_timed_out
+    stdout.truncated = stdout_capture_timed_out
         || stdout_capture_result.original_bytes > stdout_capture_result.retained_bytes;
-    stderr.truncated = capture_thread_aborted
-        || stderr_capture_timed_out
+    stderr.truncated = stderr_capture_timed_out
         || stderr_capture_result.original_bytes > stderr_capture_result.retained_bytes;
 
     let duration_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
@@ -5490,6 +5488,47 @@ exec 'sleep', '9999';
         assert_eq!(Some(1), quick_capture_result);
         assert!(blocking_original_counter.load(Ordering::Acquire) > 0);
         assert!(stop_immediately.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_exec_stdout_timeout_does_not_mark_stderr_truncated() {
+        let env = TestEnv::new("proc-capture-thread-sibling");
+        let tool = ProcExecTool::new(
+            &env.root,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "(while true; do printf x; done) & exit 0".to_string(),
+            ],
+        )
+        .with_max_output_bytes(128);
+
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+        let stdout_truncated = result
+            .fields
+            .iter()
+            .find(|f| f.key == "stdout_truncated")
+            .unwrap();
+        let stderr_truncated = result
+            .fields
+            .iter()
+            .find(|f| f.key == "stderr_truncated")
+            .unwrap();
+        assert_eq!(StructuredValue::Bool(true), stdout_truncated.value);
+        assert_eq!(StructuredValue::Bool(false), stderr_truncated.value);
+        let trunc = result.truncation.unwrap();
+        assert!(trunc.reason.contains("stdout truncated at 128 bytes"));
+        assert!(!trunc.reason.contains("stderr truncated at 128 bytes"));
+        let summary = result.fields.iter().find(|f| f.key == "summary").unwrap();
+        assert!(string_value(&summary.value)
+            .contains("output capture stream timeout"));
+
+        env.cleanup();
     }
 
     #[test]
