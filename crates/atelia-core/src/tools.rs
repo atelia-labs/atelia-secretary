@@ -3215,7 +3215,7 @@ fn write_file_bytes_atomically(_path: &Path, _bytes: &[u8], _create_new: bool) -
     ))
 }
 
-#[cfg(any(test, not(unix)))]
+#[cfg(test)]
 fn read_entire_text_file(path: &Path, max_bytes: usize) -> io::Result<String> {
     let mut file = open_file_no_follow(path)?;
     let mut content = Vec::new();
