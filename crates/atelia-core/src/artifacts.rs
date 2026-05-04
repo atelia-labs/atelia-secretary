@@ -875,6 +875,10 @@ impl LocalArtifactStore {
             return Ok(());
         }
 
+        if !path_is_within_root(path, &root) {
+            return Ok(());
+        }
+
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -1743,6 +1747,42 @@ mod tests {
         store.delete_artifact(&forged_output_ref).unwrap();
 
         assert!(outside_artifact.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_artifact_ignores_external_symlink_pointing_into_root() {
+        let root = temp_root("delete-external-symlink");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let output_id = OutputRefId::new();
+        let target_path = scope_dir.join(format!("{}-target.artifact", output_id.as_str()));
+        fs::write(&target_path, b"keep me").unwrap();
+
+        let external_root = temp_root("delete-external-symlink-outside");
+        let external_dir = external_root.join("outside");
+        fs::create_dir_all(&external_dir).unwrap();
+        let symlink_path = external_dir.join(format!("{}.artifact", output_id.as_str()));
+        symlink(&target_path, &symlink_path).unwrap();
+
+        let output_ref = OutputRef {
+            id: output_id,
+            uri: symlink_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("linked".to_string()),
+            digest: None,
+        };
+
+        store.delete_artifact(&output_ref).unwrap();
+
+        assert!(symlink_path.exists());
+        assert!(fs::symlink_metadata(&symlink_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(target_path.exists());
     }
 
     #[cfg(unix)]
