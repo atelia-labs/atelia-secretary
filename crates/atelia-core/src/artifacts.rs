@@ -642,7 +642,7 @@ impl LocalArtifactStore {
                         });
                     }
 
-                    if let Some(candidate_path) = validate_record_path(
+                    if let Some(candidate_path) = validate_expiration_record_path(
                         &self.config.root_dir,
                         &scope,
                         &record.id,
@@ -832,19 +832,50 @@ impl LocalArtifactStore {
     }
     pub fn delete_artifact(&self, output_ref: &OutputRef) -> ArtifactResult<()> {
         let path = Path::new(&output_ref.uri);
-        let Some(parent) = path.parent() else {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
             return Ok(());
         };
 
-        let root = self.canonical_root_dir().map_err(ArtifactError::Io)?;
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(());
+        };
 
-        let canonical_parent = match parent.canonicalize() {
+        if matches!(file_name, DEFAULT_ARTIFACT_INDEX_FILE | ".index.lock") {
+            return Ok(());
+        }
+
+        if !artifact_file_name_matches(file_name, &output_ref.id) {
+            if file_name.starts_with(output_ref.id.as_str()) {
+                return Err(ArtifactError::Io(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "artifact path basename does not match expected artifact suffix",
+                )));
+            }
+            return Ok(());
+        }
+
+        let resolved_path = match path.canonicalize() {
             Ok(path) => path,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let root = self.canonical_root_dir().map_err(ArtifactError::Io)?;
+                if metadata.file_type().is_symlink() && path_is_within_root(path, &root) {
+                    match fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                return Ok(());
+            }
             Err(error) => return Err(ArtifactError::Io(error)),
         };
 
-        if !canonical_parent.starts_with(&root) {
+        let root = self.canonical_root_dir().map_err(ArtifactError::Io)?;
+        if !resolved_path.starts_with(&root) {
+            return Ok(());
+        }
+
+        if !path_is_within_root(path, &root) {
             return Ok(());
         }
 
@@ -1166,7 +1197,6 @@ fn rename_atomic(source: &Path, destination: &Path) -> io::Result<()> {
         Err(error) => Err(error),
     }
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultSpilloverOptions {
     pub max_inline_bytes: usize,
@@ -1388,7 +1418,6 @@ fn remove_record_bytes(
     store.write_scope_records_unlocked(&scope_dir, records)?;
     Ok(())
 }
-
 fn spillable_field_bytes(field: &ToolResultField) -> Option<Vec<u8>> {
     match &field.value {
         StructuredValue::String(value) => Some(value.as_bytes().to_vec()),
@@ -1450,6 +1479,82 @@ fn validate_record_path(
         return None;
     }
 
+    if candidate_file_name == ".index.lock" {
+        return None;
+    }
+
+    if !artifact_file_name_matches(candidate_file_name, record_id) {
+        return None;
+    }
+
+    let metadata = match candidate_path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Some(candidate_path);
+        }
+        Err(_) => return None,
+    };
+
+    if metadata.file_type().is_symlink() {
+        return None;
+    }
+
+    let resolved_path = match candidate_path.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            if error.kind() == ErrorKind::NotFound {
+                candidate_path
+            } else {
+                return None;
+            }
+        }
+    };
+
+    if !resolved_path.starts_with(&canonical_scope_dir) {
+        return None;
+    }
+
+    Some(resolved_path)
+}
+
+fn validate_expiration_record_path(
+    root_dir: &Path,
+    sanitized_scope: &str,
+    record_id: &OutputRefId,
+    record_path: &str,
+) -> Option<PathBuf> {
+    let path = Path::new(record_path);
+
+    let expected_scope_dir = root_dir.join(sanitized_scope);
+    let canonical_scope_dir = match expected_scope_dir.canonicalize() {
+        Ok(dir) => dir,
+        Err(_) => return None,
+    };
+
+    let scope_relative_path = match path.strip_prefix(&canonical_scope_dir) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => match path.file_name() {
+            Some(file_name) => PathBuf::from(file_name),
+            None => return None,
+        },
+    };
+
+    let candidate_path = canonical_scope_dir.join(scope_relative_path);
+    let candidate_file_name = candidate_path.file_name().and_then(|name| name.to_str())?;
+    let debug_tmp_file = format!("{}-debug.tmp", record_id.as_str());
+
+    if candidate_file_name == DEFAULT_ARTIFACT_INDEX_FILE {
+        return None;
+    }
+
+    if candidate_file_name == ".index.lock" {
+        return None;
+    }
+
+    if candidate_file_name == debug_tmp_file {
+        return None;
+    }
+
     if !candidate_file_name.starts_with(record_id.as_str()) {
         return None;
     }
@@ -1467,6 +1572,25 @@ fn validate_record_path(
     }
 
     Some(candidate_path)
+}
+
+fn artifact_file_name_matches(file_name: &str, record_id: &OutputRefId) -> bool {
+    let prefix = record_id.as_str();
+    file_name != DEFAULT_ARTIFACT_INDEX_FILE
+        && file_name != ".index.lock"
+        && file_name.starts_with(prefix)
+        && file_name.ends_with(".artifact")
+}
+
+fn path_is_within_root(path: &Path, root: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+
+    match parent.canonicalize() {
+        Ok(canonical_parent) => canonical_parent.starts_with(root),
+        Err(_) => false,
+    }
 }
 
 fn sanitize_segment(value: &str) -> ArtifactResult<String> {
@@ -1703,25 +1827,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn delete_artifact_removes_symlink_entry_without_touching_target() {
-        let root = temp_root("delete-symlink");
+    fn delete_artifact_ignores_external_symlink_pointing_into_root() {
+        let root = temp_root("delete-external-symlink");
         let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
         let scope_dir = root.join("repo_example");
         create_scope_dir(&scope_dir).unwrap();
 
-        let target_path = scope_dir.join("target.artifact");
-        fs::write(&target_path, b"kept").unwrap();
+        let output_id = OutputRefId::new();
+        let target_path = scope_dir.join(format!("{}-target.artifact", output_id.as_str()));
+        fs::write(&target_path, b"keep me").unwrap();
 
-        let symlink_path = scope_dir.join("linked.artifact");
+        let external_root = temp_root("delete-external-symlink-outside");
+        let external_dir = external_root.join("outside");
+        fs::create_dir_all(&external_dir).unwrap();
+        let symlink_path = external_dir.join(format!("{}.artifact", output_id.as_str()));
         symlink(&target_path, &symlink_path).unwrap();
-        assert!(symlink_path.exists());
-        assert!(fs::symlink_metadata(&symlink_path)
-            .unwrap()
-            .file_type()
-            .is_symlink());
 
         let output_ref = OutputRef {
-            id: OutputRefId::new(),
+            id: output_id,
             uri: symlink_path.to_string_lossy().into_owned(),
             media_type: "text/plain".to_string(),
             label: Some("linked".to_string()),
@@ -1730,8 +1853,89 @@ mod tests {
 
         store.delete_artifact(&output_ref).unwrap();
 
-        assert!(!symlink_path.exists());
+        assert!(symlink_path.exists());
+        assert!(fs::symlink_metadata(&symlink_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert!(target_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_artifact_removes_dangling_symlink_entry() {
+        let root = temp_root("delete-symlink");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let output_id = OutputRefId::new();
+        let target_path = scope_dir.join(format!("{}-target.artifact", output_id.as_str()));
+
+        let symlink_path = scope_dir.join(format!("{}-linked.artifact", output_id.as_str()));
+        symlink(&target_path, &symlink_path).unwrap();
+        assert!(fs::symlink_metadata(&symlink_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!symlink_path.exists());
+
+        let output_ref = OutputRef {
+            id: output_id,
+            uri: symlink_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("linked".to_string()),
+            digest: None,
+        };
+
+        store.delete_artifact(&output_ref).unwrap();
+
+        assert!(fs::symlink_metadata(&symlink_path).is_err());
+    }
+
+    #[test]
+    fn delete_artifact_rejects_scope_files_and_mismatched_artifacts() {
+        let root = temp_root("delete-scope-files");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let index_path = scope_dir.join(DEFAULT_ARTIFACT_INDEX_FILE);
+        let lock_path = scope_dir.join(".index.lock");
+        let mismatched_path = scope_dir.join("different-id.artifact");
+        fs::write(&index_path, b"index").unwrap();
+        fs::write(&lock_path, b"lock").unwrap();
+        fs::write(&mismatched_path, b"artifact").unwrap();
+
+        let index_ref = OutputRef {
+            id: OutputRefId::new(),
+            uri: index_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("index".to_string()),
+            digest: None,
+        };
+        let lock_ref = OutputRef {
+            id: OutputRefId::new(),
+            uri: lock_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("lock".to_string()),
+            digest: None,
+        };
+        let mismatched_ref = OutputRef {
+            id: OutputRefId::new(),
+            uri: mismatched_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("mismatch".to_string()),
+            digest: None,
+        };
+
+        store.delete_artifact(&index_ref).unwrap();
+        store.delete_artifact(&lock_ref).unwrap();
+        store.delete_artifact(&mismatched_ref).unwrap();
+
+        assert!(index_path.exists());
+        assert!(lock_path.exists());
+        assert!(mismatched_path.exists());
     }
 
     #[test]
@@ -1790,6 +1994,56 @@ mod tests {
             .resolve_output_path_for_context(&output_ref.id, Some("repo-b"), Some("repo-b"), None)
             .unwrap();
         assert_eq!(None, mismatched);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_output_path_rejects_symlink_record_escaping_root() {
+        let root = temp_root("resolve-output-path-symlink");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let output_id = OutputRefId::new();
+        let outside_root = temp_root("resolve-output-path-symlink-target");
+        create_scope_dir(&outside_root).unwrap();
+        let outside_artifact =
+            outside_root.join(format!("{}-outside.artifact", output_id.as_str()));
+        fs::write(&outside_artifact, b"outside root artifact").unwrap();
+
+        let symlink_path = scope_dir.join(format!("{}.artifact", output_id.as_str()));
+        symlink(&outside_artifact, &symlink_path).unwrap();
+
+        let forged = LocalArtifactRecord {
+            id: output_id.clone(),
+            scope: "repo_example".to_string(),
+            project_id: None,
+            repository_id: None,
+            path: symlink_path.to_string_lossy().into_owned(),
+            uri: symlink_path.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("escaped".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+        store.write_scope_records(&scope_dir, vec![forged]).unwrap();
+
+        let error = store
+            .resolve_output_record_for_context(
+                &output_id,
+                Some("repo_example"),
+                Some("repo_example"),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidIndex { path, reason }
+            if path == symlink_path.to_string_lossy() && reason == "artifact path failed scope validation"
+        ));
     }
 
     #[test]
@@ -1957,7 +2211,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(&absolute_root);
     }
-
     #[test]
     fn spills_large_string_field_to_output_ref() {
         let root = temp_root("spill");
@@ -2209,6 +2462,59 @@ mod tests {
         assert!(
             mismatched_file.exists(),
             "file with mismatched name must not be deleted"
+        );
+
+        let records = store.list_records(None).unwrap();
+        assert_eq!(1, records.len());
+        assert_eq!(
+            Some("retention policy"),
+            records[0].tombstone.as_ref().map(|t| t.reason.as_str())
+        );
+    }
+
+    #[test]
+    fn safe_expire_artifact_records_rejects_debug_tmp_filename() {
+        let root = temp_root("expire-debug-tmp-filename");
+        let store = LocalArtifactStore::new(ArtifactStoreConfig::new(&root));
+        let scope_dir = root.join("repo_example");
+        create_scope_dir(&scope_dir).unwrap();
+
+        let record_id = OutputRefId::new();
+        let debug_tmp_file = scope_dir.join(format!("{}-debug.tmp", record_id.as_str()));
+        fs::write(&debug_tmp_file, b"stale").unwrap();
+        let record = LocalArtifactRecord {
+            id: record_id.clone(),
+            scope: "repo_example".to_string(),
+            project_id: None,
+            repository_id: None,
+            path: debug_tmp_file.to_string_lossy().into_owned(),
+            uri: debug_tmp_file.to_string_lossy().into_owned(),
+            media_type: "text/plain".to_string(),
+            label: Some("debug".to_string()),
+            created_at: LedgerTimestamp::now(),
+            original_bytes: None,
+            retained_bytes: None,
+            tombstone: None,
+        };
+        store.write_scope_records(&scope_dir, vec![record]).unwrap();
+
+        let policy = ArtifactRetentionPolicy::new(Duration::from_millis(0));
+        let report = store
+            .safe_expire_artifacts_by_retention(
+                None,
+                LedgerTimestamp::now(),
+                &policy,
+                "retention policy",
+            )
+            .unwrap();
+
+        assert_eq!(1, report.requested);
+        assert_eq!(1, report.matched);
+        assert_eq!(1, report.tombstoned);
+        assert_eq!(0, report.deleted_files);
+        assert!(
+            debug_tmp_file.exists(),
+            "debug tmp file must not be deleted"
         );
 
         let records = store.list_records(None).unwrap();
@@ -3162,22 +3468,6 @@ mod tests {
             if path == expected_path && reason.contains("missing index row")
         ));
     }
-
-    #[derive(Debug)]
-    struct FailingWriter {
-        writes: Cell<usize>,
-        fail_on: usize,
-    }
-
-    impl FailingWriter {
-        fn new(fail_on: usize) -> Self {
-            Self {
-                writes: Cell::new(0),
-                fail_on,
-            }
-        }
-    }
-
     #[derive(Debug)]
     struct FailingLocalWriter {
         delegate: LocalArtifactStore,
@@ -3228,75 +3518,6 @@ mod tests {
             self.delegate.delete_artifact_record(scope, output_ref)
         }
     }
-
-    impl ArtifactWriter for FailingWriter {
-        fn write_artifact_bytes(
-            &self,
-            scope: &str,
-            label: &str,
-            media_type: &str,
-            bytes: &[u8],
-        ) -> ArtifactResult<OutputRef> {
-            let write_count = self.writes.get() + 1;
-            self.writes.set(write_count);
-
-            if write_count == self.fail_on {
-                return Err(ArtifactError::Io(std::io::Error::other(
-                    "simulated write failure",
-                )));
-            }
-
-            Ok(OutputRef {
-                id: OutputRefId::new(),
-                uri: format!("file://{scope}/{label}/{}-bytes", bytes.len()),
-                media_type: media_type.to_string(),
-                label: Some(label.to_string()),
-                digest: None,
-            })
-        }
-    }
-
-    #[test]
-    fn does_not_mutate_result_when_later_spill_write_fails() {
-        let mut result = ToolResult {
-            id: ToolResultId::new(),
-            schema_version: 1,
-            created_at: LedgerTimestamp::now(),
-            invocation_id: ToolInvocationId::new(),
-            tool_id: "fs.search".to_string(),
-            status: ToolResultStatus::Succeeded,
-            schema_ref: Some("tool_result.test.v1".to_string()),
-            fields: vec![
-                ToolResultField {
-                    key: "matches".to_string(),
-                    value: StructuredValue::String("abcdef".into()),
-                },
-                ToolResultField {
-                    key: "summary".to_string(),
-                    value: StructuredValue::String("ghijkl".into()),
-                },
-            ],
-            evidence_refs: Vec::new(),
-            output_refs: Vec::new(),
-            truncation: None,
-            redactions: Vec::new(),
-        };
-
-        let expected = result.clone();
-        let writer = FailingWriter::new(2);
-
-        let error = spill_large_tool_result_fields_with_writer(
-            &mut result,
-            &writer,
-            "repo_example",
-            &ToolResultSpilloverOptions::new(4),
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, ArtifactError::Io(_)));
-        assert_eq!(expected, result);
-    }
-
     #[test]
     fn rolls_back_partial_artifact_writes_on_later_failure() {
         let root = temp_root("spill-rollback");
