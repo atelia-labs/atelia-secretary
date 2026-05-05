@@ -469,8 +469,9 @@ fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String>
             set_restrictive_permissions(&token_path)?;
             Ok(token)
         }
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to read session token file {token_path:?}")),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to read session token file {token_path:?}"))
+        }
     }
 }
 
@@ -3432,7 +3433,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             response.headers().get(header::WWW_AUTHENTICATE),
-            Some(&header::HeaderValue::from_static(r#"Bearer realm="Atelia Secretary""#))
+            Some(&header::HeaderValue::from_static(
+                r#"Bearer realm="Atelia Secretary""#
+            ))
         );
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
@@ -3472,8 +3475,7 @@ mod tests {
     async fn local_auth_allows_valid_authorization_header() {
         let rpc_server = ready_rpc_server();
         let response =
-            send_authenticated_request(&rpc_server, Method::GET, "/v1/health", "test-token")
-                .await;
+            send_authenticated_request(&rpc_server, Method::GET, "/v1/health", "test-token").await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX)
@@ -3499,7 +3501,9 @@ mod tests {
             .to_string();
 
         match resolved {
-            LocalAuthConfig::BearerToken { token: resolved_token } => {
+            LocalAuthConfig::BearerToken {
+                token: resolved_token,
+            } => {
                 assert_eq!(resolved_token, token);
                 assert_eq!(resolved_token.len(), 64);
             }
@@ -3507,10 +3511,7 @@ mod tests {
         }
 
         let resolved_again = resolve_local_auth(&storage_dir).expect("resolve local auth again");
-        assert_eq!(
-            resolved_again,
-            LocalAuthConfig::BearerToken { token }
-        );
+        assert_eq!(resolved_again, LocalAuthConfig::BearerToken { token });
     }
 
     #[test]
