@@ -5,7 +5,7 @@ expose. Convenience integrations belong to extensions.
 
 See also [Tool Definition Schema](tool-definition-schema.md), [Tool Output
 Schema](tool-output-schema.md), [Extensions Runtime](extensions-runtime.md),
-Atelia [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md), and [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/docs/agent-repertoire/docs/agent-repertoire.md) for the live tool surface visible to agents.
+Atelia [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md), and [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/docs/agent-repertoire/docs/agent-repertoire.md) as a computed projection of the live tool surface in the current context.
 
 Secretary core should provide a general harness: filesystem, shell, search,
 jobs, events, policy, extension hosting, hooks, output rendering, agent
