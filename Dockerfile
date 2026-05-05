@@ -1,7 +1,7 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /workspace
 COPY . .
-RUN cargo build --release -p ateliad
+RUN cargo build --locked --release -p ateliad
 
 FROM debian:bookworm-slim
 RUN useradd --system --uid 10001 --create-home atelia

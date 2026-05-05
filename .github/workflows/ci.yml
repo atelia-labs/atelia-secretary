@@ -35,10 +35,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
 
       - name: Docker build
         run: docker build --file Dockerfile .
