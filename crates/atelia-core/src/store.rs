@@ -893,17 +893,19 @@ impl SecretaryStore for InMemoryStore {
         limit: Option<usize>,
     ) -> StoreResult<Vec<JobEvent>> {
         let inner = self.lock()?;
-        let after_sequence = match cursor {
-            EventCursor::Beginning => 0,
-            EventCursor::AfterSequence(sequence) => sequence,
-            EventCursor::AfterEventId(id) => {
-                let event = inner
-                    .job_events_by_id
-                    .get(&id)
-                    .ok_or_else(|| cursor_expired_event_id("replay_job_events", &id))?;
-                event.sequence_number
-            }
-        };
+        let after_sequence =
+            match cursor {
+                EventCursor::Beginning => 0,
+                EventCursor::AfterSequence(sequence) => sequence,
+                EventCursor::AfterEventId(id) => {
+                    let event = inner.job_events_by_id.get(&id).ok_or_else(|| {
+                        StoreError::InvalidCursor {
+                            reason: format!("unknown event id: {}", id_debug(&id)),
+                        }
+                    })?;
+                    event.sequence_number
+                }
+            };
 
         let mut events = Vec::new();
         if let Some(start_sequence) = after_sequence.checked_add(1) {
@@ -3002,10 +3004,13 @@ fn event_cursor_sequence(inner: &InMemoryInner, cursor: EventCursor) -> StoreRes
         EventCursor::Beginning => Ok(0),
         EventCursor::AfterSequence(sequence) => Ok(sequence),
         EventCursor::AfterEventId(id) => {
-            let event = inner
-                .job_events_by_id
-                .get(&id)
-                .ok_or_else(|| cursor_expired_event_id("event_cursor_sequence", &id))?;
+            let event =
+                inner
+                    .job_events_by_id
+                    .get(&id)
+                    .ok_or_else(|| StoreError::InvalidCursor {
+                        reason: format!("unknown event id: {}", id_debug(&id)),
+                    })?;
             Ok(event.sequence_number)
         }
     }
@@ -6816,22 +6821,14 @@ mod tests {
     }
 
     #[test]
-    fn replay_after_retained_event_is_removed_returns_cursor_expired() {
+    fn replay_after_unknown_event_id_returns_invalid_cursor() {
         let store = InMemoryStore::new();
-        let repository = repository_record();
-
-        store.create_repository(repository.clone()).unwrap();
-
-        let event = store.append_job_event(job_event(repository.id)).unwrap();
-        {
-            let mut inner = store.lock().unwrap();
-            inner.job_events_by_id.remove(&event.id);
-        }
-
-        let cursor = EventCursor::AfterEventId(event.id.clone());
+        let cursor = EventCursor::AfterEventId(
+            JobEventId::try_from_string("evt_12345678-1234-1234-1234-123456789abc").unwrap(),
+        );
         assert!(matches!(
             store.replay_job_events(cursor, None),
-            Err(StoreError::CursorExpired { reason }) if reason.contains("event id is no longer retained")
+            Err(StoreError::InvalidCursor { reason }) if reason.contains("unknown event id")
         ));
     }
 
