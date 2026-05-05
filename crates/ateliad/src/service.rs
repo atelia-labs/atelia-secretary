@@ -1122,10 +1122,17 @@ fn resolve_submit_job_tool_kind(
 
             if !matches!(
                 resource_scope.kind.trim(),
-                "repository" | "explicit_paths" | "read_only"
+                "repository" | "explicit_paths" | "read_only" | "path"
             ) {
                 return Err(ServiceError::InvalidArgument {
-                    reason: "filesystem.read requires resource_scope.kind to be repository, explicit_paths, or read_only".to_string(),
+                    reason: "filesystem.read requires resource_scope.kind to be repository, explicit_paths, read_only, or path".to_string(),
+                });
+            }
+
+            if matches!(resource_scope.value.trim(), "" | ".") {
+                return Err(ServiceError::InvalidArgument {
+                    reason: "filesystem.read requires a concrete path_scope/resource_scope root"
+                        .to_string(),
                 });
             }
 
@@ -2987,7 +2994,7 @@ mod tests {
                 kind: JobKind::Read,
                 goal: "read repository notes".to_string(),
                 resource_scope: Some(ResourceScope {
-                    kind: "explicit_paths".to_string(),
+                    kind: "path".to_string(),
                     value: "README.md".to_string(),
                 }),
                 requested_capabilities: vec!["filesystem.read".to_string()],
@@ -3102,6 +3109,44 @@ mod tests {
                 kind: JobKind::Read,
                 goal: "read repository notes".to_string(),
                 resource_scope: None,
+                requested_capabilities: vec!["filesystem.read".to_string()],
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(svc
+            .list_jobs(None, None, None, None, None)
+            .expect("job query should succeed")
+            .jobs
+            .is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_read_repository_root_before_side_effects() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-read-root-rejected");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "read-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "read repository root".to_string(),
+                resource_scope: Some(ResourceScope {
+                    kind: "repository".to_string(),
+                    value: ".".to_string(),
+                }),
                 requested_capabilities: vec!["filesystem.read".to_string()],
                 idempotency_key: None,
             })
