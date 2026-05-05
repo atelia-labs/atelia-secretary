@@ -555,10 +555,27 @@ fn write_or_reuse_session_token(token_path: &std::path::Path, token: String) -> 
             Ok(token)
         }
         Err(error) if is_already_exists_error(&error) => {
-            read_and_validate_session_token(token_path)
+            read_and_validate_session_token_with_retry(token_path)
         }
         Err(error) => Err(error),
     }
+}
+
+fn read_and_validate_session_token_with_retry(token_path: &std::path::Path) -> Result<String> {
+    const SESSION_TOKEN_READ_ATTEMPTS: usize = 4;
+    let retry_delay = Duration::from_millis(10);
+
+    for attempt in 0..SESSION_TOKEN_READ_ATTEMPTS {
+        match read_and_validate_session_token(token_path) {
+            Ok(token) => return Ok(token),
+            Err(_error) if attempt + 1 < SESSION_TOKEN_READ_ATTEMPTS => {
+                std::thread::sleep(retry_delay);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("retry loop must return on success or failure")
 }
 
 fn is_already_exists_error(error: &anyhow::Error) -> bool {
@@ -3677,6 +3694,26 @@ mod tests {
 
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn local_auth_write_or_reuse_session_token_retries_after_transient_invalid_read() {
+        let storage_dir = test_repo_dir("local-auth-already-exists-transient");
+        let token_path = local_auth_token_path(&storage_dir);
+        fs::write(&token_path, "broken-token").expect("seed invalid session token");
+
+        let repaired_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let writer_token_path = token_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            fs::write(&writer_token_path, repaired_token).expect("repair session token");
+        });
+
+        let recovered = write_or_reuse_session_token(&token_path, "f".repeat(64))
+            .expect("recover repaired session token");
+
+        writer.join().expect("repair thread");
+        assert_eq!(recovered, repaired_token);
     }
 
     #[test]
