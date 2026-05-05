@@ -468,6 +468,15 @@ pub fn resolve_local_auth(storage_dir: &std::path::Path) -> Result<LocalAuthConf
                 "{AUTH_TOKEN_ENV} must not contain internal whitespace"
             ));
         }
+        if !token
+            .as_bytes()
+            .iter()
+            .all(|byte| (0x20..=0x7e).contains(byte))
+        {
+            return Err(anyhow!(
+                "{AUTH_TOKEN_ENV} must contain only visible ASCII characters"
+            ));
+        }
 
         return Ok(LocalAuthConfig::BearerToken { token });
     }
@@ -3600,6 +3609,23 @@ mod tests {
         assert!(err
             .to_string()
             .contains("ATELIA_DAEMON_AUTH_TOKEN must not contain internal whitespace"));
+    }
+
+    #[test]
+    fn resolve_local_auth_rejects_bearer_token_with_non_visible_ascii() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+
+        for (label, token) in [("control", "abc\u{0007}def"), ("non_ascii", "abcédef")] {
+            std::env::set_var(AUTH_TOKEN_ENV, token);
+
+            let err = resolve_local_auth(&test_repo_dir(&format!("local-auth-env-token-{label}")))
+                .expect_err("non-visible ASCII should be rejected");
+
+            assert!(err
+                .to_string()
+                .contains("ATELIA_DAEMON_AUTH_TOKEN must contain only visible ASCII characters"));
+        }
     }
 
     #[test]
