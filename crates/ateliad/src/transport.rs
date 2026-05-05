@@ -471,14 +471,8 @@ pub fn resolve_local_auth(storage_dir: &std::path::Path) -> Result<LocalAuthConf
         if token.is_empty() {
             return Err(anyhow!("{AUTH_TOKEN_ENV} must not be empty"));
         }
-        if token
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_whitespace())
-            || token
-                .chars()
-                .last()
-                .is_some_and(|ch| ch.is_whitespace())
+        if token.chars().next().is_some_and(|ch| ch.is_whitespace())
+            || token.chars().last().is_some_and(|ch| ch.is_whitespace())
         {
             return Err(anyhow!(
                 "{AUTH_TOKEN_ENV} must not have leading or trailing whitespace"
@@ -3675,9 +3669,9 @@ mod tests {
         let err = resolve_local_auth(&test_repo_dir("local-auth-env-conflict"))
             .expect_err("conflicting envs should be rejected");
 
-        assert!(err
-            .to_string()
-            .contains("ATELIA_DAEMON_AUTH_DISABLED and ATELIA_DAEMON_AUTH_TOKEN are mutually exclusive"));
+        assert!(err.to_string().contains(
+            "ATELIA_DAEMON_AUTH_DISABLED and ATELIA_DAEMON_AUTH_TOKEN are mutually exclusive"
+        ));
     }
 
     #[test]
