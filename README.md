@@ -11,7 +11,7 @@ client UX, and governance live in the
 focuses on the daemon implementation that executes those contracts.
 
 Atelia Secretary is the reference backend host for
-[AEP](https://github.com/atelia-labs/atelia/blob/main/docs/aep.md). It owns the
+[AEP](https://github.com/atelia-labs/atelia/pull/4). It owns the
 Rust / WASM backend runtime boundary, manifest validation slice, permission and
 capability enforcement, brokered services, hook execution boundaries, audit,
 blocklist, install records, and rollback behavior.
@@ -72,9 +72,9 @@ Release and research:
 Project-level docs:
 
 - [Atelia](https://github.com/atelia-labs/atelia)
-- [Atelia Extension Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/aep.md)
-- [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.md)
-- [AEP Package Model](https://github.com/atelia-labs/atelia/blob/main/docs/aep-package.md)
+- [Atelia Extension Protocol](https://github.com/atelia-labs/atelia/pull/4)
+- [AEP Manifest](https://github.com/atelia-labs/atelia/pull/4)
+- [AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
 - [AX Feedback](https://github.com/atelia-labs/atelia/blob/main/docs/ax-feedback.md)
 - [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
 - [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md)

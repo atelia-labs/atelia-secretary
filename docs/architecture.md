@@ -98,8 +98,8 @@ policy requires it, human approval.
 
 See the project-level Atelia documents for normative extension and Hook specs.
 
-- [Atelia Extension Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/aep.md)
-- [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.md)
+- [Atelia Extension Protocol](https://github.com/atelia-labs/atelia/pull/4)
+- [AEP Manifest](https://github.com/atelia-labs/atelia/pull/4)
 - [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
 - [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md)
 - [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.md)

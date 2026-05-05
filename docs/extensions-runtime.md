@@ -6,13 +6,14 @@ audits, and rolls back Custom Extensions.
 The normative AEP, extension, composition, hook, tool-output, and security
 contracts live in the [`atelia`](https://github.com/atelia-labs/atelia)
 repository:
-[AEP](https://github.com/atelia-labs/atelia/blob/main/docs/aep.md),
-[AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.md),
 [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md),
 [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md),
 [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md),
 [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.md),
 and [Extension Security](https://github.com/atelia-labs/atelia/blob/main/docs/extension-security.md).
+AEP overview and manifest docs are introduced by
+[atelia PR #4](https://github.com/atelia-labs/atelia/pull/4) and should be
+linked directly after that PR lands in the `atelia` repository.
 This document defines the daemon-side enforcement that gives Secretary a
 trustworthy extension workplace. In AEP terms, this is the backend host
 reference implementation slice.
