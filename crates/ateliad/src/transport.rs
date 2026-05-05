@@ -4435,12 +4435,47 @@ mod tests {
             .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
             .expect("response bytes");
         assert_eq!(payload["status"], "ok");
+        let entries = payload["data"]["entries"]
+            .as_array()
+            .expect("repertoire entries array");
+        let tool_ids: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry["tool_id"].as_str().expect("tool id"))
+            .collect();
         assert_eq!(
-            payload["data"]["entries"].as_array().map(|v| v.len()),
-            Some(2)
+            tool_ids,
+            vec![
+                "fs.delete",
+                "fs.diff",
+                "fs.list",
+                "fs.move",
+                "fs.patch",
+                "fs.read",
+                "fs.search",
+                "fs.stat",
+                "fs.write",
+                "proc.exec",
+                "proc.run",
+                "secretary.echo",
+            ]
         );
-        assert_eq!(payload["data"]["entries"][0]["tool_id"], "fs.read");
-        assert_eq!(payload["data"]["entries"][1]["tool_id"], "secretary.echo");
+        assert!(tool_ids.iter().all(|tool_id| {
+            matches!(
+                *tool_id,
+                "fs.diff"
+                    | "fs.delete"
+                    | "fs.list"
+                    | "fs.move"
+                    | "fs.patch"
+                    | "fs.read"
+                    | "fs.search"
+                    | "fs.stat"
+                    | "fs.write"
+                    | "proc.exec"
+                    | "proc.run"
+                    | "secretary.echo"
+            )
+        }));
     }
 
     #[tokio::test]

@@ -2566,14 +2566,60 @@ mod tests {
             .list_repertoire(ListRepertoireRequest)
             .expect("repertoire projection should succeed");
 
-        assert_eq!(response.entries.len(), 2);
-        assert_eq!(response.entries[0].tool_id, "fs.read");
-        assert_eq!(response.entries[0].name, "Filesystem Read");
-        assert_eq!(response.entries[0].risk_tier, "R1");
-        assert_eq!(response.entries[1].tool_id, "secretary.echo");
-        assert_eq!(response.entries[1].risk_tier, "R0");
-        assert!(!response.entries[1].cancellable);
-        assert_eq!(response.entries[0].provider_id, "atelia-secretary");
+        let tool_ids: Vec<&str> = response
+            .entries
+            .iter()
+            .map(|entry| entry.tool_id.as_str())
+            .collect();
+        assert_eq!(
+            tool_ids,
+            vec![
+                "fs.delete",
+                "fs.diff",
+                "fs.list",
+                "fs.move",
+                "fs.patch",
+                "fs.read",
+                "fs.search",
+                "fs.stat",
+                "fs.write",
+                "proc.exec",
+                "proc.run",
+                "secretary.echo",
+            ]
+        );
+        let read = response
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "fs.read")
+            .expect("fs.read repertoire entry");
+        assert_eq!(read.name, "Filesystem Read");
+        assert_eq!(read.risk_tier, "R1");
+        assert_eq!(read.provider_id, "atelia-secretary");
+        let echo = response
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "secretary.echo")
+            .expect("secretary.echo repertoire entry");
+        assert_eq!(echo.risk_tier, "R0");
+        assert!(!echo.cancellable);
+        assert!(response.entries.iter().all(|entry| {
+            matches!(
+                entry.tool_id.as_str(),
+                "fs.diff"
+                    | "fs.delete"
+                    | "fs.list"
+                    | "fs.move"
+                    | "fs.patch"
+                    | "fs.read"
+                    | "fs.search"
+                    | "fs.stat"
+                    | "fs.write"
+                    | "proc.exec"
+                    | "proc.run"
+                    | "secretary.echo"
+            )
+        }));
     }
 
     #[test]

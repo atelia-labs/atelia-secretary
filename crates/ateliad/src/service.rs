@@ -589,7 +589,7 @@ impl SecretaryService {
             })
     }
 
-    /// Project the current built-in tool surface for beta repertoire clients.
+    /// Project the implemented built-in tool surface for beta repertoire clients.
     pub fn list_repertoire(
         &self,
         _request: ListRepertoireRequest,
@@ -1136,41 +1136,143 @@ fn paginate_records<T>(
 }
 
 fn list_repertoire_entries() -> Vec<RepertoireEntry> {
+    fn entry(
+        tool_id: &str,
+        name: &str,
+        description: &str,
+        risk_tier: &str,
+        idempotency: &str,
+        cancellable: bool,
+        timeout_ms: u32,
+    ) -> RepertoireEntry {
+        RepertoireEntry {
+            tool_id: tool_id.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+            provider_kind: SECRETARY_TOOL_PROVIDER_KIND.to_string(),
+            provider_id: SECRETARY_TOOL_PROVIDER_ID.to_string(),
+            risk_tier: risk_tier.to_string(),
+            default_result_format: SECRETARY_TOON_FORMAT.to_string(),
+            supported_result_formats: vec![
+                SECRETARY_TOON_FORMAT.to_string(),
+                SECRETARY_JSON_FORMAT.to_string(),
+            ],
+            idempotency: idempotency.to_string(),
+            cancellable,
+            streaming: false,
+            timeout_ms,
+        }
+    }
+
     let mut entries = vec![
-        RepertoireEntry {
-            tool_id: SECRETARY_ECHO_TOOL_ID.to_string(),
-            name: SECRETARY_ECHO_TOOL_NAME.to_string(),
-            description: SECRETARY_ECHO_TOOL_DESCRIPTION.to_string(),
-            provider_kind: SECRETARY_TOOL_PROVIDER_KIND.to_string(),
-            provider_id: SECRETARY_TOOL_PROVIDER_ID.to_string(),
-            risk_tier: "R0".to_string(),
-            default_result_format: SECRETARY_TOON_FORMAT.to_string(),
-            supported_result_formats: vec![
-                SECRETARY_TOON_FORMAT.to_string(),
-                SECRETARY_JSON_FORMAT.to_string(),
-            ],
-            idempotency: "idempotent".to_string(),
-            cancellable: false,
-            streaming: false,
-            timeout_ms: 5_000,
-        },
-        RepertoireEntry {
-            tool_id: SECRETARY_FS_READ_TOOL_ID.to_string(),
-            name: SECRETARY_FS_READ_TOOL_NAME.to_string(),
-            description: SECRETARY_FS_READ_TOOL_DESCRIPTION.to_string(),
-            provider_kind: SECRETARY_TOOL_PROVIDER_KIND.to_string(),
-            provider_id: SECRETARY_TOOL_PROVIDER_ID.to_string(),
-            risk_tier: "R1".to_string(),
-            default_result_format: SECRETARY_TOON_FORMAT.to_string(),
-            supported_result_formats: vec![
-                SECRETARY_TOON_FORMAT.to_string(),
-                SECRETARY_JSON_FORMAT.to_string(),
-            ],
-            idempotency: "idempotent".to_string(),
-            cancellable: true,
-            streaming: false,
-            timeout_ms: 10_000,
-        },
+        entry(
+            SECRETARY_ECHO_TOOL_ID,
+            SECRETARY_ECHO_TOOL_NAME,
+            SECRETARY_ECHO_TOOL_DESCRIPTION,
+            "R0",
+            "idempotent",
+            false,
+            5_000,
+        ),
+        entry(
+            "fs.diff",
+            "Filesystem Diff",
+            "Compare two files within the registered repository scope.",
+            "R1",
+            "idempotent",
+            true,
+            10_000,
+        ),
+        entry(
+            "fs.delete",
+            "Filesystem Delete",
+            "Delete one file within the registered repository scope; safe delete is Unix-validated and unsupported on non-Unix platforms.",
+            "R2",
+            "non_idempotent",
+            true,
+            10_000,
+        ),
+        entry(
+            "fs.list",
+            "Filesystem List",
+            "List entries within the registered repository scope.",
+            "R1",
+            "idempotent",
+            true,
+            10_000,
+        ),
+        entry(
+            "fs.move",
+            "Filesystem Move",
+            "Move one file within the registered repository scope; safe move is Unix-validated and unsupported on non-Unix platforms.",
+            "R2",
+            "non_idempotent",
+            true,
+            10_000,
+        ),
+        entry(
+            "fs.patch",
+            "Filesystem Patch",
+            "Apply a bounded exact-text patch within the registered repository scope.",
+            "R2",
+            "non_idempotent",
+            true,
+            15_000,
+        ),
+        entry(
+            SECRETARY_FS_READ_TOOL_ID,
+            SECRETARY_FS_READ_TOOL_NAME,
+            SECRETARY_FS_READ_TOOL_DESCRIPTION,
+            "R1",
+            "idempotent",
+            true,
+            10_000,
+        ),
+        entry(
+            "fs.search",
+            "Filesystem Search",
+            "Search files within the registered repository scope.",
+            "R1",
+            "idempotent",
+            true,
+            10_000,
+        ),
+        entry(
+            "fs.stat",
+            "Filesystem Stat",
+            "Inspect file metadata within the registered repository scope.",
+            "R1",
+            "idempotent",
+            true,
+            10_000,
+        ),
+        entry(
+            "fs.write",
+            "Filesystem Write",
+            "Write a file within the registered repository scope.",
+            "R2",
+            "non_idempotent",
+            true,
+            15_000,
+        ),
+        entry(
+            "proc.exec",
+            "Process Exec",
+            "Run an explicit argv process within the registered repository scope; explicit argv execution is unsupported on non-Unix platforms.",
+            "R2",
+            "non_idempotent",
+            true,
+            30_000,
+        ),
+        entry(
+            "proc.run",
+            "Process Run",
+            "Run a bounded explicit argv process within the registered repository scope; explicit argv execution is unsupported on non-Unix platforms.",
+            "R2",
+            "non_idempotent",
+            true,
+            30_000,
+        ),
     ];
 
     entries.sort_by(|left, right| left.tool_id.cmp(&right.tool_id));
@@ -1936,6 +2038,10 @@ mod tests {
             .contains(&"project_status.v1".to_string()));
     }
 
+    fn repertoire_tool_ids(entries: &[RepertoireEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.tool_id.as_str()).collect()
+    }
+
     #[test]
     fn list_repertoire_projects_static_builtin_tools() {
         let svc = ready_service();
@@ -1943,21 +2049,62 @@ mod tests {
             .list_repertoire(ListRepertoireRequest)
             .expect("repertoire projection should succeed");
 
-        assert_eq!(repertoire.entries.len(), 2);
-        assert_eq!(repertoire.entries[0].tool_id, "fs.read");
-        assert_eq!(repertoire.entries[0].name, "Filesystem Read");
-        assert_eq!(repertoire.entries[0].risk_tier, "R1");
-        assert_eq!(repertoire.entries[0].provider_kind, "builtin");
-        assert_eq!(repertoire.entries[0].provider_id, "atelia-secretary");
-        assert_eq!(repertoire.entries[0].default_result_format, "toon");
         assert_eq!(
-            repertoire.entries[0].supported_result_formats,
+            repertoire_tool_ids(&repertoire.entries),
+            vec![
+                "fs.delete",
+                "fs.diff",
+                "fs.list",
+                "fs.move",
+                "fs.patch",
+                "fs.read",
+                "fs.search",
+                "fs.stat",
+                "fs.write",
+                "proc.exec",
+                "proc.run",
+                "secretary.echo",
+            ]
+        );
+        let read = repertoire
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "fs.read")
+            .expect("fs.read repertoire entry");
+        assert_eq!(read.name, "Filesystem Read");
+        assert_eq!(read.risk_tier, "R1");
+        assert_eq!(read.provider_kind, "builtin");
+        assert_eq!(read.provider_id, "atelia-secretary");
+        assert_eq!(read.default_result_format, "toon");
+        assert_eq!(
+            read.supported_result_formats,
             vec!["toon".to_string(), "json".to_string()]
         );
-        assert_eq!(repertoire.entries[1].tool_id, "secretary.echo");
-        assert_eq!(repertoire.entries[1].risk_tier, "R0");
-        assert!(!repertoire.entries[1].cancellable);
-        assert_eq!(repertoire.entries[1].timeout_ms, 5_000);
+        let echo = repertoire
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "secretary.echo")
+            .expect("secretary.echo repertoire entry");
+        assert_eq!(echo.risk_tier, "R0");
+        assert!(!echo.cancellable);
+        assert_eq!(echo.timeout_ms, 5_000);
+        assert!(repertoire.entries.iter().all(|entry| {
+            matches!(
+                entry.tool_id.as_str(),
+                "fs.diff"
+                    | "fs.delete"
+                    | "fs.list"
+                    | "fs.move"
+                    | "fs.patch"
+                    | "fs.read"
+                    | "fs.search"
+                    | "fs.stat"
+                    | "fs.write"
+                    | "proc.exec"
+                    | "proc.run"
+                    | "secretary.echo"
+            )
+        }));
     }
 
     // -- register / list round trip -----------------------------------------

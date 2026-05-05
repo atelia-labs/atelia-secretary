@@ -104,13 +104,17 @@ Secretary built-in は意図的に小さくします。すべての built-in too
 
 初期 built-ins:
 
+- `secretary.echo`
 - `fs.read`
 - `fs.list`
-- `fs.search`
 - `fs.stat`
+- `fs.search`
 - `fs.diff`
 - `fs.write`
 - `fs.patch`
+- `fs.delete`
+- `fs.move`
+- `proc.exec`
 - `proc.run`
 - `proc.spawn`
 - `proc.kill`
