@@ -74,7 +74,7 @@ protocol は、現在の health endpoint から versioned service surface へ育
 - `CheckPolicy`: requested action が allowed / audited / approval-gated / blocked のどれかを事前確認する
 - `RenderToolOutput`: canonical tool result を TOON、JSON、text として render する
 
-Agent が見える projected tool surface については [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/docs/agent-repertoire/docs/agent-repertoire.ja.md) を参照します。`ListRepertoire` はその projection の最初の beta protocol slice として予定されています。
+Agent が見える projected tool surface については [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.ja.md) を参照します。`ListRepertoire` はその projection の最初の beta protocol slice として予定されています。
 初期 transport は gRPC または別の typed RPC transport で構いません。ただし domain contract は versioned かつ stable にします。
 
 ## Domain Records

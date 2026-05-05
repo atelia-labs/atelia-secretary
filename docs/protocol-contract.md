@@ -81,7 +81,7 @@ Required RPC groups:
 | `ListBlocklist` | Inspect the current blocklist |
 
 `ListRepertoire` is planned as the first beta protocol slice for
-[Agent Repertoire](https://github.com/atelia-labs/atelia/blob/docs/agent-repertoire/docs/agent-repertoire.md).
+[Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md).
 It will return a computed projection, not a persisted store.
 
 ## Core Messages
