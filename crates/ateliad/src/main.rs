@@ -5,9 +5,12 @@ mod transport;
 use anyhow::Context;
 use anyhow::Result;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tracing::info;
+
+const STORAGE_DIR_ENV: &str = "ATELIA_DAEMON_STORAGE_DIR";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -15,7 +18,10 @@ async fn main() -> Result<()> {
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "ateliad=info".to_string()))
         .init();
 
-    let mut service = service::SecretaryService::new();
+    let storage_dir = std::env::var_os(STORAGE_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".atelia-secretary"));
+    let mut service = service::SecretaryService::new_durable(storage_dir)?;
     info!("Atelia Secretary daemon starting");
 
     service.set_running();

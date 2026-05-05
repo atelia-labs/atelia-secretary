@@ -2359,6 +2359,18 @@ mod tests {
         dir
     }
 
+    fn durable_storage_dir(name: &str) -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "atelia-rpc-durable-test-{}-{}-{name}",
+            std::process::id(),
+            id
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn transport_blocker_is_explicit_while_tonic_is_absent() {
         let server = ready_server();
@@ -2366,6 +2378,78 @@ mod tests {
         assert_eq!(blocker, TRANSPORT_BLOCKER);
         assert!(blocker.contains("HTTP/JSON is the beta transport"));
         assert!(blocker.contains("gRPC server generation is not shipped"));
+    }
+
+    #[test]
+    fn durable_rpc_server_replays_state_after_restart() {
+        let storage_dir = durable_storage_dir("restart");
+        let service = SecretaryService::new_durable(storage_dir.clone()).expect("durable service");
+        let server = SecretaryRpcServer::new(service);
+        let root = test_repo_dir("durable-rpc");
+        let repository = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "durable-rpc-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                requester: None,
+                allowed_scope: None,
+            })
+            .expect("repository registration should succeed")
+            .repository;
+        let submit = server
+            .submit_job(SubmitJobRequest {
+                repository_id: repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "persist rpc state".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("job submission should succeed");
+        let job_id = submit.job.job_id.clone();
+
+        let restarted = SecretaryRpcServer::new(
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable restart"),
+        );
+
+        let repositories = restarted
+            .list_repositories(ListRepositoriesRequest {
+                trust_state: None,
+                page_size: None,
+                page_token: None,
+            })
+            .expect("repositories should reload");
+        assert_eq!(repositories.repositories.len(), 1);
+        assert_eq!(
+            repositories.repositories[0].repository_id,
+            repository.repository_id
+        );
+
+        let status = restarted
+            .get_project_status(GetProjectStatusRequest {
+                repository_id: repository.repository_id.clone(),
+            })
+            .expect("project status should reload");
+        assert_eq!(status.recent_jobs.len(), 1);
+        assert_eq!(status.recent_jobs[0].job_id, job_id.clone());
+        assert!(status.latest_cursor.is_some());
+
+        let events = restarted
+            .watch_events(WatchEventsRequest {
+                repository_id: repository.repository_id,
+                cursor: None,
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: None,
+            })
+            .expect("events should replay");
+        assert!(!events.events.is_empty());
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.refs.job_id == Some(job_id.clone())));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(storage_dir);
     }
 
     #[test]

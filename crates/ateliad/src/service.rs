@@ -117,6 +117,20 @@ impl BetaStateHint {
             ],
         }
     }
+
+    /// Build the beta hint for the durable ledger snapshot store.
+    pub fn durable_snapshot_replay() -> Self {
+        Self {
+            scope: "storage_backed".to_string(),
+            durability: "durable_snapshot".to_string(),
+            restart_semantics: "restore_on_restart".to_string(),
+            limits: vec![
+                "state_is_persisted_to_ledger_json".to_string(),
+                "state_is_validated_on_startup".to_string(),
+                "state_is_restored_after_restart".to_string(),
+            ],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,8 +348,20 @@ pub struct SecretaryService {
 impl SecretaryService {
     /// Create a new service backed by an in-memory store and default policy.
     pub fn new() -> Self {
+        Self::from_store(InMemoryStore::new())
+    }
+
+    pub fn new_durable(storage_dir: impl Into<PathBuf>) -> ServiceResult<Self> {
+        let store = InMemoryStore::with_durable_storage_dir(storage_dir)?;
+        Ok(Self::from_store(store))
+    }
+
+    fn from_store(store: InMemoryStore) -> Self {
         Self {
-            lifecycle: JobLifecycleService::in_memory(),
+            lifecycle: JobLifecycleService::new(atelia_core::SecretaryRuntime::new(
+                store,
+                DefaultPolicyEngine::new(),
+            )),
             started_at: LedgerTimestamp::now(),
             daemon_status: DaemonStatus::Starting,
             extension_registry: Mutex::new(ExtensionRegistryService::new()),
@@ -394,10 +420,16 @@ impl SecretaryService {
                 }
             };
 
+        let beta_state = if self.lifecycle.runtime().store().uses_durable_snapshot() {
+            BetaStateHint::durable_snapshot_replay()
+        } else {
+            BetaStateHint::in_memory_process_local()
+        };
+
         DaemonHealth {
             daemon_status: self.daemon_status,
             storage_status,
-            beta_state: Some(BetaStateHint::in_memory_process_local()),
+            beta_state: Some(beta_state),
             daemon_version: DAEMON_VERSION.to_string(),
             protocol_version: PROTOCOL_VERSION.to_string(),
             storage_version: STORAGE_VERSION.to_string(),
@@ -1304,6 +1336,18 @@ mod tests {
         dir
     }
 
+    fn durable_storage_dir(name: &str) -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "atelia-service-durable-test-{}-{}-{name}",
+            std::process::id(),
+            id
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn extension_manifest(
         id: &str,
         version: &str,
@@ -1386,6 +1430,24 @@ mod tests {
         assert_eq!(health.daemon_version, DAEMON_VERSION);
         assert_eq!(health.protocol_version, PROTOCOL_VERSION);
         assert_eq!(health.storage_version, STORAGE_VERSION);
+    }
+
+    #[test]
+    fn health_marks_durable_snapshot_restart_semantics() {
+        let storage_dir = durable_storage_dir("health");
+        let svc =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service reload");
+
+        let health = svc.health();
+        let beta_state = health.beta_state.expect("beta state hint");
+        assert_eq!(beta_state.scope, "storage_backed");
+        assert_eq!(beta_state.durability, "durable_snapshot");
+        assert_eq!(beta_state.restart_semantics, "restore_on_restart");
+        assert!(beta_state
+            .limits
+            .contains(&"state_is_validated_on_startup".to_string()));
+
+        let _ = fs::remove_dir_all(storage_dir);
     }
 
     #[test]
@@ -1647,6 +1709,68 @@ mod tests {
     #[test]
     fn health_reports_zero_repositories_initially() {
         assert_eq!(ready_service().health().repository_count, 0);
+    }
+
+    #[test]
+    fn durable_service_replays_state_after_restart() {
+        let storage_dir = durable_storage_dir("restart");
+        let first_service =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service");
+        let root = test_repo_dir("durable-restart");
+        let repository = first_service
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "durable-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("repository registration should succeed");
+        let receipt = first_service
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "persist me".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("job submission should succeed");
+        let job_id = receipt.job.id.clone();
+        drop(first_service);
+
+        let second_service =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service reload");
+        let repositories = second_service
+            .list_repositories()
+            .expect("repositories should reload");
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0].id, repository.id);
+
+        let jobs = second_service
+            .list_jobs(None, None, None, None, None)
+            .expect("jobs should reload");
+        assert_eq!(jobs.jobs.len(), 1);
+        assert_eq!(jobs.jobs[0].id, job_id.clone());
+
+        let status = second_service
+            .get_project_status(GetProjectStatusRequest {
+                repository_id: repository.id.clone(),
+            })
+            .expect("project status should reload");
+        assert_eq!(status.recent_jobs.len(), 1);
+        assert_eq!(status.recent_jobs[0].id, job_id.clone());
+        assert!(status.latest_event.is_some());
+        let replayed = second_service
+            .watch_events(atelia_core::EventCursor::Beginning, None)
+            .expect("event replay should succeed");
+        assert!(!replayed.is_empty());
+        assert!(replayed
+            .iter()
+            .any(|event| event.refs.job_id == Some(job_id.clone())));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(storage_dir);
     }
 
     #[test]
