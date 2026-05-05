@@ -56,7 +56,7 @@ repository explains how the Secretary daemon implements those contracts.
 - [Tool Definition Schema](tool-definition-schema.md)
 - [Tool Output Schema](tool-output-schema.md)
 - [Operational AX Analytics](operational-ax-analytics.md)
-- [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md) - live tool surface visible to agents
+- [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md) - computed projection of the live tool surface in the current context
 
 ## Extensions
 
