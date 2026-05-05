@@ -45,20 +45,26 @@ jobs:
 
       - name: Docker smoke
         run: |
-          docker run --detach --rm --name atelia-secretary-beta-gate \
+          cleanup() {
+            docker logs atelia-secretary-beta-gate || true
+            docker rm --force atelia-secretary-beta-gate || true
+          }
+          trap cleanup EXIT
+
+          docker run --detach --name atelia-secretary-beta-gate \
             --env ATELIA_DAEMON_LISTEN_ADDR=0.0.0.0:8080 \
             --publish 127.0.0.1:18080:8080 \
             atelia-secretary-beta-gate
-          for attempt in {1..20}; do
+          sleep 2
+          healthy=0
+          for attempt in $(seq 1 20); do
             if curl --fail --silent --show-error http://127.0.0.1:18080/v1/health >/dev/null; then
-              docker stop atelia-secretary-beta-gate
-              exit 0
+              healthy=1
+              break
             fi
             sleep 1
           done
-          docker logs atelia-secretary-beta-gate
-          docker stop atelia-secretary-beta-gate
-          exit 1
+          test "$healthy" = "1"
 
   dependency-review:
     name: Dependency Review
