@@ -458,6 +458,7 @@ mod tests {
             "fs.write",
             "fs.delete",
             "fs.move",
+            "fs.patch",
         ] {
             let decision = decide(input(capability));
 
