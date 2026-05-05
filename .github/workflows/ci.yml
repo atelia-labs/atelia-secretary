@@ -16,18 +16,19 @@ concurrency:
 jobs:
   rust:
     name: Rust
-    uses: atelia-labs/.github/.github/workflows/reusable-rust-ci.yml@main
+    uses: atelia-labs/.github/.github/workflows/reusable-rust-ci.yml@5934886a87c0e09edfa8d9d6d019d8ce0b63afba
 
   beta-release-gates:
     name: Beta Release Gates
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Format
@@ -44,4 +45,4 @@ jobs:
 
   dependency-review:
     name: Dependency Review
-    uses: atelia-labs/.github/.github/workflows/reusable-dependency-review.yml@main
+    uses: atelia-labs/.github/.github/workflows/reusable-dependency-review.yml@5934886a87c0e09edfa8d9d6d019d8ce0b63afba
