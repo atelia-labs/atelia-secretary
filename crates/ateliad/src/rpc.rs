@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use crate::service::{
-    CheckPolicyRequest as ServiceCheckPolicyRequest, DaemonHealth, DaemonStatus,
+    BetaStateHint, CheckPolicyRequest as ServiceCheckPolicyRequest, DaemonHealth, DaemonStatus,
     GetProjectStatusRequest as ServiceGetProjectStatusRequest,
     ListRepositoriesRequest as ServiceListRepositoriesRequest,
     ListToolOutputSettingsHistoryRequest as ServiceListToolOutputSettingsHistoryRequest,
@@ -611,6 +611,7 @@ pub struct HealthResponse {
     pub storage_version: String,
     pub storage_status: String,
     pub daemon_status: String,
+    pub beta_state: Option<BetaStateHint>,
     pub capabilities: Vec<String>,
 }
 
@@ -623,6 +624,7 @@ impl From<DaemonHealth> for HealthResponse {
             storage_version: health.storage_version,
             storage_status: storage_status_label(health.storage_status).to_string(),
             daemon_status: daemon_status_label(health.daemon_status).to_string(),
+            beta_state: health.beta_state,
             capabilities: health.capabilities,
         }
     }
@@ -2377,6 +2379,7 @@ mod tests {
         let unavailable = HealthResponse::from(DaemonHealth {
             daemon_status: DaemonStatus::Ready,
             storage_status: StorageStatus::Unavailable,
+            beta_state: Some(BetaStateHint::in_memory_process_local()),
             daemon_version: "daemon".to_string(),
             protocol_version: "protocol".to_string(),
             storage_version: "storage".to_string(),
@@ -2389,6 +2392,7 @@ mod tests {
         let read_only = HealthResponse::from(DaemonHealth {
             daemon_status: DaemonStatus::Ready,
             storage_status: StorageStatus::ReadOnly,
+            beta_state: Some(BetaStateHint::in_memory_process_local()),
             daemon_version: "daemon".to_string(),
             protocol_version: "protocol".to_string(),
             storage_version: "storage".to_string(),
@@ -2397,6 +2401,14 @@ mod tests {
             started_at: atelia_core::LedgerTimestamp::from_unix_millis(0),
         });
         assert_eq!(read_only.status, "degraded");
+        assert_eq!(
+            read_only
+                .beta_state
+                .as_ref()
+                .expect("beta state hint")
+                .restart_semantics,
+            "reset_on_restart"
+        );
     }
 
     #[test]

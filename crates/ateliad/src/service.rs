@@ -78,12 +78,35 @@ pub enum StorageStatus {
 pub struct DaemonHealth {
     pub daemon_status: DaemonStatus,
     pub storage_status: StorageStatus,
+    pub beta_state: Option<BetaStateHint>,
     pub daemon_version: String,
     pub protocol_version: String,
     pub storage_version: String,
     pub capabilities: Vec<String>,
     pub repository_count: usize,
     pub started_at: LedgerTimestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BetaStateHint {
+    pub scope: String,
+    pub durability: String,
+    pub restart_semantics: String,
+    pub limits: Vec<String>,
+}
+
+impl BetaStateHint {
+    pub fn in_memory_process_local() -> Self {
+        Self {
+            scope: "process_local".to_string(),
+            durability: "in_memory".to_string(),
+            restart_semantics: "reset_on_restart".to_string(),
+            limits: vec![
+                "state_is_limited_to_the_current_daemon_process".to_string(),
+                "state_is_not_recovered_after_restart".to_string(),
+            ],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,6 +372,7 @@ impl SecretaryService {
         DaemonHealth {
             daemon_status: self.daemon_status,
             storage_status,
+            beta_state: Some(BetaStateHint::in_memory_process_local()),
             daemon_version: DAEMON_VERSION.to_string(),
             protocol_version: PROTOCOL_VERSION.to_string(),
             storage_version: STORAGE_VERSION.to_string(),
@@ -1224,6 +1248,13 @@ mod tests {
         let health = svc.health();
         assert_eq!(health.daemon_status, DaemonStatus::Ready);
         assert_eq!(health.storage_status, StorageStatus::Ready);
+        let beta_state = health.beta_state.expect("beta state hint");
+        assert_eq!(beta_state.scope, "process_local");
+        assert_eq!(beta_state.durability, "in_memory");
+        assert_eq!(beta_state.restart_semantics, "reset_on_restart");
+        assert!(beta_state
+            .limits
+            .contains(&"state_is_not_recovered_after_restart".to_string()));
         assert_eq!(health.daemon_version, DAEMON_VERSION);
         assert_eq!(health.protocol_version, PROTOCOL_VERSION);
         assert_eq!(health.storage_version, STORAGE_VERSION);
