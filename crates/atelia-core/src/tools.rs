@@ -4367,6 +4367,40 @@ impl crate::runtime::RuntimeTool for FsDeleteTool {
         let schema_ref = "tool_result.fs.delete.v1";
         let relative = target_from_request(request);
 
+        #[cfg(not(unix))]
+        {
+            return make_tool_result(
+                invocation,
+                ToolResultStatus::Failed,
+                schema_ref,
+                vec![
+                    ToolResultField {
+                        key: "summary".to_string(),
+                        value: StructuredValue::String(
+                            "delete failed: unsupported on this platform".to_string(),
+                        ),
+                    },
+                    ToolResultField {
+                        key: "error".to_string(),
+                        value: StructuredValue::String(format!(
+                            "{}: safe delete requires Unix no-follow validation",
+                            request.resource_scope.value
+                        )),
+                    },
+                    ToolResultField {
+                        key: "platform_safety".to_string(),
+                        value: StructuredValue::String("unsupported-non-unix".to_string()),
+                    },
+                    ToolResultField {
+                        key: "path".to_string(),
+                        value: StructuredValue::String(request.resource_scope.value.clone()),
+                    },
+                ],
+                None,
+                Vec::new(),
+            );
+        }
+
         let target = match resolve_mutation_target(&self.repository_root, &relative) {
             Ok(target) => target,
             Err(PathResolutionError::TargetNotFound { .. }) if self.allow_missing => {
@@ -4679,6 +4713,48 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
 
     fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
         let schema_ref = "tool_result.fs.move.v1";
+
+        #[cfg(not(unix))]
+        {
+            return make_tool_result(
+                invocation,
+                ToolResultStatus::Failed,
+                schema_ref,
+                vec![
+                    ToolResultField {
+                        key: "summary".to_string(),
+                        value: StructuredValue::String(
+                            "move failed: unsupported on this platform".to_string(),
+                        ),
+                    },
+                    ToolResultField {
+                        key: "error".to_string(),
+                        value: StructuredValue::String(format!(
+                            "{} -> {}: safe move requires Unix no-follow validation",
+                            request.resource_scope.value,
+                            self.destination_path.to_string_lossy()
+                        )),
+                    },
+                    ToolResultField {
+                        key: "platform_safety".to_string(),
+                        value: StructuredValue::String("unsupported-non-unix".to_string()),
+                    },
+                    ToolResultField {
+                        key: "source_path".to_string(),
+                        value: StructuredValue::String(request.resource_scope.value.clone()),
+                    },
+                    ToolResultField {
+                        key: "destination_path".to_string(),
+                        value: StructuredValue::String(
+                            self.destination_path.to_string_lossy().to_string(),
+                        ),
+                    },
+                ],
+                None,
+                Vec::new(),
+            );
+        }
+
         let source =
             match resolve_mutation_target(&self.repository_root, &target_from_request(request)) {
                 Ok(target) => target,
