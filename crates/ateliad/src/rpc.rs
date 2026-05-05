@@ -2587,23 +2587,10 @@ mod tests {
             .expect("secretary.echo repertoire entry");
         assert_eq!(echo.risk_tier, "R0");
         assert!(!echo.cancellable);
-        assert!(response.entries.iter().all(|entry| {
-            matches!(
-                entry.tool_id.as_str(),
-                "fs.diff"
-                    | "fs.delete"
-                    | "fs.list"
-                    | "fs.move"
-                    | "fs.patch"
-                    | "fs.read"
-                    | "fs.search"
-                    | "fs.stat"
-                    | "fs.write"
-                    | "proc.exec"
-                    | "proc.run"
-                    | "secretary.echo"
-            )
-        }));
+        assert!(response
+            .entries
+            .iter()
+            .all(|entry| { matches!(entry.tool_id.as_str(), "fs.read" | "secretary.echo") }));
     }
 
     #[test]
