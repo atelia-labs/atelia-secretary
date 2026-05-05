@@ -23,15 +23,14 @@ async fn main() -> Result<()> {
     let health = rpc_server.read().await.health(rpc::HealthRequest);
 
     let (listen_addr, explicit_addr) = transport::listen_addr()?;
-    if !explicit_addr && !transport::is_loopback(&listen_addr) {
-        return Err(anyhow::anyhow!(
-            "default listener address resolved to non-loopback {listen_addr}"
-        ));
-    }
-    if explicit_addr && !transport::is_loopback(&listen_addr) {
+    transport::validate_listen_addr(&listen_addr, explicit_addr)?;
+    if explicit_addr
+        && !transport::is_loopback(&listen_addr)
+        && transport::unsafe_allow_non_loopback_listen()
+    {
         tracing::warn!(
             listen_addr = %listen_addr,
-            "daemon is bound to explicit non-loopback address via ATELIA_DAEMON_LISTEN_ADDR"
+            "daemon is bound to explicit non-loopback address via ATELIA_DAEMON_LISTEN_ADDR and ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN"
         );
     }
 

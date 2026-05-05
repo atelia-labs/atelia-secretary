@@ -22,6 +22,7 @@ use tokio::sync::{oneshot, RwLock};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const LISTEN_ADDR_ENV: &str = "ATELIA_DAEMON_LISTEN_ADDR";
+const UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV: &str = "ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN";
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
 
 pub type RpcServerState = Arc<RwLock<rpc::SecretaryRpcServer>>;
@@ -338,6 +339,7 @@ struct GetProjectStatusRequestPayload {
     repository_id: String,
 }
 
+/// Resolve the daemon listen address and whether it came from the environment.
 pub fn listen_addr() -> Result<(SocketAddr, bool)> {
     let raw_addr = std::env::var(LISTEN_ADDR_ENV)
         .ok()
@@ -349,8 +351,44 @@ pub fn listen_addr() -> Result<(SocketAddr, bool)> {
     Ok((addr, from_env))
 }
 
+/// Enforce the beta loopback-only listener boundary unless explicitly bypassed.
+pub fn validate_listen_addr(listen_addr: &SocketAddr, explicit_addr: bool) -> Result<()> {
+    if is_loopback(listen_addr) {
+        return Ok(());
+    }
+
+    if unsafe_allow_non_loopback_listen() {
+        return Ok(());
+    }
+
+    if explicit_addr {
+        Err(anyhow!(
+            "refusing explicit non-loopback listener address {listen_addr}; set {UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV}=1 to allow this during beta"
+        ))
+    } else {
+        Err(anyhow!(
+            "refusing default non-loopback listener address {listen_addr}; set {UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV}=1 to allow this during beta"
+        ))
+    }
+}
+
+/// Return whether the socket address binds only to the local host.
 pub fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
+}
+
+/// Return whether the unsafe beta escape hatch allows non-loopback binding.
+pub fn unsafe_allow_non_loopback_listen() -> bool {
+    matches!(
+        std::env::var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 fn parse_socket_addr(raw: &str) -> Result<SocketAddr> {
@@ -2680,6 +2718,7 @@ mod tests {
 
     struct ListenAddrEnvGuard {
         previous: Option<OsString>,
+        previous_unsafe_allow_non_loopback_listen: Option<OsString>,
         _lock: MutexGuard<'static, ()>,
     }
 
@@ -2687,8 +2726,11 @@ mod tests {
         fn lock() -> Self {
             let lock = LISTEN_ADDR_ENV_MUTEX.lock().unwrap();
             let previous = std::env::var_os(LISTEN_ADDR_ENV);
+            let previous_unsafe_allow_non_loopback_listen =
+                std::env::var_os(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV);
             Self {
                 previous,
+                previous_unsafe_allow_non_loopback_listen,
                 _lock: lock,
             }
         }
@@ -2699,6 +2741,10 @@ mod tests {
             match self.previous.as_ref() {
                 Some(value) => std::env::set_var(LISTEN_ADDR_ENV, value),
                 None => std::env::remove_var(LISTEN_ADDR_ENV),
+            }
+            match self.previous_unsafe_allow_non_loopback_listen.as_ref() {
+                Some(value) => std::env::set_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV, value),
+                None => std::env::remove_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV),
             }
         }
     }
@@ -3035,11 +3081,53 @@ mod tests {
     fn parse_listen_addr_uses_default_when_env_not_set() {
         let _guard = ListenAddrEnvGuard::lock();
         std::env::remove_var(LISTEN_ADDR_ENV);
+        std::env::remove_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV);
         let (addr, from_env) = listen_addr().expect("listen addr");
         assert!(!from_env);
         assert!(is_loopback(&addr));
         assert_eq!(addr.port(), 8080);
         assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn parse_listen_addr_uses_explicit_loopback_when_env_is_set() {
+        let _guard = ListenAddrEnvGuard::lock();
+        std::env::set_var(LISTEN_ADDR_ENV, "127.0.0.1:0");
+        std::env::remove_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV);
+
+        let (addr, from_env) = listen_addr().expect("listen addr");
+
+        assert!(from_env);
+        assert!(is_loopback(&addr));
+        assert_eq!(addr.port(), 0);
+    }
+
+    #[test]
+    fn validate_listen_addr_rejects_explicit_non_loopback_without_escape_hatch() {
+        let _guard = ListenAddrEnvGuard::lock();
+        std::env::set_var(LISTEN_ADDR_ENV, "0.0.0.0:8080");
+        std::env::remove_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV);
+
+        let (addr, explicit_addr) = listen_addr().expect("listen addr");
+
+        let error =
+            validate_listen_addr(&addr, explicit_addr).expect_err("non-loopback should fail");
+        assert!(error
+            .to_string()
+            .contains(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV));
+    }
+
+    #[test]
+    fn validate_listen_addr_allows_explicit_non_loopback_with_escape_hatch() {
+        let _guard = ListenAddrEnvGuard::lock();
+        std::env::set_var(LISTEN_ADDR_ENV, "0.0.0.0:8080");
+        std::env::set_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV, "1");
+
+        let (addr, explicit_addr) = listen_addr().expect("listen addr");
+
+        assert!(unsafe_allow_non_loopback_listen());
+        validate_listen_addr(&addr, explicit_addr).expect("escape hatch should allow non-loopback");
+        assert!(!is_loopback(&addr));
     }
 
     #[test]

@@ -19,6 +19,15 @@ This document covers Secretary daemon-specific security boundaries.
 - The daemon should provide confirmation, audit, and recovery paths on the
   assumption that Secretary or humans can make mistakes.
 
+## Beta Network Boundary
+
+During beta, Secretary is a same-host daemon by default. It listens on
+`127.0.0.1:8080` unless `ATELIA_DAEMON_LISTEN_ADDR` is set to another loopback
+address. Bind attempts to non-loopback addresses are rejected unless the
+explicit unsafe escape hatch `ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN=1`
+is configured. That override is for controlled local testing only and should
+not be treated as a normal deployment mode.
+
 ## Threat Model Seeds
 
 Initial threat model work should cover:
