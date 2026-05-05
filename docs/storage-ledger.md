@@ -69,9 +69,10 @@ closed if a snapshot contains an incomplete or inconsistent workflow. Automatic
 policy re-evaluation and tool retry / cleanup reconciliation are reserved for a
 future WAL or database-backed store.
 
-The current beta in-memory state is process-local only. It is bounded by the
-daemon lifetime, is not recovered from the ledger after restart, and is reset
-when the daemon process restarts. Health surfaces this as a hint so clients do
+`new()` creates process-local, in-memory beta state that is bounded by the
+daemon lifetime and resets on restart. `new_durable()` and the daemon's default
+durable mode load the snapshot on startup and restore the previous durable
+state instead of starting empty. Health surfaces this as a hint so clients do
 not mistake the beta state for durable storage.
 
 ## Repository Records

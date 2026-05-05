@@ -1199,20 +1199,29 @@ fn validate_loaded_store(inner: &InMemoryInner) -> StoreResult<()> {
             &lock_decision.repository_id,
             "lock_decisions.repository_id",
         )?;
-        ensure_ref_exists(
-            inner
-                .policy_decisions
-                .contains_key(&lock_decision.policy_decision_id),
-            "policy_decisions",
-            &lock_decision.policy_decision_id,
-            "lock_decisions.policy_decision_id",
+        let policy_decision = inner
+            .policy_decisions
+            .get(&lock_decision.policy_decision_id)
+            .ok_or_else(|| StoreError::NotFound {
+                collection: "policy_decisions",
+                id: id_debug(&lock_decision.policy_decision_id),
+            })?;
+        ensure_same_repository(
+            "lock_decisions",
+            "lock_decision.policy_decision_id",
+            &lock_decision.repository_id,
+            &policy_decision.repository_id,
         )?;
         if let LockOwner::Job(job_id) = &lock_decision.owner {
-            ensure_ref_exists(
-                inner.jobs.contains_key(job_id),
-                "jobs",
-                job_id,
-                "lock_decisions.owner",
+            let job = inner.jobs.get(job_id).ok_or_else(|| StoreError::NotFound {
+                collection: "jobs",
+                id: format!("{} (lock_decision.owner)", id_debug(job_id)),
+            })?;
+            ensure_same_repository(
+                "lock_decisions",
+                "lock_decision.owner",
+                &lock_decision.repository_id,
+                &job.repository_id,
             )?;
         }
     }
@@ -5997,6 +6006,83 @@ mod tests {
             err,
             StoreError::NotFound {
                 collection: "repositories",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn durable_store_rejects_cross_repository_lock_policy_snapshot() {
+        let storage_dir = durable_storage_dir("cross-repository-lock-policy");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let mut inner = InMemoryInner::default();
+        let repository = repository_record();
+        let other_repository = repository_record();
+        let policy = policy_decision(other_repository.id.clone());
+        let lock = lock_decision(repository.id.clone(), policy.id.clone());
+
+        inner.repositories.insert(repository.id.clone(), repository);
+        inner
+            .repositories
+            .insert(other_repository.id.clone(), other_repository);
+        inner.policy_decisions.insert(policy.id.clone(), policy);
+        inner.lock_decisions.insert(lock.id.clone(), lock);
+
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner,
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidReference {
+                collection: "lock_decisions",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn durable_store_rejects_cross_repository_lock_owner_snapshot() {
+        let storage_dir = durable_storage_dir("cross-repository-lock-owner");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let mut inner = InMemoryInner::default();
+        let repository = repository_record();
+        let other_repository = repository_record();
+        let policy = policy_decision(repository.id.clone());
+        let job = job_record(other_repository.id.clone());
+        let mut lock = lock_decision(repository.id.clone(), policy.id.clone());
+        lock.owner = LockOwner::Job(job.id.clone());
+
+        inner.repositories.insert(repository.id.clone(), repository);
+        inner
+            .repositories
+            .insert(other_repository.id.clone(), other_repository);
+        inner.jobs.insert(job.id.clone(), job);
+        inner.policy_decisions.insert(policy.id.clone(), policy);
+        inner.lock_decisions.insert(lock.id.clone(), lock);
+
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner,
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidReference {
+                collection: "lock_decisions",
                 ..
             }
         ));
