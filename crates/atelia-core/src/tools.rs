@@ -3827,26 +3827,22 @@ fn unlink_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<()>
 // Multi-link targets (nlink > 1) are rejected because a concurrent removal of
 // a different hardlink would decrease nlink independently, masking a leaf swap.
 //
-// When `resolved_fd` is `Some`, the reopen-by-name is skipped entirely and the
-// carried fd is used directly for identity checks, closing the inode-reuse
-// window that exists when the file must be reopened by name.
+// A resolved fd (opened at path-resolution time) is required — the mutation
+// refuses to proceed if no fd is available, eliminating the inode-reuse window
+// that a reopen-by-name fallback would allow.
 fn unlink_validated_file_in_parent_dir(
     parent: &File,
     name: &std::ffi::OsStr,
     expected_metadata: &fs::Metadata,
     resolved_fd: Option<&File>,
 ) -> io::Result<()> {
-    let (file, opened_metadata) = match resolved_fd {
-        Some(fd) => {
-            let md = fd.metadata()?;
-            (None, md)
-        }
-        None => {
-            let f = open_path_no_follow_in_parent_dir(parent, name)?;
-            let md = f.metadata()?;
-            (Some(f), md)
-        }
-    };
+    let fd = resolved_fd.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "race-safe delete requires a resolved file descriptor",
+        )
+    })?;
+    let opened_metadata = fd.metadata()?;
     if !opened_metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3872,9 +3868,8 @@ fn unlink_validated_file_in_parent_dir(
     )?;
 
     unlink_in_parent_dir(parent, name)?;
-    let check_fd = resolved_fd.or(file.as_ref()).unwrap();
     ensure_opened_link_count_decreased(
-        check_fd,
+        fd,
         &opened_metadata,
         "delete target link count did not decrease after unlink",
     )
@@ -3885,12 +3880,9 @@ fn unlink_validated_file_in_parent_dir(
 //
 // Same TOCTOU note as `unlink_validated_file_in_parent_dir`: renameat(2) also
 // has no fd-targeting form (pathname argument required), so the rename operates
-// by name.  Post-rename checks detect a leaf swap and return PermissionDenied.
-// detect a leaf swap and return PermissionDenied.
-//
-// When `resolved_fd` is `Some`, the reopen-by-name is skipped entirely and the
-// carried fd is used directly for identity checks, closing the inode-reuse
-// window that exists when the file must be reopened by name.
+// by name.  A resolved fd (opened at path-resolution time) is required — the
+// mutation refuses to proceed if no fd is available, eliminating the inode-reuse
+// window that a reopen-by-name fallback would allow.
 fn rename_validated_file_between_parent_dirs(
     source_parent: &File,
     source: &std::ffi::OsStr,
@@ -3900,13 +3892,13 @@ fn rename_validated_file_between_parent_dirs(
     expected_metadata: &fs::Metadata,
     resolved_fd: Option<&File>,
 ) -> io::Result<()> {
-    let opened_metadata = match resolved_fd {
-        Some(fd) => fd.metadata()?,
-        None => {
-            let file = open_path_no_follow_in_parent_dir(source_parent, source)?;
-            file.metadata()?
-        }
-    };
+    let fd = resolved_fd.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "race-safe move requires a resolved file descriptor",
+        )
+    })?;
+    let opened_metadata = fd.metadata()?;
     if !opened_metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -6989,6 +6981,7 @@ mod tests {
         let path = env.root.join("notes.txt");
         env.create_file("notes.txt", "validated");
 
+        let target = resolve_mutation_target(&env.root, Path::new("notes.txt")).unwrap();
         let expected_metadata = fs::symlink_metadata(&path).unwrap();
         let parent = open_parent_no_follow(path.parent().unwrap()).unwrap();
         let file_name = path.file_name().unwrap();
@@ -6998,7 +6991,7 @@ mod tests {
         fs::write(&path, "replacement").unwrap();
 
         let result =
-            unlink_validated_file_in_parent_dir(&parent, file_name, &expected_metadata, None)
+            unlink_validated_file_in_parent_dir(&parent, file_name, &expected_metadata, target.resolved_fd())
                 .unwrap_err();
         assert_eq!(io::ErrorKind::PermissionDenied, result.kind());
         assert_eq!("replacement", fs::read_to_string(&path).unwrap());
@@ -7014,12 +7007,13 @@ mod tests {
         fs::hard_link(env.root.join("notes.txt"), env.root.join("alias.txt")).unwrap();
 
         let path = env.root.join("notes.txt");
+        let target = resolve_mutation_target(&env.root, Path::new("notes.txt")).unwrap();
         let expected_metadata = fs::symlink_metadata(&path).unwrap();
         let parent = open_parent_no_follow(path.parent().unwrap()).unwrap();
         let file_name = path.file_name().unwrap();
 
         let result =
-            unlink_validated_file_in_parent_dir(&parent, file_name, &expected_metadata, None)
+            unlink_validated_file_in_parent_dir(&parent, file_name, &expected_metadata, target.resolved_fd())
                 .unwrap_err();
         assert_eq!(io::ErrorKind::InvalidInput, result.kind());
         assert!(result.to_string().contains("single-link"));
@@ -7210,6 +7204,7 @@ mod tests {
         let source = env.root.join("from.txt");
         let destination = env.root.join("archive/from.txt");
         let expected_metadata = fs::symlink_metadata(&source).unwrap();
+        let target = resolve_mutation_target(&env.root, Path::new("from.txt")).unwrap();
         let source_parent = open_parent_no_follow(source.parent().unwrap()).unwrap();
         let destination_parent = open_parent_no_follow(destination.parent().unwrap()).unwrap();
 
@@ -7224,7 +7219,7 @@ mod tests {
             destination.file_name().unwrap(),
             false,
             &expected_metadata,
-            None,
+            target.resolved_fd(),
         )
         .unwrap_err();
 
@@ -7245,6 +7240,7 @@ mod tests {
         let source = env.root.join("from.txt");
         let destination = env.root.join("archive/from.txt");
         let expected_metadata = fs::symlink_metadata(&source).unwrap();
+        let target = resolve_mutation_target(&env.root, Path::new("from.txt")).unwrap();
         let source_parent = open_parent_no_follow(source.parent().unwrap()).unwrap();
         let destination_parent = open_parent_no_follow(destination.parent().unwrap()).unwrap();
 
@@ -7256,7 +7252,7 @@ mod tests {
             destination.file_name().unwrap(),
             false,
             &expected_metadata,
-            None,
+            target.resolved_fd(),
         )
         .unwrap_err();
 
