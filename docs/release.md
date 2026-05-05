@@ -19,7 +19,19 @@ checked explicitly at connection time.
 
 ## Release Gates
 
-A release should require:
+Beta releases should require the following local and CI gates:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-features`
+- `docker build --file Dockerfile .`
+
+The CI workflow runs the same gate set in `.github/workflows/ci.yml` as the
+`Beta Release Gates` job. If a future shared workflow absorbs the Rust
+checks, keep this job as the packaging check or mark the relevant step manual
+in both CI and this document.
+
+In addition to the beta gate, a release should require:
 
 - formatting;
 - tests;
