@@ -23,6 +23,7 @@ use atelia_core::{
     ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
     TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse,
 };
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1569,27 +1570,33 @@ fn submit_job_request_signature(
     request: &SubmitJobRequest,
     requested_capabilities: &[String],
 ) -> String {
-    let resource_scope = request.resource_scope.as_ref().map_or_else(
-        || "repository:.".to_string(),
-        |scope| format!("{}:{}", scope.kind, scope.value),
-    );
-    let kind = match &request.kind {
-        JobKind::Read => "read",
-        JobKind::Mutate => "mutate",
-        JobKind::Process => "process",
-        JobKind::Maintenance => "maintenance",
-        JobKind::Other { name } => name.as_str(),
-    };
+    #[derive(Serialize)]
+    struct SubmitJobRequestSignature<'a> {
+        actor: &'a Actor,
+        repository_id: &'a str,
+        kind: &'a JobKind,
+        goal: &'a str,
+        resource_scope: &'a ResourceScope,
+        requested_capabilities: &'a [String],
+    }
 
-    format!(
-        "requester={};repository={};kind={};goal={};resource_scope={};capabilities={};",
-        actor_signature(&request.requester),
-        request.repository_id.as_str(),
-        kind,
-        request.goal.trim(),
-        resource_scope,
-        requested_capabilities.join(","),
-    )
+    let resource_scope = request
+        .resource_scope
+        .clone()
+        .unwrap_or_else(|| ResourceScope {
+            kind: "repository".to_string(),
+            value: ".".to_string(),
+        });
+
+    serde_json::to_string(&SubmitJobRequestSignature {
+        actor: &request.requester,
+        repository_id: request.repository_id.as_str(),
+        kind: &request.kind,
+        goal: request.goal.trim(),
+        resource_scope: &resource_scope,
+        requested_capabilities,
+    })
+    .expect("serialize canonical submit_job request signature")
 }
 
 impl Default for SecretaryService {
@@ -4307,31 +4314,94 @@ mod tests {
             })
             .expect("register should succeed");
 
+        let first_request = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id.clone(),
+            kind: JobKind::Read,
+            goal: "summarize".to_string(),
+            resource_scope: None,
+            requested_capabilities: Vec::new(),
+            idempotency_key: Some("request-123".to_string()),
+        };
+        let first_signature = submit_job_request_signature(
+            &first_request,
+            &normalize_requested_capabilities(&first_request.requested_capabilities)
+                .expect("first capability normalization should succeed"),
+        );
         let first = svc
-            .submit_job(SubmitJobRequest {
-                requester: actor(),
-                repository_id: repository.id.clone(),
-                kind: JobKind::Read,
-                goal: "summarize".to_string(),
-                resource_scope: None,
-                requested_capabilities: Vec::new(),
-                idempotency_key: Some("request-123".to_string()),
-            })
+            .submit_job(first_request)
             .expect("submit should succeed");
 
+        let second_request = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id,
+            kind: JobKind::Read,
+            goal: "summarize".to_string(),
+            resource_scope: None,
+            requested_capabilities: vec!["capability.discovery".to_string()],
+            idempotency_key: Some("request-123".to_string()),
+        };
+        let second_signature = submit_job_request_signature(
+            &second_request,
+            &normalize_requested_capabilities(&second_request.requested_capabilities)
+                .expect("second capability normalization should succeed"),
+        );
         let second = svc
-            .submit_job(SubmitJobRequest {
-                requester: actor(),
-                repository_id: repository.id,
-                kind: JobKind::Read,
-                goal: "summarize".to_string(),
-                resource_scope: None,
-                requested_capabilities: vec!["capability.discovery".to_string()],
-                idempotency_key: Some("request-123".to_string()),
-            })
+            .submit_job(second_request)
             .expect("normalized capability should replay the same job");
 
         assert_eq!(first.job.id, second.job.id);
+        assert_eq!(first_signature, second_signature);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_request_signature_distinguishes_delimiter_like_goal_and_scope_values() {
+        let svc = ready_service();
+        let root = test_repo_dir("delimiter-like-signature");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let normalized_capabilities =
+            normalize_requested_capabilities(&["capability.discovery".to_string()])
+                .expect("capability discovery should normalize");
+
+        let request_one = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id.clone(),
+            kind: JobKind::Read,
+            goal: "summarize;resource_scope=repository:.".to_string(),
+            resource_scope: Some(ResourceScope {
+                kind: "repository".to_string(),
+                value: "branch=main;capabilities=capability.discovery".to_string(),
+            }),
+            requested_capabilities: vec!["capability.discovery".to_string()],
+            idempotency_key: None,
+        };
+        let request_two = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id,
+            kind: JobKind::Read,
+            goal: "summarize".to_string(),
+            resource_scope: Some(ResourceScope {
+                kind: "repository".to_string(),
+                value: "branch=main".to_string(),
+            }),
+            requested_capabilities: vec!["capability.discovery".to_string()],
+            idempotency_key: None,
+        };
+
+        let signature_one = submit_job_request_signature(&request_one, &normalized_capabilities);
+        let signature_two = submit_job_request_signature(&request_two, &normalized_capabilities);
+
+        assert_ne!(signature_one, signature_two);
         let _ = fs::remove_dir_all(root);
     }
 
