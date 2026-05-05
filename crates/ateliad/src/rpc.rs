@@ -110,6 +110,7 @@ impl SecretaryRpcServer {
         })
     }
 
+    /// Return the beta repertoire projection over the daemon's built-in tools.
     pub fn list_repertoire(
         &self,
         _request: ListRepertoireRequest,
@@ -756,28 +757,45 @@ pub struct ListRepositoriesResponse {
     pub next_page_token: Option<String>,
 }
 
+/// Request for the repertoire projection RPC.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ListRepertoireRequest;
 
+/// Repertoire projection response including protocol metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListRepertoireResponse {
+    /// Protocol metadata for the current daemon instance.
     pub metadata: ProtocolMetadata,
+    /// Projected repertoire entries in stable display order.
     pub entries: Vec<RepertoireEntry>,
 }
 
+/// Public repertoire view for a single built-in tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepertoireEntry {
+    /// Stable tool identifier.
     pub tool_id: String,
+    /// Human-readable tool name.
     pub name: String,
+    /// Concise description shown to clients.
     pub description: String,
+    /// Provider category for the tool implementation.
     pub provider_kind: String,
+    /// Stable provider identifier.
     pub provider_id: String,
+    /// Risk tier used for client-side policy and presentation.
     pub risk_tier: String,
+    /// Default result format returned by the tool.
     pub default_result_format: String,
+    /// Result formats the tool can emit.
     pub supported_result_formats: Vec<String>,
+    /// Idempotency classification for repeated calls.
     pub idempotency: String,
+    /// Whether the tool can be cancelled after dispatch.
     pub cancellable: bool,
+    /// Whether the tool streams partial results.
     pub streaming: bool,
+    /// Default timeout in milliseconds.
     pub timeout_ms: u32,
 }
 

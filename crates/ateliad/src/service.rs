@@ -322,27 +322,43 @@ pub struct ListRepositoriesPage {
     pub next_page_token: Option<String>,
 }
 
+/// Request for the beta repertoire projection.
 #[derive(Debug, Clone, Default)]
 pub struct ListRepertoireRequest;
 
+/// Response containing the built-in tools exposed through the beta repertoire.
 #[derive(Debug, Clone)]
 pub struct ListRepertoireResponse {
+    /// Projected repertoire entries in stable display order.
     pub entries: Vec<RepertoireEntry>,
 }
 
+/// Public repertoire view for a single built-in tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepertoireEntry {
+    /// Stable tool identifier.
     pub tool_id: String,
+    /// Human-readable tool name.
     pub name: String,
+    /// Concise description shown to clients.
     pub description: String,
+    /// Provider category for the tool implementation.
     pub provider_kind: String,
+    /// Stable provider identifier.
     pub provider_id: String,
+    /// Risk tier used for client-side policy and presentation.
     pub risk_tier: String,
+    /// Default result format returned by the tool.
     pub default_result_format: String,
+    /// Result formats the tool can emit.
     pub supported_result_formats: Vec<String>,
+    /// Idempotency classification for repeated calls.
     pub idempotency: String,
+    /// Whether the tool can be cancelled after dispatch.
     pub cancellable: bool,
+    /// Whether the tool streams partial results.
     pub streaming: bool,
+    /// Default timeout in milliseconds.
     pub timeout_ms: u32,
 }
 
