@@ -7024,6 +7024,7 @@ mod tests {
 
     // -- FsDeleteTool tests --
 
+    #[cfg(unix)]
     #[test]
     fn fs_delete_removes_file_within_scope() {
         let env = TestEnv::new("delete-file");
@@ -7204,6 +7205,7 @@ mod tests {
 
     // -- FsMoveTool tests --
 
+    #[cfg(unix)]
     #[test]
     fn fs_move_moves_file_within_scope() {
         let env = TestEnv::new("move-file");
@@ -7259,6 +7261,7 @@ mod tests {
         env.cleanup();
     }
 
+    #[cfg(unix)]
     #[test]
     fn fs_move_overwrites_existing_file_when_allowed() {
         let env = TestEnv::new("move-overwrite");
@@ -8651,6 +8654,7 @@ exit 0
         env.cleanup();
     }
 
+    #[cfg(unix)]
     #[test]
     fn fs_delete_integrates_with_secretary_runtime() {
         let env = TestEnv::new("runtime-delete");
@@ -8695,6 +8699,58 @@ exit 0
         env.cleanup();
     }
 
+    #[cfg(not(unix))]
+    #[test]
+    fn fs_delete_integrates_with_secretary_runtime_on_non_unix() {
+        let env = TestEnv::new("runtime-delete-non-unix");
+        env.create_file("stale.txt", "delete me");
+
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = RepositoryRecord::new(
+            "test-repo",
+            env.root.to_string_lossy(),
+            RepositoryTrustState::Trusted,
+            LedgerTimestamp::now(),
+        );
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let tool = FsDeleteTool::new(&env.root);
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Mutate,
+            "delete repository file",
+        )
+        .with_resource_scope("path", "stale.txt")
+        .with_requested_capabilities(vec!["filesystem.delete".to_string()]);
+        let receipt = runtime.run_tool_job(request, &tool).unwrap();
+
+        assert_eq!(crate::domain::JobStatus::Failed, receipt.job.status);
+        assert_eq!(
+            crate::domain::PolicyOutcome::Audited,
+            receipt.policy_decision.outcome
+        );
+        assert_eq!(
+            "fs.delete",
+            receipt.tool_invocation.as_ref().unwrap().tool_id
+        );
+        assert!(env.root.join("stale.txt").exists());
+        let result = receipt.tool_result.unwrap();
+        let safety = result
+            .fields
+            .iter()
+            .find(|f| f.key == "platform_safety")
+            .unwrap();
+        assert_eq!("unsupported-non-unix", string_value(&safety.value));
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("Unix no-follow validation"));
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn fs_move_integrates_with_secretary_runtime() {
         let env = TestEnv::new("runtime-move");
@@ -8742,6 +8798,64 @@ exit 0
             .find(|f| f.key == "overwritten")
             .unwrap();
         assert_eq!(StructuredValue::Bool(false), overwritten.value);
+        env.cleanup();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn fs_move_integrates_with_secretary_runtime_on_non_unix() {
+        let env = TestEnv::new("runtime-move-non-unix");
+        env.create_file("draft.txt", "move me");
+        env.create_dir("archive");
+        env.create_file("archive/draft.txt", "destination");
+
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = RepositoryRecord::new(
+            "test-repo",
+            env.root.to_string_lossy(),
+            RepositoryTrustState::Trusted,
+            LedgerTimestamp::now(),
+        );
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let tool = FsMoveTool::new(&env.root, "archive/draft.txt");
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Mutate,
+            "move repository file",
+        )
+        .with_resource_scope("path", "draft.txt")
+        .with_requested_capabilities(vec!["filesystem.move".to_string()]);
+        let receipt = runtime.run_tool_job(request, &tool).unwrap();
+
+        assert_eq!(crate::domain::JobStatus::Failed, receipt.job.status);
+        assert_eq!(
+            crate::domain::PolicyOutcome::Audited,
+            receipt.policy_decision.outcome
+        );
+        assert_eq!("fs.move", receipt.tool_invocation.as_ref().unwrap().tool_id);
+        assert!(env.root.join("draft.txt").exists());
+        assert_eq!(
+            "move me",
+            fs::read_to_string(env.root.join("draft.txt")).unwrap()
+        );
+        assert_eq!(
+            "destination",
+            fs::read_to_string(env.root.join("archive/draft.txt")).unwrap()
+        );
+        let result = receipt.tool_result.unwrap();
+        let safety = result
+            .fields
+            .iter()
+            .find(|f| f.key == "platform_safety")
+            .unwrap();
+        assert_eq!("unsupported-non-unix", string_value(&safety.value));
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("Unix no-follow validation"));
         env.cleanup();
     }
 }
