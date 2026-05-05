@@ -393,7 +393,8 @@ fn parse_path_scope_kind(value: Option<String>) -> Result<rpc::RpcPathScopeKind,
     };
 
     match value.trim().to_ascii_lowercase().as_str() {
-        "" | "repository" => Ok(rpc::RpcPathScopeKind::Repository),
+        "" => Err("path_scope.kind must not be empty".to_string()),
+        "repository" => Ok(rpc::RpcPathScopeKind::Repository),
         "explicit_paths" | "explicit" => Ok(rpc::RpcPathScopeKind::ExplicitPaths),
         "read_only" | "readonly" => Ok(rpc::RpcPathScopeKind::ReadOnly),
         "unspecified" => Ok(rpc::RpcPathScopeKind::Unspecified),
@@ -2956,6 +2957,17 @@ mod tests {
         })
         .expect("empty scope can use repository default");
         assert_eq!(parsed.kind, rpc::RpcPathScopeKind::Repository);
+
+        for kind in ["", "   "] {
+            let err = parse_path_scope_payload(PathScopePayload {
+                kind: Some(kind.to_string()),
+                roots: Some(vec!["src".to_string()]),
+                include_patterns: Some(vec!["**/*.rs".to_string()]),
+                exclude_patterns: Some(vec!["target/**".to_string()]),
+            })
+            .expect_err("blank scope kind should fail");
+            assert!(err.contains("path_scope.kind must not be empty"));
+        }
     }
 
     #[test]
