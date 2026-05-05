@@ -26,8 +26,8 @@ use atelia_core::{
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "1.0.0";
@@ -419,6 +419,12 @@ pub struct SecretaryService {
     idempotent_submissions: Mutex<VecDeque<(String, IdempotentSubmitJob)>>,
     idempotent_submission_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     cancellation_requesters: Mutex<HashMap<JobId, Actor>>,
+}
+
+#[allow(dead_code)]
+pub struct LiveEventSubscription {
+    pub events: Vec<JobEvent>,
+    pub receiver: broadcast::Receiver<JobEvent>,
 }
 
 impl SecretaryService {
@@ -1145,6 +1151,22 @@ impl SecretaryService {
             .runtime()
             .store()
             .replay_job_events(cursor, limit)?)
+    }
+
+    /// Subscribe to future events while returning the initial replay slice.
+    #[allow(dead_code)]
+    pub fn watch_events_live(
+        &self,
+        cursor: EventCursor,
+        limit: Option<usize>,
+    ) -> ServiceResult<LiveEventSubscription> {
+        let receiver = self.lifecycle.runtime().store().subscribe_job_events();
+        let events = self
+            .lifecycle
+            .runtime()
+            .store()
+            .replay_job_events(cursor, limit)?;
+        Ok(LiveEventSubscription { events, receiver })
     }
 
     /// Request cancellation for a queued/running job.

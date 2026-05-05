@@ -51,8 +51,9 @@ repository, job, policy, event replay, project status, tool-output settings,
 operations are currently exposed through the daemon HTTP/JSON beta
 transport. The Rust RPC boundary in `ateliad` stays transport-neutral so a
 future proto/gRPC client path can bind to the same contract instead of
-redefining it. `WatchEvents` is implemented as a cursor replay surface today;
-a long-lived streaming transport remains a future transport refinement.
+redefining it. `WatchEvents` is the live beta subscription surface, while
+`ReplayEvents` and `/v1/events/replay` remain available for bounded replay and
+compatibility.
 
 Required RPC groups:
 
@@ -66,7 +67,8 @@ Required RPC groups:
 | `GetJob` | Inspect one job |
 | `ListJobs` | Inspect recent jobs with filters |
 | `CancelJob` | Request cancellation |
-| `WatchEvents` | Stream ordered events from a cursor |
+| `WatchEvents` | Stream live ordered events from a cursor |
+| `ReplayEvents` | Replay ordered events from a cursor |
 | `CheckPolicy` | Preview policy outcome for a requested action |
 | `RenderToolOutput` | Render canonical tool result as TOON, JSON, or text |
 | `InstallExtension` | Install a new extension manifest |
@@ -172,8 +174,10 @@ durable restart; failed submissions are not currently cached as replay results.
 - refs to job, policy decision, lock decision, tool invocation, tool result, or
   audit record
 
-`WatchEvents` accepts a cursor and returns events after that cursor. Clients can
-replay events after reconnect without losing job history.
+`WatchEvents` accepts a cursor, returns a replay snapshot for that cursor, and
+then keeps streaming new ordered events. Clients can reconnect to the live
+surface without losing job history, or call `ReplayEvents` for the bounded
+replay-only compatibility path.
 
 ### Policy Decision
 
@@ -205,7 +209,8 @@ Event ordering is per daemon store:
 
 If the daemon cannot guarantee continuity, `WatchEvents` returns a
 `CURSOR_EXPIRED` recovery error and tells the client to call `GetProjectStatus`
-and then resume from the returned latest event.
+and then resume from the returned latest event. `ReplayEvents` keeps the older
+replay-only semantics for beta clients that still depend on it.
 
 ## Error Shape
 
@@ -227,8 +232,8 @@ For agents, the protocol must reduce repeated guessing:
 
 - `GetProjectStatus` gives one compact orienting call.
 - `SubmitJob` returns a job id and initial policy summary immediately.
-- `WatchEvents` gives a single stream for job, policy, audit, and repository
-  changes.
+- `WatchEvents` gives a live stream for job, policy, audit, and repository
+  changes, with `ReplayEvents` preserved for compatibility.
 - `RenderToolOutput` avoids re-running tools only to get a different format.
 - Policy errors include next states so the agent knows whether to ask the human,
   retry with narrower scope, or stop.

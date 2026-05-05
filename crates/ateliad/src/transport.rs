@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::rpc;
 use anyhow::{anyhow, Context, Result};
+use async_stream::stream;
 use atelia_core::{
     Actor, JobId, LedgerTimestamp, OutputFormat, OversizeOutputPolicy, ProjectId, RenderOptions,
     RepositoryId, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
@@ -67,6 +68,7 @@ enum Route {
     ListRepositories,
     ListRepertoire,
     ListEvents,
+    WatchEvents,
     ReplayEvents,
     GetToolOutputDefaults,
     UpdateToolOutputDefaults,
@@ -176,6 +178,7 @@ fn route_for_path(path: &str) -> Route {
         "/v1/repositories:list" => Route::ListRepositories,
         "/v1/repertoire:list" => Route::ListRepertoire,
         "/v1/events/list" => Route::ListEvents,
+        "/v1/events/watch" => Route::WatchEvents,
         "/v1/events/replay" => Route::ReplayEvents,
         "/v1/tool-output/settings/get" => Route::GetToolOutputDefaults,
         "/v1/tool-output/settings/update" => Route::UpdateToolOutputDefaults,
@@ -1038,6 +1041,12 @@ fn parse_replay_events_payload(
     })
 }
 
+fn parse_watch_events_payload(
+    payload: ReplayEventsRequestPayload,
+) -> Result<rpc::WatchEventsRequest, String> {
+    parse_replay_events_payload(payload)
+}
+
 fn core_tool_output_scope_to_rpc(
     scope: ToolOutputSettingsScope,
 ) -> Result<rpc::RpcToolOutputScope> {
@@ -1652,6 +1661,19 @@ fn serialize_replay_events_response(response: rpc::WatchEventsReplayResponse) ->
     })
 }
 
+fn serialize_watch_events_snapshot(response: &rpc::WatchEventsLiveResponse) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "snapshot",
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "events": response
+            .events
+            .iter()
+            .map(serialize_event)
+            .collect::<Vec<_>>(),
+        "cursor": response.cursor.as_ref().map(serialize_event_cursor_request),
+    })
+}
+
 fn serialize_event(event: &rpc::RpcEvent) -> serde_json::Value {
     serde_json::json!({
         "event_id": event.event_id,
@@ -2243,6 +2265,106 @@ async fn dispatch_replay_events(state: RpcServerState, request: Request<Body>) -
             Json(ApiResponse::ok(serialize_replay_events_response(response))),
         )
             .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+fn watch_events_stream_body(
+    response: rpc::WatchEventsLiveResponse,
+    request: rpc::WatchEventsRequest,
+) -> Body {
+    let snapshot = serialize_watch_events_snapshot(&response);
+    let rpc::WatchEventsLiveResponse { subscription, .. } = response;
+
+    let stream = stream! {
+        match serde_json::to_vec(&snapshot) {
+            Ok(bytes) => {
+                yield Ok::<Vec<u8>, std::io::Error>(bytes);
+            }
+            Err(error) => {
+                yield Err::<Vec<u8>, std::io::Error>(std::io::Error::other(error));
+                return;
+            }
+        }
+        yield Ok::<Vec<u8>, std::io::Error>(b"\n".to_vec());
+
+        let mut receiver = subscription.receiver;
+        let mut last_sequence = subscription.last_sequence;
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    if event.sequence_number <= last_sequence {
+                        continue;
+                    }
+                    let rpc_event = rpc::RpcEvent::from(event);
+                    if !rpc::watch_event_matches_request(&rpc_event, &request) {
+                        continue;
+                    }
+                    last_sequence = rpc_event.sequence;
+                    let frame = serde_json::json!({
+                        "kind": "event",
+                        "event": serialize_event(&rpc_event),
+                    });
+                    match serde_json::to_vec(&frame) {
+                        Ok(bytes) => {
+                            yield Ok::<Vec<u8>, std::io::Error>(bytes);
+                        }
+                        Err(error) => {
+                            yield Err::<Vec<u8>, std::io::Error>(std::io::Error::other(error));
+                            return;
+                        }
+                    }
+                    yield Ok::<Vec<u8>, std::io::Error>(b"\n".to_vec());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    };
+
+    Body::from_stream(stream)
+}
+
+async fn dispatch_watch_events(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<ReplayEventsRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let parsed = match parse_watch_events_payload(payload) {
+        Ok(request) => request,
+        Err(reason) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                reason,
+                false,
+                next_state,
+            );
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.watch_events_live(parsed.clone()) {
+        Ok(response) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/x-ndjson")
+            .body(watch_events_stream_body(response, parsed))
+            .expect("stream response"),
         Err(error) => {
             let (status, recoverable) = rpc_error_status(error.code);
             make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
@@ -2883,6 +3005,26 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                     dispatch_list_events(state, request).await
                 }
             }
+            Route::WatchEvents => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_watch_events(state, request).await
+                }
+            }
             Route::ReplayEvents => {
                 if method != Method::POST {
                     let mut response = make_error_response(
@@ -3286,6 +3428,7 @@ pub fn build_router(rpc_server: RpcServerState, auth: LocalAuthConfig) -> Router
         .route("/v1/repositories:list", any(dispatch_route))
         .route("/v1/repertoire:list", any(dispatch_route))
         .route("/v1/events/list", any(dispatch_route))
+        .route("/v1/events/watch", any(dispatch_route))
         .route("/v1/events/replay", any(dispatch_route))
         .route("/v1/tool-output/settings/get", any(dispatch_route))
         .route("/v1/tool-output/settings/update", any(dispatch_route))
@@ -3638,6 +3781,7 @@ mod tests {
         );
         assert_eq!(route_for_path("/v1/repertoire:list"), Route::ListRepertoire);
         assert_eq!(route_for_path("/v1/events/list"), Route::ListEvents);
+        assert_eq!(route_for_path("/v1/events/watch"), Route::WatchEvents);
         assert_eq!(route_for_path("/v1/events/replay"), Route::ReplayEvents);
         assert_eq!(
             route_for_path("/v1/tool-output/settings/get"),
@@ -4607,6 +4751,50 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(other_root);
+    }
+
+    #[tokio::test]
+    async fn watch_events_endpoint_returns_ndjson_stream() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("watch-events-stream");
+        let repository = {
+            let server = rpc_server.read().await;
+            server
+                .register_repository(rpc::RegisterRepositoryRequest {
+                    display_name: "watch-events-stream-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed")
+                .repository
+        };
+
+        let response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/events/watch",
+            serde_json::json!({
+                "repository_id": repository.repository_id,
+                "cursor": { "kind": "beginning" },
+                "subject_ids": [],
+                "min_severity": "info",
+                "limit": 1,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("content type")
+                .to_str()
+                .expect("valid content type"),
+            "application/x-ndjson"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

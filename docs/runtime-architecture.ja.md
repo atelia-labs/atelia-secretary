@@ -70,7 +70,8 @@ protocol は、現在の health endpoint から versioned service surface へ育
 - `GetJob`: 1つの job を inspect する
 - `ListJobs`: filter 付きで recent jobs を inspect する
 - `CancelJob`: cancellation を request する
-- `WatchEvents`: job、policy、audit、repository event を stream する
+- `WatchEvents`: job、policy、audit、repository event を live stream する
+- `ReplayEvents`: compatibility 用に同じ event ledger を replay する
 - `CheckPolicy`: requested action が allowed / audited / approval-gated / blocked のどれかを事前確認する
 - `RenderToolOutput`: canonical tool result を TOON、JSON、text として render する
 

@@ -16,6 +16,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::sync::broadcast;
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
@@ -285,10 +286,11 @@ pub trait SecretaryStore: Send + Sync + 'static {
     fn get_audit_record(&self, id: &AuditRecordId) -> StoreResult<AuditRecord>;
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InMemoryStore {
     inner: Arc<Mutex<InMemoryInner>>,
     durable_snapshot_path: Option<PathBuf>,
+    event_broadcaster: broadcast::Sender<JobEvent>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -318,6 +320,11 @@ pub struct SubmitJobIdempotencyRecord {
 }
 
 impl InMemoryStore {
+    fn new_event_broadcaster() -> broadcast::Sender<JobEvent> {
+        let (sender, _) = broadcast::channel(1024);
+        sender
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -341,6 +348,7 @@ impl InMemoryStore {
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             durable_snapshot_path: Some(snapshot_path),
+            event_broadcaster: Self::new_event_broadcaster(),
         })
     }
 
@@ -353,6 +361,16 @@ impl InMemoryStore {
 
     pub fn uses_durable_snapshot(&self) -> bool {
         self.durable_snapshot_path.is_some()
+    }
+
+    pub fn subscribe_job_events(&self) -> broadcast::Receiver<JobEvent> {
+        self.event_broadcaster.subscribe()
+    }
+
+    fn publish_job_events(&self, events: &[JobEvent]) {
+        for event in events {
+            let _ = self.event_broadcaster.send(event.clone());
+        }
     }
 
     fn mutate<R>(
@@ -375,6 +393,16 @@ impl InMemoryStore {
     ) -> StoreResult<Option<JobEvent>> {
         let inner = self.lock()?;
         latest_job_event_for_repository_with_inner(&inner, repository_id)
+    }
+}
+
+impl Default for InMemoryStore {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(InMemoryInner::default())),
+            durable_snapshot_path: None,
+            event_broadcaster: InMemoryStore::new_event_broadcaster(),
+        }
     }
 }
 
@@ -443,7 +471,7 @@ impl SecretaryStore for InMemoryStore {
         mut record: JobRecord,
         mut initial_event: JobEvent,
     ) -> StoreResult<JobEvent> {
-        self.mutate(|inner| {
+        let initial_event = self.mutate(|inner| {
             validate_job_refs(inner, &record)?;
             if inner.jobs.contains_key(&record.id) {
                 return Err(StoreError::DuplicateId {
@@ -470,7 +498,9 @@ impl SecretaryStore for InMemoryStore {
                 .job_events_by_id
                 .insert(initial_event.id.clone(), initial_event.clone());
             Ok(initial_event)
-        })
+        })?;
+        self.publish_job_events(std::slice::from_ref(&initial_event));
+        Ok(initial_event)
     }
 
     fn list_jobs(&self) -> StoreResult<Vec<JobRecord>> {
@@ -565,11 +595,13 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn append_job_event(&self, mut event: JobEvent) -> StoreResult<JobEvent> {
-        self.mutate(|inner| {
+        let event = self.mutate(|inner| {
             validate_new_job_event(inner, &event, None)?;
             append_event_locked(inner, &mut event)?;
             Ok(event)
-        })
+        })?;
+        self.publish_job_events(std::slice::from_ref(&event));
+        Ok(event)
     }
 
     fn append_job_event_and_update_job(
@@ -577,7 +609,7 @@ impl SecretaryStore for InMemoryStore {
         mut record: JobRecord,
         mut event: JobEvent,
     ) -> StoreResult<JobEvent> {
-        self.mutate(|inner| {
+        let event = self.mutate(|inner| {
             validate_job_update(inner, &record, &event)?;
             validate_new_job_event(inner, &event, None)?;
 
@@ -586,7 +618,9 @@ impl SecretaryStore for InMemoryStore {
             inner.jobs.insert(record.id.clone(), record);
 
             Ok(event)
-        })
+        })?;
+        self.publish_job_events(std::slice::from_ref(&event));
+        Ok(event)
     }
 
     fn append_job_event_and_update_job_with_submit_job_idempotency(
@@ -621,7 +655,7 @@ impl SecretaryStore for InMemoryStore {
         mut final_record: JobRecord,
         mut final_event: JobEvent,
     ) -> StoreResult<(JobEvent, JobEvent)> {
-        self.mutate(|inner| {
+        let (first_event, final_event) = self.mutate(|inner| {
             validate_sibling_event_ids_are_unique(&first_event, &final_event)?;
             validate_two_stage_job_update_identity(
                 &first_record,
@@ -644,7 +678,9 @@ impl SecretaryStore for InMemoryStore {
             inner.jobs.insert(final_record.id.clone(), final_record);
 
             Ok((first_event, final_event))
-        })
+        })?;
+        self.publish_job_events(&[first_event.clone(), final_event.clone()]);
+        Ok((first_event, final_event))
     }
 
     fn replay_job_events(
@@ -1092,7 +1128,7 @@ impl SecretaryStore for InMemoryStore {
         audit_record: AuditRecord,
         mut audit_event: JobEvent,
     ) -> StoreResult<(JobEvent, JobEvent)> {
-        self.mutate(|inner| {
+        let (tool_result_event, audit_event) = self.mutate(|inner| {
             validate_sibling_event_ids_are_unique(&tool_result_event, &audit_event)?;
             validate_job_update(inner, &record, &tool_result_event)?;
             validate_job_update(inner, &record, &audit_event)?;
@@ -1149,7 +1185,9 @@ impl SecretaryStore for InMemoryStore {
             inner.jobs.insert(record.id.clone(), record);
 
             Ok((tool_result_event, audit_event))
-        })
+        })?;
+        self.publish_job_events(&[tool_result_event.clone(), audit_event.clone()]);
+        Ok((tool_result_event, audit_event))
     }
 
     fn record_tool_result_audit_terminal_with_submit_job_idempotency(
