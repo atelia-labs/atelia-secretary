@@ -575,6 +575,7 @@ impl SecretaryStore for InMemoryStore {
             if let Some(last_event) = idempotency_record.receipt.events.last_mut() {
                 *last_event = event.clone();
             }
+            idempotency_record.receipt.job.latest_event_id = Some(event.id.clone());
             insert_submit_job_idempotency_locked(inner, idempotency_key, idempotency_record)?;
 
             Ok(event)
@@ -1740,6 +1741,23 @@ fn validate_loaded_submit_job_receipt(
             collection: "submit_job_idempotency",
             reason: "successful submit_job receipts must include events".to_string(),
         });
+    }
+
+    for (index, pair) in receipt.events.windows(2).enumerate() {
+        let previous_event = &pair[0];
+        let event = &pair[1];
+        if event.sequence_number <= previous_event.sequence_number {
+            return Err(StoreError::InvalidRecord {
+                collection: "submit_job_idempotency",
+                reason: format!(
+                    "receipt.events[{next_index}] sequence_number {} must be greater than receipt.events[{previous_index}] sequence_number {}",
+                    event.sequence_number,
+                    previous_event.sequence_number,
+                    next_index = index + 1,
+                    previous_index = index,
+                ),
+            });
+        }
     }
 
     for event in &receipt.events {
@@ -7084,6 +7102,58 @@ mod tests {
         assert!(matches!(
             err,
             StoreError::InvalidReference {
+                collection: "submit_job_idempotency",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn durable_store_rejects_submit_job_idempotency_with_out_of_order_receipt_events() {
+        let storage_dir = durable_storage_dir("idempotency-event-order");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let store = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        let repository = repository_record();
+        store.create_repository(repository.clone()).unwrap();
+
+        let runtime = SecretaryRuntime::new(store.clone(), DefaultPolicyEngine::new());
+        let receipt = runtime
+            .run_tool_job(
+                RuntimeJobRequest::new(actor(), repository.id.clone(), JobKind::Read, "persist me")
+                    .with_requested_capabilities(vec!["capability.discovery".to_string()]),
+                &EchoTool,
+            )
+            .unwrap();
+        let submission = SubmitJobIdempotencyRecord {
+            signature: "request-signature".to_string(),
+            receipt: receipt.clone(),
+        };
+        store
+            .record_submit_job_idempotency("ledger-key".to_string(), submission)
+            .unwrap();
+
+        let mut invalid_inner = store.lock().unwrap().clone();
+        invalid_inner
+            .idempotent_submit_jobs
+            .get_mut("ledger-key")
+            .expect("idempotency record should exist")
+            .receipt
+            .events
+            .swap(0, 1);
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner: invalid_inner,
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidRecord {
                 collection: "submit_job_idempotency",
                 ..
             }
