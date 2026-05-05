@@ -1,0 +1,54 @@
+{
+  "id": "res_00000000-0000-4000-8000-000000000001",
+  "schema_version": 1,
+  "created_at": {
+    "unix_millis": 1700000000000
+  },
+  "invocation_id": "tool_00000000-0000-4000-8000-000000000002",
+  "tool_id": "git_status",
+  "status": "succeeded",
+  "schema_ref": "schema:git.status.v1",
+  "fields": [
+    {
+      "key": "summary",
+      "value": {
+        "string": "2 modified files"
+      }
+    },
+    {
+      "key": "changed_files",
+      "value": {
+        "string_list": [
+          "crates/atelia-core/src/lib.rs",
+          "docs/tool-output-schema.md"
+        ]
+      }
+    },
+    {
+      "key": "exit_code",
+      "value": {
+        "integer": 0
+      }
+    }
+  ],
+  "evidence_refs": [
+    {
+      "id": "art_00000000-0000-4000-8000-000000000003",
+      "uri": "/tmp/evidence.txt",
+      "media_type": "text/plain",
+      "label": "status evidence",
+      "digest": "sha256:abc123"
+    }
+  ],
+  "output_refs": [
+    {
+      "id": "out_00000000-0000-4000-8000-000000000004",
+      "uri": "/tmp/stdout.txt",
+      "media_type": "text/plain",
+      "label": "stdout",
+      "digest": null
+    }
+  ],
+  "truncation": null,
+  "redactions": []
+}

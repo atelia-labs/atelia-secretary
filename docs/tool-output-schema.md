@@ -180,6 +180,7 @@ Compatibility rules:
 - unsupported customizer versions fall back to canonical Secretary output
 - TOON and JSON renderers share the same canonical schema version
 - default format changes are release-note-visible behavior changes
+- release gates keep golden compatibility fixtures for TOON, JSON, and customizer-style field filtering under `crates/atelia-core/tests/fixtures/tool_output/`
 
 ## Schema Negotiation
 
