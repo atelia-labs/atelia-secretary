@@ -90,6 +90,8 @@ Required RPC groups:
   approval-gated, or blocked.
 - `RenderToolOutput`: render a canonical tool result as TOON, JSON, or text.
 
+See [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/docs/agent-repertoire/docs/agent-repertoire.md) for the projected tool surface visible to agents. `ListRepertoire` is planned as the first beta protocol slice for that projection.
+
 The initial transport may be gRPC or another typed RPC transport, but these
 domain contracts should remain versioned and stable.
 
