@@ -449,19 +449,40 @@ pub fn unsafe_allow_non_loopback_listen() -> bool {
 
 /// Resolve the local bearer token boundary used by the beta daemon.
 pub fn resolve_local_auth(storage_dir: &std::path::Path) -> Result<LocalAuthConfig> {
-    if env_var_is_truthy(AUTH_DISABLED_ENV) {
+    let auth_disabled = env_var_is_truthy(AUTH_DISABLED_ENV);
+    let auth_token = std::env::var_os(AUTH_TOKEN_ENV);
+
+    if auth_disabled && auth_token.is_some() {
+        return Err(anyhow!(
+            "{AUTH_DISABLED_ENV} and {AUTH_TOKEN_ENV} are mutually exclusive"
+        ));
+    }
+
+    if auth_disabled {
         return Ok(LocalAuthConfig::Disabled);
     }
 
-    if let Some(raw_token) = std::env::var_os(AUTH_TOKEN_ENV) {
+    if let Some(raw_token) = auth_token {
         let token = raw_token
             .as_os_str()
             .to_str()
             .ok_or_else(|| anyhow!("{AUTH_TOKEN_ENV} must contain valid UTF-8"))?
-            .trim()
             .to_string();
         if token.is_empty() {
             return Err(anyhow!("{AUTH_TOKEN_ENV} must not be empty"));
+        }
+        if token
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_whitespace())
+            || token
+                .chars()
+                .last()
+                .is_some_and(|ch| ch.is_whitespace())
+        {
+            return Err(anyhow!(
+                "{AUTH_TOKEN_ENV} must not have leading or trailing whitespace"
+            ));
         }
         if token.chars().any(|ch| ch.is_whitespace()) {
             return Err(anyhow!(
@@ -3612,6 +3633,23 @@ mod tests {
     }
 
     #[test]
+    fn resolve_local_auth_rejects_bearer_token_with_boundary_whitespace() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+
+        for token in [" abcdef", "abcdef "] {
+            std::env::set_var(AUTH_TOKEN_ENV, token);
+
+            let err = resolve_local_auth(&test_repo_dir("local-auth-env-token-boundary"))
+                .expect_err("boundary whitespace should be rejected");
+
+            assert!(err
+                .to_string()
+                .contains("ATELIA_DAEMON_AUTH_TOKEN must not have leading or trailing whitespace"));
+        }
+    }
+
+    #[test]
     fn resolve_local_auth_rejects_bearer_token_with_non_visible_ascii() {
         let _guard = LocalAuthEnvGuard::lock();
         std::env::remove_var(AUTH_DISABLED_ENV);
@@ -3626,6 +3664,20 @@ mod tests {
                 .to_string()
                 .contains("ATELIA_DAEMON_AUTH_TOKEN must contain only visible ASCII characters"));
         }
+    }
+
+    #[test]
+    fn resolve_local_auth_rejects_conflicting_disabled_and_token_env() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::set_var(AUTH_DISABLED_ENV, "1");
+        std::env::set_var(AUTH_TOKEN_ENV, "abcdef");
+
+        let err = resolve_local_auth(&test_repo_dir("local-auth-env-conflict"))
+            .expect_err("conflicting envs should be rejected");
+
+        assert!(err
+            .to_string()
+            .contains("ATELIA_DAEMON_AUTH_DISABLED and ATELIA_DAEMON_AUTH_TOKEN are mutually exclusive"));
     }
 
     #[test]
