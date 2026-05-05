@@ -5047,7 +5047,7 @@ mod tests {
             .unwrap();
         let second = store.append_job_event(job_event(repository.id)).unwrap();
 
-        let received = vec![
+        let received = [
             receiver.blocking_recv().expect("first event should arrive"),
             receiver
                 .blocking_recv()
