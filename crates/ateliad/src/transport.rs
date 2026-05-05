@@ -1,5 +1,6 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::rpc;
 use anyhow::{anyhow, Context, Result};
@@ -23,6 +24,7 @@ use tokio::sync::{oneshot, RwLock};
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const LISTEN_ADDR_ENV: &str = "ATELIA_DAEMON_LISTEN_ADDR";
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type RpcServerState = Arc<RwLock<rpc::SecretaryRpcServer>>;
 
@@ -1274,6 +1276,37 @@ fn transport_error_response(next_state: String, reason: impl std::fmt::Display) 
     )
 }
 
+async fn request_timeout_response(
+    state: RpcServerState,
+    path: &str,
+    request_timeout: Duration,
+) -> Response {
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    make_error_response(
+        StatusCode::GATEWAY_TIMEOUT,
+        "request_timeout",
+        format!("request to {path} exceeded {request_timeout:?}"),
+        true,
+        next_state,
+    )
+}
+
+async fn with_request_timeout<F>(
+    state: RpcServerState,
+    path: String,
+    request_timeout: Duration,
+    future: F,
+) -> Response
+where
+    F: std::future::Future<Output = Response>,
+{
+    match tokio::time::timeout(request_timeout, future).await {
+        Ok(response) => response,
+        Err(_) => request_timeout_response(state, &path, request_timeout).await,
+    }
+}
+
 fn rpc_next_state(server: &rpc::SecretaryRpcServer) -> String {
     server.health(rpc::HealthRequest).daemon_status
 }
@@ -2101,490 +2134,509 @@ async fn dispatch_list_blocklist(state: RpcServerState, request: Request<Body>) 
 }
 async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Body>) -> Response {
     let method = request.method().clone();
-    let path = request.uri().path();
+    let path = request.uri().path().to_string();
 
-    match route_for_path(path) {
-        Route::Health => {
-            if method != Method::GET {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("GET"));
-                response
-            } else {
-                dispatch_health(state).await
+    with_request_timeout(state.clone(), path.clone(), REQUEST_TIMEOUT, async move {
+        match route_for_path(&path) {
+            Route::Health => {
+                if method != Method::GET {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("GET"));
+                    response
+                } else {
+                    dispatch_health(state).await
+                }
             }
-        }
-        Route::SubmitJob => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_submit_job(state, request).await
+            Route::SubmitJob => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_submit_job(state, request).await
+                }
             }
-        }
-        Route::ListJobs => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_list_jobs(state, request).await
+            Route::ListJobs => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_list_jobs(state, request).await
+                }
             }
-        }
-        Route::GetJob { job_id } => {
-            if method != Method::GET {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("GET"));
-                response
-            } else {
-                dispatch_get_job(state, job_id).await
+            Route::GetJob { job_id } => {
+                if method != Method::GET {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("GET"));
+                    response
+                } else {
+                    dispatch_get_job(state, job_id).await
+                }
             }
-        }
-        Route::ListJobEvents { job_id } => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_list_job_events(state, job_id, request).await
+            Route::ListJobEvents { job_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_list_job_events(state, job_id, request).await
+                }
             }
-        }
-        Route::CancelJob { job_id } => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_cancel_job(state, job_id, request).await
+            Route::CancelJob { job_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_cancel_job(state, job_id, request).await
+                }
             }
-        }
-        Route::ListRepositories => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_list_repositories(state, request).await
+            Route::ListRepositories => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_list_repositories(state, request).await
+                }
             }
-        }
-        Route::ListEvents => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_list_events(state, request).await
+            Route::ListEvents => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_list_events(state, request).await
+                }
             }
-        }
-        Route::ReplayEvents => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_replay_events(state, request).await
+            Route::ReplayEvents => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_replay_events(state, request).await
+                }
             }
-        }
-        Route::GetToolOutputDefaults => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_get_tool_output_defaults(state, request).await
+            Route::GetToolOutputDefaults => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_get_tool_output_defaults(state, request).await
+                }
             }
-        }
-        Route::UpdateToolOutputDefaults => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_update_tool_output_defaults(state, request).await
+            Route::UpdateToolOutputDefaults => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_update_tool_output_defaults(state, request).await
+                }
             }
-        }
-        Route::ListToolOutputSettingsHistory => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_list_tool_output_settings_history(state, request).await
+            Route::ListToolOutputSettingsHistory => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_list_tool_output_settings_history(state, request).await
+                }
             }
-        }
-        Route::InstallExtension => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_install_extension(state, request).await
+            Route::InstallExtension => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_install_extension(state, request).await
+                }
             }
-        }
-        Route::UpdateExtension => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_update_extension(state, request).await
+            Route::UpdateExtension => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_update_extension(state, request).await
+                }
             }
-        }
-        Route::ListExtensions => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_list_extensions(state, request).await
+            Route::ListExtensions => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_list_extensions(state, request).await
+                }
             }
-        }
-        Route::RenderToolOutput => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_render_tool_output(state, request).await
+            Route::RenderToolOutput => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_render_tool_output(state, request).await
+                }
             }
-        }
-        Route::ExtensionStatus { extension_id } => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_extension_status(state, extension_id, request).await
+            Route::ExtensionStatus { extension_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_extension_status(state, extension_id, request).await
+                }
             }
-        }
-        Route::RollbackExtension { extension_id } => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_rollback_extension(state, extension_id, request).await
+            Route::RollbackExtension { extension_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_rollback_extension(state, extension_id, request).await
+                }
             }
-        }
-        Route::DisableExtension { extension_id } => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_disable_extension(state, extension_id, request).await
+            Route::DisableExtension { extension_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_disable_extension(state, extension_id, request).await
+                }
             }
-        }
-        Route::EnableExtension { extension_id } => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_enable_extension(state, extension_id, request).await
+            Route::EnableExtension { extension_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_enable_extension(state, extension_id, request).await
+                }
             }
-        }
-        Route::RemoveExtension { extension_id } => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_remove_extension(state, extension_id, request).await
+            Route::RemoveExtension { extension_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_remove_extension(state, extension_id, request).await
+                }
             }
-        }
-        Route::ApplyBlocklist => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_apply_blocklist(state, request).await
+            Route::ApplyBlocklist => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_apply_blocklist(state, request).await
+                }
             }
-        }
-        Route::ListBlocklist => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_list_blocklist(state, request).await
+            Route::ListBlocklist => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_list_blocklist(state, request).await
+                }
             }
-        }
-        Route::ProjectStatus => {
-            if method != Method::POST {
-                let mut response = make_error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    format!("{} is not supported on {path}", method),
-                    false,
-                    {
-                        let rpc_server = state.read().await;
-                        rpc_next_state(&rpc_server)
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
-                response
-            } else {
-                dispatch_project_status(state, request).await
+            Route::ProjectStatus => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_project_status(state, request).await
+                }
             }
+            Route::Unsupported => make_error_response(
+                StatusCode::NOT_FOUND,
+                "unsupported_endpoint",
+                format!("{path} is not a supported endpoint"),
+                false,
+                {
+                    let rpc_server = state.read().await;
+                    rpc_next_state(&rpc_server)
+                },
+            ),
         }
-        Route::Unsupported => make_error_response(
+    })
+    .await
+}
+
+async fn fallback_route(State(state): State<RpcServerState>, request: Request<Body>) -> Response {
+    let path = request.uri().path().to_string();
+    with_request_timeout(state.clone(), path.clone(), REQUEST_TIMEOUT, async move {
+        make_error_response(
             StatusCode::NOT_FOUND,
             "unsupported_endpoint",
             format!("{path} is not a supported endpoint"),
@@ -2593,22 +2645,9 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                 let rpc_server = state.read().await;
                 rpc_next_state(&rpc_server)
             },
-        ),
-    }
-}
-
-async fn fallback_route(State(state): State<RpcServerState>, request: Request<Body>) -> Response {
-    let path = request.uri().path();
-    make_error_response(
-        StatusCode::NOT_FOUND,
-        "unsupported_endpoint",
-        format!("{path} is not a supported endpoint"),
-        false,
-        {
-            let rpc_server = state.read().await;
-            rpc_next_state(&rpc_server)
-        },
-    )
+        )
+    })
+    .await
 }
 
 pub fn build_router(rpc_server: RpcServerState) -> Router {
@@ -2935,6 +2974,36 @@ mod tests {
         assert_eq!(
             route_for_path("/v1/jobs/not-a-job-id/cancel"),
             Route::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_returns_structured_gateway_timeout_error() {
+        let state = ready_rpc_server();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            with_request_timeout(
+                state,
+                "/v1/health".to_string(),
+                Duration::from_millis(25),
+                std::future::pending::<Response>(),
+            ),
+        )
+        .await
+        .expect("timed request should complete")
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json: Value = serde_json::from_slice(&body).expect("timeout response json");
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["error"]["code"], "request_timeout");
+        assert_eq!(json["error"]["recoverable"], true);
+        assert_eq!(
+            json["error"]["reason"],
+            "request to /v1/health exceeded 25ms"
         );
     }
 
