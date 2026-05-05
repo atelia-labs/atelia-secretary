@@ -47,6 +47,7 @@ pub struct EventQuery {
     pub repository_id: Option<RepositoryId>,
     pub cursor: EventCursor,
     pub subject_ids: Vec<String>,
+    pub job_ids: Vec<JobId>,
     pub min_severity: Option<EventSeverity>,
     pub page_size: Option<usize>,
     pub page_token: Option<String>,
@@ -58,6 +59,7 @@ impl Default for EventQuery {
             repository_id: None,
             cursor: EventCursor::Beginning,
             subject_ids: Vec::new(),
+            job_ids: Vec::new(),
             min_severity: None,
             page_size: None,
             page_token: None,
@@ -1167,12 +1169,23 @@ fn event_matches_query(
         .unwrap_or(true);
     let subject_matches =
         query.subject_ids.is_empty() || query.subject_ids.contains(&event.subject.subject_id);
+    let job_matches = query.job_ids.is_empty()
+        || event.refs.job_id.as_ref().map_or_else(
+            || {
+                event.subject.subject_type == EventSubjectType::Job
+                    && query
+                        .job_ids
+                        .iter()
+                        .any(|job_id| job_id.as_str() == event.subject.subject_id)
+            },
+            |job_id| query.job_ids.contains(job_id),
+        );
     let severity_matches = query
         .min_severity
         .map(|min_severity| severity_rank(event.severity) >= severity_rank(min_severity))
         .unwrap_or(true);
 
-    Ok(repository_matches && subject_matches && severity_matches)
+    Ok(repository_matches && subject_matches && job_matches && severity_matches)
 }
 
 #[cfg(test)]
@@ -4717,6 +4730,7 @@ mod tests {
                 repository_id: Some(first_repository.id),
                 cursor: EventCursor::Beginning,
                 subject_ids: vec![first_event.subject.subject_id.clone()],
+                job_ids: Vec::new(),
                 min_severity: Some(EventSeverity::Warning),
                 page_size: Some(1),
                 page_token: None,
@@ -4748,6 +4762,77 @@ mod tests {
                 cursor: EventCursor::Beginning,
                 page_size: Some(10),
                 ..EventQuery::default()
+            })
+            .unwrap();
+
+        assert!(page.events.contains(&event));
+    }
+
+    #[test]
+    fn query_job_events_filters_by_job_ref_when_subject_is_not_job() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let matching_job = job_record(repository.id.clone());
+        let other_job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let matching_job = persist_job(&store, matching_job);
+        let other_job = persist_job(&store, other_job);
+
+        let mut matching_event = job_event(repository.id.clone());
+        matching_event.subject = EventSubject::repository(&repository.id);
+        matching_event.refs.job_id = Some(matching_job.id.clone());
+        matching_event.kind = JobEventKind::Message;
+        let matching_event = store.append_job_event(matching_event).unwrap();
+
+        let mut other_event = job_event(repository.id.clone());
+        other_event.subject = EventSubject::repository(&repository.id);
+        other_event.refs.job_id = Some(other_job.id.clone());
+        other_event.kind = JobEventKind::Message;
+        store.append_job_event(other_event).unwrap();
+
+        let page = store
+            .query_job_events(EventQuery {
+                repository_id: Some(repository.id),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: vec![matching_job.id.clone()],
+                min_severity: None,
+                page_size: Some(10),
+                page_token: None,
+            })
+            .unwrap();
+
+        assert!(page.events.contains(&matching_event));
+        assert!(page
+            .events
+            .iter()
+            .all(|event| event.refs.job_id.as_ref() == Some(&matching_job.id)));
+    }
+
+    #[test]
+    fn query_job_events_filters_by_job_subject_when_job_ref_is_omitted() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+
+        let mut event = job_event(repository.id.clone());
+        event.subject = EventSubject::job(&job.id);
+        event.refs.job_id = None;
+        let event = store.append_job_event(event).unwrap();
+
+        let page = store
+            .query_job_events(EventQuery {
+                repository_id: Some(repository.id),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: vec![job.id.clone()],
+                min_severity: None,
+                page_size: Some(10),
+                page_token: None,
             })
             .unwrap();
 
