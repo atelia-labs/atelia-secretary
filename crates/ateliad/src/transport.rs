@@ -510,25 +510,34 @@ fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String>
 
     let token_path = local_auth_token_path(storage_dir);
     match std::fs::read_to_string(&token_path) {
-        Ok(token) => {
-            set_restrictive_permissions(&token_path)?;
-            if token.len() != 64 || !token.chars().all(|ch| ch.is_ascii_hexdigit()) {
-                Err(anyhow!(
-                    "session token file {token_path:?} must contain exactly 64 hexadecimal characters; delete it and restart to regenerate"
-                ))
-            } else {
-                Ok(token)
-            }
-        }
+        Ok(token) => validate_and_restrict_session_token(&token_path, token),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let token = generate_session_token()?;
-            write_session_token(&token_path, token.as_bytes())?;
-            set_restrictive_permissions(&token_path)?;
-            Ok(token)
+            write_or_reuse_session_token(&token_path, token)
         }
         Err(error) => {
             Err(error).with_context(|| format!("failed to read session token file {token_path:?}"))
         }
+    }
+}
+
+fn read_and_validate_session_token(token_path: &std::path::Path) -> Result<String> {
+    let token = std::fs::read_to_string(token_path)
+        .with_context(|| format!("failed to read session token file {token_path:?}"))?;
+    validate_and_restrict_session_token(token_path, token)
+}
+
+fn validate_and_restrict_session_token(
+    token_path: &std::path::Path,
+    token: String,
+) -> Result<String> {
+    set_restrictive_permissions(token_path)?;
+    if token.len() != 64 || !token.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Err(anyhow!(
+            "session token file {token_path:?} must contain exactly 64 hexadecimal characters; delete it and restart to regenerate"
+        ))
+    } else {
+        Ok(token)
     }
 }
 
@@ -537,6 +546,27 @@ fn write_session_token(token_path: &std::path::Path, token: &[u8]) -> Result<()>
     use std::io::Write;
     file.write_all(token)
         .with_context(|| format!("failed to write session token file {token_path:?}"))
+}
+
+fn write_or_reuse_session_token(token_path: &std::path::Path, token: String) -> Result<String> {
+    match write_session_token(token_path, token.as_bytes()) {
+        Ok(()) => {
+            set_restrictive_permissions(token_path)?;
+            Ok(token)
+        }
+        Err(error) if is_already_exists_error(&error) => {
+            read_and_validate_session_token(token_path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_already_exists_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+    })
 }
 
 #[cfg(unix)]
@@ -3610,6 +3640,43 @@ mod tests {
 
         let resolved_again = resolve_local_auth(&storage_dir).expect("resolve local auth again");
         assert_eq!(resolved_again, LocalAuthConfig::BearerToken { token });
+    }
+
+    #[test]
+    fn local_auth_write_or_reuse_session_token_recovers_from_already_exists() {
+        let storage_dir = test_repo_dir("local-auth-already-exists");
+        let token_path = local_auth_token_path(&storage_dir);
+        let existing_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        fs::write(&token_path, existing_token).expect("seed session token");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&token_path)
+                .expect("seed token metadata")
+                .permissions();
+            permissions.set_mode(0o644);
+            fs::set_permissions(&token_path, permissions).expect("seed token permissions");
+        }
+
+        let recovered = write_or_reuse_session_token(&token_path, "f".repeat(64))
+            .expect("recover existing session token");
+
+        assert_eq!(recovered, existing_token);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(&token_path)
+                .expect("session token metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]
