@@ -53,12 +53,13 @@ jobs:
 
           docker run --detach --name atelia-secretary-beta-gate \
             --env ATELIA_DAEMON_LISTEN_ADDR=0.0.0.0:8080 \
-            --publish 127.0.0.1:18080:8080 \
+            --publish 127.0.0.1::8080 \
             atelia-secretary-beta-gate
+          host_port="$(docker port atelia-secretary-beta-gate 8080/tcp | sed -n 's/.*://p' | head -n1)"
           sleep 2
           healthy=0
           for attempt in $(seq 1 20); do
-            if curl --fail --silent --show-error http://127.0.0.1:18080/v1/health >/dev/null; then
+            if curl --fail --silent --show-error "http://127.0.0.1:${host_port}/v1/health" >/dev/null; then
               healthy=1
               break
             fi
