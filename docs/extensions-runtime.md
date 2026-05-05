@@ -125,10 +125,10 @@ Initial backend enforcement lives in `atelia-core::extensions` as
 first slice accepts backend `wasm-rust` / `wasm` manifests, explicit
 local-development process manifests, per-version provenance digests, blocklist
 checks, rollback pointers, and brokered service-call authorization. It does not
-execute WASM yet. In this beta slice, extension install, status, and blocklist
-management are available to operator-facing clients; execution-oriented
-requests are intentionally unavailable and return structured
-unsupported-capability errors instead of silently pretending to run.
+execute WASM yet. In this beta slice, extension management APIs are available
+to operator-facing clients; execution-oriented requests are intentionally
+unavailable and return structured unsupported-capability errors instead of
+silently pretending to run.
 
 The initial implementation also reserves concrete id boundaries:
 
@@ -418,8 +418,8 @@ Block reasons:
 - `user_blocked`
 - `registry_removed`
 
-Checks run at install, update, startup, and before execution. Running jobs are
-cancelled or quarantined.
+Checks run at install, update, startup, and before any future execution
+surface. Running jobs are cancelled or quarantined.
 
 ## Audit Events
 
@@ -434,7 +434,7 @@ Minimum events:
 - capability grant
 - hook creation / change
 - webhook receipt
-- extension execution start / end
+- future extension execution start / end, once execution is enabled
 - policy decision
 - secret access
 - repo mutation

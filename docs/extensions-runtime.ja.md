@@ -352,7 +352,7 @@ block reasons:
 - `user_blocked`
 - `registry_removed`
 
-blocklist check は install、update、startup、execution 前に行います。実行中 job は cancel または quarantine します。
+blocklist check は install、update、startup、future の execution surface 前に行います。実行中 job は cancel または quarantine します。
 
 ## Audit Events
 
@@ -367,7 +367,7 @@ minimum events:
 - capability grant
 - hook creation / change
 - webhook receipt
-- extension execution start / end
+- future extension execution start / end (execution が有効化された後)
 - policy decision
 - secret access
 - repo mutation
