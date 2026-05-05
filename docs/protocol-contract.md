@@ -70,9 +70,13 @@ Required RPC groups:
 | `CheckPolicy` | Preview policy outcome for a requested action |
 | `RenderToolOutput` | Render canonical tool result as TOON, JSON, or text |
 | `InstallExtension` | Install or update an extension manifest |
+| `UpdateExtension` | Update an installed extension manifest |
 | `ExtensionStatus` | Inspect one extension installation and blocklist state |
 | `ListExtensions` | List installed extension statuses |
 | `RollbackExtension` | Restore the previous version of an extension |
+| `DisableExtension` | Disable an installed extension |
+| `EnableExtension` | Enable a disabled extension |
+| `RemoveExtension` | Remove an installed extension |
 | `ApplyBlocklist` | Add a blocklist entry |
 | `ListBlocklist` | Inspect the current blocklist |
 
