@@ -1170,11 +1170,16 @@ fn event_matches_query(
     let subject_matches =
         query.subject_ids.is_empty() || query.subject_ids.contains(&event.subject.subject_id);
     let job_matches = query.job_ids.is_empty()
-        || event
-            .refs
-            .job_id
-            .as_ref()
-            .is_some_and(|job_id| query.job_ids.contains(job_id));
+        || event.refs.job_id.as_ref().map_or_else(
+            || {
+                event.subject.subject_type == EventSubjectType::Job
+                    && query
+                        .job_ids
+                        .iter()
+                        .any(|job_id| job_id.as_str() == event.subject.subject_id)
+            },
+            |job_id| query.job_ids.contains(job_id),
+        );
     let severity_matches = query
         .min_severity
         .map(|min_severity| severity_rank(event.severity) >= severity_rank(min_severity))
@@ -4803,6 +4808,35 @@ mod tests {
             .events
             .iter()
             .all(|event| event.refs.job_id.as_ref() == Some(&matching_job.id)));
+    }
+
+    #[test]
+    fn query_job_events_filters_by_job_subject_when_job_ref_is_omitted() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        let job = persist_job(&store, job);
+
+        let mut event = job_event(repository.id.clone());
+        event.subject = EventSubject::job(&job.id);
+        event.refs.job_id = None;
+        let event = store.append_job_event(event).unwrap();
+
+        let page = store
+            .query_job_events(EventQuery {
+                repository_id: Some(repository.id),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: vec![job.id.clone()],
+                min_severity: None,
+                page_size: Some(10),
+                page_token: None,
+            })
+            .unwrap();
+
+        assert!(page.events.contains(&event));
     }
 
     #[test]
