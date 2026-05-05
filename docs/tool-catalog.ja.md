@@ -2,7 +2,7 @@
 
 この文書は、Atelia Secretary が built-in として expose する小さな tool surface を整理します。便利な integration は extension に寄せます。
 
-[Tool Definition Schema](tool-definition-schema.ja.md)、[Tool Output Schema](tool-output-schema.ja.md)、[Extensions Runtime](extensions-runtime.ja.md)、Atelia の [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.ja.md)、[Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.ja.md) も参照します。Agent Repertoire は agent が現在の context で見られる live tool surface の computed projection です。
+[Tool Definition Schema](tool-definition-schema.ja.md)、[Tool Output Schema](tool-output-schema.ja.md)、[Extensions Runtime](extensions-runtime.ja.md)、Atelia の [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.ja.md)、[Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.ja.md) も参照します。Agent Repertoire は現在の context にある live tool surface の computed projection です。
 
 Secretary core は general harness を提供します。filesystem、shell、search、job、event、policy、extension hosting、service broker、hook intake、output rendering、agent delegation substrate が中心です。Git、GitHub、Linear、memory provider、memory strategy、notification、review agent、approval agent は extension-provided surface として扱います。
 

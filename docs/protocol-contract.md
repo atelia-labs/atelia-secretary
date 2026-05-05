@@ -82,7 +82,8 @@ Required RPC groups:
 
 `ListRepertoire` is planned as the first beta protocol slice for
 [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md).
-It will return a computed projection, not a persisted store.
+It returns the computed projection of the live tool surface in the current
+context, not a persisted store.
 
 For the beta slice, extension management APIs are operator-facing.
 Extension execution RPCs are not supported in beta. Endpoints may exist, but
