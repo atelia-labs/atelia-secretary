@@ -29,6 +29,19 @@ append log. The architecture requires these logical collections:
 | `lock_decisions` | durable repository/path mutual-exclusion decisions |
 | `schema_migrations` | applied storage migrations |
 
+## Beta Durable Snapshot
+
+The current beta implementation uses an atomic JSON snapshot at
+`<ATELIA_DAEMON_STORAGE_DIR>/ledger.json` for restartable Secretary state.
+Each successful ledger mutation rewrites that snapshot after validation.
+
+Snapshot startup is strict:
+
+- malformed JSON fails startup;
+- unsupported snapshot schema versions fail startup;
+- referentially inconsistent records fail startup;
+- the daemon does not guess or auto-heal corrupted durable state.
+
 ## Record Requirements
 
 Every record includes:
@@ -50,11 +63,11 @@ Backends must provide one of these minimal storage primitives:
 
 The first lifecycle boundary persists `job: queued` and the initial `job_event`
 in one atomic commit. A `policy_decision` must be durably committed before any
-`tool_invocation`, `tool_result`, or audit effect record can be created. On
-restart, the daemon uses these durable boundaries to recover deterministically:
-if `policy_decision` is missing, re-run policy evaluation; if a
-`tool_invocation` exists without a `tool_result`, mark it for retry or cleanup
-before accepting new work for that job.
+`tool_invocation`, `tool_result`, or audit effect record can be created.
+The beta JSON snapshot loader validates these references at startup and fails
+closed if a snapshot contains an incomplete or inconsistent workflow. Automatic
+policy re-evaluation and tool retry / cleanup reconciliation are reserved for a
+future WAL or database-backed store.
 
 The current beta in-memory state is process-local only. It is bounded by the
 daemon lifetime, is not recovered from the ledger after restart, and is reset

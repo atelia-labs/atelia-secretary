@@ -7,13 +7,18 @@ use crate::domain::{
     RepositoryRecord, SchemaMigrationId, SchemaMigrationRecord, ToolInvocation, ToolInvocationId,
     ToolResult, ToolResultId, MIGRATION_LOCK_RECORD_NAME,
 };
-use std::collections::{BTreeMap, HashMap};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::hash::Hash;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+const DURABLE_STORE_SCHEMA_VERSION: u32 = 1;
+const DURABLE_STORE_FILE_NAME: &str = "ledger.json";
 
 /// Cursor used by clients to replay the ordered job-event ledger.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -235,9 +240,11 @@ pub trait SecretaryStore: Send + Sync + 'static {
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryStore {
     inner: Arc<Mutex<InMemoryInner>>,
+    durable_snapshot_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct InMemoryInner {
     repositories: HashMap<RepositoryId, RepositoryRecord>,
     jobs: HashMap<JobId, JobRecord>,
@@ -257,11 +264,47 @@ impl InMemoryStore {
         Self::default()
     }
 
+    pub fn with_durable_storage_dir(storage_dir: impl Into<PathBuf>) -> StoreResult<Self> {
+        let storage_dir = storage_dir.into();
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        Self::with_durable_snapshot_path(snapshot_path)
+    }
+
+    pub fn with_durable_snapshot_path(snapshot_path: impl Into<PathBuf>) -> StoreResult<Self> {
+        let snapshot_path = snapshot_path.into();
+        let inner = if snapshot_path.exists() {
+            load_durable_snapshot(&snapshot_path)?
+        } else {
+            InMemoryInner::default()
+        };
+
+        validate_loaded_store(&inner)?;
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+            durable_snapshot_path: Some(snapshot_path),
+        })
+    }
+
     fn lock(&self) -> StoreResult<MutexGuard<'_, InMemoryInner>> {
         self.inner.lock().map_err(|_| StoreError::Conflict {
             collection: "store",
             reason: "in-memory store lock was poisoned".to_string(),
         })
+    }
+
+    fn mutate<R>(
+        &self,
+        mutator: impl FnOnce(&mut InMemoryInner) -> StoreResult<R>,
+    ) -> StoreResult<R> {
+        let mut guard = self.lock()?;
+        let mut draft = guard.clone();
+        let result = mutator(&mut draft)?;
+        if let Some(snapshot_path) = &self.durable_snapshot_path {
+            persist_durable_snapshot(snapshot_path, &draft)?;
+        }
+        *guard = draft;
+        Ok(result)
     }
 
     pub fn latest_job_event_for_repository(
@@ -276,23 +319,24 @@ impl InMemoryStore {
 impl SecretaryStore for InMemoryStore {
     fn create_repository(&self, record: RepositoryRecord) -> StoreResult<()> {
         validate_repository_record(&record)?;
-        let mut inner = self.lock()?;
-        if inner
-            .repositories
-            .values()
-            .any(|repository| repository.root_path == record.root_path)
-        {
-            return Err(StoreError::DuplicateId {
-                collection: "repositories",
-                id: format!("root_path {}", record.root_path),
-            });
-        }
-        insert_record(
-            &mut inner.repositories,
-            record.id.clone(),
-            record,
-            "repositories",
-        )
+        self.mutate(|inner| {
+            if inner
+                .repositories
+                .values()
+                .any(|repository| repository.root_path == record.root_path)
+            {
+                return Err(StoreError::DuplicateId {
+                    collection: "repositories",
+                    id: format!("root_path {}", record.root_path),
+                });
+            }
+            insert_record(
+                &mut inner.repositories,
+                record.id.clone(),
+                record,
+                "repositories",
+            )
+        })
     }
 
     fn list_repositories(&self) -> StoreResult<Vec<RepositoryRecord>> {
@@ -308,33 +352,34 @@ impl SecretaryStore for InMemoryStore {
         mut record: JobRecord,
         mut initial_event: JobEvent,
     ) -> StoreResult<JobEvent> {
-        let mut inner = self.lock()?;
-        validate_job_refs(&inner, &record)?;
-        if inner.jobs.contains_key(&record.id) {
-            return Err(StoreError::DuplicateId {
-                collection: "jobs",
-                id: id_debug(&record.id),
-            });
-        }
-        validate_initial_event_for_job(&record, &initial_event)?;
-        validate_new_job_event(&inner, &initial_event, Some(&record))?;
+        self.mutate(|inner| {
+            validate_job_refs(inner, &record)?;
+            if inner.jobs.contains_key(&record.id) {
+                return Err(StoreError::DuplicateId {
+                    collection: "jobs",
+                    id: id_debug(&record.id),
+                });
+            }
+            validate_initial_event_for_job(&record, &initial_event)?;
+            validate_new_job_event(inner, &initial_event, Some(&record))?;
 
-        let next_sequence = inner
-            .next_event_sequence
-            .checked_add(1)
-            .ok_or(StoreError::SequenceOverflow)?;
-        inner.next_event_sequence = next_sequence;
-        initial_event.sequence_number = next_sequence;
-        record.latest_event_id = Some(initial_event.id.clone());
+            let next_sequence = inner
+                .next_event_sequence
+                .checked_add(1)
+                .ok_or(StoreError::SequenceOverflow)?;
+            inner.next_event_sequence = next_sequence;
+            initial_event.sequence_number = next_sequence;
+            record.latest_event_id = Some(initial_event.id.clone());
 
-        inner.jobs.insert(record.id.clone(), record);
-        inner
-            .job_events_by_sequence
-            .insert(initial_event.sequence_number, initial_event.id.clone());
-        inner
-            .job_events_by_id
-            .insert(initial_event.id.clone(), initial_event.clone());
-        Ok(initial_event)
+            inner.jobs.insert(record.id.clone(), record);
+            inner
+                .job_events_by_sequence
+                .insert(initial_event.sequence_number, initial_event.id.clone());
+            inner
+                .job_events_by_id
+                .insert(initial_event.id.clone(), initial_event.clone());
+            Ok(initial_event)
+        })
     }
 
     fn list_jobs(&self) -> StoreResult<Vec<JobRecord>> {
@@ -429,11 +474,11 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn append_job_event(&self, mut event: JobEvent) -> StoreResult<JobEvent> {
-        let mut inner = self.lock()?;
-        validate_new_job_event(&inner, &event, None)?;
-
-        append_event_locked(&mut inner, &mut event)?;
-        Ok(event)
+        self.mutate(|inner| {
+            validate_new_job_event(inner, &event, None)?;
+            append_event_locked(inner, &mut event)?;
+            Ok(event)
+        })
     }
 
     fn append_job_event_and_update_job(
@@ -441,15 +486,16 @@ impl SecretaryStore for InMemoryStore {
         mut record: JobRecord,
         mut event: JobEvent,
     ) -> StoreResult<JobEvent> {
-        let mut inner = self.lock()?;
-        validate_job_update(&inner, &record, &event)?;
-        validate_new_job_event(&inner, &event, None)?;
+        self.mutate(|inner| {
+            validate_job_update(inner, &record, &event)?;
+            validate_new_job_event(inner, &event, None)?;
 
-        append_event_locked(&mut inner, &mut event)?;
-        record.latest_event_id = Some(event.id.clone());
-        inner.jobs.insert(record.id.clone(), record);
+            append_event_locked(inner, &mut event)?;
+            record.latest_event_id = Some(event.id.clone());
+            inner.jobs.insert(record.id.clone(), record);
 
-        Ok(event)
+            Ok(event)
+        })
     }
 
     fn append_job_events_and_update_job(
@@ -459,30 +505,30 @@ impl SecretaryStore for InMemoryStore {
         mut final_record: JobRecord,
         mut final_event: JobEvent,
     ) -> StoreResult<(JobEvent, JobEvent)> {
-        let mut inner = self.lock()?;
+        self.mutate(|inner| {
+            validate_sibling_event_ids_are_unique(&first_event, &final_event)?;
+            validate_two_stage_job_update_identity(
+                &first_record,
+                &first_event,
+                &final_record,
+                &final_event,
+            )?;
+            validate_job_update(inner, &first_record, &first_event)?;
+            validate_new_job_event(inner, &first_event, None)?;
 
-        validate_sibling_event_ids_are_unique(&first_event, &final_event)?;
-        validate_two_stage_job_update_identity(
-            &first_record,
-            &first_event,
-            &final_record,
-            &final_event,
-        )?;
-        validate_job_update(&inner, &first_record, &first_event)?;
-        validate_new_job_event(&inner, &first_event, None)?;
+            let mut intermediate_record = first_record;
+            intermediate_record.latest_event_id = Some(first_event.id.clone());
+            validate_job_update_against(&intermediate_record, &final_record, &final_event)?;
+            validate_new_job_event(inner, &final_event, None)?;
+            ensure_event_sequence_capacity(inner, 2)?;
 
-        let mut intermediate_record = first_record;
-        intermediate_record.latest_event_id = Some(first_event.id.clone());
-        validate_job_update_against(&intermediate_record, &final_record, &final_event)?;
-        validate_new_job_event(&inner, &final_event, None)?;
-        ensure_event_sequence_capacity(&inner, 2)?;
+            append_event_locked(inner, &mut first_event)?;
+            append_event_locked(inner, &mut final_event)?;
+            final_record.latest_event_id = Some(final_event.id.clone());
+            inner.jobs.insert(final_record.id.clone(), final_record);
 
-        append_event_locked(&mut inner, &mut first_event)?;
-        append_event_locked(&mut inner, &mut final_event)?;
-        final_record.latest_event_id = Some(final_event.id.clone());
-        inner.jobs.insert(final_record.id.clone(), final_record);
-
-        Ok((first_event, final_event))
+            Ok((first_event, final_event))
+        })
     }
 
     fn replay_job_events(
@@ -561,19 +607,20 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn create_policy_decision(&self, record: PolicyDecision) -> StoreResult<()> {
-        let mut inner = self.lock()?;
-        ensure_ref_exists(
-            inner.repositories.contains_key(&record.repository_id),
-            "repositories",
-            &record.repository_id,
-            "policy_decision.repository_id",
-        )?;
-        insert_record(
-            &mut inner.policy_decisions,
-            record.id.clone(),
-            record,
-            "policy_decisions",
-        )
+        self.mutate(|inner| {
+            ensure_ref_exists(
+                inner.repositories.contains_key(&record.repository_id),
+                "repositories",
+                &record.repository_id,
+                "policy_decision.repository_id",
+            )?;
+            insert_record(
+                &mut inner.policy_decisions,
+                record.id.clone(),
+                record,
+                "policy_decisions",
+            )
+        })
     }
 
     fn list_policy_decisions(&self) -> StoreResult<Vec<PolicyDecision>> {
@@ -585,63 +632,64 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn create_lock_decision(&self, record: LockDecision) -> StoreResult<()> {
-        let mut inner = self.lock()?;
-        if inner.lock_decisions.contains_key(&record.id) {
-            return Err(StoreError::DuplicateId {
-                collection: "lock_decisions",
-                id: id_debug(&record.id),
-            });
-        }
-        validate_lock_decision_timing(&record)?;
-        if !inner.repositories.contains_key(&record.repository_id) {
-            return Err(StoreError::NotFound {
-                collection: "repositories",
-                id: id_debug(&record.repository_id),
-            });
-        }
-        let policy_decision = inner
-            .policy_decisions
-            .get(&record.policy_decision_id)
-            .ok_or_else(|| StoreError::NotFound {
-                collection: "policy_decisions",
-                id: id_debug(&record.policy_decision_id),
-            })?;
-        ensure_same_repository(
-            "lock_decisions",
-            "lock_decision.policy_decision_id",
-            &record.repository_id,
-            &policy_decision.repository_id,
-        )?;
-        if let LockOwner::Job(job_id) = &record.owner {
-            let job = inner.jobs.get(job_id).ok_or_else(|| StoreError::NotFound {
-                collection: "jobs",
-                id: format!("{} (lock_decision.owner)", id_debug(job_id)),
-            })?;
-            ensure_same_repository(
-                "lock_decisions",
-                "lock_decision.owner",
-                &record.repository_id,
-                &job.repository_id,
-            )?;
-        }
-        if is_active_lock_status(&record.status) {
-            let conflicting_lock = inner.lock_decisions.values().find(|existing| {
-                is_active_lock_status(&existing.status)
-                    && existing.repository_id == record.repository_id
-                    && existing.locked_scope == record.locked_scope
-            });
-            if let Some(existing) = conflicting_lock {
-                return Err(StoreError::Conflict {
+        self.mutate(|inner| {
+            if inner.lock_decisions.contains_key(&record.id) {
+                return Err(StoreError::DuplicateId {
                     collection: "lock_decisions",
-                    reason: format!(
-                        "active lock {} already covers repository/scope",
-                        id_debug(&existing.id)
-                    ),
+                    id: id_debug(&record.id),
                 });
             }
-        }
-        inner.lock_decisions.insert(record.id.clone(), record);
-        Ok(())
+            validate_lock_decision_timing(&record)?;
+            if !inner.repositories.contains_key(&record.repository_id) {
+                return Err(StoreError::NotFound {
+                    collection: "repositories",
+                    id: id_debug(&record.repository_id),
+                });
+            }
+            let policy_decision = inner
+                .policy_decisions
+                .get(&record.policy_decision_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "policy_decisions",
+                    id: id_debug(&record.policy_decision_id),
+                })?;
+            ensure_same_repository(
+                "lock_decisions",
+                "lock_decision.policy_decision_id",
+                &record.repository_id,
+                &policy_decision.repository_id,
+            )?;
+            if let LockOwner::Job(job_id) = &record.owner {
+                let job = inner.jobs.get(job_id).ok_or_else(|| StoreError::NotFound {
+                    collection: "jobs",
+                    id: format!("{} (lock_decision.owner)", id_debug(job_id)),
+                })?;
+                ensure_same_repository(
+                    "lock_decisions",
+                    "lock_decision.owner",
+                    &record.repository_id,
+                    &job.repository_id,
+                )?;
+            }
+            if is_active_lock_status(&record.status) {
+                let conflicting_lock = inner.lock_decisions.values().find(|existing| {
+                    is_active_lock_status(&existing.status)
+                        && existing.repository_id == record.repository_id
+                        && existing.locked_scope == record.locked_scope
+                });
+                if let Some(existing) = conflicting_lock {
+                    return Err(StoreError::Conflict {
+                        collection: "lock_decisions",
+                        reason: format!(
+                            "active lock {} already covers repository/scope",
+                            id_debug(&existing.id)
+                        ),
+                    });
+                }
+            }
+            inner.lock_decisions.insert(record.id.clone(), record);
+            Ok(())
+        })
     }
 
     fn list_lock_decisions(&self) -> StoreResult<Vec<LockDecision>> {
@@ -659,35 +707,36 @@ impl SecretaryStore for InMemoryStore {
             .as_ref()
             .map(|lock| lock.locked_at)
             .unwrap_or(record.updated_at);
-        let mut inner = self.lock()?;
-        expire_schema_migration_locks(&mut inner, &write_at)?;
+        self.mutate(|inner| {
+            expire_schema_migration_locks(inner, &write_at)?;
 
-        if let Some(active_lock) = active_migration_lock(&inner, &write_at) {
-            if record.is_migration_lock() {
-                return Err(StoreError::Conflict {
-                    collection: "schema_migrations",
-                    reason: schema_migration_lock_conflict_reason(active_lock),
-                });
-            }
+            if let Some(active_lock) = active_migration_lock(inner, &write_at) {
+                if record.is_migration_lock() {
+                    return Err(StoreError::Conflict {
+                        collection: "schema_migrations",
+                        reason: schema_migration_lock_conflict_reason(active_lock),
+                    });
+                }
 
-            let active_leader_id = active_lock
-                .migration_lock
-                .as_ref()
-                .map(|lock| lock.leader_id.as_str())
-                .unwrap_or("<unknown>");
-            if record.leader_id.as_deref() != Some(active_leader_id) {
-                return Err(StoreError::Conflict {
-                    collection: "schema_migrations",
-                    reason: schema_migration_lock_conflict_reason(active_lock),
-                });
+                let active_leader_id = active_lock
+                    .migration_lock
+                    .as_ref()
+                    .map(|lock| lock.leader_id.as_str())
+                    .unwrap_or("<unknown>");
+                if record.leader_id.as_deref() != Some(active_leader_id) {
+                    return Err(StoreError::Conflict {
+                        collection: "schema_migrations",
+                        reason: schema_migration_lock_conflict_reason(active_lock),
+                    });
+                }
             }
-        }
-        insert_record(
-            &mut inner.schema_migrations,
-            record.id.clone(),
-            record,
-            "schema_migrations",
-        )
+            insert_record(
+                &mut inner.schema_migrations,
+                record.id.clone(),
+                record,
+                "schema_migrations",
+            )
+        })
     }
 
     fn acquire_schema_migration_lock(
@@ -710,35 +759,41 @@ impl SecretaryStore for InMemoryStore {
             });
         }
 
-        let mut inner = self.lock()?;
-        expire_schema_migration_locks(&mut inner, &locked_at)?;
+        self.mutate(|inner| {
+            expire_schema_migration_locks(inner, &locked_at)?;
 
-        if let Some(active_lock) = active_migration_lock(&inner, &locked_at) {
-            return Err(StoreError::Conflict {
-                collection: "schema_migrations",
-                reason: schema_migration_lock_conflict_reason(active_lock),
-            });
-        }
+            if let Some(active_lock) = active_migration_lock(inner, &locked_at) {
+                return Err(StoreError::Conflict {
+                    collection: "schema_migrations",
+                    reason: schema_migration_lock_conflict_reason(active_lock),
+                });
+            }
 
-        let record =
-            SchemaMigrationRecord::new_migration_lock(leader_id, locked_at, safe, timeout_millis)
-                .expect("timeout_millis validated above");
-        insert_record(
-            &mut inner.schema_migrations,
-            record.id.clone(),
-            record.clone(),
-            "schema_migrations",
-        )?;
-        Ok(record)
+            let record = SchemaMigrationRecord::new_migration_lock(
+                leader_id,
+                locked_at,
+                safe,
+                timeout_millis,
+            )
+            .expect("timeout_millis validated above");
+            insert_record(
+                &mut inner.schema_migrations,
+                record.id.clone(),
+                record.clone(),
+                "schema_migrations",
+            )?;
+            Ok(record)
+        })
     }
 
     fn get_schema_migration_lock(
         &self,
         now: LedgerTimestamp,
     ) -> StoreResult<Option<SchemaMigrationRecord>> {
-        let mut inner = self.lock()?;
-        expire_schema_migration_locks(&mut inner, &now)?;
-        Ok(most_recent_schema_migration_lock_record(&inner.schema_migrations).cloned())
+        self.mutate(|inner| {
+            expire_schema_migration_locks(inner, &now)?;
+            Ok(most_recent_schema_migration_lock_record(&inner.schema_migrations).cloned())
+        })
     }
 
     fn release_schema_migration_lock(
@@ -747,54 +802,55 @@ impl SecretaryStore for InMemoryStore {
         leader_id: &str,
         released_at: LedgerTimestamp,
     ) -> StoreResult<SchemaMigrationRecord> {
-        let mut inner = self.lock()?;
-        expire_schema_migration_locks(&mut inner, &released_at)?;
+        self.mutate(|inner| {
+            expire_schema_migration_locks(inner, &released_at)?;
 
-        let lock = inner
-            .schema_migrations
-            .get_mut(id)
-            .ok_or_else(|| StoreError::NotFound {
-                collection: "schema_migrations",
-                id: id_debug(id),
-            })?;
+            let lock = inner
+                .schema_migrations
+                .get_mut(id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "schema_migrations",
+                    id: id_debug(id),
+                })?;
 
-        if !is_schema_migration_lock(lock) {
-            return Err(StoreError::InvalidRecord {
-                collection: "schema_migrations",
-                reason: format!("{} is not a migration lock", id_debug(id)),
-            });
-        }
+            if !is_schema_migration_lock(lock) {
+                return Err(StoreError::InvalidRecord {
+                    collection: "schema_migrations",
+                    reason: format!("{} is not a migration lock", id_debug(id)),
+                });
+            }
 
-        let lock_record = lock.migration_lock.as_ref().unwrap();
-        if lock_record.leader_id != leader_id {
-            return Err(StoreError::Conflict {
-                collection: "schema_migrations",
-                reason: "migration lock leader_id mismatch".to_string(),
-            });
-        }
-        if lock_record.status == MigrationLockStatus::Released {
-            return Ok(lock.clone());
-        }
-        if lock_record.status == MigrationLockStatus::Expired {
-            return Err(StoreError::Conflict {
-                collection: "schema_migrations",
-                reason: "migration lock is already expired".to_string(),
-            });
-        }
-        if released_at.unix_millis < lock_record.locked_at.unix_millis {
-            return Err(StoreError::InvalidRecord {
-                collection: "schema_migrations",
-                reason: "released_at must not be earlier than locked_at".to_string(),
-            });
-        }
+            let lock_record = lock.migration_lock.as_ref().unwrap();
+            if lock_record.leader_id != leader_id {
+                return Err(StoreError::Conflict {
+                    collection: "schema_migrations",
+                    reason: "migration lock leader_id mismatch".to_string(),
+                });
+            }
+            if lock_record.status == MigrationLockStatus::Released {
+                return Ok(lock.clone());
+            }
+            if lock_record.status == MigrationLockStatus::Expired {
+                return Err(StoreError::Conflict {
+                    collection: "schema_migrations",
+                    reason: "migration lock is already expired".to_string(),
+                });
+            }
+            if released_at.unix_millis < lock_record.locked_at.unix_millis {
+                return Err(StoreError::InvalidRecord {
+                    collection: "schema_migrations",
+                    reason: "released_at must not be earlier than locked_at".to_string(),
+                });
+            }
 
-        debug_assert_eq!(lock_record.status, MigrationLockStatus::Held);
+            debug_assert_eq!(lock_record.status, MigrationLockStatus::Held);
 
-        let lock_record = lock.migration_lock.as_mut().unwrap();
-        lock_record.status = MigrationLockStatus::Released;
-        lock_record.released_at = Some(released_at);
-        lock.updated_at = std::cmp::max(released_at, lock.updated_at);
-        Ok(lock.clone())
+            let lock_record = lock.migration_lock.as_mut().unwrap();
+            lock_record.status = MigrationLockStatus::Released;
+            lock_record.released_at = Some(released_at);
+            lock.updated_at = std::cmp::max(released_at, lock.updated_at);
+            Ok(lock.clone())
+        })
     }
 
     fn list_schema_migrations(&self) -> StoreResult<Vec<SchemaMigrationRecord>> {
@@ -813,14 +869,15 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn create_tool_invocation(&self, record: ToolInvocation) -> StoreResult<()> {
-        let mut inner = self.lock()?;
-        validate_tool_invocation_refs(&inner, &record)?;
-        insert_record(
-            &mut inner.tool_invocations,
-            record.id.clone(),
-            record,
-            "tool_invocations",
-        )
+        self.mutate(|inner| {
+            validate_tool_invocation_refs(inner, &record)?;
+            insert_record(
+                &mut inner.tool_invocations,
+                record.id.clone(),
+                record,
+                "tool_invocations",
+            )
+        })
     }
 
     fn list_tool_invocations(&self) -> StoreResult<Vec<ToolInvocation>> {
@@ -832,14 +889,15 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn create_tool_result(&self, record: ToolResult) -> StoreResult<()> {
-        let mut inner = self.lock()?;
-        validate_tool_result_refs(&inner, &record)?;
-        insert_record(
-            &mut inner.tool_results,
-            record.id.clone(),
-            record,
-            "tool_results",
-        )
+        self.mutate(|inner| {
+            validate_tool_result_refs(inner, &record)?;
+            insert_record(
+                &mut inner.tool_results,
+                record.id.clone(),
+                record,
+                "tool_results",
+            )
+        })
     }
 
     fn list_tool_results(&self) -> StoreResult<Vec<ToolResult>> {
@@ -851,14 +909,15 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn create_audit_record(&self, record: AuditRecord) -> StoreResult<()> {
-        let mut inner = self.lock()?;
-        validate_audit_record_refs(&inner, &record)?;
-        insert_record(
-            &mut inner.audit_records,
-            record.id.clone(),
-            record,
-            "audit_records",
-        )
+        self.mutate(|inner| {
+            validate_audit_record_refs(inner, &record)?;
+            insert_record(
+                &mut inner.audit_records,
+                record.id.clone(),
+                record,
+                "audit_records",
+            )
+        })
     }
 
     fn record_tool_result_and_audit_with_events(
@@ -869,64 +928,64 @@ impl SecretaryStore for InMemoryStore {
         audit_record: AuditRecord,
         mut audit_event: JobEvent,
     ) -> StoreResult<(JobEvent, JobEvent)> {
-        let mut inner = self.lock()?;
+        self.mutate(|inner| {
+            validate_sibling_event_ids_are_unique(&tool_result_event, &audit_event)?;
+            validate_job_update(inner, &record, &tool_result_event)?;
+            validate_job_update(inner, &record, &audit_event)?;
+            validate_tool_result_refs(inner, &tool_result)?;
+            validate_audit_record_refs_with_pending_tool_result(
+                inner,
+                &audit_record,
+                Some(&tool_result),
+            )?;
+            validate_new_job_event_with_pending_records(
+                inner,
+                &tool_result_event,
+                None,
+                Some(&tool_result),
+                None,
+            )?;
+            validate_new_job_event_with_pending_records(
+                inner,
+                &audit_event,
+                None,
+                Some(&tool_result),
+                Some(&audit_record),
+            )?;
+            ensure_ref_absent(
+                !inner.tool_results.contains_key(&tool_result.id),
+                "tool_results",
+                &tool_result.id,
+            )?;
+            ensure_ref_absent(
+                !inner.audit_records.contains_key(&audit_record.id),
+                "audit_records",
+                &audit_record.id,
+            )?;
+            ensure_event_sequence_capacity(inner, 2)?;
 
-        validate_sibling_event_ids_are_unique(&tool_result_event, &audit_event)?;
-        validate_job_update(&inner, &record, &tool_result_event)?;
-        validate_job_update(&inner, &record, &audit_event)?;
-        validate_tool_result_refs(&inner, &tool_result)?;
-        validate_audit_record_refs_with_pending_tool_result(
-            &inner,
-            &audit_record,
-            Some(&tool_result),
-        )?;
-        validate_new_job_event_with_pending_records(
-            &inner,
-            &tool_result_event,
-            None,
-            Some(&tool_result),
-            None,
-        )?;
-        validate_new_job_event_with_pending_records(
-            &inner,
-            &audit_event,
-            None,
-            Some(&tool_result),
-            Some(&audit_record),
-        )?;
-        ensure_ref_absent(
-            !inner.tool_results.contains_key(&tool_result.id),
-            "tool_results",
-            &tool_result.id,
-        )?;
-        ensure_ref_absent(
-            !inner.audit_records.contains_key(&audit_record.id),
-            "audit_records",
-            &audit_record.id,
-        )?;
-        ensure_event_sequence_capacity(&inner, 2)?;
+            insert_record(
+                &mut inner.tool_results,
+                tool_result.id.clone(),
+                tool_result,
+                "tool_results",
+            )?;
+            append_event_locked(inner, &mut tool_result_event)?;
+            record.latest_event_id = Some(tool_result_event.id.clone());
+            inner.jobs.insert(record.id.clone(), record.clone());
 
-        insert_record(
-            &mut inner.tool_results,
-            tool_result.id.clone(),
-            tool_result,
-            "tool_results",
-        )?;
-        append_event_locked(&mut inner, &mut tool_result_event)?;
-        record.latest_event_id = Some(tool_result_event.id.clone());
-        inner.jobs.insert(record.id.clone(), record.clone());
+            insert_record(
+                &mut inner.audit_records,
+                audit_record.id.clone(),
+                audit_record,
+                "audit_records",
+            )?;
+            append_event_locked(inner, &mut audit_event)?;
+            record.latest_event_id = Some(audit_event.id.clone());
+            inner.jobs.insert(record.id.clone(), record);
 
-        insert_record(
-            &mut inner.audit_records,
-            audit_record.id.clone(),
-            audit_record,
-            "audit_records",
-        )?;
-        append_event_locked(&mut inner, &mut audit_event)?;
-        record.latest_event_id = Some(audit_event.id.clone());
-        inner.jobs.insert(record.id.clone(), record);
-
-        Ok((tool_result_event, audit_event))
+            Ok((tool_result_event, audit_event))
+        })
     }
 
     fn list_audit_records(&self) -> StoreResult<Vec<AuditRecord>> {
@@ -977,6 +1036,399 @@ fn most_recent_schema_migration_lock_record(
             .cmp(&right.created_at)
             .then_with(|| left.id.as_str().cmp(right.id.as_str()))
     })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DurableStoreSnapshot {
+    schema_version: u32,
+    inner: InMemoryInner,
+}
+
+fn load_durable_snapshot(path: &Path) -> StoreResult<InMemoryInner> {
+    let raw = std::fs::read_to_string(path).map_err(|error| StoreError::InvalidRecord {
+        collection: "store",
+        reason: format!(
+            "failed to read durable snapshot {}: {error}",
+            path.display()
+        ),
+    })?;
+    let snapshot: DurableStoreSnapshot =
+        serde_json::from_str(&raw).map_err(|error| StoreError::InvalidRecord {
+            collection: "store",
+            reason: format!(
+                "failed to parse durable snapshot {}: {error}",
+                path.display()
+            ),
+        })?;
+
+    if snapshot.schema_version != DURABLE_STORE_SCHEMA_VERSION {
+        return Err(StoreError::InvalidRecord {
+            collection: "store",
+            reason: format!(
+                "durable snapshot {} has unsupported schema_version {}",
+                path.display(),
+                snapshot.schema_version
+            ),
+        });
+    }
+
+    Ok(snapshot.inner)
+}
+
+fn persist_durable_snapshot(path: &Path, inner: &InMemoryInner) -> StoreResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| StoreError::Conflict {
+            collection: "store",
+            reason: format!(
+                "failed to create durable snapshot directory {}: {error}",
+                parent.display()
+            ),
+        })?;
+    }
+
+    let snapshot = DurableStoreSnapshot {
+        schema_version: DURABLE_STORE_SCHEMA_VERSION,
+        inner: inner.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|error| StoreError::Conflict {
+        collection: "store",
+        reason: format!(
+            "failed to serialize durable snapshot {}: {error}",
+            path.display()
+        ),
+    })?;
+
+    write_bytes_atomically(path, &bytes).map_err(|error| StoreError::Conflict {
+        collection: "store",
+        reason: format!(
+            "failed to write durable snapshot {}: {error}",
+            path.display()
+        ),
+    })
+}
+
+fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::fs;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("ledger.json");
+
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        WRITE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    sync_directory(parent)?;
+
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)?.sync_all()
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn validate_loaded_store(inner: &InMemoryInner) -> StoreResult<()> {
+    let mut seen_repository_roots = HashSet::new();
+    for repository in inner.repositories.values() {
+        validate_repository_record(repository)?;
+        if !seen_repository_roots.insert(repository.root_path.clone()) {
+            return Err(StoreError::InvalidRecord {
+                collection: "repositories",
+                reason: format!("duplicate root_path {}", repository.root_path),
+            });
+        }
+    }
+
+    for job in inner.jobs.values() {
+        validate_loaded_job_record(inner, job)?;
+    }
+
+    for policy_decision in inner.policy_decisions.values() {
+        ensure_ref_exists(
+            inner
+                .repositories
+                .contains_key(&policy_decision.repository_id),
+            "repositories",
+            &policy_decision.repository_id,
+            "policy_decisions.repository_id",
+        )?;
+    }
+
+    for lock_decision in inner.lock_decisions.values() {
+        validate_lock_decision_timing(lock_decision)?;
+        ensure_ref_exists(
+            inner
+                .repositories
+                .contains_key(&lock_decision.repository_id),
+            "repositories",
+            &lock_decision.repository_id,
+            "lock_decisions.repository_id",
+        )?;
+        ensure_ref_exists(
+            inner
+                .policy_decisions
+                .contains_key(&lock_decision.policy_decision_id),
+            "policy_decisions",
+            &lock_decision.policy_decision_id,
+            "lock_decisions.policy_decision_id",
+        )?;
+        if let LockOwner::Job(job_id) = &lock_decision.owner {
+            ensure_ref_exists(
+                inner.jobs.contains_key(job_id),
+                "jobs",
+                job_id,
+                "lock_decisions.owner",
+            )?;
+        }
+    }
+
+    let mut active_lock_scopes = HashSet::new();
+    for lock_decision in inner
+        .lock_decisions
+        .values()
+        .filter(|lock| is_active_lock_status(&lock.status))
+    {
+        let scope_key = (
+            lock_decision.repository_id.as_str().to_string(),
+            format!("{:?}", lock_decision.locked_scope),
+        );
+        if !active_lock_scopes.insert(scope_key) {
+            return Err(StoreError::Conflict {
+                collection: "lock_decisions",
+                reason: "multiple active lock decisions cover the same repository/scope"
+                    .to_string(),
+            });
+        }
+    }
+
+    for schema_migration in inner.schema_migrations.values() {
+        validate_schema_migration_record(schema_migration)?;
+    }
+
+    for tool_invocation in inner.tool_invocations.values() {
+        validate_tool_invocation_refs(inner, tool_invocation)?;
+    }
+
+    let mut seen_tool_result_invocations = HashSet::new();
+    for tool_result in inner.tool_results.values() {
+        validate_loaded_tool_result_record(inner, tool_result)?;
+        if !seen_tool_result_invocations.insert(tool_result.invocation_id.clone()) {
+            return Err(StoreError::Conflict {
+                collection: "tool_results",
+                reason: format!(
+                    "multiple tool_results reference invocation {}",
+                    id_debug(&tool_result.invocation_id)
+                ),
+            });
+        }
+    }
+
+    for audit_record in inner.audit_records.values() {
+        validate_audit_record_refs(inner, audit_record)?;
+    }
+
+    validate_loaded_job_event_sequence(inner)?;
+
+    Ok(())
+}
+
+fn validate_loaded_job_record(inner: &InMemoryInner, job: &JobRecord) -> StoreResult<()> {
+    ensure_ref_exists(
+        inner.repositories.contains_key(&job.repository_id),
+        "repositories",
+        &job.repository_id,
+        "jobs.repository_id",
+    )?;
+
+    if job.updated_at < job.created_at {
+        return Err(StoreError::InvalidRecord {
+            collection: "jobs",
+            reason: "updated_at must not be earlier than created_at".to_string(),
+        });
+    }
+    if let Some(started_at) = job.started_at {
+        if started_at < job.created_at {
+            return Err(StoreError::InvalidRecord {
+                collection: "jobs",
+                reason: "started_at must not be earlier than created_at".to_string(),
+            });
+        }
+    }
+    if let Some(completed_at) = job.completed_at {
+        if completed_at < job.created_at {
+            return Err(StoreError::InvalidRecord {
+                collection: "jobs",
+                reason: "completed_at must not be earlier than created_at".to_string(),
+            });
+        }
+    }
+    match job.status {
+        JobStatus::Running if job.started_at.is_none() => {
+            return Err(StoreError::InvalidRecord {
+                collection: "jobs",
+                reason: "running jobs must have started_at".to_string(),
+            });
+        }
+        status if status.is_terminal() && job.completed_at.is_none() => {
+            return Err(StoreError::InvalidRecord {
+                collection: "jobs",
+                reason: "terminal jobs must have completed_at".to_string(),
+            });
+        }
+        status if !status.is_terminal() && job.completed_at.is_some() => {
+            return Err(StoreError::InvalidRecord {
+                collection: "jobs",
+                reason: "non-terminal jobs must not have completed_at".to_string(),
+            });
+        }
+        _ => {}
+    }
+
+    if let Some(latest_event_id) = &job.latest_event_id {
+        let event =
+            inner
+                .job_events_by_id
+                .get(latest_event_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "job_events",
+                    id: format!("{} (jobs.latest_event_id)", id_debug(latest_event_id)),
+                })?;
+        if event.refs.job_id.as_ref() != Some(&job.id)
+            && event.subject.subject_id != job.id.as_str()
+        {
+            return Err(StoreError::InvalidReference {
+                collection: "jobs",
+                reason: format!(
+                    "latest_event_id {} does not point at an event for job {}",
+                    id_debug(latest_event_id),
+                    id_debug(&job.id)
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_loaded_tool_result_record(
+    inner: &InMemoryInner,
+    record: &ToolResult,
+) -> StoreResult<()> {
+    let invocation = inner
+        .tool_invocations
+        .get(&record.invocation_id)
+        .ok_or_else(|| StoreError::NotFound {
+            collection: "tool_invocations",
+            id: format!(
+                "{} (tool_result.invocation_id)",
+                id_debug(&record.invocation_id)
+            ),
+        })?;
+    if invocation.tool_id != record.tool_id {
+        return Err(StoreError::InvalidReference {
+            collection: "tool_results",
+            reason: format!(
+                "tool_result.tool_id {} does not match invocation tool_id {}",
+                record.tool_id, invocation.tool_id
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_loaded_job_event_sequence(inner: &InMemoryInner) -> StoreResult<()> {
+    let mut expected_sequence = 1u64;
+    let mut validated = inner.clone();
+    for (sequence_number, event_id) in &inner.job_events_by_sequence {
+        if *sequence_number != expected_sequence {
+            return Err(StoreError::InvalidRecord {
+                collection: "job_events",
+                reason: format!(
+                    "sequence ledger has gap: expected {}, found {}",
+                    expected_sequence, sequence_number
+                ),
+            });
+        }
+        expected_sequence = expected_sequence.saturating_add(1);
+
+        let event = inner
+            .job_events_by_id
+            .get(event_id)
+            .ok_or_else(|| StoreError::Conflict {
+                collection: "job_events",
+                reason: format!(
+                    "sequence index references missing id {}",
+                    id_debug(event_id)
+                ),
+            })?;
+        if event.sequence_number != *sequence_number {
+            return Err(StoreError::InvalidRecord {
+                collection: "job_events",
+                reason: format!(
+                    "event {} stores sequence {} but ledger index says {}",
+                    id_debug(event_id),
+                    event.sequence_number,
+                    sequence_number
+                ),
+            });
+        }
+
+        validated.job_events_by_id.remove(event_id);
+        validated.job_events_by_sequence.remove(sequence_number);
+        validate_new_job_event(&validated, event, None)?;
+    }
+
+    if expected_sequence.saturating_sub(1) != inner.next_event_sequence {
+        return Err(StoreError::InvalidRecord {
+            collection: "job_events",
+            reason: format!(
+                "next_event_sequence {} does not match retained sequence {}",
+                inner.next_event_sequence,
+                expected_sequence.saturating_sub(1)
+            ),
+        });
+    }
+
+    if inner.job_events_by_id.len() != inner.job_events_by_sequence.len() {
+        return Err(StoreError::InvalidRecord {
+            collection: "job_events",
+            reason: "sequence index and id index disagree on event count".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn active_migration_lock<'a>(
@@ -2699,9 +3151,12 @@ mod tests {
         StructuredValue, ToolResultField, ToolResultStatus,
     };
     use std::cell::Cell;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static REPOSITORY_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static DURABLE_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn timestamp(value: i64) -> LedgerTimestamp {
         LedgerTimestamp::from_unix_millis(value)
@@ -2731,6 +3186,17 @@ mod tests {
             "store test job",
             timestamp(2),
         )
+    }
+
+    fn durable_storage_dir(name: &str) -> PathBuf {
+        let counter = DURABLE_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "atelia-store-durable-{}-{counter}-{name}",
+            std::process::id(),
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn job_event(repository_id: RepositoryId) -> JobEvent {
@@ -5397,6 +5863,138 @@ mod tests {
                 collection: "audit_records",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn durable_store_round_trips_jobs_events_and_ledgers() {
+        let storage_dir = durable_storage_dir("roundtrip");
+        let store = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        let repository = repository_record();
+        let job = job_record(repository.id.clone());
+        let policy = policy_decision(repository.id.clone());
+        let lock = lock_decision(repository.id.clone(), policy.id.clone());
+
+        store.create_repository(repository.clone()).unwrap();
+        store.create_policy_decision(policy.clone()).unwrap();
+        let stored_job = persist_job(&store, job.clone());
+        let repository_event = store
+            .append_job_event(job_event(repository.id.clone()))
+            .unwrap();
+        let repository_event_id = repository_event.id.clone();
+        let tool_invocation = tool_invocation(
+            repository.id.clone(),
+            stored_job.id.clone(),
+            policy.id.clone(),
+        );
+        store
+            .create_lock_decision(lock.clone())
+            .expect("lock decision should persist");
+        store
+            .create_tool_invocation(tool_invocation.clone())
+            .expect("tool invocation should persist");
+        let tool_result = tool_result(tool_invocation.id.clone());
+        store
+            .create_tool_result(tool_result.clone())
+            .expect("tool result should persist");
+        let audit = audit_record(
+            repository.id.clone(),
+            policy.id.clone(),
+            Some(tool_invocation.id.clone()),
+        );
+        store
+            .create_audit_record(audit.clone())
+            .expect("audit record should persist");
+
+        drop(store);
+
+        let reopened = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        assert_eq!(reopened.get_repository(&repository.id).unwrap(), repository);
+        assert_eq!(reopened.get_job(&stored_job.id).unwrap(), stored_job);
+        assert_eq!(reopened.get_policy_decision(&policy.id).unwrap(), policy);
+        assert_eq!(reopened.get_lock_decision(&lock.id).unwrap(), lock);
+        assert_eq!(
+            reopened.get_tool_invocation(&tool_invocation.id).unwrap(),
+            tool_invocation
+        );
+        assert_eq!(
+            reopened.get_tool_result(&tool_result.id).unwrap(),
+            tool_result
+        );
+        assert_eq!(reopened.get_audit_record(&audit.id).unwrap(), audit);
+
+        let replayed = reopened
+            .replay_job_events(EventCursor::Beginning, None)
+            .unwrap();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0].id, stored_job.latest_event_id.clone().unwrap());
+        assert_eq!(replayed[1].id, repository_event_id.clone());
+        assert_eq!(
+            reopened
+                .latest_job_event_for_repository(&repository.id)
+                .unwrap()
+                .as_ref()
+                .map(|event| event.id.clone()),
+            Some(repository_event_id)
+        );
+    }
+
+    #[test]
+    fn durable_store_rejects_malformed_snapshot() {
+        let storage_dir = durable_storage_dir("malformed");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        fs::write(&snapshot_path, "{not-json}").unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidRecord { collection, .. } if collection == "store")
+        );
+    }
+
+    #[test]
+    fn durable_store_rejects_unsupported_snapshot_schema_version() {
+        let storage_dir = durable_storage_dir("unsupported-schema");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION + 1,
+            inner: InMemoryInner::default(),
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidRecord { collection, .. } if collection == "store")
+        );
+    }
+
+    #[test]
+    fn durable_store_rejects_referentially_inconsistent_snapshot() {
+        let storage_dir = durable_storage_dir("invalid-reference");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let mut inner = InMemoryInner::default();
+        let policy = policy_decision(RepositoryId::new());
+        inner.policy_decisions.insert(policy.id.clone(), policy);
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner,
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::NotFound {
+                collection: "repositories",
+                ..
+            }
         ));
     }
 }
