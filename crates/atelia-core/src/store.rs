@@ -444,7 +444,6 @@ impl SecretaryStore for InMemoryStore {
             .jobs
             .values()
             .filter(|job| job.repository_id == *repository_id)
-            .cloned()
             .collect::<Vec<_>>();
         recent_jobs.sort_by(|left, right| {
             right
@@ -453,12 +452,12 @@ impl SecretaryStore for InMemoryStore {
                 .then_with(|| right.id.cmp(&left.id))
         });
         recent_jobs.truncate(recent_job_limit);
+        let recent_jobs = recent_jobs.into_iter().cloned().collect();
 
         let mut recent_policy_decisions = inner
             .policy_decisions
             .values()
             .filter(|decision| decision.repository_id == *repository_id)
-            .cloned()
             .collect::<Vec<_>>();
         recent_policy_decisions.sort_by(|left, right| {
             right
@@ -467,6 +466,7 @@ impl SecretaryStore for InMemoryStore {
                 .then_with(|| right.id.cmp(&left.id))
         });
         recent_policy_decisions.truncate(recent_policy_decision_limit);
+        let recent_policy_decisions = recent_policy_decisions.into_iter().cloned().collect();
 
         let latest_event = latest_job_event_for_repository_with_inner(&inner, repository_id)?;
 
@@ -593,12 +593,13 @@ impl SecretaryStore for InMemoryStore {
                     })?;
 
                 if event_matches_query(&inner, event, &query)? {
-                    filtered.push(event.clone());
+                    filtered.push(event);
                 }
             }
         }
 
-        let (events, next_page_token) = page_records(filtered.into_iter(), start, page_size);
+        let (event_refs, next_page_token) = page_records(filtered.into_iter(), start, page_size);
+        let events = event_refs.into_iter().cloned().collect();
 
         Ok(EventPage {
             events,
