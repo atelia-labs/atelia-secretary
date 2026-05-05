@@ -6990,9 +6990,13 @@ mod tests {
         fs::rename(&path, &backup).unwrap();
         fs::write(&path, "replacement").unwrap();
 
-        let result =
-            unlink_validated_file_in_parent_dir(&parent, file_name, &expected_metadata, target.resolved_fd())
-                .unwrap_err();
+        let result = unlink_validated_file_in_parent_dir(
+            &parent,
+            file_name,
+            &expected_metadata,
+            target.resolved_fd(),
+        )
+        .unwrap_err();
         assert_eq!(io::ErrorKind::PermissionDenied, result.kind());
         assert_eq!("replacement", fs::read_to_string(&path).unwrap());
         assert_eq!("validated", fs::read_to_string(&backup).unwrap());
@@ -7012,9 +7016,13 @@ mod tests {
         let parent = open_parent_no_follow(path.parent().unwrap()).unwrap();
         let file_name = path.file_name().unwrap();
 
-        let result =
-            unlink_validated_file_in_parent_dir(&parent, file_name, &expected_metadata, target.resolved_fd())
-                .unwrap_err();
+        let result = unlink_validated_file_in_parent_dir(
+            &parent,
+            file_name,
+            &expected_metadata,
+            target.resolved_fd(),
+        )
+        .unwrap_err();
         assert_eq!(io::ErrorKind::InvalidInput, result.kind());
         assert!(result.to_string().contains("single-link"));
         assert!(env.root.join("notes.txt").exists());
