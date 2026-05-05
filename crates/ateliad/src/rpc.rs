@@ -2340,7 +2340,10 @@ mod tests {
     #[test]
     fn transport_blocker_is_explicit_while_tonic_is_absent() {
         let server = ready_server();
-        assert_eq!(server.transport_blocker(), Some(TRANSPORT_BLOCKER));
+        let blocker = server.transport_blocker().unwrap();
+        assert_eq!(blocker, TRANSPORT_BLOCKER);
+        assert!(blocker.contains("HTTP/JSON is the beta transport"));
+        assert!(blocker.contains("gRPC server generation is not shipped"));
     }
 
     #[test]
