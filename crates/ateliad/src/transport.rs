@@ -339,6 +339,7 @@ struct GetProjectStatusRequestPayload {
     repository_id: String,
 }
 
+/// Resolve the daemon listen address and whether it came from the environment.
 pub fn listen_addr() -> Result<(SocketAddr, bool)> {
     let raw_addr = std::env::var(LISTEN_ADDR_ENV)
         .ok()
@@ -350,6 +351,7 @@ pub fn listen_addr() -> Result<(SocketAddr, bool)> {
     Ok((addr, from_env))
 }
 
+/// Enforce the beta loopback-only listener boundary unless explicitly bypassed.
 pub fn validate_listen_addr(listen_addr: &SocketAddr, explicit_addr: bool) -> Result<()> {
     if is_loopback(listen_addr) {
         return Ok(());
@@ -370,10 +372,12 @@ pub fn validate_listen_addr(listen_addr: &SocketAddr, explicit_addr: bool) -> Re
     }
 }
 
+/// Return whether the socket address binds only to the local host.
 pub fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
+/// Return whether the unsafe beta escape hatch allows non-loopback binding.
 pub fn unsafe_allow_non_loopback_listen() -> bool {
     matches!(
         std::env::var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV)
