@@ -78,7 +78,7 @@ pub enum StorageStatus {
 pub struct DaemonHealth {
     pub daemon_status: DaemonStatus,
     pub storage_status: StorageStatus,
-    /// Beta-only state durability hint exposed so clients can detect restarts.
+    /// Beta-only state durability hint exposed so clients understand restart semantics.
     pub beta_state: Option<BetaStateHint>,
     pub daemon_version: String,
     pub protocol_version: String,

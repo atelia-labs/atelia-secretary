@@ -82,6 +82,11 @@ Required RPC groups:
 - protocol version
 - storage version
 - storage status: `ready`, `migrating`, `read_only`, `unavailable`
+- beta state hint:
+  - `scope`
+  - `durability`
+  - `restart_semantics`
+  - `limits`
 - capability names
 
 ### Repository
