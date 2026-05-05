@@ -1632,6 +1632,8 @@ fn validate_loaded_submit_job_receipt(
         });
     }
 
+    validate_loaded_submit_job_receipt_lineage(receipt)?;
+
     match (
         &receipt.tool_invocation,
         &receipt.tool_result,
@@ -1771,6 +1773,130 @@ fn validate_loaded_submit_job_receipt(
     }
 
     Ok(())
+}
+
+fn validate_loaded_submit_job_receipt_lineage(receipt: &RuntimeJobReceipt) -> StoreResult<()> {
+    ensure_same_repository(
+        "submit_job_idempotency",
+        "receipt.policy_decision.repository_id",
+        &receipt.job.repository_id,
+        &receipt.policy_decision.repository_id,
+    )?;
+
+    if let Some(tool_invocation) = &receipt.tool_invocation {
+        ensure_same_repository(
+            "submit_job_idempotency",
+            "receipt.tool_invocation.repository_id",
+            &receipt.job.repository_id,
+            &tool_invocation.repository_id,
+        )?;
+        if tool_invocation.job_id != receipt.job.id {
+            return Err(StoreError::InvalidReference {
+                collection: "submit_job_idempotency",
+                reason: format!(
+                    "receipt.tool_invocation {} does not belong to receipt.job {}",
+                    id_debug(&tool_invocation.id),
+                    id_debug(&receipt.job.id)
+                ),
+            });
+        }
+        if tool_invocation.policy_decision_id != receipt.policy_decision.id {
+            return Err(StoreError::InvalidReference {
+                collection: "submit_job_idempotency",
+                reason: format!(
+                    "receipt.tool_invocation {} does not belong to receipt.policy_decision {}",
+                    id_debug(&tool_invocation.id),
+                    id_debug(&receipt.policy_decision.id)
+                ),
+            });
+        }
+    }
+
+    if let Some(tool_result) = &receipt.tool_result {
+        if let Some(tool_invocation) = &receipt.tool_invocation {
+            if tool_result.invocation_id != tool_invocation.id {
+                return Err(StoreError::InvalidReference {
+                    collection: "submit_job_idempotency",
+                    reason: format!(
+                        "receipt.tool_result {} does not reference receipt.tool_invocation {}",
+                        id_debug(&tool_result.id),
+                        id_debug(&tool_invocation.id)
+                    ),
+                });
+            }
+        }
+    }
+
+    if let Some(audit_record) = &receipt.audit_record {
+        ensure_same_repository(
+            "submit_job_idempotency",
+            "receipt.audit_record.repository_id",
+            &receipt.job.repository_id,
+            &audit_record.repository_id,
+        )?;
+        if audit_record.policy_decision_id != receipt.policy_decision.id {
+            return Err(StoreError::InvalidReference {
+                collection: "submit_job_idempotency",
+                reason: format!(
+                    "receipt.audit_record {} does not belong to receipt.policy_decision {}",
+                    id_debug(&audit_record.id),
+                    id_debug(&receipt.policy_decision.id)
+                ),
+            });
+        }
+        if let Some(tool_invocation_id) = &audit_record.tool_invocation_id {
+            if let Some(tool_invocation) = &receipt.tool_invocation {
+                if tool_invocation_id != &tool_invocation.id {
+                    return Err(StoreError::InvalidReference {
+                        collection: "submit_job_idempotency",
+                        reason: format!(
+                            "receipt.audit_record {} does not reference receipt.tool_invocation {}",
+                            id_debug(&audit_record.id),
+                            id_debug(&tool_invocation.id)
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    for event in &receipt.events {
+        validate_submit_job_receipt_event_lineage(&receipt.job.id, event)?;
+    }
+
+    Ok(())
+}
+
+fn validate_submit_job_receipt_event_lineage(job_id: &JobId, event: &JobEvent) -> StoreResult<()> {
+    if let Some(event_job_id) = &event.refs.job_id {
+        if event_job_id != job_id {
+            return Err(StoreError::InvalidReference {
+                collection: "submit_job_idempotency",
+                reason: format!(
+                    "receipt.event {} belongs to job {}, not {}",
+                    id_debug(&event.id),
+                    id_debug(event_job_id),
+                    id_debug(job_id)
+                ),
+            });
+        }
+        return Ok(());
+    }
+
+    if event.subject.subject_type == EventSubjectType::Job
+        && event.subject.subject_id == job_id.as_str()
+    {
+        return Ok(());
+    }
+
+    Err(StoreError::InvalidReference {
+        collection: "submit_job_idempotency",
+        reason: format!(
+            "receipt.event {} does not belong to receipt.job {}",
+            id_debug(&event.id),
+            id_debug(job_id)
+        ),
+    })
 }
 
 fn insert_submit_job_idempotency_locked(
@@ -3639,7 +3765,8 @@ mod tests {
         StructuredValue, ToolResultField, ToolResultStatus,
     };
     use crate::policy::DefaultPolicyEngine;
-    use crate::runtime::{EchoTool, RuntimeJobRequest, SecretaryRuntime};
+    use crate::runtime::{EchoTool, RuntimeJobReceipt, RuntimeJobRequest, SecretaryRuntime};
+    use crate::tool_output::{OutputFormat, RenderedToolOutput};
     use std::cell::Cell;
     use std::fs;
     use std::path::PathBuf;
@@ -6713,6 +6840,242 @@ mod tests {
         };
         fs::write(
             storage_dir.join(DURABLE_STORE_FILE_NAME),
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidReference {
+                collection: "submit_job_idempotency",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn durable_store_rejects_submit_job_idempotency_with_cross_repository_policy_decision() {
+        let storage_dir = durable_storage_dir("idempotency-policy-repository");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let mut inner = InMemoryInner::default();
+        let repository = repository_record();
+        let other_repository = repository_record();
+        let mut job = job_record(repository.id.clone());
+        let event = initial_job_event(repository.id.clone(), &job.id);
+        let mut policy = policy_decision(repository.id.clone());
+
+        job.latest_event_id = Some(event.id.clone());
+        let mut event = event;
+        event.sequence_number = 1;
+        policy.repository_id = other_repository.id.clone();
+
+        inner
+            .repositories
+            .insert(repository.id.clone(), repository.clone());
+        inner
+            .repositories
+            .insert(other_repository.id.clone(), other_repository);
+        inner.jobs.insert(job.id.clone(), job.clone());
+        inner
+            .policy_decisions
+            .insert(policy.id.clone(), policy.clone());
+        inner
+            .job_events_by_id
+            .insert(event.id.clone(), event.clone());
+        inner.job_events_by_sequence.insert(1, event.id.clone());
+        inner.next_event_sequence = 1;
+        inner.idempotent_submit_jobs.insert(
+            "ledger-key".to_string(),
+            SubmitJobIdempotencyRecord {
+                signature: "request-signature".to_string(),
+                receipt: RuntimeJobReceipt {
+                    job,
+                    policy_decision: policy,
+                    tool_invocation: None,
+                    tool_result: None,
+                    rendered_output: None,
+                    audit_record: None,
+                    events: vec![event],
+                },
+            },
+        );
+
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner,
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidReference {
+                collection: "submit_job_idempotency",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn durable_store_rejects_submit_job_idempotency_with_foreign_tool_lineage() {
+        let storage_dir = durable_storage_dir("idempotency-tool-lineage");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let mut inner = InMemoryInner::default();
+        let repository = repository_record();
+        let other_repository = repository_record();
+
+        let mut job = job_record(repository.id.clone());
+        let event = initial_job_event(repository.id.clone(), &job.id);
+        let policy = policy_decision(repository.id.clone());
+        job.latest_event_id = Some(event.id.clone());
+        let mut event = event;
+        event.sequence_number = 1;
+
+        let other_job = job_record(other_repository.id.clone());
+        let other_policy = policy_decision(other_repository.id.clone());
+        let other_invocation = tool_invocation(
+            other_repository.id.clone(),
+            other_job.id.clone(),
+            other_policy.id.clone(),
+        );
+        let other_result = tool_result(other_invocation.id.clone());
+        let other_audit = audit_record(
+            other_repository.id.clone(),
+            other_policy.id.clone(),
+            Some(other_invocation.id.clone()),
+        );
+
+        inner.repositories.insert(repository.id.clone(), repository);
+        inner
+            .repositories
+            .insert(other_repository.id.clone(), other_repository);
+        inner.jobs.insert(job.id.clone(), job.clone());
+        inner.jobs.insert(other_job.id.clone(), other_job);
+        inner
+            .policy_decisions
+            .insert(policy.id.clone(), policy.clone());
+        inner
+            .policy_decisions
+            .insert(other_policy.id.clone(), other_policy.clone());
+        inner
+            .tool_invocations
+            .insert(other_invocation.id.clone(), other_invocation.clone());
+        inner
+            .tool_results
+            .insert(other_result.id.clone(), other_result.clone());
+        inner
+            .audit_records
+            .insert(other_audit.id.clone(), other_audit.clone());
+        inner
+            .job_events_by_id
+            .insert(event.id.clone(), event.clone());
+        inner.job_events_by_sequence.insert(1, event.id.clone());
+        inner.next_event_sequence = 1;
+        inner.idempotent_submit_jobs.insert(
+            "ledger-key".to_string(),
+            SubmitJobIdempotencyRecord {
+                signature: "request-signature".to_string(),
+                receipt: RuntimeJobReceipt {
+                    job,
+                    policy_decision: policy,
+                    tool_invocation: Some(other_invocation),
+                    tool_result: Some(other_result),
+                    rendered_output: Some(RenderedToolOutput {
+                        format: OutputFormat::Toon,
+                        schema_version: "1".to_string(),
+                        body: "ok".to_string(),
+                        fallback_reason: None,
+                        truncation: None,
+                    }),
+                    audit_record: Some(other_audit),
+                    events: vec![event],
+                },
+            },
+        );
+
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner,
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidReference {
+                collection: "submit_job_idempotency",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn durable_store_rejects_submit_job_idempotency_with_foreign_event_lineage() {
+        let storage_dir = durable_storage_dir("idempotency-event-lineage");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let mut inner = InMemoryInner::default();
+        let repository = repository_record();
+
+        let mut job = job_record(repository.id.clone());
+        let mut event = initial_job_event(repository.id.clone(), &job.id);
+        job.latest_event_id = Some(event.id.clone());
+
+        let mut other_job = job_record(repository.id.clone());
+        let mut other_event = initial_job_event(repository.id.clone(), &other_job.id);
+        other_job.latest_event_id = Some(other_event.id.clone());
+
+        let policy = policy_decision(repository.id.clone());
+
+        inner.repositories.insert(repository.id.clone(), repository);
+        inner.jobs.insert(job.id.clone(), job.clone());
+        inner.jobs.insert(other_job.id.clone(), other_job);
+        inner
+            .policy_decisions
+            .insert(policy.id.clone(), policy.clone());
+        event.sequence_number = 2;
+        other_event.sequence_number = 1;
+        inner
+            .job_events_by_id
+            .insert(event.id.clone(), event.clone());
+        inner
+            .job_events_by_id
+            .insert(other_event.id.clone(), other_event.clone());
+        inner
+            .job_events_by_sequence
+            .insert(1, other_event.id.clone());
+        inner.job_events_by_sequence.insert(2, event.id.clone());
+        inner.next_event_sequence = 2;
+        inner.idempotent_submit_jobs.insert(
+            "ledger-key".to_string(),
+            SubmitJobIdempotencyRecord {
+                signature: "request-signature".to_string(),
+                receipt: RuntimeJobReceipt {
+                    job,
+                    policy_decision: policy,
+                    tool_invocation: None,
+                    tool_result: None,
+                    rendered_output: None,
+                    audit_record: None,
+                    events: vec![other_event, event],
+                },
+            },
+        );
+
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner,
+        };
+        fs::write(
+            &snapshot_path,
             serde_json::to_vec_pretty(&snapshot).unwrap(),
         )
         .unwrap();
