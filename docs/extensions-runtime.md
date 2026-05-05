@@ -297,7 +297,7 @@ require explicit dev-mode approval and visible client labeling.
 Beta backend runtime matrix:
 
 - WASM (Rust): first-class runtime for backend extensions
-- WASM (non-Rust): reserved for reviewed cases that still fit the WASM host
+- Non-Rust WASM: reserved for reviewed cases that still fit the WASM host
   boundary
 - process: local-development only and disabled unless policy explicitly enables
   it

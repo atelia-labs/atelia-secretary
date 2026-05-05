@@ -56,6 +56,9 @@ Atelia Secretary は AEP の backend host reference implementation です。規�
 - [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.ja.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.ja.md)
 
+上記3つの AEP link は、個別 docs が `atelia` main に入るまで同じ
+[atelia PR #4](https://github.com/atelia-labs/atelia/pull/4) を指す一時リンクです。
+
 ## Release And Research
 
 - [Release Policy](release.ja.md)
