@@ -5,9 +5,16 @@
 Atelia Secretary is the Rust backend daemon that runs the always-on project
 secretary inside Atelia.
 
-Project-wide philosophy, AX principles, Custom AX extensions, Hooks, client UX,
-and governance live in the [`atelia`](https://github.com/atelia-labs/atelia) repository. This
-repository focuses on the daemon implementation that executes those contracts.
+Project-wide philosophy, AX principles, AEP / extension specifications, Hooks,
+client UX, and governance live in the
+[`atelia`](https://github.com/atelia-labs/atelia) repository. This repository
+focuses on the daemon implementation that executes those contracts.
+
+Atelia Secretary is the reference backend host for
+[AEP](https://github.com/atelia-labs/atelia/pull/4). It owns the
+Rust / WASM backend runtime boundary, manifest validation slice, permission and
+capability enforcement, brokered services, hook execution boundaries, audit,
+blocklist, install records, and rollback behavior.
 
 ## Scope
 
@@ -27,7 +34,7 @@ repository focuses on the daemon implementation that executes those contracts.
 - Atelia-wide philosophy and specifications
 - Mac / iOS client UI
 - shared Swift logic in Atelia Kit
-- normative Custom AX extension specification
+- normative AEP / extension specification
 - normative Hooks specification
 
 ## Docs
@@ -65,6 +72,9 @@ Release and research:
 Project-level docs:
 
 - [Atelia](https://github.com/atelia-labs/atelia)
+- [Atelia Extension Protocol / AEP Manifest / AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
+  is a temporary link to `atelia` PR `#4` until the individual docs land on
+  `atelia` main.
 - [AX Feedback](https://github.com/atelia-labs/atelia/blob/main/docs/ax-feedback.md)
 - [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
 - [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md)

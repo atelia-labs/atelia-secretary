@@ -3,15 +3,20 @@
 This document defines how Atelia Secretary validates, installs, executes,
 audits, and rolls back Custom Extensions.
 
-The normative extension, composition, hook, tool-output, and security contracts
-live in the [`atelia`](https://github.com/atelia-labs/atelia) repository:
+The normative AEP, extension, composition, hook, tool-output, and security
+contracts live in the [`atelia`](https://github.com/atelia-labs/atelia)
+repository:
 [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md),
 [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md),
 [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md),
 [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.md),
 and [Extension Security](https://github.com/atelia-labs/atelia/blob/main/docs/extension-security.md).
+AEP overview and manifest docs are introduced by
+[atelia PR #4](https://github.com/atelia-labs/atelia/pull/4) and should be
+linked directly after that PR lands in the `atelia` repository.
 This document defines the daemon-side enforcement that gives Secretary a
-trustworthy extension workplace.
+trustworthy extension workplace. In AEP terms, this is the backend host
+reference implementation slice.
 
 ## Extension Kinds
 
@@ -40,12 +45,15 @@ surface.
 - `presentation`: changes human/agent-facing display
 - `integration`: connects external services such as GitHub, Linear, or Slack
 
-Presentation extensions can change rendering. Errors, blocked status,
-permission use, provenance, and security warnings remain visible.
+Semantic presentation is declared by AEP packages and rendered by presentation
+hosts such as Atelia Mac and Atelia iOS. Secretary preserves the backend audit,
+permission, and provenance facts that those hosts must display.
 
 ## Manifest
 
-Secretary requires a versioned manifest.
+Secretary currently validates a backend-only compatibility slice. The public AEP
+package schema is `aep.package.v0`; this daemon slice is still
+`atelia.extension.v1` while implementation catches up.
 
 ```yaml
 schema: atelia.extension.v1
@@ -63,8 +71,8 @@ compatibility:
   atelia_protocol: ">=0.1 <0.3"
   atelia_secretary: ">=0.1 <0.2"
 entrypoints:
-  realm: backend | client
-  runtime: wasm-rust | wasm | docker | process | remote | swift-client
+  realm: backend
+  runtime: wasm-rust | wasm | process
   command: null
   image: null
   wasm: null
@@ -98,6 +106,10 @@ migration:
   from: []
   notes: null
 ```
+
+`process` is local-development only and must be explicitly enabled. Docker,
+remote runtime, and native client executable extension profiles are future or
+special-purpose AEP profiles, not this beta backend slice.
 
 These additive sections default to empty collections or null notes in the daemon
 manifest model, so older manifests can still deserialize cleanly. Validation
@@ -282,13 +294,20 @@ require explicit dev-mode approval and visible client labeling.
 
 ## Runtime And Sandbox
 
-Initial runtime matrix:
+Beta backend runtime matrix:
 
 - WASM (Rust): first-class runtime for backend extensions
-- Docker: heavy or special-purpose work that does not fit WASM
-- process: local development only
-- remote: future / explicitly permissioned
-- Swift client: client extension runtime in atelia-mac / atelia-ios
+- Non-Rust WASM: reserved for reviewed cases that still fit the WASM host
+  boundary
+- process: local-development only and disabled unless policy explicitly enables
+  it
+
+Reserved future or special-purpose AEP runtime profiles:
+
+- Docker: heavy work that does not fit WASM and requires stricter host policy
+- remote: future / explicitly permissioned runtime
+- native client executable extension: future, platform-specific, high-trust
+  profile outside the Secretary backend host
 
 Secretary-side backend extensions use Rust -> WASM as the primary target.
 Official backend extensions are written in Rust by default. Community backend
@@ -297,8 +316,8 @@ extensions initially use or strongly prefer Rust / WASM.
 Atelia does not treat arbitrary WASM as inherently safe. Rust provides a typed
 SDK and memory-safe default, while WASM provides controlled host capabilities,
 linear memory isolation, fuel / timeout limits, and auditable imports. Non-Rust
-WASM, Docker, process, and remote runtimes require stricter review, capability
-limits, provenance checks, and runtime policy.
+WASM, process, Docker, remote, and native client executable profiles require
+stricter review, capability limits, provenance checks, and runtime policy.
 
 Defaults:
 
@@ -311,28 +330,32 @@ Defaults:
 
 Missing CLIs or API keys return structured unavailable status.
 
-## Bundles
+## AEP Bundles
 
-Secretary can treat a bundle manifest as an install / update / rollback unit.
+Secretary can treat an `aep.bundle.v0` manifest as a meta install / update /
+rollback unit for multiple AEP packages. A bundle is not the mechanism for
+combining one product's backend, presentation, and resource components; those
+belong inside one multi-component AEP package.
 
 Bundle records include:
 
 - bundle id / version
-- included extension ids
-- required / optional status
-- approved permission diff
-- service dependency graph
-- protocol / Secretary / client compatibility range
+- included package ids and version ranges
+- required / optional package status
+- approved permission diff across included packages
+- service dependency graph across included packages
+- AEP profile / Atelia Protocol / Secretary / client compatibility range
 - bundle provenance and signature
-- rollback snapshot
+- rollback snapshot for package membership and approved versions
 
-Bundle install, update, and rollback should be atomic. If a required extension
-fails, the bundle is not installed. If an optional extension fails, manifest
-degrade behavior applies.
+Bundle install, update, and rollback should be atomic for required packages. If
+a required package fails, the bundle is not installed. If an optional package
+fails, package manifest degradation applies.
 
-When multiple bundles include the same extension, Secretary can share one
-extension install. It still checks version range, permission diff, service
-dependency, and composition attachment compatibility.
+When multiple bundles include the same package, Secretary can share one package
+install. It still checks version range, permission diff, service dependency, and
+composition attachment compatibility. Same-bundle membership never grants
+service access automatically.
 
 ## Install, Update, Rollback
 

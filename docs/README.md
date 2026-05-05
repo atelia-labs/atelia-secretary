@@ -3,8 +3,8 @@
 This directory contains the daemon-side design and implementation contracts for
 Atelia Secretary.
 
-Project-wide product philosophy, client UX, extension specifications, hooks, and
-governance live in [`atelia`](https://github.com/atelia-labs/atelia). This
+Project-wide product philosophy, client UX, AEP / extension specifications,
+hooks, and governance live in [`atelia`](https://github.com/atelia-labs/atelia). This
 repository explains how the Secretary daemon implements those contracts.
 
 ## Reading Order
@@ -61,9 +61,13 @@ repository explains how the Secretary daemon implements those contracts.
 
 - [Extensions Runtime](extensions-runtime.md)
 
-Normative extension, hook, and extension composition specs live in the project
+Atelia Secretary is the AEP backend host reference implementation. Normative
+AEP, extension, hook, and extension composition specs live in the project
 repository:
 
+- [Atelia Extension Protocol / AEP Manifest / AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
+  is a temporary link to `atelia` PR `#4` until the individual docs land on
+  `atelia` main.
 - [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
 - [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md)

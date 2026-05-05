@@ -1,8 +1,13 @@
 # Architecture
 
-Atelia Secretary is the backend daemon for Atelia. Normative client, extension,
-and Hook specifications live in the [`atelia`](https://github.com/atelia-labs/atelia)
-repository. This document covers only the daemon implementation boundary.
+Atelia Secretary is the backend daemon for Atelia. Normative client, AEP /
+extension, and Hook specifications live in the
+[`atelia`](https://github.com/atelia-labs/atelia) repository. This document
+covers only the daemon implementation boundary.
+
+Within AEP, Secretary is the reference backend host. It implements backend
+runtime boundaries, permission and capability enforcement, service brokering,
+hook execution boundaries, audit, blocklist, install records, and rollback.
 
 ## Shape
 
@@ -93,6 +98,9 @@ policy requires it, human approval.
 
 See the project-level Atelia documents for normative extension and Hook specs.
 
+- [Atelia Extension Protocol / AEP Manifest / AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
+  is a temporary link to `atelia` PR `#4` until the individual docs land on
+  `atelia` main.
 - [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
 - [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md)
 - [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.md)
