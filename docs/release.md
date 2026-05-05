@@ -22,8 +22,8 @@ checked explicitly at connection time.
 Beta releases should require the following local and CI gates:
 
 - `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-features`
+- `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --locked --workspace --all-features`
 - `docker build --file Dockerfile .`
 - `docker run` smoke that starts `ateliad` with `ATELIA_DAEMON_LISTEN_ADDR=0.0.0.0:8080` and `ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN=1`, then probes `/v1/health`
 
