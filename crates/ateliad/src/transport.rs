@@ -562,8 +562,8 @@ fn write_or_reuse_session_token(token_path: &std::path::Path, token: String) -> 
 }
 
 fn read_and_validate_session_token_with_retry(token_path: &std::path::Path) -> Result<String> {
-    const SESSION_TOKEN_READ_ATTEMPTS: usize = 4;
-    let retry_delay = Duration::from_millis(10);
+    const SESSION_TOKEN_READ_ATTEMPTS: usize = 10;
+    let retry_delay = Duration::from_millis(25);
 
     for attempt in 0..SESSION_TOKEN_READ_ATTEMPTS {
         match read_and_validate_session_token(token_path) {
@@ -599,14 +599,10 @@ fn open_session_token_file(token_path: &std::path::Path) -> Result<std::fs::File
 }
 
 #[cfg(not(unix))]
-fn open_session_token_file(token_path: &std::path::Path) -> Result<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(token_path)
-        .with_context(|| format!("failed to create session token file {token_path:?}"))?;
-    set_restrictive_permissions(token_path)?;
-    Ok(file)
+fn open_session_token_file(_token_path: &std::path::Path) -> Result<std::fs::File> {
+    Err(anyhow!(
+        "refusing to create session token file on non-Unix platforms because restrictive permissions are not implemented"
+    ))
 }
 
 fn generate_session_token() -> Result<String> {
@@ -640,7 +636,9 @@ fn set_restrictive_permissions(path: &std::path::Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_restrictive_permissions(_path: &std::path::Path) -> Result<()> {
-    Ok(())
+    Err(anyhow!(
+        "session token files require Unix restrictive permissions and cannot be safely used on non-Unix platforms"
+    ))
 }
 
 fn env_var_is_truthy(name: &str) -> bool {
