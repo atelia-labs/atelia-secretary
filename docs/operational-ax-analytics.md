@@ -147,6 +147,8 @@ Collect:
 - actual format returned
 - temporary override vs persistent setting
 - format switch reason
+- `scope` touched by the persistent update
+- settings history entries with `actor`, `reason`, `old_defaults`, `new_defaults`, `changed_at`, and `changed_at_unix_ms`
 - parse success by format
 - token cost by format
 - repeated-call rate by format

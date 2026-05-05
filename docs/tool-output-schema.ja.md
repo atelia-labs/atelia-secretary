@@ -208,7 +208,8 @@ artifact_ref artifact:full-result:91a
 
 ## Secretary Preferences
 
-Secretary は tool output に関する preference を持てます。
+Secretary は tool output に関する conceptual preference を持てます。下の list は
+仕事場の ergonomics を表す product vocabulary であり、wire schema ではありません。
 
 - `default_result_format`: `toon` / `json`
 - `per_tool_format`
@@ -225,6 +226,7 @@ Secretary は tool output に関する preference を持てます。
 preference は Secretary の仕事場の好みであり、繰り返しの修正や AX Feedback から改善される対象です。
 
 これらの preference は、Secretary が自分の仕事場に対して持つ professional judgment を表します。client、extension、支援エージェントは変更を提案できます。永続 preference は Secretary が所有します。
+daemon は workspace、repository、project、session、`agent_profile`、optional な `tool_id` scope に対して、shipped settings を `/v1/tool-output/settings/get`、`/v1/tool-output/settings/update`、`/v1/tool-output/settings/history:list` で公開します。persistent history entries は `actor`、`reason`、`scope`、`old_defaults`、`new_defaults`、`changed_at`、`changed_at_unix_ms` を記録します。
 
 ## Recovery Contract
 

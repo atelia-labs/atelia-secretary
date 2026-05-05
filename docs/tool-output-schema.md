@@ -216,7 +216,8 @@ artifact_ref artifact:full-result:91a
 
 ## Secretary Preferences
 
-Secretary can keep preferences for tool output.
+Secretary can keep conceptual preferences for tool output. The list below is
+product vocabulary for workplace ergonomics, not the wire schema.
 
 - `default_result_format`: `toon` / `json`
 - `per_tool_format`
@@ -235,6 +236,12 @@ Preferences are workplace ergonomics.
 These preferences express Secretary's professional judgment about its workplace.
 Clients, extensions, and supporting agents can propose changes; Secretary owns
 the persistent preference.
+The daemon exposes shipped settings through
+`/v1/tool-output/settings/get`, `/v1/tool-output/settings/update`, and
+`/v1/tool-output/settings/history:list` across workspace, repository, project,
+session, `agent_profile`, and optional `tool_id` scopes. Persistent history
+entries record `actor`, `reason`, `scope`, `old_defaults`, `new_defaults`,
+`changed_at`, and `changed_at_unix_ms`.
 
 ## Recovery Contract
 
