@@ -3817,8 +3817,8 @@ fn unlink_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> io::Result<()>
 // Deletes a file after validating its identity against expected metadata.
 //
 // Race window: the final `unlink_in_parent_dir` operates by name (not by fd)
-// because `unlinkat(fd, "", AT_EMPTY_PATH)` requires `CAP_DAC_READ_SEARCH`
-// on Linux, which is a privileged capability unavailable to user-space daemons.
+// because unlinkat(2) does not support AT_EMPTY_PATH — it requires a pathname
+// argument and offers no fd-targeting form for user-space daemons.
 // The post-unlink `ensure_opened_link_count_decreased` check detects a swapped
 // leaf and returns PermissionDenied, making this a detect-rather-than-prevent
 // defense.  The opened fd keeps the inode alive for the post-check even if
@@ -3883,9 +3883,9 @@ fn unlink_validated_file_in_parent_dir(
 #[cfg(unix)]
 // Renames a file after validating its identity against expected metadata.
 //
-// Same TOCTOU note as `unlink_validated_file_in_parent_dir`: the rename operates
-// by name because fd-based renameat with AT_EMPTY_PATH requires privileged
-// capabilities.  Post-rename checks on both source and destination entries
+// Same TOCTOU note as `unlink_validated_file_in_parent_dir`: renameat(2) also
+// has no fd-targeting form (pathname argument required), so the rename operates
+// by name.  Post-rename checks detect a leaf swap and return PermissionDenied.
 // detect a leaf swap and return PermissionDenied.
 //
 // When `resolved_fd` is `Some`, the reopen-by-name is skipped entirely and the
@@ -7205,6 +7205,7 @@ mod tests {
         let env = TestEnv::new("move-source-leaf-swap");
         env.create_file("from.txt", "validated");
         env.create_dir("archive");
+        env.create_file("archive/from.txt", "old");
 
         let source = env.root.join("from.txt");
         let destination = env.root.join("archive/from.txt");
@@ -7221,7 +7222,7 @@ mod tests {
             source.file_name().unwrap(),
             &destination_parent,
             destination.file_name().unwrap(),
-            true,
+            false,
             &expected_metadata,
             None,
         )
@@ -7230,7 +7231,7 @@ mod tests {
         assert_eq!(io::ErrorKind::PermissionDenied, result.kind());
         assert_eq!("replacement", fs::read_to_string(&source).unwrap());
         assert_eq!("validated", fs::read_to_string(&backup).unwrap());
-        assert!(!destination.exists());
+        assert_eq!("old", fs::read_to_string(&destination).unwrap());
         env.cleanup();
     }
 
