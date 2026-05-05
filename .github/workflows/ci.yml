@@ -41,7 +41,24 @@ jobs:
         run: cargo test --locked --workspace --all-features
 
       - name: Docker build
-        run: docker build --file Dockerfile .
+        run: docker build --file Dockerfile --tag atelia-secretary-beta-gate .
+
+      - name: Docker smoke
+        run: |
+          docker run --detach --rm --name atelia-secretary-beta-gate \
+            --env ATELIA_DAEMON_LISTEN_ADDR=0.0.0.0:8080 \
+            --publish 127.0.0.1:18080:8080 \
+            atelia-secretary-beta-gate
+          for attempt in {1..20}; do
+            if curl --fail --silent --show-error http://127.0.0.1:18080/v1/health >/dev/null; then
+              docker stop atelia-secretary-beta-gate
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs atelia-secretary-beta-gate
+          docker stop atelia-secretary-beta-gate
+          exit 1
 
   dependency-review:
     name: Dependency Review
