@@ -78,6 +78,7 @@ pub enum StorageStatus {
 pub struct DaemonHealth {
     pub daemon_status: DaemonStatus,
     pub storage_status: StorageStatus,
+    /// Beta-only state durability hint exposed so clients can detect restarts.
     pub beta_state: Option<BetaStateHint>,
     pub daemon_version: String,
     pub protocol_version: String,
@@ -89,13 +90,18 @@ pub struct DaemonHealth {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BetaStateHint {
+    /// Process or storage boundary that owns the state.
     pub scope: String,
+    /// Durability class for the current beta daemon state.
     pub durability: String,
+    /// Observable behavior clients should expect across daemon restarts.
     pub restart_semantics: String,
+    /// Human-readable limits attached to this beta durability class.
     pub limits: Vec<String>,
 }
 
 impl BetaStateHint {
+    /// Build the beta hint for the process-local in-memory store.
     pub fn in_memory_process_local() -> Self {
         Self {
             scope: "process_local".to_string(),

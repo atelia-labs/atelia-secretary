@@ -611,6 +611,7 @@ pub struct HealthResponse {
     pub storage_version: String,
     pub storage_status: String,
     pub daemon_status: String,
+    /// Beta-only state durability hint for clients that need restart semantics.
     pub beta_state: Option<BetaStateHint>,
     pub capabilities: Vec<String>,
 }
