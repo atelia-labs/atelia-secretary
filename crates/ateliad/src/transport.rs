@@ -240,6 +240,16 @@ struct SubmitJobRequestPayload {
     idempotency_key: Option<String>,
 }
 
+fn requests_filesystem_read(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|capability| {
+        capability
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['_', '-', ':', '/'], ".")
+            == "filesystem.read"
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct ListJobsRequestPayload {
     repository_id: Option<String>,
@@ -499,16 +509,35 @@ fn parse_job_status(value: Option<String>) -> Result<Option<rpc::RpcJobStatus>, 
 fn parse_submit_job_payload(
     payload: SubmitJobRequestPayload,
 ) -> Result<rpc::SubmitJobRequest, String> {
+    let requested_capabilities = payload.requested_capabilities.unwrap_or_default();
+    let path_scope = payload
+        .path_scope
+        .map(parse_path_scope_payload)
+        .transpose()?;
+
+    if requests_filesystem_read(&requested_capabilities) {
+        let roots = path_scope
+            .as_ref()
+            .map(|scope| scope.roots.as_slice())
+            .ok_or_else(|| {
+                "filesystem.read requires path_scope.roots to contain exactly one concrete path"
+                    .to_string()
+            })?;
+        if roots.len() != 1 || roots[0].trim().is_empty() || roots[0].trim() == "." {
+            return Err(
+                "filesystem.read requires path_scope.roots to contain exactly one concrete path"
+                    .to_string(),
+            );
+        }
+    }
+
     Ok(rpc::SubmitJobRequest {
         repository_id: payload.repository_id,
         requester: parse_actor_payload(payload.requester),
         kind: payload.kind,
         goal: payload.goal,
-        path_scope: payload
-            .path_scope
-            .map(parse_path_scope_payload)
-            .transpose()?,
-        requested_capabilities: payload.requested_capabilities.unwrap_or_default(),
+        path_scope,
+        requested_capabilities,
         idempotency_key: payload.idempotency_key,
     })
 }
@@ -3107,6 +3136,61 @@ mod tests {
             })
             .expect_err("blank scope kind should fail");
             assert!(err.contains("path_scope.kind must not be empty"));
+        }
+    }
+
+    #[test]
+    fn submit_job_payload_rejects_empty_filesystem_read_scope() {
+        let err = parse_submit_job_payload(SubmitJobRequestPayload {
+            repository_id: RepositoryId::new().as_str().to_string(),
+            requester: ActorPayload::Agent {
+                id: "agent:transport".to_string(),
+                display_name: None,
+            },
+            kind: "read".to_string(),
+            goal: "read over HTTP".to_string(),
+            path_scope: Some(PathScopePayload {
+                kind: None,
+                roots: None,
+                include_patterns: None,
+                exclude_patterns: None,
+            }),
+            requested_capabilities: Some(vec!["filesystem.read".to_string()]),
+            idempotency_key: None,
+        })
+        .expect_err("filesystem.read should reject empty path_scope");
+
+        assert!(err.contains("filesystem.read requires path_scope.roots"));
+    }
+
+    #[test]
+    fn submit_job_payload_rejects_ambiguous_filesystem_read_scopes() {
+        for roots in [
+            vec![".".to_string()],
+            vec!["src".to_string(), "docs".to_string()],
+        ] {
+            let err = parse_submit_job_payload(SubmitJobRequestPayload {
+                repository_id: RepositoryId::new().as_str().to_string(),
+                requester: ActorPayload::Agent {
+                    id: "agent:transport".to_string(),
+                    display_name: None,
+                },
+                kind: "read".to_string(),
+                goal: "read over HTTP".to_string(),
+                path_scope: Some(PathScopePayload {
+                    kind: Some("repository".to_string()),
+                    roots: Some(roots),
+                    include_patterns: None,
+                    exclude_patterns: None,
+                }),
+                requested_capabilities: Some(vec!["filesystem.read".to_string()]),
+                idempotency_key: None,
+            })
+            .expect_err("filesystem.read should reject ambiguous path_scope roots");
+
+            assert!(err.contains(
+                "filesystem.read requires path_scope.roots to contain exactly one concrete path"
+            ));
         }
     }
 

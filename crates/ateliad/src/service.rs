@@ -9,17 +9,18 @@ use atelia_core::{
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
     CancelJobReceipt, DefaultPolicyEngine, DisableExtensionRequest, DisableExtensionResponse,
     EnableExtensionRequest, EnableExtensionResponse, EventCursor, EventPage, EventQuery,
-    ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, InMemoryStore,
-    InMemoryToolOutputSettingsService, InstallExtensionRequest, InstallExtensionResponse, JobEvent,
-    JobId, JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
-    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
-    OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput, RegistryError,
-    RemoveExtensionRequest, RemoveExtensionResponse, RenderedToolOutput, RepositoryId,
-    RepositoryRecord, RepositoryTrustState, ResourceScope, RollbackExtensionRequest,
-    RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore,
-    StoreError, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
-    ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
-    TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse,
+    ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, FsReadTool,
+    InMemoryStore, InMemoryToolOutputSettingsService, InstallExtensionRequest,
+    InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService, JobPage, JobQuery,
+    JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest, ListBlocklistResponse,
+    ListExtensionsRequest, ListExtensionsResponse, OutputFormat, PathScope, PolicyDecision,
+    PolicyEngine, PolicyInput, RegistryError, RemoveExtensionRequest, RemoveExtensionResponse,
+    RenderedToolOutput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
+    RollbackExtensionRequest, RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt,
+    RuntimeJobRequest, SecretaryStore, StoreError, ToolInvocationId, ToolOutputDefaults,
+    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
+    ToolOutputSettingsScope, ToolResultId, TruncationMetadata, UpdateExtensionRequest,
+    UpdateExtensionResponse,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -42,6 +43,9 @@ const DAEMON_CAPABILITIES: &[&str] = &[
 ];
 const MAX_HISTORY_PAGE: usize = 1000;
 const SECRETARY_ECHO_TOOL_ID: &str = "secretary.echo";
+const SECRETARY_FS_READ_TOOL_ID: &str = "fs.read";
+const SECRETARY_FS_READ_CAPABILITY: &str = "filesystem.read";
+const SECRETARY_CAPABILITY_DISCOVERY: &str = "capability.discovery";
 
 fn daemon_capabilities() -> Vec<String> {
     DAEMON_CAPABILITIES
@@ -195,6 +199,21 @@ pub struct SubmitJobRequest {
     pub resource_scope: Option<ResourceScope>,
     pub requested_capabilities: Vec<String>,
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitJobToolKind {
+    Echo,
+    FsRead,
+}
+
+impl SubmitJobToolKind {
+    fn tool_id(self) -> &'static str {
+        match self {
+            Self::Echo => SECRETARY_ECHO_TOOL_ID,
+            Self::FsRead => SECRETARY_FS_READ_TOOL_ID,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -576,7 +595,8 @@ impl SecretaryService {
         })
     }
 
-    /// Submit the first supported daemon job, backed by the core echo tool.
+    /// Submit a supported daemon job, dispatching the echo tool by default
+    /// and `fs.read` when the request asks for a filesystem read.
     #[allow(dead_code)]
     pub fn submit_job(&self, request: SubmitJobRequest) -> ServiceResult<RuntimeJobReceipt> {
         if request.goal.trim().is_empty() {
@@ -587,6 +607,8 @@ impl SecretaryService {
 
         let requested_capabilities =
             normalize_requested_capabilities(&request.requested_capabilities)?;
+        let tool_kind = resolve_submit_job_tool_kind(&request, &requested_capabilities)?;
+        let repository = self.get_repository(&request.repository_id)?;
 
         let normalized_idempotency_key = request
             .idempotency_key
@@ -619,9 +641,17 @@ impl SecretaryService {
         };
 
         let tool_output_defaults = self.get_tool_output_defaults(
-            ToolOutputSettingsScope::repository(request.repository_id.clone())
-                .for_tool(SECRETARY_ECHO_TOOL_ID),
+            ToolOutputSettingsScope::repository(repository.id.clone())
+                .for_tool(tool_kind.tool_id()),
         )?;
+
+        let resource_scope = request.resource_scope.unwrap_or_else(|| ResourceScope {
+            kind: "repository".to_string(),
+            value: ".".to_string(),
+        });
+        if matches!(tool_kind, SubmitJobToolKind::FsRead) {
+            validate_filesystem_read_scope(&repository, &resource_scope)?;
+        }
 
         let runtime_request = RuntimeJobRequest::new(
             request.requester,
@@ -631,20 +661,17 @@ impl SecretaryService {
         )
         .with_requested_capabilities(requested_capabilities)
         .with_tool_output_defaults(tool_output_defaults)
-        .with_resource_scope(
-            request
-                .resource_scope
-                .as_ref()
-                .map(|scope| scope.kind.clone())
-                .unwrap_or_else(|| "repository".to_string()),
-            request
-                .resource_scope
-                .as_ref()
-                .map(|scope| scope.value.clone())
-                .unwrap_or_else(|| ".".to_string()),
-        );
+        .with_resource_scope(resource_scope.kind, resource_scope.value);
 
-        let receipt = self.lifecycle.submit_echo_job(runtime_request)?;
+        let receipt = match tool_kind {
+            SubmitJobToolKind::Echo => self.lifecycle.submit_echo_job(runtime_request)?,
+            SubmitJobToolKind::FsRead => {
+                let tool = FsReadTool::new(&repository.root_path);
+                self.lifecycle
+                    .runtime()
+                    .run_tool_job(runtime_request, &tool)?
+            }
+        };
 
         if let Some((idempotency_key, mut cache)) = idempotent_cache_lock.take() {
             cache.insert(
@@ -1039,7 +1066,7 @@ fn normalize_requested_capabilities(
             });
         }
 
-        let canonical = canonicalize_job_requested_capability(trimmed).ok_or_else(|| {
+        let canonical = canonicalize_submit_requested_capability(trimmed).ok_or_else(|| {
             ServiceError::InvalidArgument {
                 reason: format!(
                     "requested_capabilities contains unsupported capability: {trimmed}"
@@ -1062,6 +1089,101 @@ fn normalize_requested_capabilities(
 
     normalized.sort();
     Ok(normalized)
+}
+
+fn canonicalize_submit_requested_capability(name: &str) -> Option<&'static str> {
+    canonicalize_job_requested_capability(name).or_else(|| {
+        let normalized = name
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['_', '-', ':', '/'], ".");
+
+        match normalized.as_str() {
+            SECRETARY_FS_READ_CAPABILITY => Some(SECRETARY_FS_READ_CAPABILITY),
+            _ => None,
+        }
+    })
+}
+
+fn resolve_submit_job_tool_kind(
+    request: &SubmitJobRequest,
+    requested_capabilities: &[String],
+) -> ServiceResult<SubmitJobToolKind> {
+    match requested_capabilities {
+        [capability] if capability == SECRETARY_CAPABILITY_DISCOVERY => Ok(SubmitJobToolKind::Echo),
+        [capability] if capability == SECRETARY_FS_READ_CAPABILITY => {
+            let resource_scope =
+                request
+                    .resource_scope
+                    .as_ref()
+                    .ok_or_else(|| ServiceError::InvalidArgument {
+                        reason: "filesystem.read requires a path_scope/resource_scope".to_string(),
+                    })?;
+
+            if !matches!(
+                resource_scope.kind.trim(),
+                "repository" | "explicit_paths" | "read_only" | "path"
+            ) {
+                return Err(ServiceError::InvalidArgument {
+                    reason: "filesystem.read requires resource_scope.kind to be repository, explicit_paths, read_only, or path".to_string(),
+                });
+            }
+
+            if matches!(resource_scope.value.trim(), "" | ".") {
+                return Err(ServiceError::InvalidArgument {
+                    reason: "filesystem.read requires a concrete path_scope/resource_scope root"
+                        .to_string(),
+                });
+            }
+
+            Ok(SubmitJobToolKind::FsRead)
+        }
+        [capability] => Err(ServiceError::InvalidArgument {
+            reason: format!("requested_capabilities contains unsupported capability: {capability}"),
+        }),
+        _ => Err(ServiceError::InvalidArgument {
+            reason: "requested_capabilities must resolve to exactly one supported capability"
+                .to_string(),
+        }),
+    }
+}
+
+fn validate_filesystem_read_scope(
+    repository: &RepositoryRecord,
+    resource_scope: &ResourceScope,
+) -> ServiceResult<()> {
+    let root = Path::new(&repository.root_path);
+    let requested =
+        canonicalize_within_scope(root, Path::new(&resource_scope.value)).map_err(|err| {
+            ServiceError::InvalidArgument {
+                reason: format!("filesystem.read path is outside repository scope: {err}"),
+            }
+        })?;
+
+    if requested.canonical == requested.root {
+        return Err(ServiceError::InvalidArgument {
+            reason: "filesystem.read requires a concrete path_scope/resource_scope root"
+                .to_string(),
+        });
+    }
+
+    let allowed = repository
+        .allowed_path_scope
+        .allowed_paths
+        .iter()
+        .any(|allowed_path| {
+            canonicalize_within_scope(root, Path::new(allowed_path))
+                .map(|allowed| requested.canonical.starts_with(&allowed.canonical))
+                .unwrap_or(false)
+        });
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(ServiceError::InvalidArgument {
+            reason: "filesystem.read path is outside allowed_path_scope".to_string(),
+        })
+    }
 }
 
 fn submit_job_request_signature(
@@ -2854,6 +2976,198 @@ mod tests {
             .expect("normalized alias should replay the same job");
 
         assert_eq!(first.job.id, second.job.id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_read_tool() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-read-dispatch");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "read-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("README.md"), "alpha\nbeta\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "read repository notes".to_string(),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "README.md".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.read".to_string()],
+                idempotency_key: Some("read-job-key".to_string()),
+            })
+            .expect("real read dispatch should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.read"
+        );
+        assert_eq!(
+            receipt.policy_decision.requested_capability,
+            "filesystem.read"
+        );
+
+        let tool_result = receipt.tool_result.expect("tool result should exist");
+        assert_eq!(
+            tool_result.schema_ref.as_deref(),
+            Some("tool_result.fs.read.v1")
+        );
+        assert!(tool_result.fields.iter().any(|field| {
+            field.key == "content"
+                && matches!(&field.value, atelia_core::StructuredValue::String(value) if value == "alpha\nbeta")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_read_outside_allowed_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-read-allowed-scope");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("README.md"), "root\n").unwrap();
+        fs::write(root.join("docs/guide.md"), "docs\n").unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "read-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: Some(PathScope {
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_paths: vec!["docs".to_string()],
+                }),
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let allowed = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "read scoped notes".to_string(),
+                resource_scope: Some(ResourceScope {
+                    kind: "explicit_paths".to_string(),
+                    value: "docs/guide.md".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.read".to_string()],
+                idempotency_key: None,
+            })
+            .expect("read inside allowed scope should succeed");
+        assert_eq!(
+            allowed
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.read"
+        );
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "read root notes".to_string(),
+                resource_scope: Some(ResourceScope {
+                    kind: "explicit_paths".to_string(),
+                    value: "README.md".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.read".to_string()],
+                idempotency_key: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_read_without_path_scope_before_side_effects() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-read-rejected");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "read-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "read repository notes".to_string(),
+                resource_scope: None,
+                requested_capabilities: vec!["filesystem.read".to_string()],
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(svc
+            .list_jobs(None, None, None, None, None)
+            .expect("job query should succeed")
+            .jobs
+            .is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_read_repository_root_before_side_effects() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-read-root-rejected");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "read-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        for value in [".", "./", "docs/.."] {
+            let err = svc
+                .submit_job(SubmitJobRequest {
+                    requester: actor(),
+                    repository_id: repository.id.clone(),
+                    kind: JobKind::Read,
+                    goal: "read repository root".to_string(),
+                    resource_scope: Some(ResourceScope {
+                        kind: "repository".to_string(),
+                        value: value.to_string(),
+                    }),
+                    requested_capabilities: vec!["filesystem.read".to_string()],
+                    idempotency_key: None,
+                })
+                .unwrap_err();
+
+            assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        }
+        assert!(svc
+            .list_jobs(None, None, None, None, None)
+            .expect("job query should succeed")
+            .jobs
+            .is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
