@@ -1,7 +1,8 @@
 # Extensions Runtime
 
-This document defines how Atelia Secretary validates, installs, executes,
-audits, and rolls back Custom Extensions.
+This document defines how Atelia Secretary validates, installs, audits,
+rolls back, and manages Custom Extensions. Extension execution is disabled in
+beta and reserved for a future release.
 
 The normative AEP, extension, composition, hook, tool-output, and security
 contracts live in the [`atelia`](https://github.com/atelia-labs/atelia)
@@ -125,7 +126,10 @@ Initial backend enforcement lives in `atelia-core::extensions` as
 first slice accepts backend `wasm-rust` / `wasm` manifests, explicit
 local-development process manifests, per-version provenance digests, blocklist
 checks, rollback pointers, and brokered service-call authorization. It does not
-execute WASM yet.
+execute WASM yet. In this beta slice, extension management APIs are available
+to operator-facing clients; execution-oriented requests are intentionally
+unavailable and return structured unsupported-capability errors instead of
+silently pretending to run.
 
 The initial implementation also reserves concrete id boundaries:
 
@@ -415,8 +419,8 @@ Block reasons:
 - `user_blocked`
 - `registry_removed`
 
-Checks run at install, update, startup, and before execution. Running jobs are
-cancelled or quarantined.
+Checks run at install, update, startup, and before any future execution
+surface. Running jobs are cancelled or quarantined.
 
 ## Audit Events
 
@@ -431,7 +435,7 @@ Minimum events:
 - capability grant
 - hook creation / change
 - webhook receipt
-- extension execution start / end
+- future extension execution start / end, once execution is enabled
 - policy decision
 - secret access
 - repo mutation

@@ -84,6 +84,10 @@ Required RPC groups:
 [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md).
 It will return a computed projection, not a persisted store.
 
+For the beta slice, extension management APIs are operator-facing.
+Extension execution RPCs are not supported in beta. Endpoints may exist, but
+they must return unsupported-capability when invoked.
+
 ## Core Messages
 
 ### Health

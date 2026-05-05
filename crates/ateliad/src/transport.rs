@@ -46,6 +46,7 @@ enum Route {
     InstallExtension,
     UpdateExtension,
     ListExtensions,
+    ExtensionExecution { extension_id: String },
     ExtensionStatus { extension_id: String },
     RollbackExtension { extension_id: String },
     DisableExtension { extension_id: String },
@@ -124,6 +125,19 @@ fn route_for_path(path: &str) -> Route {
         .and_then(valid_extension_id)
     {
         return Route::RemoveExtension {
+            extension_id: extension_id.to_string(),
+        };
+    }
+    if let Some(extension_id) = path
+        .strip_prefix("/v1/extensions/")
+        .and_then(|path| {
+            path.strip_suffix("/execute")
+                .or_else(|| path.strip_suffix("/invoke"))
+                .or_else(|| path.strip_suffix("/run"))
+        })
+        .and_then(valid_extension_id)
+    {
+        return Route::ExtensionExecution {
             extension_id: extension_id.to_string(),
         };
     }
@@ -1185,6 +1199,15 @@ fn serialize_list_blocklist_response(response: rpc::ListBlocklistResponse) -> se
     })
 }
 
+fn serialize_extension_execution_response(
+    response: rpc::ExtensionExecutionResponse,
+) -> serde_json::Value {
+    let metadata = rpc::ProtocolMetadata::from(response.metadata);
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&metadata),
+    })
+}
+
 fn serialize_output_format(format: &rpc::RpcOutputFormat) -> &'static str {
     match format {
         rpc::RpcOutputFormat::Toon => "toon",
@@ -1389,6 +1412,7 @@ fn rpc_error_status(code: rpc::RpcErrorCode) -> (StatusCode, bool) {
         rpc::RpcErrorCode::InvalidArgument => (StatusCode::BAD_REQUEST, false),
         rpc::RpcErrorCode::NotFound => (StatusCode::NOT_FOUND, false),
         rpc::RpcErrorCode::Conflict => (StatusCode::CONFLICT, true),
+        rpc::RpcErrorCode::UnsupportedCapability => (StatusCode::NOT_IMPLEMENTED, true),
         rpc::RpcErrorCode::Internal => (StatusCode::INTERNAL_SERVER_ERROR, false),
     }
 }
@@ -2511,6 +2535,45 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                     dispatch_list_extensions(state, request).await
                 }
             }
+            Route::ExtensionExecution { extension_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    let rpc_server = state.read().await;
+                    let next_state = rpc_next_state(&rpc_server);
+                    match rpc_server
+                        .execute_extension(rpc::ExtensionExecutionRequest { extension_id })
+                    {
+                        Ok(response) => Json(ApiResponse::ok(
+                            serialize_extension_execution_response(response),
+                        ))
+                        .into_response(),
+                        Err(error) => {
+                            let (status, recoverable) = rpc_error_status(error.code);
+                            make_error_response(
+                                status,
+                                "rpc_error",
+                                error.reason,
+                                recoverable,
+                                next_state,
+                            )
+                        }
+                    }
+                }
+            }
             Route::RenderToolOutput => {
                 if method != Method::POST {
                     let mut response = make_error_response(
@@ -3049,6 +3112,24 @@ mod tests {
         assert_eq!(
             route_for_path("/v1/extensions/com.example.extension/remove"),
             Route::RemoveExtension {
+                extension_id: "com.example.extension".to_string()
+            }
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/com.example.extension/execute"),
+            Route::ExtensionExecution {
+                extension_id: "com.example.extension".to_string()
+            }
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/com.example.extension/invoke"),
+            Route::ExtensionExecution {
+                extension_id: "com.example.extension".to_string()
+            }
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/com.example.extension/run"),
+            Route::ExtensionExecution {
                 extension_id: "com.example.extension".to_string()
             }
         );
@@ -4036,6 +4117,25 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+
+        let execute_response = send_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/execute",
+        )
+        .await;
+        assert_eq!(execute_response.status(), StatusCode::NOT_IMPLEMENTED);
+        let execute_payload = to_bytes(execute_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(execute_payload["status"], "error");
+        assert_eq!(execute_payload["error"]["code"], "rpc_error");
+        assert!(execute_payload["error"]["recoverable"].as_bool().unwrap());
+        assert!(execute_payload["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("install, status, and blocklist management APIs"));
 
         let remove_response = send_request(
             &rpc_server,

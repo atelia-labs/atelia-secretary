@@ -30,6 +30,8 @@ use std::sync::Mutex;
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "1.0.0";
 const STORAGE_VERSION: &str = "0.1.0";
+pub(crate) const EXTENSION_EXECUTION_UNAVAILABLE_REASON: &str =
+    "extension execution is not implemented in the Secretary beta; use extension install, status, and blocklist management APIs instead";
 const DAEMON_CAPABILITIES: &[&str] = &[
     "health.v1",
     "repositories.v1",
@@ -167,6 +169,7 @@ pub enum ServiceError {
     Store(atelia_core::StoreError),
     Runtime(RuntimeError),
     ExtensionRegistry(RegistryError),
+    UnsupportedCapability { reason: String },
     Settings(ToolOutputSettingsError),
     InvalidArgument { reason: String },
     Internal { reason: String },
@@ -179,6 +182,9 @@ impl std::fmt::Display for ServiceError {
             Self::Store(err) => write!(f, "{err}"),
             Self::Runtime(err) => write!(f, "{err}"),
             Self::ExtensionRegistry(err) => write!(f, "{err}"),
+            Self::UnsupportedCapability { reason } => {
+                write!(f, "unsupported capability: {reason}")
+            }
             Self::Settings(err) => write!(f, "tool output settings: {err}"),
             Self::InvalidArgument { reason } => write!(f, "invalid argument: {reason}"),
             Self::Internal { reason } => write!(f, "internal error: {reason}"),
@@ -318,6 +324,16 @@ pub struct ListToolOutputSettingsHistoryRequest {
 pub struct ListToolOutputSettingsHistoryPage {
     pub changes: Vec<ToolOutputSettingsChange>,
     pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionExecutionRequest {
+    pub extension_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionExecutionResponse {
+    pub metadata: ProtocolMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -990,6 +1006,16 @@ impl SecretaryService {
             .list_blocklist(request)
             .map_err(ServiceError::from)
     }
+
+    pub fn execute_extension(
+        &self,
+        request: ExtensionExecutionRequest,
+    ) -> ServiceResult<ExtensionExecutionResponse> {
+        let _ = request.extension_id;
+        Err(ServiceError::UnsupportedCapability {
+            reason: EXTENSION_EXECUTION_UNAVAILABLE_REASON.to_string(),
+        })
+    }
 }
 
 fn parse_page_token(page_token: Option<&str>, collection: &'static str) -> ServiceResult<usize> {
@@ -1489,6 +1515,22 @@ mod tests {
         assert!(health
             .capabilities
             .contains(&"project_status.v1".to_string()));
+    }
+
+    #[test]
+    fn extension_execution_is_explicitly_unavailable_in_beta() {
+        let svc = ready_service();
+        let err = svc
+            .execute_extension(ExtensionExecutionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect_err("extension execution should be gated in beta");
+
+        assert!(matches!(
+            err,
+            ServiceError::UnsupportedCapability { reason }
+                if reason.contains("install, status, and blocklist")
+        ));
     }
 
     #[test]

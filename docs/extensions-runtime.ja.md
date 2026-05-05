@@ -1,6 +1,6 @@
 # Extensions Runtime
 
-この文書は、Atelia Secretary が Custom Extensions をどのように検証、導入、実行、監査、rollback するかを定義します。
+この文書は、Atelia Secretary が Custom Extensions をどのように検証、導入、監査、rollback、管理するかを定義します。extension の実行は beta では無効で、将来のリリース向けです。
 
 規範的な AEP / extension / composition / hook / tool-output / security contract は [`atelia`](https://github.com/atelia-labs/atelia/blob/main/README.ja.md) repository が所有します。[Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.ja.md)、[Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.ja.md)、[Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.ja.md)、[Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.ja.md)、[Extension Security](https://github.com/atelia-labs/atelia/blob/main/docs/extension-security.ja.md) を参照します。AEP overview と manifest docs は [atelia PR #4](https://github.com/atelia-labs/atelia/pull/4) で追加されるため、その PR が `atelia` repository に入った後で直接リンクします。この文書は、Secretary が信頼できる拡張機能の仕事場を持つための daemon-side enforcement を定義します。AEP において、これは backend host reference implementation slice です。
 
@@ -103,6 +103,10 @@ WASM execution はまだ実装しません。
 - local development extension は `local.*` namespace を使い、unsigned の場合は
   明示的な unsigned dev-mode approval を必要とする
 - third-party extension は official / local namespace を使えない
+
+この beta slice では、extension management API を operator-facing client に
+提供します。execution を伴う request は意図的に未実装であり、黙って実行した
+ふりをせず、structured unsupported-capability error を返します。
 
 ## Permission And Capability
 
@@ -348,7 +352,7 @@ block reasons:
 - `user_blocked`
 - `registry_removed`
 
-blocklist check は install、update、startup、execution 前に行います。実行中 job は cancel または quarantine します。
+blocklist check は install、update、startup、future の execution surface 前に行います。実行中 job は cancel または quarantine します。
 
 ## Audit Events
 
@@ -363,7 +367,7 @@ minimum events:
 - capability grant
 - hook creation / change
 - webhook receipt
-- extension execution start / end
+- future extension execution start / end (execution が有効化された後)
 - policy decision
 - secret access
 - repo mutation
