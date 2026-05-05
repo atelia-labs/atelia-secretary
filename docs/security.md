@@ -34,7 +34,9 @@ or reuses `<storage_dir>/daemon-auth.token` and expects every request to carry
 `ATELIA_DAEMON_AUTH_DISABLED=1`, exists for controlled local testing only and
 should not be used as a normal deployment mode. `ATELIA_DAEMON_AUTH_TOKEN`
 may be set to pin a specific token for automation, but it should still be
-treated as a local secret.
+treated as a local secret. Existing token files are normalized to restrictive
+permissions before reuse, and the auth-disabled opt-out is rejected if it is
+paired with an unsafe non-loopback listener override.
 
 ## Threat Model Seeds
 

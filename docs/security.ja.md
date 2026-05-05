@@ -30,7 +30,9 @@ Secretary は beta では local bearer token も要求します。startup 時に
 向けの明示的な opt-out として `ATELIA_DAEMON_AUTH_DISABLED=1` があり、
 通常の deployment mode として扱うべきではありません。
 `ATELIA_DAEMON_AUTH_TOKEN` を設定すると token を固定できますが、
-それでも local secret として扱う必要があります。
+それでも local secret として扱う必要があります。既存の token file は
+再利用前に restrictive permissions に正規化され、auth-disabled の opt-out
+は unsafe な non-loopback listener override と組み合わせると拒否されます。
 
 ## threat model の種
 

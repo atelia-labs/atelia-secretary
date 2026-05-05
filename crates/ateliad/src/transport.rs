@@ -420,6 +420,23 @@ pub fn validate_listen_addr(listen_addr: &SocketAddr, explicit_addr: bool) -> Re
     }
 }
 
+/// Refuse to combine auth-disabled mode with an unsafe non-loopback listener.
+pub fn validate_local_auth_binding(
+    local_auth: &LocalAuthConfig,
+    listen_addr: &SocketAddr,
+) -> Result<()> {
+    if matches!(local_auth, LocalAuthConfig::Disabled)
+        && !is_loopback(listen_addr)
+        && unsafe_allow_non_loopback_listen()
+    {
+        Err(anyhow!(
+            "refusing to combine {AUTH_DISABLED_ENV}=1 with non-loopback listener address {listen_addr}; keep auth enabled or bind to loopback only"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Return whether the socket address binds only to the local host.
 pub fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
@@ -465,6 +482,7 @@ fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String>
     let token_path = local_auth_token_path(storage_dir);
     match std::fs::read_to_string(&token_path) {
         Ok(token) => {
+            set_restrictive_permissions(&token_path)?;
             let token = token.trim().to_string();
             if token.is_empty() {
                 Err(anyhow!(
@@ -3564,7 +3582,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resolve_local_auth_creates_token_file_with_restrictive_permissions() {
+    fn resolve_local_auth_enforces_restrictive_permissions_on_existing_token_file() {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = LocalAuthEnvGuard::lock();
@@ -3572,7 +3590,23 @@ mod tests {
         std::env::remove_var(AUTH_TOKEN_ENV);
 
         let storage_dir = test_repo_dir("local-auth-permissions");
-        let _ = resolve_local_auth(&storage_dir).expect("resolve local auth");
+        let token_path = local_auth_token_path(&storage_dir);
+        let token = "existing-session-token";
+        fs::write(&token_path, format!("  {token}\n")).expect("seed session token");
+        let mut permissions = fs::metadata(&token_path)
+            .expect("seed token metadata")
+            .permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&token_path, permissions).expect("seed token permissions");
+
+        let resolved = resolve_local_auth(&storage_dir).expect("resolve local auth");
+        assert_eq!(
+            resolved,
+            LocalAuthConfig::BearerToken {
+                token: token.to_string(),
+            }
+        );
+
         let token_path = local_auth_token_path(&storage_dir);
         let mode = fs::metadata(&token_path)
             .expect("session token metadata")
@@ -3581,6 +3615,20 @@ mod tests {
             & 0o777;
 
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn validate_local_auth_binding_rejects_auth_disabled_on_unsafe_non_loopback_listener() {
+        let _guard = UnsafeAllowNonLoopbackListenEnvGuard::lock();
+        std::env::set_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV, "1");
+        let listen_addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+
+        let err = validate_local_auth_binding(&LocalAuthConfig::Disabled, &listen_addr)
+            .expect_err("auth-disabled non-loopback listener should fail closed");
+
+        assert!(err
+            .to_string()
+            .contains("refusing to combine ATELIA_DAEMON_AUTH_DISABLED=1"));
     }
 
     #[test]

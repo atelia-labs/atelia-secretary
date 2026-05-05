@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
 
     let (listen_addr, explicit_addr) = transport::listen_addr()?;
     transport::validate_listen_addr(&listen_addr, explicit_addr)?;
+    transport::validate_local_auth_binding(&local_auth, &listen_addr)?;
     if explicit_addr
         && !transport::is_loopback(&listen_addr)
         && transport::unsafe_allow_non_loopback_listen()
