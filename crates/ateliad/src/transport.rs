@@ -4442,40 +4442,7 @@ mod tests {
             .iter()
             .map(|entry| entry["tool_id"].as_str().expect("tool id"))
             .collect();
-        assert_eq!(
-            tool_ids,
-            vec![
-                "fs.delete",
-                "fs.diff",
-                "fs.list",
-                "fs.move",
-                "fs.patch",
-                "fs.read",
-                "fs.search",
-                "fs.stat",
-                "fs.write",
-                "proc.exec",
-                "proc.run",
-                "secretary.echo",
-            ]
-        );
-        assert!(tool_ids.iter().all(|tool_id| {
-            matches!(
-                *tool_id,
-                "fs.diff"
-                    | "fs.delete"
-                    | "fs.list"
-                    | "fs.move"
-                    | "fs.patch"
-                    | "fs.read"
-                    | "fs.search"
-                    | "fs.stat"
-                    | "fs.write"
-                    | "proc.exec"
-                    | "proc.run"
-                    | "secretary.echo"
-            )
-        }));
+        assert_eq!(tool_ids, vec!["fs.read", "secretary.echo"]);
     }
 
     #[tokio::test]

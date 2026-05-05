@@ -6,7 +6,7 @@
 
 Secretary core は general harness を提供します。filesystem、shell、search、job、event、policy、extension hosting、service broker、hook intake、output rendering、agent delegation substrate が中心です。Git、GitHub、Linear、memory provider、memory strategy、notification、review agent、approval agent は extension-provided surface として扱います。
 
-現在の beta repertoire surface は、初期の live tool surface として built-in Secretary tool の `fs.read`、`fs.list`、`fs.stat`、`fs.search`、`fs.diff`、`fs.write`、`fs.patch`、`fs.delete`、`fs.move`、`proc.exec`、`proc.run`、`secretary.echo` を projection します。
+現在の beta repertoire surface は、この beta slice で dispatch 可能な built-in Secretary tool だけ、すなわち `fs.read` と `secretary.echo` を projection します。より広い built-in は将来の slice または runtime-backed slice に存在し得ますが、dispatch が存在するまでは `ListRepertoire` では claim しません。
 
 ## Risk Scale
 

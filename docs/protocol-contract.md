@@ -85,11 +85,12 @@ Required RPC groups:
 It returns the computed projection of the live tool surface in the current
 context, not a persisted store.
 
-The first beta server surface is intentionally small and currently projects the
-built-in Secretary tools `fs.read`, `fs.list`, `fs.stat`, `fs.search`,
-`fs.diff`, `fs.write`, `fs.patch`, `fs.delete`, `fs.move`, `proc.exec`,
-`proc.run`, and `secretary.echo` with their stable tool definitions.
-Extension-backed repertoire entries remain a future slice.
+The first beta server surface is intentionally small and currently projects
+only the built-in Secretary tools that are dispatchable in this beta slice:
+`fs.read` and `secretary.echo` with their stable tool definitions. Broader
+built-ins may exist in future or runtime-backed slices, but they are not
+claimed by `ListRepertoire` until dispatch exists. Extension-backed repertoire
+entries remain a future slice.
 
 For the beta slice, extension management APIs are operator-facing.
 Extension execution RPCs are not supported in beta. Endpoints may exist, but

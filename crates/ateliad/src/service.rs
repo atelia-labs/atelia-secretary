@@ -1166,60 +1166,6 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
 
     let mut entries = vec![
         entry(
-            SECRETARY_ECHO_TOOL_ID,
-            SECRETARY_ECHO_TOOL_NAME,
-            SECRETARY_ECHO_TOOL_DESCRIPTION,
-            "R0",
-            "idempotent",
-            false,
-            5_000,
-        ),
-        entry(
-            "fs.diff",
-            "Filesystem Diff",
-            "Compare two files within the registered repository scope.",
-            "R1",
-            "idempotent",
-            true,
-            10_000,
-        ),
-        entry(
-            "fs.delete",
-            "Filesystem Delete",
-            "Delete one file within the registered repository scope; safe delete is Unix-validated and unsupported on non-Unix platforms.",
-            "R2",
-            "non_idempotent",
-            true,
-            10_000,
-        ),
-        entry(
-            "fs.list",
-            "Filesystem List",
-            "List entries within the registered repository scope.",
-            "R1",
-            "idempotent",
-            true,
-            10_000,
-        ),
-        entry(
-            "fs.move",
-            "Filesystem Move",
-            "Move one file within the registered repository scope; safe move is Unix-validated and unsupported on non-Unix platforms.",
-            "R2",
-            "non_idempotent",
-            true,
-            10_000,
-        ),
-        entry(
-            "fs.patch",
-            "Filesystem Patch",
-            "Apply a bounded exact-text patch within the registered repository scope.",
-            "R2",
-            "non_idempotent",
-            true,
-            15_000,
-        ),
-        entry(
             SECRETARY_FS_READ_TOOL_ID,
             SECRETARY_FS_READ_TOOL_NAME,
             SECRETARY_FS_READ_TOOL_DESCRIPTION,
@@ -1229,49 +1175,13 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
             10_000,
         ),
         entry(
-            "fs.search",
-            "Filesystem Search",
-            "Search files within the registered repository scope.",
-            "R1",
+            SECRETARY_ECHO_TOOL_ID,
+            SECRETARY_ECHO_TOOL_NAME,
+            SECRETARY_ECHO_TOOL_DESCRIPTION,
+            "R0",
             "idempotent",
-            true,
-            10_000,
-        ),
-        entry(
-            "fs.stat",
-            "Filesystem Stat",
-            "Inspect file metadata within the registered repository scope.",
-            "R1",
-            "idempotent",
-            true,
-            10_000,
-        ),
-        entry(
-            "fs.write",
-            "Filesystem Write",
-            "Write a file within the registered repository scope.",
-            "R2",
-            "non_idempotent",
-            true,
-            15_000,
-        ),
-        entry(
-            "proc.exec",
-            "Process Exec",
-            "Run an explicit argv process within the registered repository scope; explicit argv execution is unsupported on non-Unix platforms.",
-            "R2",
-            "non_idempotent",
-            true,
-            30_000,
-        ),
-        entry(
-            "proc.run",
-            "Process Run",
-            "Run a bounded explicit argv process within the registered repository scope; explicit argv execution is unsupported on non-Unix platforms.",
-            "R2",
-            "non_idempotent",
-            true,
-            30_000,
+            false,
+            5_000,
         ),
     ];
 
@@ -2051,20 +1961,7 @@ mod tests {
 
         assert_eq!(
             repertoire_tool_ids(&repertoire.entries),
-            vec![
-                "fs.delete",
-                "fs.diff",
-                "fs.list",
-                "fs.move",
-                "fs.patch",
-                "fs.read",
-                "fs.search",
-                "fs.stat",
-                "fs.write",
-                "proc.exec",
-                "proc.run",
-                "secretary.echo",
-            ]
+            vec!["fs.read", "secretary.echo"]
         );
         let read = repertoire
             .entries
@@ -2088,23 +1985,10 @@ mod tests {
         assert_eq!(echo.risk_tier, "R0");
         assert!(!echo.cancellable);
         assert_eq!(echo.timeout_ms, 5_000);
-        assert!(repertoire.entries.iter().all(|entry| {
-            matches!(
-                entry.tool_id.as_str(),
-                "fs.diff"
-                    | "fs.delete"
-                    | "fs.list"
-                    | "fs.move"
-                    | "fs.patch"
-                    | "fs.read"
-                    | "fs.search"
-                    | "fs.stat"
-                    | "fs.write"
-                    | "proc.exec"
-                    | "proc.run"
-                    | "secretary.echo"
-            )
-        }));
+        assert!(repertoire
+            .entries
+            .iter()
+            .all(|entry| { matches!(entry.tool_id.as_str(), "fs.read" | "secretary.echo") }));
     }
 
     // -- register / list round trip -----------------------------------------

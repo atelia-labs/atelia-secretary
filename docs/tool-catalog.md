@@ -13,10 +13,10 @@ delegation substrate, and a service broker. Git, GitHub, Linear, memory
 providers, memory strategies, notification systems, review agents, and approval
 agents are extension-provided surfaces.
 
-The current beta repertoire surface projects the built-in Secretary tools
-`fs.read`, `fs.list`, `fs.stat`, `fs.search`, `fs.diff`, `fs.write`,
-`fs.patch`, `fs.delete`, `fs.move`, `proc.exec`, `proc.run`, and
-`secretary.echo` as the initial live tool surface.
+The current beta repertoire surface projects only the built-in Secretary tools
+that are dispatchable in this beta slice: `fs.read` and `secretary.echo`.
+Broader built-ins may exist in future or runtime-backed slices, but they are
+not claimed by `ListRepertoire` until dispatch exists.
 
 ## Risk Scale
 
