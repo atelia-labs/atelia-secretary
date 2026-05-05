@@ -151,6 +151,13 @@ policy
 audit_ref audit:tool-call:01h
 ```
 
+## Text Rendering
+
+Text rendering is a human-readable fallback for compact summaries, diagnosis,
+and small one-off results. It preserves high-signal status and summary context
+while favoring plain prose over table structure. Rich policy, recovery, and
+long payload details still belong in TOON, JSON, or artifacts.
+
 ## JSON Rendering
 
 JSON is another format Secretary can choose.
@@ -180,6 +187,7 @@ Compatibility rules:
 - unsupported customizer versions fall back to canonical Secretary output
 - TOON and JSON renderers share the same canonical schema version
 - default format changes are release-note-visible behavior changes
+- release gates keep golden compatibility fixtures for TOON, JSON, and customizer-style field filtering under `crates/atelia-core/tests/fixtures/tool_output/`
 
 ## Schema Negotiation
 

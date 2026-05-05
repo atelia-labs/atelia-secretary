@@ -48,6 +48,7 @@ In addition to the beta gate, a release should require:
 - extension runtime compatibility checks;
 - tool-output TOON / JSON golden fixtures;
 - tool-output customizer compatibility fixtures;
+- tool-output compatibility fixture checks under `crates/atelia-core/tests/fixtures/tool_output/`;
 - extension compatibility matrix updates;
 - AX impact review when tool-output defaults, permission model, extension
   contracts, or Hook behavior change;

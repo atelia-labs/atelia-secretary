@@ -144,6 +144,12 @@ policy
 audit_ref audit:tool-call:01h
 ```
 
+## Text Rendering
+
+text rendering は、compact な summary、diagnosis、小さな one-off result のための human-readable fallback です。
+高 signal な status と summary context を保ちながら、table structure より plain prose を優先します。
+rich な policy、recovery、長い payload detail は引き続き TOON、JSON、artifact に置きます。
+
 ## JSON Rendering
 
 JSON は Secretary が選べる別形式です。
@@ -174,6 +180,7 @@ compatibility rules:
 - unsupported customizer version では canonical Secretary output に戻す
 - TOON renderer と JSON renderer は同じ canonical schema version を共有する
 - default format の変更は release note に出る behavior change として扱う
+- release gate は `crates/atelia-core/tests/fixtures/tool_output/` に TOON、JSON、customizer 風の field filtering 用 golden compatibility fixtures を保持する
 
 ## Schema Negotiation
 

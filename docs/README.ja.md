@@ -42,7 +42,7 @@ Atelia 全体の product philosophy、client UX、AEP / extension 仕様、Hook�
 - [Tool Definition Schema](tool-definition-schema.ja.md)
 - [Tool Output Schema](tool-output-schema.ja.md)
 - [Operational AX Analytics](operational-ax-analytics.ja.md)
-- [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.ja.md) - agent が見える live tool surface
+- [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.ja.md) - 現在の context にある live tool surface の computed projection
 
 ## Extensions
 

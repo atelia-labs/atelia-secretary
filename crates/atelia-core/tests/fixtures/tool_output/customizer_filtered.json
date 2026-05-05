@@ -1,0 +1,29 @@
+{
+  "id": "res_00000000-0000-4000-8000-000000000005",
+  "schema_version": 1,
+  "created_at": {
+    "unix_millis": 1700000123000
+  },
+  "invocation_id": "tool_00000000-0000-4000-8000-000000000006",
+  "tool_id": "git_status",
+  "status": "succeeded",
+  "schema_ref": "schema:tool.customizer.v1",
+  "fields": [
+    {
+      "key": "summary",
+      "value": {
+        "string": "customizer keeps summary"
+      }
+    },
+    {
+      "key": "policy.state",
+      "value": {
+        "string": "allowed_with_audit"
+      }
+    }
+  ],
+  "evidence_refs": [],
+  "output_refs": [],
+  "truncation": null,
+  "redactions": []
+}
