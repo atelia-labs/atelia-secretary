@@ -946,6 +946,12 @@ fn serialize_health_response(response: rpc::HealthResponse) -> serde_json::Value
         "storage_version": response.storage_version,
         "storage_status": response.storage_status,
         "daemon_status": response.daemon_status,
+        "beta_state": response.beta_state.map(|beta_state| serde_json::json!({
+            "scope": beta_state.scope,
+            "durability": beta_state.durability,
+            "restart_semantics": beta_state.restart_semantics,
+            "limits": beta_state.limits,
+        })),
         "capabilities": response.capabilities,
     })
 }
@@ -4247,6 +4253,12 @@ mod tests {
         assert_eq!(response["status"], "ok");
         assert!(response["data"]["daemon_status"].is_string());
         assert!(response["data"]["capabilities"].is_array());
+        assert_eq!(response["data"]["beta_state"]["scope"], "process_local");
+        assert_eq!(response["data"]["beta_state"]["durability"], "in_memory");
+        assert_eq!(
+            response["data"]["beta_state"]["restart_semantics"],
+            "reset_on_restart"
+        );
 
         shutdown_tx.send(()).expect("shutdown signal");
         let _ = server_task

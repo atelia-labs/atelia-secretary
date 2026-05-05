@@ -56,6 +56,11 @@ if `policy_decision` is missing, re-run policy evaluation; if a
 `tool_invocation` exists without a `tool_result`, mark it for retry or cleanup
 before accepting new work for that job.
 
+The current beta in-memory state is process-local only. It is bounded by the
+daemon lifetime, is not recovered from the ledger after restart, and is reset
+when the daemon process restarts. Health surfaces this as a hint so clients do
+not mistake the beta state for durable storage.
+
 ## Repository Records
 
 Repository records include:
