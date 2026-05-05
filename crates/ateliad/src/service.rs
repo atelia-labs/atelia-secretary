@@ -895,13 +895,17 @@ impl SecretaryService {
                         let idempotency_key = idempotency_key.clone();
                         let request_signature = request_signature.clone();
                         move |receipt: &RuntimeJobReceipt| {
-                            Some((
-                                idempotency_key.clone(),
-                                SubmitJobIdempotencyRecord {
-                                    signature: request_signature.clone(),
-                                    receipt: receipt.clone(),
-                                },
-                            ))
+                            if receipt.job.status == JobStatus::Succeeded {
+                                Some((
+                                    idempotency_key.clone(),
+                                    SubmitJobIdempotencyRecord {
+                                        signature: request_signature.clone(),
+                                        receipt: receipt.clone(),
+                                    },
+                                ))
+                            } else {
+                                None
+                            }
                         }
                     });
                 self.lifecycle.runtime().run_tool_job_with_finalizer(
@@ -917,13 +921,17 @@ impl SecretaryService {
                         let idempotency_key = idempotency_key.clone();
                         let request_signature = request_signature.clone();
                         move |receipt: &RuntimeJobReceipt| {
-                            Some((
-                                idempotency_key.clone(),
-                                SubmitJobIdempotencyRecord {
-                                    signature: request_signature.clone(),
-                                    receipt: receipt.clone(),
-                                },
-                            ))
+                            if receipt.job.status == JobStatus::Succeeded {
+                                Some((
+                                    idempotency_key.clone(),
+                                    SubmitJobIdempotencyRecord {
+                                        signature: request_signature.clone(),
+                                        receipt: receipt.clone(),
+                                    },
+                                ))
+                            } else {
+                                None
+                            }
                         }
                     });
                 self.lifecycle.runtime().run_tool_job_with_finalizer(
@@ -2168,6 +2176,72 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServiceError::Conflict { .. }));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn durable_service_does_not_persist_blocked_idempotency_records() {
+        let storage_dir = durable_storage_dir("blocked-idempotency");
+        let first_service =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service");
+        let root = test_repo_dir("blocked-idempotency");
+        let repository = first_service
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "durable-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Blocked,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("repository registration should succeed");
+
+        let first = first_service
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "blocked request".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("blocked-key".to_string()),
+            })
+            .expect("blocked submit should still return a receipt");
+        assert_eq!(first.job.status, JobStatus::Blocked);
+        assert!(first_service
+            .lifecycle
+            .runtime()
+            .store()
+            .get_submit_job_idempotency("blocked-key")
+            .expect("idempotency lookup should succeed")
+            .is_none());
+        let first_job_id = first.job.id.clone();
+        drop(first_service);
+
+        let second_service =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service reload");
+        assert!(second_service
+            .lifecycle
+            .runtime()
+            .store()
+            .get_submit_job_idempotency("blocked-key")
+            .expect("idempotency lookup should succeed")
+            .is_none());
+
+        let second = second_service
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "blocked request".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("blocked-key".to_string()),
+            })
+            .expect("blocked submit should execute again after restart");
+        assert_eq!(second.job.status, JobStatus::Blocked);
+        assert_ne!(second.job.id, first_job_id);
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(storage_dir);
