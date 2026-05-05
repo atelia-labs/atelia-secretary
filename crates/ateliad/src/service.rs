@@ -806,6 +806,7 @@ impl SecretaryService {
                 reason: "goal must not be empty".to_string(),
             });
         }
+        let normalized_goal = request.goal.trim().to_string();
 
         let requested_capabilities =
             normalize_requested_capabilities(&request.requested_capabilities)?;
@@ -818,7 +819,8 @@ impl SecretaryService {
             .map(|key| key.trim())
             .filter(|key| !key.is_empty())
             .map(str::to_string);
-        let request_signature = submit_job_request_signature(&request, &requested_capabilities);
+        let request_signature =
+            submit_job_request_signature(&request, &normalized_goal, &requested_capabilities);
         let mut idempotent_cache_lock = if let Some(idempotency_key) =
             normalized_idempotency_key.as_deref()
         {
@@ -883,7 +885,7 @@ impl SecretaryService {
             request.requester,
             request.repository_id,
             request.kind,
-            request.goal,
+            normalized_goal,
         )
         .with_requested_capabilities(requested_capabilities)
         .with_tool_output_defaults(tool_output_defaults)
@@ -943,13 +945,15 @@ impl SecretaryService {
             }
         };
         if let Some((idempotency_key, mut cache)) = idempotent_cache_lock.take() {
-            cache.insert(
-                idempotency_key,
-                IdempotentSubmitJob {
-                    signature: request_signature,
-                    receipt: receipt.clone(),
-                },
-            );
+            if receipt.job.status == JobStatus::Succeeded {
+                cache.insert(
+                    idempotency_key,
+                    IdempotentSubmitJob {
+                        signature: request_signature,
+                        receipt: receipt.clone(),
+                    },
+                );
+            }
         }
 
         Ok(receipt)
@@ -1568,6 +1572,7 @@ fn validate_filesystem_read_scope(
 
 fn submit_job_request_signature(
     request: &SubmitJobRequest,
+    normalized_goal: &str,
     requested_capabilities: &[String],
 ) -> String {
     #[derive(Serialize)]
@@ -1592,7 +1597,7 @@ fn submit_job_request_signature(
         actor: &request.requester,
         repository_id: request.repository_id.as_str(),
         kind: &request.kind,
-        goal: request.goal.trim(),
+        goal: normalized_goal,
         resource_scope: &resource_scope,
         requested_capabilities,
     })
@@ -4323,8 +4328,10 @@ mod tests {
             requested_capabilities: Vec::new(),
             idempotency_key: Some("request-123".to_string()),
         };
+        let first_normalized_goal = first_request.goal.trim().to_string();
         let first_signature = submit_job_request_signature(
             &first_request,
+            &first_normalized_goal,
             &normalize_requested_capabilities(&first_request.requested_capabilities)
                 .expect("first capability normalization should succeed"),
         );
@@ -4341,8 +4348,10 @@ mod tests {
             requested_capabilities: vec!["capability.discovery".to_string()],
             idempotency_key: Some("request-123".to_string()),
         };
+        let second_normalized_goal = second_request.goal.trim().to_string();
         let second_signature = submit_job_request_signature(
             &second_request,
+            &second_normalized_goal,
             &normalize_requested_capabilities(&second_request.requested_capabilities)
                 .expect("second capability normalization should succeed"),
         );
@@ -4352,6 +4361,103 @@ mod tests {
 
         assert_eq!(first.job.id, second.job.id);
         assert_eq!(first_signature, second_signature);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_trims_goal_before_runtime_and_replay() {
+        let svc = ready_service();
+        let root = test_repo_dir("trimmed-goal-idempotency");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let first = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "  summarize  ".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("request-123".to_string()),
+            })
+            .expect("first submit should succeed");
+
+        assert_eq!(first.job.goal, "summarize");
+
+        let second = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("request-123".to_string()),
+            })
+            .expect("trimmed goal should replay the same job");
+
+        assert_eq!(second.job.id, first.job.id);
+        assert_eq!(second.job.goal, "summarize");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_does_not_cache_failed_idempotent_requests() {
+        let svc = ready_service();
+        let root = test_repo_dir("failed-idempotency");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("binary.bin"), vec![0x61, 0x00, 0x62]).expect("binary test file");
+
+        let first = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "inspect".to_string(),
+                resource_scope: Some(ResourceScope {
+                    kind: "repository".to_string(),
+                    value: "binary.bin".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.read".to_string()],
+                idempotency_key: Some("request-123".to_string()),
+            })
+            .expect("first submit should return a failed receipt");
+
+        assert_eq!(first.job.status, JobStatus::Failed);
+
+        let second = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "inspect".to_string(),
+                resource_scope: Some(ResourceScope {
+                    kind: "repository".to_string(),
+                    value: "binary.bin".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.read".to_string()],
+                idempotency_key: Some("request-123".to_string()),
+            })
+            .expect("failed job should not be replayed from the in-memory cache");
+
+        assert_eq!(second.job.status, JobStatus::Failed);
+        assert_ne!(second.job.id, first.job.id);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4398,8 +4504,18 @@ mod tests {
             idempotency_key: None,
         };
 
-        let signature_one = submit_job_request_signature(&request_one, &normalized_capabilities);
-        let signature_two = submit_job_request_signature(&request_two, &normalized_capabilities);
+        let request_one_normalized_goal = request_one.goal.trim().to_string();
+        let request_two_normalized_goal = request_two.goal.trim().to_string();
+        let signature_one = submit_job_request_signature(
+            &request_one,
+            &request_one_normalized_goal,
+            &normalized_capabilities,
+        );
+        let signature_two = submit_job_request_signature(
+            &request_two,
+            &request_two_normalized_goal,
+            &normalized_capabilities,
+        );
 
         assert_ne!(signature_one, signature_two);
         let _ = fs::remove_dir_all(root);
