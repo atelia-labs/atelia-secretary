@@ -78,7 +78,7 @@ filesystem tool は execution 前に path を resolve します。
 
 authoritative path algorithm は canonicalization with verification です。daemon は requested path と repository root を absolute canonical path に resolve し、resolved path が canonical allowed root の下にない場合は reject します。そのうえで、[Storage And Ledger Design](storage-ledger.ja.md) が定義する tool invocation / audit record に resolved path と redacted display path を記録します。TOCTOU mitigation として、mutating tool は use 直前に target を open または stat し、可能なら final inode または platform equivalent を記録し、その final target が validated resolved path と一致しない場合は fail します。将来の platform-specific implementation は `openat` / dirfd chaining に置き換えて構いませんが、同じ visible record と rejection semantics を保つ必要があります。
 
-`fs.delete` と `fs.move` は、この validated mutation path を uphold できる場合にだけ support します。Unix では、mutation が成功したときに caller は `platform_safety=unix-validated` の result marker を受け取ります。non-Unix platform では、best-effort の unlink や rename に fallback せず、unsupported を返さなければなりません。
+`fs.delete` と `fs.move` は、この validated mutation path を uphold できる場合にだけ support します。Unix では、mutation が成功したときに caller は `platform_safety=unix-validated` の result marker を受け取ります。non-Unix platform では、best-effort の unlink や rename に fallback せず、`platform_safety=unsupported-non-unix` 付きの unsupported を返さなければなりません。
 
 write と patch は audit が必要です。
 

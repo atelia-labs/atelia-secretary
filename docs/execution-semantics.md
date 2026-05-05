@@ -119,8 +119,8 @@ records and rejection semantics.
 `fs.delete` and `fs.move` are only supported where that validated mutation path
 can be upheld. On Unix, callers receive a `platform_safety=unix-validated`
 result marker when the mutation succeeds. On non-Unix platforms, those
-operations must return unsupported rather than falling back to best-effort
-unlink or rename behavior.
+operations must return unsupported with `platform_safety=unsupported-non-unix`
+rather than falling back to best-effort unlink or rename behavior.
 
 Writes and patches require audit.
 
