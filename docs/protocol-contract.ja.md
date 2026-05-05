@@ -2,7 +2,7 @@
 
 この文書は、Atelia Secretary の最初の durable protocol contract を定義します。daemon runtime architecture、`atelia-kit`、native client の間の境界です。
 
-beta contract は Rust RPC boundary では transport-neutral に保ちます。shipping している beta transport は HTTP/JSON で、proto/gRPC の generated client / server path は future work であり、まだ ship していません。
+beta contract は Rust RPC boundary では transport-neutral に保ちます。shipping している beta transport は HTTP/JSON で、proto/gRPC-generated の client / server path は future work であり、まだ ship していません。
 
 protocol は退屈で、typed で、versioned で、event-friendly であるべきです。storage detail をそのまま expose しませんが、client と agent が起きたことを理解できる identity と audit reference は保ちます。
 

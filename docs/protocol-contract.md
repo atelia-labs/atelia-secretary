@@ -5,7 +5,7 @@ It is the bridge between the daemon runtime architecture, `atelia-kit`, and
 native clients.
 
 The beta contract is transport-neutral at the Rust RPC boundary. The shipping
-beta transport is HTTP/JSON, while proto/gRPC generated client and server paths
+beta transport is HTTP/JSON, while proto/gRPC-generated client and server paths
 are future work and are not shipped yet.
 
 The protocol should be boring, typed, versioned, and event-friendly. It should
