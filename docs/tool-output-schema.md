@@ -154,9 +154,9 @@ audit_ref audit:tool-call:01h
 ## Text Rendering
 
 Text rendering is a human-readable fallback for compact summaries, diagnosis,
-and small one-off results. It should preserve the same `status`, `summary`,
-policy, and recovery signals as TOON or JSON, while favoring plain prose over
-table structure. Longer payloads still belong in artifacts.
+and small one-off results. It preserves high-signal status and summary context
+while favoring plain prose over table structure. Rich policy, recovery, and
+long payload detail still belongs in TOON, JSON, or artifacts.
 
 ## JSON Rendering
 
