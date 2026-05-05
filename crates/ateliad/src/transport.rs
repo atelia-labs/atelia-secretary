@@ -536,12 +536,19 @@ fn open_session_token_file(token_path: &std::path::Path) -> Result<std::fs::File
 
 fn generate_session_token() -> Result<String> {
     let mut bytes = [0u8; 32];
-    let mut file = std::fs::File::open("/dev/urandom")
-        .context("failed to open /dev/urandom for local auth token generation")?;
-    use std::io::Read;
-    file.read_exact(&mut bytes)
-        .context("failed to read entropy for local auth token generation")?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    getrandom::fill(&mut bytes)
+        .context("failed to obtain secure randomness for local auth token generation")?;
+    Ok(encode_session_token(&bytes))
+}
+
+fn encode_session_token(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        token.push(HEX[(byte >> 4) as usize] as char);
+        token.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    token
 }
 
 #[cfg(unix)]
@@ -3578,6 +3585,15 @@ mod tests {
 
         let resolved_again = resolve_local_auth(&storage_dir).expect("resolve local auth again");
         assert_eq!(resolved_again, LocalAuthConfig::BearerToken { token });
+    }
+
+    #[test]
+    fn encode_session_token_formats_lowercase_hex() {
+        let token = encode_session_token(&[0x00, 0x01, 0xab, 0xcd, 0xef, 0xff]);
+
+        assert_eq!(token, "0001abcdefff");
+        assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(token.chars().all(|ch| !ch.is_ascii_uppercase()));
     }
 
     #[cfg(unix)]
