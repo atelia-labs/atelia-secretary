@@ -76,3 +76,4 @@ Release and research:
 ## 現在の状態
 
 Atelia Secretary は初期設計と first product 実装の段階です。現在は Rust daemon architecture を、実装できる粒度まで具体化しています。対象は typed protocol、domain record、policy、job orchestration、execution ledger、tool execution、extension boundary です。
+beta protocol contract は `docs/protocol-contract.ja.md` で lock しており、shipping transport は HTTP/JSON です。generated proto/gRPC client / server path は future work です。

@@ -4,6 +4,10 @@ This document defines the first durable protocol contract for Atelia Secretary.
 It is the bridge between the daemon runtime architecture, `atelia-kit`, and
 native clients.
 
+The beta contract is transport-neutral at the Rust RPC boundary. The shipping
+beta transport is HTTP/JSON, while proto/gRPC generated client and server paths
+are future work and are not shipped yet.
+
 The protocol should be boring, typed, versioned, and event-friendly. It should
 not expose implementation storage details, but it must preserve enough identity
 and audit references for clients and agents to understand what happened.
@@ -44,9 +48,10 @@ This table is the required service contract, not merely a description of the
 current protobuf implementation. The current daemon exposes the health,
 repository, job, policy, event replay, project status, tool-output settings,
 `RenderToolOutput`, and extension RPC groups. Extension installation and
-blocklist operations are currently exposed through the daemon HTTP/JSON
-transport while the protobuf service remains focused on the shared client
-runtime contract. `WatchEvents` is implemented as a cursor replay surface today;
+blocklist operations are currently exposed through the daemon HTTP/JSON beta
+transport. The Rust RPC boundary in `ateliad` stays transport-neutral so a
+future proto/gRPC client path can bind to the same contract instead of
+redefining it. `WatchEvents` is implemented as a cursor replay surface today;
 a long-lived streaming transport remains a future transport refinement.
 
 Required RPC groups:

@@ -34,7 +34,7 @@ use std::convert::TryFrom;
 const MAX_WATCH_EVENTS_PAGE: usize = 1000;
 
 pub const TRANSPORT_BLOCKER: &str =
-    "tonic/prost server dependencies are not configured for ateliad";
+    "tonic/prost gRPC server generation is not shipped in ateliad yet; HTTP/JSON is the beta transport";
 
 #[allow(dead_code)]
 pub struct SecretaryRpcServer {
