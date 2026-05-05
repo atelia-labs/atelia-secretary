@@ -235,6 +235,10 @@ Preferences are workplace ergonomics.
 These preferences express Secretary's professional judgment about its workplace.
 Clients, extensions, and supporting agents can propose changes; Secretary owns
 the persistent preference.
+The daemon exposes these defaults through inspect/update/history settings
+operations across workspace, repository, project, session, agent-profile, and
+optional tool-id scopes, and each persistent update records the actor, reason,
+old defaults, new defaults, and timestamp.
 
 ## Recovery Contract
 

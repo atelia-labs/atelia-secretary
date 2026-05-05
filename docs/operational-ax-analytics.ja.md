@@ -147,6 +147,8 @@ collect:
 - actual format returned
 - temporary override vs persistent setting
 - format switch reason
+- persistent update が触れた settings scope
+- actor、reason、timestamp を持つ settings history entry
 - parse success by format
 - token cost by format
 - repeated-call rate by format
