@@ -21,12 +21,13 @@ async fn main() -> Result<()> {
     let storage_dir = std::env::var_os(STORAGE_DIR_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".atelia-secretary"));
-    let mut service = service::SecretaryService::new_durable(storage_dir)?;
+    let mut service = service::SecretaryService::new_durable(storage_dir.clone())?;
     info!("Atelia Secretary daemon starting");
 
     service.set_running();
     let rpc_server = Arc::new(RwLock::new(rpc::SecretaryRpcServer::new(service)));
     let health = rpc_server.read().await.health(rpc::HealthRequest);
+    let local_auth = transport::resolve_local_auth(&storage_dir)?;
 
     let (listen_addr, explicit_addr) = transport::listen_addr()?;
     transport::validate_listen_addr(&listen_addr, explicit_addr)?;
@@ -57,6 +58,7 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let listener_task = tokio::spawn(transport::run_listener(
         rpc_server.clone(),
+        local_auth,
         listener,
         shutdown_rx,
     ));

@@ -24,6 +24,14 @@ beta では、Secretary は原則として同一ホスト内で使う daemon で
 にのみ許可されます。この override は制御された local test 向けであり、
 通常の deployment mode として扱うべきではありません。
 
+Secretary は beta では local bearer token も要求します。startup 時に
+`<storage_dir>/daemon-auth.token` を作成または再利用し、すべての request
+に `Authorization: Bearer <token>` を求めます。制御された local test
+向けの明示的な opt-out として `ATELIA_DAEMON_AUTH_DISABLED=1` があり、
+通常の deployment mode として扱うべきではありません。
+`ATELIA_DAEMON_AUTH_TOKEN` を設定すると token を固定できますが、
+それでも local secret として扱う必要があります。
+
 ## threat model の種
 
 初期の threat model work では次のものを扱うべきです。
