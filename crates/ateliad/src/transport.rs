@@ -3199,6 +3199,8 @@ mod tests {
     #[test]
     fn validate_listen_addr_rejects_default_non_loopback_binding() {
         let _guard = UnsafeAllowNonLoopbackListenEnvGuard::lock();
+        let previous_unsafe_allow_non_loopback_listen =
+            std::env::var_os(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV);
         std::env::remove_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV);
         let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
 
@@ -3207,6 +3209,11 @@ mod tests {
         assert!(err
             .to_string()
             .contains("refusing default non-loopback listener address"));
+
+        match previous_unsafe_allow_non_loopback_listen.as_ref() {
+            Some(value) => std::env::set_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV, value),
+            None => std::env::remove_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV),
+        }
     }
 
     #[test]
