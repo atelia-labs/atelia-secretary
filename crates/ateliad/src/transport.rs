@@ -280,6 +280,7 @@ struct ListEventsRequestPayload {
     repository_id: Option<String>,
     cursor: Option<EventCursorPayload>,
     subject_ids: Option<Vec<String>>,
+    job_ids: Option<Vec<String>>,
     min_severity: Option<String>,
     page_size: Option<usize>,
     page_token: Option<String>,
@@ -547,7 +548,7 @@ fn parse_list_events_payload(
             None => None,
         },
         subject_ids: payload.subject_ids.unwrap_or_default(),
-        job_ids: Vec::new(),
+        job_ids: payload.job_ids.unwrap_or_default(),
         min_severity: parse_event_severity(payload.min_severity)?,
         page_size: payload.page_size,
         page_token: payload.page_token,
@@ -3192,6 +3193,93 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(other_root);
+    }
+
+    #[tokio::test]
+    async fn events_list_accepts_job_ids_and_filters_to_that_job() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("events-list-job-ids");
+        let repository = {
+            let server = rpc_server.read().await;
+            server
+                .register_repository(rpc::RegisterRepositoryRequest {
+                    display_name: "events-list-job-ids-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed")
+                .repository
+        };
+        let repository_id = repository.repository_id.clone();
+
+        let first_job_id = {
+            let server = rpc_server.read().await;
+            server
+                .submit_job(rpc::SubmitJobRequest {
+                    repository_id: repository_id.clone(),
+                    requester: rpc::RpcActorDto::Agent {
+                        id: "agent:events-list".to_string(),
+                        display_name: Some("Events List Agent".to_string()),
+                    },
+                    kind: "read".to_string(),
+                    goal: "first".to_string(),
+                    path_scope: None,
+                    requested_capabilities: Vec::new(),
+                    idempotency_key: Some("events-list-first".to_string()),
+                })
+                .expect("first submit should succeed")
+                .job
+                .job_id
+        };
+
+        let selected_job_id = {
+            let server = rpc_server.read().await;
+            server
+                .submit_job(rpc::SubmitJobRequest {
+                    repository_id: repository_id.clone(),
+                    requester: rpc::RpcActorDto::Agent {
+                        id: "agent:events-list".to_string(),
+                        display_name: Some("Events List Agent".to_string()),
+                    },
+                    kind: "read".to_string(),
+                    goal: "second".to_string(),
+                    path_scope: None,
+                    requested_capabilities: Vec::new(),
+                    idempotency_key: Some("events-list-second".to_string()),
+                })
+                .expect("second submit should succeed")
+                .job
+                .job_id
+        };
+
+        let response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/events/list",
+            serde_json::json!({
+                "repository_id": repository_id,
+                "subject_ids": [],
+                "job_ids": [selected_job_id.clone()],
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], "ok");
+        let events = payload["data"]["events"].as_array().expect("events array");
+        assert!(!events.is_empty());
+        assert!(events
+            .iter()
+            .all(|event| event["refs"]["job_id"] == selected_job_id));
+        assert!(events
+            .iter()
+            .all(|event| event["refs"]["job_id"] != first_job_id));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
