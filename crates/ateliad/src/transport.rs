@@ -312,7 +312,7 @@ struct GetToolOutputDefaultsRequestPayload {
 #[derive(Debug, Deserialize)]
 struct UpdateToolOutputDefaultsRequestPayload {
     scope: ToolOutputSettingsScope,
-    actor: ActorPayload,
+    actor: Actor,
     reason: String,
     overrides: ToolOutputOverrides,
 }
@@ -402,11 +402,30 @@ fn parse_path_scope_kind(value: Option<String>) -> Result<rpc::RpcPathScopeKind,
 }
 
 fn parse_path_scope_payload(payload: PathScopePayload) -> Result<rpc::RpcPathScope, String> {
+    let PathScopePayload {
+        kind,
+        roots,
+        include_patterns,
+        exclude_patterns,
+    } = payload;
+    let roots = roots.unwrap_or_default();
+    let include_patterns = include_patterns.unwrap_or_default();
+    let exclude_patterns = exclude_patterns.unwrap_or_default();
+
+    if kind.is_none()
+        && (!roots.is_empty() || !include_patterns.is_empty() || !exclude_patterns.is_empty())
+    {
+        return Err(
+            "path_scope.kind is required when roots or include/exclude patterns are provided"
+                .to_string(),
+        );
+    }
+
     Ok(rpc::RpcPathScope {
-        kind: parse_path_scope_kind(payload.kind)?,
-        roots: payload.roots.unwrap_or_default(),
-        include_patterns: payload.include_patterns.unwrap_or_default(),
-        exclude_patterns: payload.exclude_patterns.unwrap_or_default(),
+        kind: parse_path_scope_kind(kind)?,
+        roots,
+        include_patterns,
+        exclude_patterns,
     })
 }
 
@@ -804,8 +823,6 @@ fn serialize_tool_output_change(
     let mut value = serde_json::to_value(rpc_change_to_core(change)?)?;
 
     if let serde_json::Value::Object(ref mut map) = value {
-        map.insert("actor".to_string(), serialize_actor(&change.actor));
-
         if let Some(serde_json::Value::Object(changed_at)) = map.get("changed_at") {
             if let Some(unix_millis) = changed_at.get("unix_millis").cloned() {
                 map.insert("changed_at_unix_ms".to_string(), unix_millis);
@@ -1687,7 +1704,7 @@ async fn dispatch_update_tool_output_defaults(
             Ok(scope) => scope,
             Err(error) => return transport_error_response(next_state, error),
         },
-        actor: parse_actor_payload(payload.actor),
+        actor: rpc::RpcActorDto::from(payload.actor),
         reason: payload.reason,
         overrides: core_tool_output_overrides_to_rpc(payload.overrides),
     }) {
@@ -2921,6 +2938,27 @@ mod tests {
     }
 
     #[test]
+    fn path_scope_payload_requires_kind_when_details_are_present() {
+        let err = parse_path_scope_payload(PathScopePayload {
+            kind: None,
+            roots: Some(vec!["src".to_string()]),
+            include_patterns: None,
+            exclude_patterns: None,
+        })
+        .expect_err("scope details without kind should fail");
+        assert!(err.contains("path_scope.kind is required"));
+
+        let parsed = parse_path_scope_payload(PathScopePayload {
+            kind: None,
+            roots: None,
+            include_patterns: None,
+            exclude_patterns: None,
+        })
+        .expect("empty scope can use repository default");
+        assert_eq!(parsed.kind, rpc::RpcPathScopeKind::Repository);
+    }
+
+    #[test]
     fn parse_trust_state_accepts_known_values_and_rejects_unknown() {
         assert_eq!(
             parse_trust_state(Some("trusted".to_string())).expect("trusted"),
@@ -3290,6 +3328,7 @@ mod tests {
     async fn job_routes_submit_list_and_report_cancel_errors() {
         let rpc_server = ready_rpc_server();
         let root = test_repo_dir("job-route");
+        let missing_job_id = JobId::new().as_str().to_string();
         let repository = {
             let server = rpc_server.read().await;
             server
@@ -3389,7 +3428,7 @@ mod tests {
         let cancel_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/jobs/not-a-job-id/cancel",
+            &format!("/v1/jobs/{missing_job_id}/cancel"),
             serde_json::json!({
                 "requester": {
                     "type": "agent",
@@ -3401,6 +3440,11 @@ mod tests {
         )
         .await;
         assert_eq!(cancel_response.status(), StatusCode::NOT_FOUND);
+        let cancel_payload = to_bytes(cancel_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(cancel_payload["error"]["code"], "rpc_error");
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3437,11 +3481,11 @@ mod tests {
             serde_json::json!({
                 "scope": serde_json::to_value(ToolOutputSettingsScope::workspace())
                     .expect("scope json"),
-                "actor": {
-                    "type": "user",
-                    "id": "user:tool-output",
-                    "display_name": "Tool Output User"
-                },
+                "actor": serde_json::to_value(Actor::User {
+                    id: "user:tool-output".to_string(),
+                    display_name: Some("Tool Output User".to_string()),
+                })
+                .expect("actor json"),
                 "reason": "tighten workspace defaults",
                 "overrides": serde_json::to_value(ToolOutputOverrides {
                     format: Some(OutputFormat::Json),
@@ -3471,12 +3515,8 @@ mod tests {
         assert!(update_payload["data"]["change"]["changed_at_unix_ms"].is_i64());
         assert!(update_payload["data"]["change"]["changed_at"]["unix_millis"].is_i64());
         assert_eq!(
-            update_payload["data"]["change"]["actor"]["id"],
+            update_payload["data"]["change"]["actor"]["user"]["id"],
             Value::String("user:tool-output".to_string())
-        );
-        assert_eq!(
-            update_payload["data"]["change"]["actor"]["type"],
-            Value::String("user".to_string())
         );
 
         let history_response = send_json_request(
@@ -3506,6 +3546,10 @@ mod tests {
         );
         assert!(history_payload["data"]["changes"][0]["changed_at_unix_ms"].is_i64());
         assert!(history_payload["data"]["changes"][0]["changed_at"]["unix_millis"].is_i64());
+        assert_eq!(
+            history_payload["data"]["changes"][0]["actor"]["user"]["id"],
+            Value::String("user:tool-output".to_string())
+        );
 
         let defaults_again = send_json_request(
             &rpc_server,
