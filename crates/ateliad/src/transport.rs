@@ -208,9 +208,28 @@ struct ListRepositoriesRequestPayload {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ActorPayload {
+    User {
+        id: String,
+        display_name: Option<String>,
+    },
+    Agent {
+        id: String,
+        display_name: Option<String>,
+    },
+    Extension {
+        id: String,
+    },
+    System {
+        id: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
 struct SubmitJobRequestPayload {
     repository_id: String,
-    requester: Actor,
+    requester: ActorPayload,
     kind: String,
     goal: String,
     path_scope: Option<PathScopePayload>,
@@ -222,14 +241,14 @@ struct SubmitJobRequestPayload {
 struct ListJobsRequestPayload {
     repository_id: Option<String>,
     status: Option<String>,
-    requester: Option<Actor>,
+    requester: Option<ActorPayload>,
     page_size: Option<usize>,
     page_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CancelJobRequestPayload {
-    requester: Actor,
+    requester: ActorPayload,
     reason: String,
 }
 
@@ -292,7 +311,7 @@ struct GetToolOutputDefaultsRequestPayload {
 #[derive(Debug, Deserialize)]
 struct UpdateToolOutputDefaultsRequestPayload {
     scope: ToolOutputSettingsScope,
-    actor: Actor,
+    actor: ActorPayload,
     reason: String,
     overrides: ToolOutputOverrides,
 }
@@ -390,6 +409,15 @@ fn parse_path_scope_payload(payload: PathScopePayload) -> Result<rpc::RpcPathSco
     })
 }
 
+fn parse_actor_payload(payload: ActorPayload) -> rpc::RpcActorDto {
+    match payload {
+        ActorPayload::User { id, display_name } => rpc::RpcActorDto::User { id, display_name },
+        ActorPayload::Agent { id, display_name } => rpc::RpcActorDto::Agent { id, display_name },
+        ActorPayload::Extension { id } => rpc::RpcActorDto::Extension { id },
+        ActorPayload::System { id } => rpc::RpcActorDto::System { id },
+    }
+}
+
 fn parse_job_status(value: Option<String>) -> Result<Option<rpc::RpcJobStatus>, String> {
     let Some(value) = value else {
         return Ok(None);
@@ -412,7 +440,7 @@ fn parse_submit_job_payload(
 ) -> Result<rpc::SubmitJobRequest, String> {
     Ok(rpc::SubmitJobRequest {
         repository_id: payload.repository_id,
-        requester: rpc::RpcActorDto::from(payload.requester),
+        requester: parse_actor_payload(payload.requester),
         kind: payload.kind,
         goal: payload.goal,
         path_scope: payload
@@ -430,7 +458,7 @@ fn parse_list_jobs_payload(
     Ok(rpc::ListJobsRequest {
         repository_id: payload.repository_id,
         status: parse_job_status(payload.status)?,
-        requester: payload.requester.map(rpc::RpcActorDto::from),
+        requester: payload.requester.map(parse_actor_payload),
         page_size: payload.page_size,
         page_token: payload.page_token,
     })
@@ -519,6 +547,7 @@ fn parse_list_events_payload(
             None => None,
         },
         subject_ids: payload.subject_ids.unwrap_or_default(),
+        job_ids: Vec::new(),
         min_severity: parse_event_severity(payload.min_severity)?,
         page_size: payload.page_size,
         page_token: payload.page_token,
@@ -532,7 +561,8 @@ fn parse_list_job_events_payload(
     Ok(rpc::ListEventsRequest {
         repository_id: payload.repository_id,
         cursor: payload.cursor.map(parse_event_cursor_payload).transpose()?,
-        subject_ids: vec![job_id],
+        subject_ids: Vec::new(),
+        job_ids: vec![job_id],
         min_severity: parse_event_severity(payload.min_severity)?,
         page_size: payload.page_size,
         page_token: payload.page_token,
@@ -773,6 +803,8 @@ fn serialize_tool_output_change(
     let mut value = serde_json::to_value(rpc_change_to_core(change)?)?;
 
     if let serde_json::Value::Object(ref mut map) = value {
+        map.insert("actor".to_string(), serialize_actor(&change.actor));
+
         if let Some(serde_json::Value::Object(changed_at)) = map.remove("changed_at") {
             if let Some(unix_millis) = changed_at.get("unix_millis").cloned() {
                 map.insert("changed_at_unix_ms".to_string(), unix_millis);
@@ -1420,7 +1452,7 @@ async fn dispatch_cancel_job(
     let next_state = rpc_next_state(&rpc_server);
     match rpc_server.cancel_job(rpc::CancelJobRequest {
         job_id,
-        requester: rpc::RpcActorDto::from(payload.requester),
+        requester: parse_actor_payload(payload.requester),
         reason: payload.reason,
     }) {
         Ok(response) => (
@@ -1654,7 +1686,7 @@ async fn dispatch_update_tool_output_defaults(
             Ok(scope) => scope,
             Err(error) => return transport_error_response(next_state, error),
         },
-        actor: rpc::RpcActorDto::from(payload.actor),
+        actor: parse_actor_payload(payload.actor),
         reason: payload.reason,
         overrides: core_tool_output_overrides_to_rpc(payload.overrides),
     }) {
@@ -3186,10 +3218,9 @@ mod tests {
             serde_json::json!({
                 "repository_id": repository.repository_id,
                 "requester": {
-                    "agent": {
-                        "id": "agent:job-route",
-                        "display_name": "Job Route Agent"
-                    }
+                    "type": "agent",
+                    "id": "agent:job-route",
+                    "display_name": "Job Route Agent"
                 },
                 "kind": "read",
                 "goal": "submit over HTTP",
@@ -3239,6 +3270,11 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+        assert!(events_payload["data"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["refs"]["job_id"] == job_id));
 
         let list_response = send_json_request(
             &rpc_server,
@@ -3264,10 +3300,9 @@ mod tests {
             "/v1/jobs/not-a-job-id/cancel",
             serde_json::json!({
                 "requester": {
-                    "agent": {
-                        "id": "agent:job-route",
-                        "display_name": "Job Route Agent"
-                    }
+                    "type": "agent",
+                    "id": "agent:job-route",
+                    "display_name": "Job Route Agent"
                 },
                 "reason": "exercise transport error mapping"
             }),
@@ -3310,11 +3345,11 @@ mod tests {
             serde_json::json!({
                 "scope": serde_json::to_value(ToolOutputSettingsScope::workspace())
                     .expect("scope json"),
-                "actor": serde_json::to_value(Actor::User {
-                    id: "user:tool-output".to_string(),
-                    display_name: Some("Tool Output User".to_string()),
-                })
-                .expect("actor json"),
+                "actor": {
+                    "type": "user",
+                    "id": "user:tool-output",
+                    "display_name": "Tool Output User"
+                },
                 "reason": "tighten workspace defaults",
                 "overrides": serde_json::to_value(ToolOutputOverrides {
                     format: Some(OutputFormat::Json),
@@ -3343,8 +3378,12 @@ mod tests {
         );
         assert!(update_payload["data"]["change"]["changed_at_unix_ms"].is_i64());
         assert_eq!(
-            update_payload["data"]["change"]["actor"]["user"]["id"],
+            update_payload["data"]["change"]["actor"]["id"],
             Value::String("user:tool-output".to_string())
+        );
+        assert_eq!(
+            update_payload["data"]["change"]["actor"]["type"],
+            Value::String("user".to_string())
         );
 
         let history_response = send_json_request(
