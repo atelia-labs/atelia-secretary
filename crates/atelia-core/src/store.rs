@@ -1383,6 +1383,7 @@ fn validate_loaded_tool_result_record(
 
 fn validate_loaded_job_event_sequence(inner: &InMemoryInner) -> StoreResult<()> {
     let mut expected_sequence = 1u64;
+    let mut seen_event_ids = HashSet::new();
     let mut validated = inner.clone();
     for (sequence_number, event_id) in &inner.job_events_by_sequence {
         if *sequence_number != expected_sequence {
@@ -1395,6 +1396,16 @@ fn validate_loaded_job_event_sequence(inner: &InMemoryInner) -> StoreResult<()> 
             });
         }
         expected_sequence = expected_sequence.saturating_add(1);
+
+        if !seen_event_ids.insert(event_id.clone()) {
+            return Err(StoreError::Conflict {
+                collection: "job_events",
+                reason: format!(
+                    "sequence index references duplicate event id {}",
+                    id_debug(event_id)
+                ),
+            });
+        }
 
         let event = inner
             .job_events_by_id
@@ -1434,7 +1445,7 @@ fn validate_loaded_job_event_sequence(inner: &InMemoryInner) -> StoreResult<()> 
         });
     }
 
-    if inner.job_events_by_id.len() != inner.job_events_by_sequence.len() {
+    if seen_event_ids.len() != inner.job_events_by_id.len() {
         return Err(StoreError::InvalidRecord {
             collection: "job_events",
             reason: "sequence index and id index disagree on event count".to_string(),
@@ -6006,6 +6017,52 @@ mod tests {
             err,
             StoreError::NotFound {
                 collection: "repositories",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn durable_store_rejects_duplicate_event_ids_in_sequence_ledger() {
+        let storage_dir = durable_storage_dir("duplicate-event-id");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let mut inner = InMemoryInner::default();
+        let repository = repository_record();
+        let mut first_event = job_event(repository.id.clone());
+        let mut second_event = job_event(repository.id.clone());
+        first_event.sequence_number = 1;
+        second_event.sequence_number = 2;
+
+        inner.repositories.insert(repository.id.clone(), repository);
+        inner
+            .job_events_by_id
+            .insert(first_event.id.clone(), first_event.clone());
+        inner
+            .job_events_by_id
+            .insert(second_event.id.clone(), second_event);
+        inner
+            .job_events_by_sequence
+            .insert(1, first_event.id.clone());
+        inner
+            .job_events_by_sequence
+            .insert(2, first_event.id.clone());
+        inner.next_event_sequence = 2;
+
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner,
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::Conflict {
+                collection: "job_events",
                 ..
             }
         ));
