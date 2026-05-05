@@ -3198,6 +3198,8 @@ mod tests {
 
     #[test]
     fn validate_listen_addr_rejects_default_non_loopback_binding() {
+        let _guard = UnsafeAllowNonLoopbackListenEnvGuard::lock();
+        std::env::remove_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV);
         let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
 
         let err = validate_listen_addr(&addr, false).expect_err("default non-loopback should fail");
