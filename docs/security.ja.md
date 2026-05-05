@@ -34,6 +34,13 @@ Secretary は beta では local bearer token も要求します。startup 時に
 再利用前に restrictive permissions に正規化され、auth-disabled の opt-out
 は unsafe な non-loopback listener override と組み合わせると拒否されます。
 
+token 生成の要件は次のとおりです。
+
+- system CSPRNG を使う
+- raw entropy を 32 bytes 以上にする
+- hex か padding なしの base64url で encode する
+- `<storage_dir>/daemon-auth.token` の permission を owner-only に harden してから再利用する
+
 ## Local token の lifecycle
 
 - local bearer token は自動では期限切れになりません。
@@ -61,22 +68,34 @@ Secretary は beta では local bearer token も要求します。startup 時に
 
 ## Replay protection
 
+beta の既知の limitation として、Secretary は local auth に built-in の
+replay protection や token expiry をまだ持ちません。認証済み request は、
+token を rotation するまで、または local boundary が失われるまで replay
+できます。loopback 上にいる attacker でも、token が rotation されるまで
+再利用できます。
+
 Secretary が現在提供している local boundary の mitigation は次の 2 つです。
 
 - daemon は default で loopback のみに bind し、unsafe な non-loopback override を
   有効にしない限り traffic を local host に限定します。
 - local auth opt-out を有効にしない限り、各 request で bearer token を要求します。
 
-一方で、nonce, timestamp, request signing, token expiry のような replay 専用の
-protective mechanism は提供していません。認証済み request を取得した側は、
-token が変わるか local boundary が外れるまで replay できます。
-
 推奨 mitigation:
 
 - daemon は loopback-only のまま使い、local auth は有効のままにする
 - host ごと、または daemon instance ごとに一意の token を使う
-- token が露出した、または盗聴された疑いがある場合は直ちに rotate する
+- token は 30 days 程度を目安に定期 rotation し、compromise の疑いがある
+  場合は直ちに rotate する
+- token の使用状況を monitoring し、audit を残す
 - shared listener, reverse proxy, それ以外の replay しやすい boundary の背後に daemon を置かない
+
+将来の roadmap:
+
+- short-lived token
+- refresh flow
+- request signing with HMAC + nonce + timestamp
+- server-side nonce tracking
+- token rotation の first-class support
 
 ## threat model の種
 

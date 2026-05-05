@@ -38,6 +38,13 @@ treated as a local secret. Existing token files are normalized to restrictive
 permissions before reuse, and the auth-disabled opt-out is rejected if it is
 paired with an unsafe non-loopback listener override.
 
+Token generation follows these requirements:
+
+- use the system CSPRNG;
+- generate at least 32 bytes of raw entropy;
+- encode the token as hex or base64url without padding;
+- harden `<storage_dir>/daemon-auth.token` to owner-only access before reuse.
+
 ## Local Token Lifecycle
 
 - The local bearer token does not expire on its own. The generated
@@ -66,16 +73,16 @@ paired with an unsafe non-loopback listener override.
 
 ## Replay Protection
 
+Accepted beta limitation: Secretary does not yet provide built-in replay
+protection or token expiry for local auth. A captured authorized request can be
+replayed until the token changes or the local boundary is removed.
+
 Secretary currently relies on two local-boundary mitigations:
 
 - the daemon binds to loopback only by default, so traffic is limited to the
   local host unless the unsafe non-loopback override is enabled;
 - the daemon requires a bearer token on each request unless the local auth
   opt-out is enabled.
-
-It does not provide replay-specific protections such as nonces, timestamps,
-request signing, or token expiry. A captured authorized request can be replayed
-until the token changes or the local boundary is removed.
 
 Recommended mitigations:
 
@@ -84,6 +91,14 @@ Recommended mitigations:
 - rotate the token immediately after exposure or suspected interception;
 - avoid putting the daemon behind a shared listener, reverse proxy, or other
   boundary that would make captured requests easier to reuse.
+
+Roadmap for stronger replay protection:
+
+- short-lived tokens;
+- refresh flow for token renewal;
+- request signing with HMAC plus nonce and timestamp;
+- server-side nonce tracking;
+- token rotation support as a first-class operation.
 
 ## Threat Model Seeds
 
