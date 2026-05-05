@@ -387,6 +387,21 @@ impl InMemoryStore {
         Ok(result)
     }
 
+    fn mutate_with_published_events<R>(
+        &self,
+        mutator: impl FnOnce(&mut InMemoryInner) -> StoreResult<(R, Vec<JobEvent>)>,
+    ) -> StoreResult<R> {
+        let mut guard = self.lock()?;
+        let mut draft = guard.clone();
+        let (result, events) = mutator(&mut draft)?;
+        if let Some(snapshot_path) = &self.durable_snapshot_path {
+            persist_durable_snapshot(snapshot_path, &draft)?;
+        }
+        *guard = draft;
+        self.publish_job_events(&events);
+        Ok(result)
+    }
+
     pub fn latest_job_event_for_repository(
         &self,
         repository_id: &RepositoryId,
@@ -471,7 +486,7 @@ impl SecretaryStore for InMemoryStore {
         mut record: JobRecord,
         mut initial_event: JobEvent,
     ) -> StoreResult<JobEvent> {
-        let initial_event = self.mutate(|inner| {
+        self.mutate_with_published_events(|inner| {
             validate_job_refs(inner, &record)?;
             if inner.jobs.contains_key(&record.id) {
                 return Err(StoreError::DuplicateId {
@@ -497,10 +512,8 @@ impl SecretaryStore for InMemoryStore {
             inner
                 .job_events_by_id
                 .insert(initial_event.id.clone(), initial_event.clone());
-            Ok(initial_event)
-        })?;
-        self.publish_job_events(std::slice::from_ref(&initial_event));
-        Ok(initial_event)
+            Ok((initial_event.clone(), vec![initial_event]))
+        })
     }
 
     fn list_jobs(&self) -> StoreResult<Vec<JobRecord>> {
@@ -595,13 +608,11 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn append_job_event(&self, mut event: JobEvent) -> StoreResult<JobEvent> {
-        let event = self.mutate(|inner| {
+        self.mutate_with_published_events(|inner| {
             validate_new_job_event(inner, &event, None)?;
             append_event_locked(inner, &mut event)?;
-            Ok(event)
-        })?;
-        self.publish_job_events(std::slice::from_ref(&event));
-        Ok(event)
+            Ok((event.clone(), vec![event]))
+        })
     }
 
     fn append_job_event_and_update_job(
@@ -609,7 +620,7 @@ impl SecretaryStore for InMemoryStore {
         mut record: JobRecord,
         mut event: JobEvent,
     ) -> StoreResult<JobEvent> {
-        let event = self.mutate(|inner| {
+        self.mutate_with_published_events(|inner| {
             validate_job_update(inner, &record, &event)?;
             validate_new_job_event(inner, &event, None)?;
 
@@ -617,10 +628,8 @@ impl SecretaryStore for InMemoryStore {
             record.latest_event_id = Some(event.id.clone());
             inner.jobs.insert(record.id.clone(), record);
 
-            Ok(event)
-        })?;
-        self.publish_job_events(std::slice::from_ref(&event));
-        Ok(event)
+            Ok((event.clone(), vec![event]))
+        })
     }
 
     fn append_job_event_and_update_job_with_submit_job_idempotency(
@@ -655,7 +664,7 @@ impl SecretaryStore for InMemoryStore {
         mut final_record: JobRecord,
         mut final_event: JobEvent,
     ) -> StoreResult<(JobEvent, JobEvent)> {
-        let (first_event, final_event) = self.mutate(|inner| {
+        self.mutate_with_published_events(|inner| {
             validate_sibling_event_ids_are_unique(&first_event, &final_event)?;
             validate_two_stage_job_update_identity(
                 &first_record,
@@ -677,10 +686,13 @@ impl SecretaryStore for InMemoryStore {
             final_record.latest_event_id = Some(final_event.id.clone());
             inner.jobs.insert(final_record.id.clone(), final_record);
 
-            Ok((first_event, final_event))
-        })?;
-        self.publish_job_events(&[first_event.clone(), final_event.clone()]);
-        Ok((first_event, final_event))
+            let published_first_event = first_event.clone();
+            let published_final_event = final_event.clone();
+            Ok((
+                (first_event, final_event),
+                vec![published_first_event, published_final_event],
+            ))
+        })
     }
 
     fn replay_job_events(
@@ -1128,7 +1140,7 @@ impl SecretaryStore for InMemoryStore {
         audit_record: AuditRecord,
         mut audit_event: JobEvent,
     ) -> StoreResult<(JobEvent, JobEvent)> {
-        let (tool_result_event, audit_event) = self.mutate(|inner| {
+        self.mutate_with_published_events(|inner| {
             validate_sibling_event_ids_are_unique(&tool_result_event, &audit_event)?;
             validate_job_update(inner, &record, &tool_result_event)?;
             validate_job_update(inner, &record, &audit_event)?;
@@ -1184,10 +1196,13 @@ impl SecretaryStore for InMemoryStore {
             record.latest_event_id = Some(audit_event.id.clone());
             inner.jobs.insert(record.id.clone(), record);
 
-            Ok((tool_result_event, audit_event))
-        })?;
-        self.publish_job_events(&[tool_result_event.clone(), audit_event.clone()]);
-        Ok((tool_result_event, audit_event))
+            let published_tool_result_event = tool_result_event.clone();
+            let published_audit_event = audit_event.clone();
+            Ok((
+                (tool_result_event, audit_event),
+                vec![published_tool_result_event, published_audit_event],
+            ))
+        })
     }
 
     fn record_tool_result_audit_terminal_with_submit_job_idempotency(
@@ -5017,6 +5032,35 @@ mod tests {
         assert_eq!(first.sequence_number, 1);
         assert_eq!(second.sequence_number, 2);
         assert_eq!(store.get_job_event(&first.id).unwrap(), first);
+    }
+
+    #[test]
+    fn append_events_publish_in_commit_order() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+
+        store.create_repository(repository.clone()).unwrap();
+        let mut receiver = store.subscribe_job_events();
+
+        let first = store
+            .append_job_event(job_event(repository.id.clone()))
+            .unwrap();
+        let second = store.append_job_event(job_event(repository.id)).unwrap();
+
+        let received = vec![
+            receiver.blocking_recv().expect("first event should arrive"),
+            receiver
+                .blocking_recv()
+                .expect("second event should arrive"),
+        ];
+
+        assert_eq!(
+            received
+                .iter()
+                .map(|event| event.sequence_number)
+                .collect::<Vec<_>>(),
+            vec![first.sequence_number, second.sequence_number]
+        );
     }
 
     #[test]

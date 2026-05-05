@@ -425,6 +425,7 @@ pub struct SecretaryService {
 pub struct LiveEventSubscription {
     pub events: Vec<JobEvent>,
     pub receiver: broadcast::Receiver<JobEvent>,
+    pub replay_max_sequence: u64,
 }
 
 impl SecretaryService {
@@ -1166,7 +1167,15 @@ impl SecretaryService {
             .runtime()
             .store()
             .replay_job_events(cursor, limit)?;
-        Ok(LiveEventSubscription { events, receiver })
+        let replay_max_sequence = events
+            .last()
+            .map(|event| event.sequence_number)
+            .unwrap_or(0);
+        Ok(LiveEventSubscription {
+            events,
+            receiver,
+            replay_max_sequence,
+        })
     }
 
     /// Request cancellation for a queued/running job.

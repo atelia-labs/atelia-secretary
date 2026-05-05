@@ -2292,18 +2292,18 @@ fn watch_events_stream_body(
         yield Ok::<Vec<u8>, std::io::Error>(b"\n".to_vec());
 
         let mut receiver = subscription.receiver;
-        let mut last_sequence = subscription.last_sequence;
+        let mut replay_max_sequence = subscription.replay_max_sequence;
         loop {
             match receiver.recv().await {
                 Ok(event) => {
-                    if event.sequence_number <= last_sequence {
+                    if event.sequence_number <= replay_max_sequence {
                         continue;
                     }
                     let rpc_event = rpc::RpcEvent::from(event);
                     if !rpc::watch_event_matches_request(&rpc_event, &request) {
                         continue;
                     }
-                    last_sequence = rpc_event.sequence;
+                    replay_max_sequence = rpc_event.sequence;
                     let frame = serde_json::json!({
                         "kind": "event",
                         "event": serialize_event(&rpc_event),
@@ -3475,10 +3475,12 @@ mod tests {
     use super::*;
     use crate::service;
     use atelia_core::{
-        BlockKey, BlockReason, DegradeBehavior, ExtensionCompatibility, ExtensionEntrypoints,
-        ExtensionFailure, ExtensionKind, ExtensionManifest, ExtensionPermission,
-        ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionServices, ProvenanceSource,
-        RetryPolicy, EXTENSION_MANIFEST_SCHEMA, EXTENSION_RPC_PROTOCOL,
+        BlockKey, BlockReason, DegradeBehavior, EventRefs, EventSeverity, EventSubject,
+        ExtensionCompatibility, ExtensionEntrypoints, ExtensionFailure, ExtensionKind,
+        ExtensionManifest, ExtensionPermission, ExtensionPublisher, ExtensionRealm,
+        ExtensionRuntime, ExtensionServices, JobEvent, JobEventId, JobEventKind, LedgerTimestamp,
+        ProvenanceSource, RepositoryId, RetryPolicy, EXTENSION_MANIFEST_SCHEMA,
+        EXTENSION_RPC_PROTOCOL,
     };
     use axum::{http::StatusCode, Router};
     use serde_json::Value;
@@ -3523,6 +3525,24 @@ mod tests {
                 Some(value) => std::env::set_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV, value),
                 None => std::env::remove_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV),
             }
+        }
+    }
+
+    fn test_job_event(repository_id: &RepositoryId, sequence_number: u64) -> JobEvent {
+        JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number,
+            created_at: LedgerTimestamp::from_unix_millis(sequence_number as i64),
+            subject: EventSubject::repository(repository_id),
+            kind: JobEventKind::Message,
+            severity: EventSeverity::Info,
+            public_message: format!("event {sequence_number}"),
+            refs: EventRefs {
+                repository_id: Some(repository_id.clone()),
+                ..Default::default()
+            },
+            redactions: Vec::new(),
         }
     }
 
@@ -4326,6 +4346,69 @@ mod tests {
         assert!(err
             .to_string()
             .contains("refusing to combine ATELIA_DAEMON_AUTH_DISABLED=1"));
+    }
+
+    #[tokio::test]
+    async fn watch_events_stream_skips_replayed_duplicates() {
+        let repository_id = RepositoryId::new();
+        let replay_event = test_job_event(&repository_id, 1);
+        let duplicate_event = test_job_event(&repository_id, 1);
+        let live_event = test_job_event(&repository_id, 2);
+        let metadata =
+            rpc::ProtocolMetadata::from(service::SecretaryService::new().protocol_metadata());
+        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        sender
+            .send(duplicate_event)
+            .expect("duplicate event should broadcast");
+        sender
+            .send(live_event.clone())
+            .expect("live event should broadcast");
+        drop(sender);
+
+        let response = rpc::WatchEventsLiveResponse {
+            metadata,
+            events: vec![rpc::RpcEvent::from(replay_event.clone())],
+            cursor: Some(rpc::EventCursorRequest::AfterSequence(
+                replay_event.sequence_number,
+            )),
+            subscription: rpc::WatchEventsLiveSubscription {
+                receiver,
+                replay_max_sequence: replay_event.sequence_number,
+                last_sequence: replay_event.sequence_number,
+            },
+        };
+        let request = rpc::WatchEventsRequest {
+            repository_id: repository_id.as_str().to_string(),
+            cursor: Some(rpc::EventCursorRequest::Beginning),
+            subject_ids: Vec::new(),
+            min_severity: None,
+            limit: Some(1),
+        };
+
+        let body = watch_events_stream_body(response, request);
+        let payload = to_bytes(body, usize::MAX)
+            .await
+            .expect("watch events stream should serialize");
+        let lines = std::str::from_utf8(&payload)
+            .expect("stream should be utf8")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+
+        let snapshot: Value = serde_json::from_str(lines[0]).expect("snapshot should parse");
+        assert_eq!(snapshot["kind"], "snapshot");
+        assert_eq!(
+            snapshot["events"]
+                .as_array()
+                .expect("snapshot events should be an array")
+                .len(),
+            1
+        );
+
+        let event_frame: Value = serde_json::from_str(lines[1]).expect("event frame should parse");
+        assert_eq!(event_frame["kind"], "event");
+        assert_eq!(event_frame["event"]["sequence"], 2);
     }
 
     #[test]

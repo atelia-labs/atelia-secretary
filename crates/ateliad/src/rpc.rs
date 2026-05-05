@@ -295,6 +295,7 @@ impl SecretaryRpcServer {
         let live = self
             .service
             .watch_events_live(query.cursor.clone(), query.page_size)?;
+        let replay_max_sequence = live.replay_max_sequence;
         let events = live
             .events
             .into_iter()
@@ -314,6 +315,7 @@ impl SecretaryRpcServer {
             cursor,
             subscription: WatchEventsLiveSubscription {
                 receiver: live.receiver,
+                replay_max_sequence,
                 last_sequence,
             },
         })
@@ -1367,6 +1369,7 @@ pub struct WatchEventsLiveResponse {
 #[allow(dead_code)]
 pub struct WatchEventsLiveSubscription {
     pub receiver: broadcast::Receiver<JobEvent>,
+    pub replay_max_sequence: u64,
     pub last_sequence: u64,
 }
 
