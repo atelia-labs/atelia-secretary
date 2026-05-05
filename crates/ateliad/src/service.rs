@@ -9,7 +9,7 @@ use atelia_core::{
     canonicalize_job_requested_capability, canonicalize_within_scope,
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
     CancelJobReceipt, DefaultPolicyEngine, DisableExtensionRequest, DisableExtensionResponse,
-    EnableExtensionRequest, EnableExtensionResponse, EventCursor, EventPage, EventQuery,
+    EchoTool, EnableExtensionRequest, EnableExtensionResponse, EventCursor, EventPage, EventQuery,
     ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, FsReadTool,
     InMemoryStore, InMemoryToolOutputSettingsService, InstallExtensionRequest,
     InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService, JobPage, JobQuery,
@@ -19,9 +19,9 @@ use atelia_core::{
     RemoveExtensionResponse, RenderedToolOutput, RepositoryId, RepositoryRecord,
     RepositoryTrustState, ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse,
     RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
-    ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange,
-    ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId, TruncationMetadata,
-    UpdateExtensionRequest, UpdateExtensionResponse,
+    SubmitJobIdempotencyRecord, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
+    ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
+    TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -821,7 +821,7 @@ impl SecretaryService {
         let mut idempotent_cache_lock = if let Some(idempotency_key) =
             normalized_idempotency_key.as_deref()
         {
-            let cache = self
+            let mut cache = self
                 .idempotent_submissions
                 .lock()
                 .expect("idempotency cache lock poisoned");
@@ -830,6 +830,30 @@ impl SecretaryService {
                 if cached.signature == request_signature {
                     return Ok(cached.receipt.clone());
                 }
+                return Err(ServiceError::Conflict {
+                    reason: "idempotency_key was previously used for a different submit request"
+                        .to_string(),
+                });
+            }
+
+            if let Some(stored) = self
+                .lifecycle
+                .runtime()
+                .store()
+                .get_submit_job_idempotency(idempotency_key)?
+            {
+                if stored.signature == request_signature {
+                    let receipt = stored.receipt.clone();
+                    cache.insert(
+                        idempotency_key.to_string(),
+                        IdempotentSubmitJob {
+                            signature: stored.signature,
+                            receipt: receipt.clone(),
+                        },
+                    );
+                    return Ok(receipt);
+                }
+
                 return Err(ServiceError::Conflict {
                     reason: "idempotency_key was previously used for a different submit request"
                         .to_string(),
@@ -865,15 +889,50 @@ impl SecretaryService {
         .with_resource_scope(resource_scope.kind, resource_scope.value);
 
         let receipt = match tool_kind {
-            SubmitJobToolKind::Echo => self.lifecycle.submit_echo_job(runtime_request)?,
+            SubmitJobToolKind::Echo => {
+                let submit_job_finalizer =
+                    idempotent_cache_lock.as_ref().map(|(idempotency_key, _)| {
+                        let idempotency_key = idempotency_key.clone();
+                        let request_signature = request_signature.clone();
+                        move |receipt: &RuntimeJobReceipt| {
+                            Some((
+                                idempotency_key.clone(),
+                                SubmitJobIdempotencyRecord {
+                                    signature: request_signature.clone(),
+                                    receipt: receipt.clone(),
+                                },
+                            ))
+                        }
+                    });
+                self.lifecycle.runtime().run_tool_job_with_finalizer(
+                    runtime_request,
+                    &EchoTool,
+                    submit_job_finalizer,
+                )?
+            }
             SubmitJobToolKind::FsRead => {
                 let tool = FsReadTool::new(&repository.root_path);
-                self.lifecycle
-                    .runtime()
-                    .run_tool_job(runtime_request, &tool)?
+                let submit_job_finalizer =
+                    idempotent_cache_lock.as_ref().map(|(idempotency_key, _)| {
+                        let idempotency_key = idempotency_key.clone();
+                        let request_signature = request_signature.clone();
+                        move |receipt: &RuntimeJobReceipt| {
+                            Some((
+                                idempotency_key.clone(),
+                                SubmitJobIdempotencyRecord {
+                                    signature: request_signature.clone(),
+                                    receipt: receipt.clone(),
+                                },
+                            ))
+                        }
+                    });
+                self.lifecycle.runtime().run_tool_job_with_finalizer(
+                    runtime_request,
+                    &tool,
+                    submit_job_finalizer,
+                )?
             }
         };
-
         if let Some((idempotency_key, mut cache)) = idempotent_cache_lock.take() {
             cache.insert(
                 idempotency_key,
@@ -2001,10 +2060,17 @@ mod tests {
                 goal: "persist me".to_string(),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
-                idempotency_key: None,
+                idempotency_key: Some("restart-key".to_string()),
             })
             .expect("job submission should succeed");
         let job_id = receipt.job.id.clone();
+        assert!(first_service
+            .lifecycle
+            .runtime()
+            .store()
+            .get_submit_job_idempotency("restart-key")
+            .expect("idempotency record should persist")
+            .is_some());
         drop(first_service);
 
         let second_service =
@@ -2021,6 +2087,26 @@ mod tests {
         assert_eq!(jobs.jobs.len(), 1);
         assert_eq!(jobs.jobs[0].id, job_id.clone());
 
+        let replayed = second_service
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "persist me".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("restart-key".to_string()),
+            })
+            .expect("idempotent replay should return the stored receipt");
+        assert_eq!(replayed.job.id, job_id);
+        assert!(second_service
+            .lifecycle
+            .runtime()
+            .store()
+            .get_submit_job_idempotency("restart-key")
+            .expect("idempotency record should reload")
+            .is_some());
+
         let status = second_service
             .get_project_status(GetProjectStatusRequest {
                 repository_id: repository.id.clone(),
@@ -2036,6 +2122,53 @@ mod tests {
         assert!(replayed
             .iter()
             .any(|event| event.refs.job_id == Some(job_id.clone())));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn durable_service_conflicts_on_idempotency_signature_mismatch_after_restart() {
+        let storage_dir = durable_storage_dir("restart-conflict");
+        let first_service =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service");
+        let root = test_repo_dir("durable-restart-conflict");
+        let repository = first_service
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "durable-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("repository registration should succeed");
+        first_service
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "first goal".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("restart-key".to_string()),
+            })
+            .expect("job submission should succeed");
+        drop(first_service);
+
+        let second_service =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service reload");
+        let err = second_service
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "different goal".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("restart-key".to_string()),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Conflict { .. }));
+
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(storage_dir);
     }

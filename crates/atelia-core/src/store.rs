@@ -8,6 +8,7 @@ use crate::domain::{
     ToolInvocation, ToolInvocationId, ToolResult, ToolResultId, MIGRATION_LOCK_RECORD_NAME,
 };
 use crate::policy::{REASON_REPOSITORY_BLOCKED, SCOPE_KIND_REPOSITORY, SCOPE_VALUE_ROOT};
+use crate::runtime::RuntimeJobReceipt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -173,6 +174,13 @@ pub trait SecretaryStore: Send + Sync + 'static {
         record: JobRecord,
         event: JobEvent,
     ) -> StoreResult<JobEvent>;
+    fn append_job_event_and_update_job_with_submit_job_idempotency(
+        &self,
+        record: JobRecord,
+        event: JobEvent,
+        idempotency_key: String,
+        idempotency_record: SubmitJobIdempotencyRecord,
+    ) -> StoreResult<JobEvent>;
     fn append_job_events_and_update_job(
         &self,
         first_record: JobRecord,
@@ -225,6 +233,17 @@ pub trait SecretaryStore: Send + Sync + 'static {
     fn list_tool_results(&self) -> StoreResult<Vec<ToolResult>>;
     fn get_tool_result(&self, id: &ToolResultId) -> StoreResult<ToolResult>;
 
+    fn get_submit_job_idempotency(
+        &self,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<SubmitJobIdempotencyRecord>>;
+
+    fn record_submit_job_idempotency(
+        &self,
+        idempotency_key: String,
+        record: SubmitJobIdempotencyRecord,
+    ) -> StoreResult<()>;
+
     fn create_audit_record(&self, record: AuditRecord) -> StoreResult<()>;
     fn record_tool_result_and_audit_with_events(
         &self,
@@ -258,6 +277,13 @@ struct InMemoryInner {
     tool_invocations: HashMap<ToolInvocationId, ToolInvocation>,
     tool_results: HashMap<ToolResultId, ToolResult>,
     audit_records: HashMap<AuditRecordId, AuditRecord>,
+    idempotent_submit_jobs: HashMap<String, SubmitJobIdempotencyRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitJobIdempotencyRecord {
+    pub signature: String,
+    pub receipt: RuntimeJobReceipt,
 }
 
 impl InMemoryStore {
@@ -527,6 +553,29 @@ impl SecretaryStore for InMemoryStore {
             append_event_locked(inner, &mut event)?;
             record.latest_event_id = Some(event.id.clone());
             inner.jobs.insert(record.id.clone(), record);
+
+            Ok(event)
+        })
+    }
+
+    fn append_job_event_and_update_job_with_submit_job_idempotency(
+        &self,
+        mut record: JobRecord,
+        mut event: JobEvent,
+        idempotency_key: String,
+        mut idempotency_record: SubmitJobIdempotencyRecord,
+    ) -> StoreResult<JobEvent> {
+        self.mutate(|inner| {
+            validate_job_update(inner, &record, &event)?;
+            validate_new_job_event(inner, &event, None)?;
+
+            append_event_locked(inner, &mut event)?;
+            record.latest_event_id = Some(event.id.clone());
+            inner.jobs.insert(record.id.clone(), record);
+            if let Some(last_event) = idempotency_record.receipt.events.last_mut() {
+                *last_event = event.clone();
+            }
+            insert_submit_job_idempotency_locked(inner, idempotency_key, idempotency_record)?;
 
             Ok(event)
         })
@@ -968,6 +1017,28 @@ impl SecretaryStore for InMemoryStore {
         get_record(&self.lock()?.tool_results, id, "tool_results")
     }
 
+    fn get_submit_job_idempotency(
+        &self,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<SubmitJobIdempotencyRecord>> {
+        Ok(self
+            .lock()?
+            .idempotent_submit_jobs
+            .get(idempotency_key)
+            .cloned())
+    }
+
+    fn record_submit_job_idempotency(
+        &self,
+        idempotency_key: String,
+        record: SubmitJobIdempotencyRecord,
+    ) -> StoreResult<()> {
+        self.mutate(|inner| {
+            insert_submit_job_idempotency_locked(inner, idempotency_key, record)?;
+            Ok(())
+        })
+    }
+
     fn create_audit_record(&self, record: AuditRecord) -> StoreResult<()> {
         self.mutate(|inner| {
             validate_audit_record_refs(inner, &record)?;
@@ -1382,6 +1453,10 @@ fn validate_loaded_store(inner: &InMemoryInner) -> StoreResult<()> {
         validate_audit_record_refs(inner, audit_record)?;
     }
 
+    for (idempotency_key, submission) in &inner.idempotent_submit_jobs {
+        validate_submit_job_idempotency_record(inner, idempotency_key, submission)?;
+    }
+
     validate_loaded_job_event_sequence(inner)?;
 
     Ok(())
@@ -1489,6 +1564,234 @@ fn validate_loaded_tool_result_record(
         });
     }
 
+    Ok(())
+}
+
+fn validate_submit_job_idempotency_record(
+    inner: &InMemoryInner,
+    idempotency_key: &str,
+    record: &SubmitJobIdempotencyRecord,
+) -> StoreResult<()> {
+    if idempotency_key.trim().is_empty() {
+        return Err(StoreError::InvalidRecord {
+            collection: "submit_job_idempotency",
+            reason: "idempotency key must not be empty".to_string(),
+        });
+    }
+    if record.signature.trim().is_empty() {
+        return Err(StoreError::InvalidRecord {
+            collection: "submit_job_idempotency",
+            reason: format!(
+                "idempotency key {} has an empty request signature",
+                id_debug(idempotency_key)
+            ),
+        });
+    }
+
+    validate_loaded_submit_job_receipt(inner, &record.receipt)
+}
+
+fn validate_loaded_submit_job_receipt(
+    inner: &InMemoryInner,
+    receipt: &RuntimeJobReceipt,
+) -> StoreResult<()> {
+    let stored_job = inner
+        .jobs
+        .get(&receipt.job.id)
+        .ok_or_else(|| StoreError::NotFound {
+            collection: "jobs",
+            id: format!("{} (submit_job_idempotency.job)", id_debug(&receipt.job.id)),
+        })?;
+    if stored_job != &receipt.job {
+        return Err(StoreError::InvalidReference {
+            collection: "submit_job_idempotency",
+            reason: format!(
+                "receipt.job {} does not match stored job record",
+                id_debug(&receipt.job.id)
+            ),
+        });
+    }
+
+    let stored_policy_decision = inner
+        .policy_decisions
+        .get(&receipt.policy_decision.id)
+        .ok_or_else(|| StoreError::NotFound {
+            collection: "policy_decisions",
+            id: format!(
+                "{} (submit_job_idempotency.policy_decision)",
+                id_debug(&receipt.policy_decision.id)
+            ),
+        })?;
+    if stored_policy_decision != &receipt.policy_decision {
+        return Err(StoreError::InvalidReference {
+            collection: "submit_job_idempotency",
+            reason: format!(
+                "receipt.policy_decision {} does not match stored policy decision record",
+                id_debug(&receipt.policy_decision.id)
+            ),
+        });
+    }
+
+    match (
+        &receipt.tool_invocation,
+        &receipt.tool_result,
+        &receipt.rendered_output,
+        &receipt.audit_record,
+    ) {
+        (None, None, None, None) => {}
+        (Some(tool_invocation), Some(tool_result), Some(_rendered_output), Some(audit_record)) => {
+            let stored_tool_invocation = inner
+                .tool_invocations
+                .get(&tool_invocation.id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "tool_invocations",
+                    id: format!(
+                        "{} (submit_job_idempotency.tool_invocation)",
+                        id_debug(&tool_invocation.id)
+                    ),
+                })?;
+            if stored_tool_invocation != tool_invocation {
+                return Err(StoreError::InvalidReference {
+                    collection: "submit_job_idempotency",
+                    reason: format!(
+                        "receipt.tool_invocation {} does not match stored tool invocation record",
+                        id_debug(&tool_invocation.id)
+                    ),
+                });
+            }
+
+            let stored_tool_result =
+                inner
+                    .tool_results
+                    .get(&tool_result.id)
+                    .ok_or_else(|| StoreError::NotFound {
+                        collection: "tool_results",
+                        id: format!(
+                            "{} (submit_job_idempotency.tool_result)",
+                            id_debug(&tool_result.id)
+                        ),
+                    })?;
+            if stored_tool_result != tool_result {
+                return Err(StoreError::InvalidReference {
+                    collection: "submit_job_idempotency",
+                    reason: format!(
+                        "receipt.tool_result {} does not match stored tool result record",
+                        id_debug(&tool_result.id)
+                    ),
+                });
+            }
+
+            let stored_audit_record =
+                inner
+                    .audit_records
+                    .get(&audit_record.id)
+                    .ok_or_else(|| StoreError::NotFound {
+                        collection: "audit_records",
+                        id: format!(
+                            "{} (submit_job_idempotency.audit_record)",
+                            id_debug(&audit_record.id)
+                        ),
+                    })?;
+            if stored_audit_record != audit_record {
+                return Err(StoreError::InvalidReference {
+                    collection: "submit_job_idempotency",
+                    reason: format!(
+                        "receipt.audit_record {} does not match stored audit record",
+                        id_debug(&audit_record.id)
+                    ),
+                });
+            }
+
+            if tool_result.invocation_id != tool_invocation.id {
+                return Err(StoreError::InvalidReference {
+                    collection: "submit_job_idempotency",
+                    reason: format!(
+                        "receipt.tool_result {} does not reference receipt.tool_invocation {}",
+                        id_debug(&tool_result.id),
+                        id_debug(&tool_invocation.id)
+                    ),
+                });
+            }
+            if audit_record.tool_invocation_id.as_ref() != Some(&tool_invocation.id) {
+                return Err(StoreError::InvalidReference {
+                    collection: "submit_job_idempotency",
+                    reason: format!(
+                        "receipt.audit_record {} does not reference receipt.tool_invocation {}",
+                        id_debug(&audit_record.id),
+                        id_debug(&tool_invocation.id)
+                    ),
+                });
+            }
+        }
+        _ => {
+            return Err(StoreError::InvalidRecord {
+                collection: "submit_job_idempotency",
+                reason:
+                    "successful submit_job receipts must include either all tool records or none"
+                        .to_string(),
+            });
+        }
+    }
+
+    if receipt.events.is_empty() {
+        return Err(StoreError::InvalidRecord {
+            collection: "submit_job_idempotency",
+            reason: "successful submit_job receipts must include events".to_string(),
+        });
+    }
+
+    for event in &receipt.events {
+        let stored_event =
+            inner
+                .job_events_by_id
+                .get(&event.id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "job_events",
+                    id: format!("{} (submit_job_idempotency.events)", id_debug(&event.id)),
+                })?;
+        if stored_event != event {
+            return Err(StoreError::InvalidReference {
+                collection: "submit_job_idempotency",
+                reason: format!(
+                    "receipt.event {} does not match stored job event record",
+                    id_debug(&event.id)
+                ),
+            });
+        }
+    }
+
+    if receipt.job.latest_event_id.as_ref() != receipt.events.last().map(|event| &event.id) {
+        return Err(StoreError::InvalidReference {
+            collection: "submit_job_idempotency",
+            reason: format!(
+                "receipt.job.latest_event_id does not match the final receipt event for job {}",
+                id_debug(&receipt.job.id)
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn insert_submit_job_idempotency_locked(
+    inner: &mut InMemoryInner,
+    idempotency_key: String,
+    record: SubmitJobIdempotencyRecord,
+) -> StoreResult<()> {
+    validate_submit_job_idempotency_record(inner, &idempotency_key, &record)?;
+    if let Some(existing) = inner.idempotent_submit_jobs.get(&idempotency_key) {
+        if existing == &record {
+            return Ok(());
+        }
+        return Err(StoreError::Conflict {
+            collection: "submit_job_idempotency",
+            reason: format!(
+                "idempotency key {} is already bound to a different submit receipt",
+                id_debug(&idempotency_key)
+            ),
+        });
+    }
+    inner.idempotent_submit_jobs.insert(idempotency_key, record);
     Ok(())
 }
 
@@ -2043,7 +2346,7 @@ const fn severity_rank(severity: EventSeverity) -> u8 {
     }
 }
 
-fn id_debug<Id: fmt::Debug>(id: &Id) -> String {
+fn id_debug<Id: fmt::Debug + ?Sized>(id: &Id) -> String {
     format!("{id:?}")
 }
 
@@ -3335,6 +3638,8 @@ mod tests {
         PolicyOutcome, PolicySummary, RepositoryTrustState, ResourceScope, RiskTier,
         StructuredValue, ToolResultField, ToolResultStatus,
     };
+    use crate::policy::DefaultPolicyEngine;
+    use crate::runtime::{EchoTool, RuntimeJobRequest, SecretaryRuntime};
     use std::cell::Cell;
     use std::fs;
     use std::path::PathBuf;
@@ -6261,6 +6566,64 @@ mod tests {
     }
 
     #[test]
+    fn durable_store_round_trips_submit_job_idempotency_records() {
+        let storage_dir = durable_storage_dir("idempotency-roundtrip");
+        let store = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        let repository = repository_record();
+        store.create_repository(repository.clone()).unwrap();
+
+        let runtime = SecretaryRuntime::new(store.clone(), DefaultPolicyEngine::new());
+        let request =
+            RuntimeJobRequest::new(actor(), repository.id.clone(), JobKind::Read, "persist me")
+                .with_requested_capabilities(vec!["capability.discovery".to_string()]);
+        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+        let submission = SubmitJobIdempotencyRecord {
+            signature: "request-signature".to_string(),
+            receipt: receipt.clone(),
+        };
+
+        store
+            .record_submit_job_idempotency("ledger-key".to_string(), submission.clone())
+            .unwrap();
+
+        drop(runtime);
+        drop(store);
+
+        let reopened = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        assert_eq!(
+            reopened.get_submit_job_idempotency("ledger-key").unwrap(),
+            Some(submission)
+        );
+    }
+
+    #[test]
+    fn durable_store_loads_legacy_snapshot_without_idempotency_ledger() {
+        let storage_dir = durable_storage_dir("legacy-idempotency");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner: InMemoryInner::default(),
+        };
+        let mut serialized = serde_json::to_value(&snapshot).unwrap();
+        serialized
+            .get_mut("inner")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("inner should serialize as an object")
+            .remove("idempotent_submit_jobs");
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&serialized).unwrap(),
+        )
+        .unwrap();
+
+        let reopened = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        assert!(reopened
+            .get_submit_job_idempotency("ledger-key")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn durable_store_rejects_malformed_snapshot() {
         let storage_dir = durable_storage_dir("malformed");
         let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
@@ -6314,6 +6677,51 @@ mod tests {
             err,
             StoreError::NotFound {
                 collection: "repositories",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn durable_store_rejects_inconsistent_submit_job_idempotency_snapshot() {
+        let storage_dir = durable_storage_dir("invalid-idempotency");
+        let store = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        let repository = repository_record();
+        store.create_repository(repository.clone()).unwrap();
+
+        let runtime = SecretaryRuntime::new(store.clone(), DefaultPolicyEngine::new());
+        let receipt = runtime
+            .run_tool_job(
+                RuntimeJobRequest::new(actor(), repository.id.clone(), JobKind::Read, "persist me")
+                    .with_requested_capabilities(vec!["capability.discovery".to_string()]),
+                &EchoTool,
+            )
+            .unwrap();
+        let mut invalid_inner = store.lock().unwrap().clone();
+        let mut invalid_receipt = receipt.clone();
+        invalid_receipt.job.goal.push_str(" mismatch");
+        invalid_inner.idempotent_submit_jobs.insert(
+            "ledger-key".to_string(),
+            SubmitJobIdempotencyRecord {
+                signature: "request-signature".to_string(),
+                receipt: invalid_receipt,
+            },
+        );
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner: invalid_inner,
+        };
+        fs::write(
+            storage_dir.join(DURABLE_STORE_FILE_NAME),
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidReference {
+                collection: "submit_job_idempotency",
                 ..
             }
         ));

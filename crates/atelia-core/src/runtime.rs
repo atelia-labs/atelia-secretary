@@ -16,10 +16,12 @@ use crate::policy::{
     DEFAULT_POLICY_VERSION,
 };
 use crate::settings::{OversizeOutputPolicy, ToolOutputDefaults};
+use crate::store::SubmitJobIdempotencyRecord;
 use crate::store::{EventCursor, InMemoryStore, JobPage, JobQuery, SecretaryStore, StoreError};
 use crate::tool_output::{
     render_tool_result_with_policy, RenderOptions, RenderedToolOutput, ToolOutputRenderError,
 };
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 
@@ -123,7 +125,7 @@ impl RuntimeArtifactSpillover {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeJobReceipt {
     pub job: JobRecord,
     pub policy_decision: PolicyDecision,
@@ -287,6 +289,23 @@ where
     where
         T: RuntimeTool,
     {
+        self.run_tool_job_with_finalizer(
+            request,
+            tool,
+            None::<fn(&RuntimeJobReceipt) -> Option<(String, SubmitJobIdempotencyRecord)>>,
+        )
+    }
+
+    pub fn run_tool_job_with_finalizer<T, F>(
+        &self,
+        request: RuntimeJobRequest,
+        tool: &T,
+        mut submit_job_idempotency: Option<F>,
+    ) -> RuntimeResult<RuntimeJobReceipt>
+    where
+        T: RuntimeTool,
+        F: FnOnce(&RuntimeJobReceipt) -> Option<(String, SubmitJobIdempotencyRecord)>,
+    {
         let requested_capability = tool.requested_capability().to_string();
         let canonical_requested_capability = normalized_requested_capability(&requested_capability);
         if canonical_requested_capability.is_empty() {
@@ -367,20 +386,41 @@ where
                 "job stopped before tool execution",
                 refs_for_policy(&job, &policy_decision),
             );
-            events.push(
-                self.store
-                    .append_job_event_and_update_job(job.clone(), status_event)?,
-            );
-            job.latest_event_id = events.last().map(|event| event.id.clone());
-            return Ok(RuntimeJobReceipt {
-                job,
-                policy_decision,
+            let mut final_events = events.clone();
+            final_events.push(status_event.clone());
+            let final_job = JobRecord {
+                latest_event_id: Some(status_event.id.clone()),
+                ..job.clone()
+            };
+            let final_receipt = RuntimeJobReceipt {
+                job: final_job.clone(),
+                policy_decision: policy_decision.clone(),
                 tool_invocation: None,
                 tool_result: None,
                 rendered_output: None,
                 audit_record: None,
-                events,
-            });
+                events: final_events,
+            };
+            let finalizer = submit_job_idempotency
+                .take()
+                .and_then(|finalizer| finalizer(&final_receipt));
+            let persisted_event = if let Some((idempotency_key, idempotency_record)) = finalizer {
+                self.store
+                    .append_job_event_and_update_job_with_submit_job_idempotency(
+                        job.clone(),
+                        status_event,
+                        idempotency_key,
+                        idempotency_record,
+                    )?
+            } else {
+                self.store
+                    .append_job_event_and_update_job(job.clone(), status_event)?
+            };
+            let mut final_receipt = final_receipt;
+            if let Some(last_event) = final_receipt.events.last_mut() {
+                *last_event = persisted_event;
+            }
+            return Ok(final_receipt);
         }
 
         let previous = job.status;
@@ -631,12 +671,6 @@ where
             "job completed",
             refs_for_audit(&job, &policy_decision, &invocation, &result, &audit_record),
         );
-        events.push(
-            self.store
-                .append_job_event_and_update_job(job.clone(), terminal_event)?,
-        );
-        job.latest_event_id = events.last().map(|event| event.id.clone());
-
         let rendered_output = if should_rerender_output {
             match render_tool_result_with_policy(&result, &render_policy) {
                 Ok(rendered_output) => rendered_output,
@@ -656,15 +690,42 @@ where
             rendered_output
         };
 
-        Ok(RuntimeJobReceipt {
-            job,
-            policy_decision,
-            tool_invocation: Some(invocation),
-            tool_result: Some(result),
-            rendered_output: Some(rendered_output),
-            audit_record: Some(audit_record),
-            events,
-        })
+        let mut final_events = events.clone();
+        final_events.push(terminal_event.clone());
+        let final_job = JobRecord {
+            latest_event_id: Some(terminal_event.id.clone()),
+            ..job.clone()
+        };
+        let final_receipt = RuntimeJobReceipt {
+            job: final_job.clone(),
+            policy_decision: policy_decision.clone(),
+            tool_invocation: Some(invocation.clone()),
+            tool_result: Some(result.clone()),
+            rendered_output: Some(rendered_output.clone()),
+            audit_record: Some(audit_record.clone()),
+            events: final_events,
+        };
+        let finalizer = submit_job_idempotency
+            .take()
+            .and_then(|finalizer| finalizer(&final_receipt));
+        let persisted_event = if let Some((idempotency_key, idempotency_record)) = finalizer {
+            self.store
+                .append_job_event_and_update_job_with_submit_job_idempotency(
+                    job.clone(),
+                    terminal_event,
+                    idempotency_key,
+                    idempotency_record,
+                )?
+        } else {
+            self.store
+                .append_job_event_and_update_job(job.clone(), terminal_event)?
+        };
+        let mut final_receipt = final_receipt;
+        if let Some(last_event) = final_receipt.events.last_mut() {
+            *last_event = persisted_event;
+        }
+
+        Ok(final_receipt)
     }
 }
 

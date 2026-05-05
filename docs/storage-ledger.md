@@ -64,10 +64,12 @@ Backends must provide one of these minimal storage primitives:
 The first lifecycle boundary persists `job: queued` and the initial `job_event`
 in one atomic commit. A `policy_decision` must be durably committed before any
 `tool_invocation`, `tool_result`, or audit effect record can be created.
-The beta JSON snapshot loader validates these references at startup and fails
-closed if a snapshot contains an incomplete or inconsistent workflow. Automatic
-policy re-evaluation and tool retry / cleanup reconciliation are reserved for a
-future WAL or database-backed store.
+Successful `SubmitJob` idempotency records are also stored in the snapshot as a
+request signature plus replayable receipt. The beta JSON snapshot loader
+validates these references at startup and fails closed if a snapshot contains
+an incomplete or inconsistent workflow. Automatic policy re-evaluation and tool
+retry / cleanup reconciliation are reserved for a future WAL or database-backed
+store.
 
 `new()` creates process-local, in-memory beta state that is bounded by the
 daemon lifetime and resets on restart. `new_durable()` and the daemon's default
