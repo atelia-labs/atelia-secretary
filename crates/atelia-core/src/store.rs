@@ -366,11 +366,11 @@ impl SecretaryStore for InMemoryStore {
                     .map(|requester| &job.requester == requester)
                     .unwrap_or(true)
             })
-            .cloned()
             .collect::<Vec<_>>();
         filtered.sort_by(|left, right| left.id.cmp(&right.id));
 
-        let (jobs, next_page_token) = page_records(filtered.into_iter(), start, page_size);
+        let (job_refs, next_page_token) = page_records(filtered.into_iter(), start, page_size);
+        let jobs = job_refs.into_iter().cloned().collect();
 
         Ok(JobPage {
             jobs,
@@ -1102,7 +1102,7 @@ fn page_records<Record>(
     page_size: usize,
 ) -> (Vec<Record>, Option<String>) {
     let mut skipped = 0usize;
-    let mut retained = Vec::new();
+    let mut retained = Vec::with_capacity(page_size.min(1024));
     let mut has_next = false;
 
     if page_size == 0 {
