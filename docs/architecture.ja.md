@@ -1,6 +1,8 @@
 # Architecture
 
-Atelia Secretary は、Atelia の backend daemon です。クライアント、extension、Hook の規範的仕様は [`atelia`](https://github.com/atelia-labs/atelia/blob/main/README.ja.md) リポジトリで扱い、この文書では daemon 実装の境界だけを扱います。
+Atelia Secretary は、Atelia の backend daemon です。クライアント、AEP / extension、Hook の規範的仕様は [`atelia`](https://github.com/atelia-labs/atelia/blob/main/README.ja.md) リポジトリで扱い、この文書では daemon 実装の境界だけを扱います。
+
+AEP において、Secretary は reference backend host です。backend runtime boundary、permission / capability enforcement、service brokering、Hook 実行境界、audit、blocklist、install record、rollback を実装します。
 
 ## 全体像
 
@@ -74,6 +76,8 @@ R0/R1 capability は contract が許す範囲で daemon policy により自動 g
 
 規範的な extension / Hook 仕様は Atelia 本体の文書を参照します。
 
+- [Atelia Extension Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/aep.ja.md)
+- [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.ja.md)
 - [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.ja.md)
 - [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.ja.md)
 - [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.ja.md)

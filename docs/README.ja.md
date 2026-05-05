@@ -2,7 +2,7 @@
 
 この directory は、Atelia Secretary の daemon 側 design と implementation contract を扱います。
 
-Atelia 全体の product philosophy、client UX、extension 仕様、Hook、governance は [`atelia`](https://github.com/atelia-labs/atelia/blob/main/README.ja.md) に置きます。この repository では、それらの contract を Secretary daemon がどう実装するかを定義します。
+Atelia 全体の product philosophy、client UX、AEP / extension 仕様、Hook、governance は [`atelia`](https://github.com/atelia-labs/atelia/blob/main/README.ja.md) に置きます。この repository では、それらの contract を Secretary daemon がどう実装するかを定義します。
 
 ## 読む順番
 
@@ -47,8 +47,11 @@ Atelia 全体の product philosophy、client UX、extension 仕様、Hook、gove
 
 - [Extensions Runtime](extensions-runtime.ja.md)
 
-規範的な extension、Hook、extension composition 仕様は project repository に置きます。
+Atelia Secretary は AEP の backend host reference implementation です。規範的な AEP、extension、Hook、extension composition 仕様は project repository に置きます。
 
+- [Atelia Extension Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/aep.ja.md)
+- [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.ja.md)
+- [AEP Package Model](https://github.com/atelia-labs/atelia/blob/main/docs/aep-package.ja.md)
 - [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.ja.md)
 - [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.ja.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.ja.md)

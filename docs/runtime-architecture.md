@@ -200,6 +200,11 @@ redundancy intentionally.
 The runtime architecture reserves extension concepts even before full extension
 installation exists.
 
+This boundary is the backend-host slice of AEP. Secretary should treat AEP as
+separate from Atelia Protocol: Atelia Protocol is daemon / client / agent RPC,
+while AEP governs package manifests, permissions, services, hooks, composition,
+presentation declarations, audit, and lifecycle behavior.
+
 It must reserve the following concepts in domain and protocol naming:
 
 - tool provider;
