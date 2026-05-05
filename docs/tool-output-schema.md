@@ -151,6 +151,13 @@ policy
 audit_ref audit:tool-call:01h
 ```
 
+## Text Rendering
+
+Text rendering is a human-readable fallback for compact summaries, diagnosis,
+and small one-off results. It should preserve the same `status`, `summary`,
+policy, and recovery signals as TOON or JSON, while favoring plain prose over
+table structure. Longer payloads still belong in artifacts.
+
 ## JSON Rendering
 
 JSON is another format Secretary can choose.
