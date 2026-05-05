@@ -945,7 +945,7 @@ fn paginate_records<T>(
 ) -> (Vec<T>, Option<String>) {
     let mut records = records.into_iter();
     let mut skipped = 0usize;
-    let mut retained = Vec::new();
+    let mut retained = Vec::with_capacity(page_size.min(1024));
     let mut has_next = false;
 
     if page_size == 0 {
