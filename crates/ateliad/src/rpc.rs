@@ -292,15 +292,12 @@ impl SecretaryRpcServer {
             ),
             page_token: None,
         };
-        let live = self
-            .service
-            .watch_events_live(query.cursor.clone(), query.page_size)?;
+        let live = self.service.watch_events_live(query)?;
         let replay_max_sequence = live.replay_max_sequence;
         let events = live
             .events
             .into_iter()
             .map(RpcEvent::from)
-            .filter(|event| watch_event_matches_request(event, &request))
             .collect::<Vec<_>>();
         let cursor = if let Some(event) = events.last() {
             Some(EventCursorRequest::AfterSequence(event.sequence))
@@ -3462,6 +3459,83 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(other_root);
+    }
+
+    #[test]
+    fn watch_events_live_filters_replay_before_limit() {
+        let server = ready_server();
+        let first_root = test_repo_dir("watch-events-live-filter-first");
+        let second_root = test_repo_dir("watch-events-live-filter-second");
+
+        let first_repository = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-first-repo".to_string(),
+                root_path: first_root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("first repository should register")
+            .repository;
+        let second_repository = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-second-repo".to_string(),
+                root_path: second_root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("second repository should register")
+            .repository;
+
+        server
+            .submit_job(SubmitJobRequest {
+                repository_id: first_repository.repository_id.clone(),
+                requester: actor_record().into(),
+                kind: "read".to_string(),
+                goal: "first repo job".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("first repository job should submit");
+
+        server
+            .submit_job(SubmitJobRequest {
+                repository_id: second_repository.repository_id.clone(),
+                requester: actor_record().into(),
+                kind: "read".to_string(),
+                goal: "second repo job".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("second repository job should submit");
+
+        let live = server
+            .watch_events_live(WatchEventsRequest {
+                repository_id: second_repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::Beginning),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: Some(1),
+            })
+            .expect("live watch should succeed");
+
+        assert_eq!(live.events.len(), 1);
+        assert_eq!(
+            live.events[0].refs.repository_id.as_deref(),
+            Some(second_repository.repository_id.as_str())
+        );
+        assert_eq!(
+            live.cursor,
+            Some(EventCursorRequest::AfterSequence(live.events[0].sequence))
+        );
+        assert_eq!(
+            live.subscription.replay_max_sequence,
+            live.events[0].sequence
+        );
+
+        let _ = fs::remove_dir_all(first_root);
+        let _ = fs::remove_dir_all(second_root);
     }
 
     #[test]

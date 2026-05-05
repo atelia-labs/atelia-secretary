@@ -1156,17 +1156,9 @@ impl SecretaryService {
 
     /// Subscribe to future events while returning the initial replay slice.
     #[allow(dead_code)]
-    pub fn watch_events_live(
-        &self,
-        cursor: EventCursor,
-        limit: Option<usize>,
-    ) -> ServiceResult<LiveEventSubscription> {
+    pub fn watch_events_live(&self, query: EventQuery) -> ServiceResult<LiveEventSubscription> {
         let receiver = self.lifecycle.runtime().store().subscribe_job_events();
-        let events = self
-            .lifecycle
-            .runtime()
-            .store()
-            .replay_job_events(cursor, limit)?;
+        let events = self.list_events_page(query)?.events;
         let replay_max_sequence = events
             .last()
             .map(|event| event.sequence_number)

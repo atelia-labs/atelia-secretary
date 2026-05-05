@@ -175,9 +175,11 @@ durable restart; failed submissions are not currently cached as replay results.
   audit record
 
 `WatchEvents` accepts a cursor, returns a replay snapshot for that cursor, and
-then keeps streaming new ordered events. Clients can reconnect to the live
-surface without losing job history, or call `ReplayEvents` for the bounded
-replay-only compatibility path.
+then keeps streaming new ordered events. The reconnect guarantee is
+process-local: within the same daemon process, clients can resume the live
+surface without losing job history. After a daemon restart, call
+`GetProjectStatus` to discover the latest durable state, or `ReplayEvents` if
+you need the bounded replay-only compatibility path.
 
 ### Policy Decision
 
@@ -207,10 +209,11 @@ Event ordering is per daemon store:
 - retries must not create duplicate semantic effects;
 - clients resume with the last seen sequence number or event id.
 
-If the daemon cannot guarantee continuity, `WatchEvents` returns a
-`CURSOR_EXPIRED` recovery error and tells the client to call `GetProjectStatus`
-and then resume from the returned latest event. `ReplayEvents` keeps the older
-replay-only semantics for beta clients that still depend on it.
+If the daemon cannot guarantee continuity within the current process,
+`WatchEvents` returns a `CURSOR_EXPIRED` recovery error and tells the client to
+call `GetProjectStatus`. After a restart, clients should use
+`GetProjectStatus` for the latest durable snapshot or `ReplayEvents` for the
+bounded replay-only semantics that beta clients still depend on.
 
 ## Error Shape
 

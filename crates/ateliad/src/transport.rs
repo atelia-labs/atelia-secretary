@@ -1674,6 +1674,18 @@ fn serialize_watch_events_snapshot(response: &rpc::WatchEventsLiveResponse) -> s
     })
 }
 
+fn serialize_watch_events_recovery_error(reason: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "error",
+        "error": {
+            "code": "cursor_expired",
+            "reason": reason.into(),
+            "recoverable": true,
+            "next_state": "refresh_status",
+        },
+    })
+}
+
 fn serialize_event(event: &rpc::RpcEvent) -> serde_json::Value {
     serde_json::json!({
         "event_id": event.event_id,
@@ -2316,16 +2328,29 @@ fn watch_events_stream_body(
                             yield Err::<Vec<u8>, std::io::Error>(std::io::Error::other(error));
                             return;
                         }
-                    }
-                    yield Ok::<Vec<u8>, std::io::Error>(b"\n".to_vec());
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    break;
-                }
+                yield Ok::<Vec<u8>, std::io::Error>(b"\n".to_vec());
             }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let frame = serialize_watch_events_recovery_error(
+                    "watch_events live stream fell behind and missed events",
+                );
+                match serde_json::to_vec(&frame) {
+                    Ok(bytes) => {
+                        yield Ok::<Vec<u8>, std::io::Error>(bytes);
+                    }
+                    Err(error) => {
+                        yield Err::<Vec<u8>, std::io::Error>(std::io::Error::other(error));
+                        return;
+                    }
+                }
+                yield Ok::<Vec<u8>, std::io::Error>(b"\n".to_vec());
+                return;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                break;
+            }
+        }
         }
     };
 
@@ -4409,6 +4434,60 @@ mod tests {
         let event_frame: Value = serde_json::from_str(lines[1]).expect("event frame should parse");
         assert_eq!(event_frame["kind"], "event");
         assert_eq!(event_frame["event"]["sequence"], 2);
+    }
+
+    #[tokio::test]
+    async fn watch_events_stream_reports_broadcast_lag() {
+        let repository_id = RepositoryId::new();
+        let replay_event = test_job_event(&repository_id, 1);
+        let lagged_event = test_job_event(&repository_id, 2);
+        let metadata =
+            rpc::ProtocolMetadata::from(service::SecretaryService::new().protocol_metadata());
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        sender
+            .send(lagged_event.clone())
+            .expect("first event should broadcast");
+        sender
+            .send(test_job_event(&repository_id, 3))
+            .expect("second event should broadcast");
+        drop(sender);
+
+        let response = rpc::WatchEventsLiveResponse {
+            metadata,
+            events: vec![rpc::RpcEvent::from(replay_event.clone())],
+            cursor: Some(rpc::EventCursorRequest::AfterSequence(
+                replay_event.sequence_number,
+            )),
+            subscription: rpc::WatchEventsLiveSubscription {
+                receiver,
+                replay_max_sequence: replay_event.sequence_number,
+                last_sequence: replay_event.sequence_number,
+            },
+        };
+        let request = rpc::WatchEventsRequest {
+            repository_id: repository_id.as_str().to_string(),
+            cursor: Some(rpc::EventCursorRequest::Beginning),
+            subject_ids: Vec::new(),
+            min_severity: None,
+            limit: Some(1),
+        };
+
+        let body = watch_events_stream_body(response, request);
+        let payload = to_bytes(body, usize::MAX)
+            .await
+            .expect("watch events stream should serialize");
+        let lines = std::str::from_utf8(&payload)
+            .expect("stream should be utf8")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+
+        let error_frame: Value = serde_json::from_str(lines[1]).expect("error frame should parse");
+        assert_eq!(error_frame["kind"], "error");
+        assert_eq!(error_frame["error"]["code"], "cursor_expired");
+        assert_eq!(error_frame["error"]["recoverable"], true);
+        assert_eq!(error_frame["error"]["next_state"], "refresh_status");
     }
 
     #[test]
