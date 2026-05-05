@@ -1,9 +1,11 @@
 use atelia_core::extensions::{ExtensionBoundary, ExtensionManifest, ManifestValidationPolicy};
 
+/// Deserialize a manifest fixture into the extension manifest model.
 fn load_manifest_fixture(contents: &str) -> ExtensionManifest {
     serde_json::from_str(contents).expect("fixture manifest should deserialize")
 }
 
+/// Assert that a fixture round-trips through serialization and validation.
 fn assert_manifest_fixture_roundtrip(
     contents: &str,
     policy: ManifestValidationPolicy,
@@ -25,6 +27,7 @@ fn assert_manifest_fixture_roundtrip(
     assert_eq!(validated.boundary, boundary);
 }
 
+/// Verify compatibility coverage for third-party backend manifest fixtures.
 #[test]
 fn extension_manifest_compatibility_fixtures_cover_third_party_backend_manifests() {
     assert_manifest_fixture_roundtrip(
@@ -34,6 +37,7 @@ fn extension_manifest_compatibility_fixtures_cover_third_party_backend_manifests
     );
 }
 
+/// Verify compatibility coverage for local process manifest fixtures.
 #[test]
 fn extension_manifest_compatibility_fixtures_cover_local_process_manifests() {
     assert_manifest_fixture_roundtrip(
