@@ -82,7 +82,7 @@ Required RPC groups:
 - protocol version
 - storage version
 - storage status: `ready`, `migrating`, `read_only`, `unavailable`
-- beta state hint:
+- optional beta state hint, field `beta_state`:
   - `scope`
   - `durability`
   - `restart_semantics`
