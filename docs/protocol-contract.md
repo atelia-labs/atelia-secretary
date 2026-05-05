@@ -4,6 +4,10 @@ This document defines the first durable protocol contract for Atelia Secretary.
 It is the bridge between the daemon runtime architecture, `atelia-kit`, and
 native clients.
 
+The beta contract is transport-neutral at the Rust RPC boundary. The shipping
+beta transport is HTTP/JSON, while proto/gRPC-generated client and server paths
+are future work and are not shipped yet.
+
 The protocol should be boring, typed, versioned, and event-friendly. It should
 not expose implementation storage details, but it must preserve enough identity
 and audit references for clients and agents to understand what happened.
@@ -43,10 +47,11 @@ diagnostic metadata.
 This table is the required service contract, not merely a description of the
 current protobuf implementation. The current daemon exposes the health,
 repository, job, policy, event replay, project status, tool-output settings,
-`RenderToolOutput`, and extension RPC groups. Extension installation and
-blocklist operations are currently exposed through the daemon HTTP/JSON
-transport while the protobuf service remains focused on the shared client
-runtime contract. `WatchEvents` is implemented as a cursor replay surface today;
+`RenderToolOutput`, and extension RPC groups. Extension registry and blocklist
+operations are currently exposed through the daemon HTTP/JSON beta
+transport. The Rust RPC boundary in `ateliad` stays transport-neutral so a
+future proto/gRPC client path can bind to the same contract instead of
+redefining it. `WatchEvents` is implemented as a cursor replay surface today;
 a long-lived streaming transport remains a future transport refinement.
 
 Required RPC groups:
@@ -64,10 +69,14 @@ Required RPC groups:
 | `WatchEvents` | Stream ordered events from a cursor |
 | `CheckPolicy` | Preview policy outcome for a requested action |
 | `RenderToolOutput` | Render canonical tool result as TOON, JSON, or text |
-| `InstallExtension` | Install or update an extension manifest |
+| `InstallExtension` | Install a new extension manifest |
+| `UpdateExtension` | Update an installed extension manifest |
 | `ExtensionStatus` | Inspect one extension installation and blocklist state |
 | `ListExtensions` | List installed extension statuses |
 | `RollbackExtension` | Restore the previous version of an extension |
+| `DisableExtension` | Disable an installed extension |
+| `EnableExtension` | Enable a disabled extension |
+| `RemoveExtension` | Remove an installed extension |
 | `ApplyBlocklist` | Add a blocklist entry |
 | `ListBlocklist` | Inspect the current blocklist |
 

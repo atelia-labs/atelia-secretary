@@ -87,4 +87,6 @@ Project-level docs:
 Atelia Secretary is in its early design and first-product implementation stage.
 The current work is to make the Rust daemon architecture concrete enough for
 implementation: typed protocol, domain records, policy, job orchestration,
-execution ledger, tool execution, and extension boundaries.
+execution ledger, tool execution, and extension boundaries. The beta protocol
+contract is locked in `docs/protocol-contract.md`; the shipping transport is
+HTTP/JSON, and generated proto/gRPC client and server paths remain future work.

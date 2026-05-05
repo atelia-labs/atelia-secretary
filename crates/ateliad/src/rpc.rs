@@ -34,7 +34,7 @@ use std::convert::TryFrom;
 const MAX_WATCH_EVENTS_PAGE: usize = 1000;
 
 pub const TRANSPORT_BLOCKER: &str =
-    "tonic/prost server dependencies are not configured for ateliad";
+    "tonic/prost gRPC server generation is not shipped in ateliad yet; HTTP/JSON is the beta transport";
 
 #[allow(dead_code)]
 pub struct SecretaryRpcServer {
@@ -2340,7 +2340,10 @@ mod tests {
     #[test]
     fn transport_blocker_is_explicit_while_tonic_is_absent() {
         let server = ready_server();
-        assert_eq!(server.transport_blocker(), Some(TRANSPORT_BLOCKER));
+        let blocker = server.transport_blocker().unwrap();
+        assert_eq!(blocker, TRANSPORT_BLOCKER);
+        assert!(blocker.contains("HTTP/JSON is the beta transport"));
+        assert!(blocker.contains("gRPC server generation is not shipped"));
     }
 
     #[test]
