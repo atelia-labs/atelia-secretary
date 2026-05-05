@@ -32,7 +32,7 @@ effects:
 idempotency: idempotent
 streaming: false
 cancellable: true
-timeout_ms: 0
+timeout_ms: 0 # ここで明示的な per-tool timeout は宣言しない。runtime-service defaults が適用される。
 artifact_policy:
   max_primary_tokens: 1200
   large_payload: artifact_ref
@@ -107,7 +107,7 @@ Secretary built-in は意図的に小さくします。すべての built-in too
 - `secretary.echo`
 - `fs.read`
 
-その他の built-in は future または non-shipped slice に存在しうりますが、現行の beta repertoire projection が
+その他の built-in は future または non-shipped slice に存在しうるが、現行の beta repertoire projection が
 公開するのは上記の tool のみで、dispatch が揃うまでは含めません。
 
 future または non-shipped built-ins:

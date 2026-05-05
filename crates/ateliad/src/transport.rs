@@ -227,6 +227,7 @@ struct ListRepositoriesRequestPayload {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListRepertoireRequestPayload {}
 
 #[derive(Debug, Deserialize)]
@@ -4445,6 +4446,32 @@ mod tests {
         assert_eq!(tool_ids, vec!["fs.read", "secretary.echo"]);
         assert_eq!(entries[0]["timeout_ms"].as_u64(), Some(0));
         assert_eq!(entries[1]["timeout_ms"].as_u64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn list_repertoire_route_rejects_unknown_fields() {
+        let rpc_server = ready_rpc_server();
+        let response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/repertoire:list",
+            serde_json::json!({
+                "unexpected": true,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["error"]["code"], "invalid_json");
+        assert!(payload["error"]["reason"]
+            .as_str()
+            .expect("error reason")
+            .contains("unknown field"));
     }
 
     #[tokio::test]
