@@ -69,6 +69,7 @@ Required RPC groups:
 | `WatchEvents` | Stream ordered events from a cursor |
 | `CheckPolicy` | Preview policy outcome for a requested action |
 | `RenderToolOutput` | Render canonical tool result as TOON, JSON, or text |
+| `ListRepertoire` | Inspect the beta repertoire projection |
 | `InstallExtension` | Install a new extension manifest |
 | `UpdateExtension` | Update an installed extension manifest |
 | `ExtensionStatus` | Inspect one extension installation and blocklist state |
@@ -82,15 +83,16 @@ Required RPC groups:
 
 `ListRepertoire` is the first beta protocol slice for
 [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md).
-It returns the computed projection of the live tool surface in the current
-context, not a persisted store.
+It returns the computed beta `RepertoireEntry` projection of the live tool
+surface in the current context, along with its metadata, not a persisted
+store.
 
 The first beta server surface is intentionally small and currently projects
 only the built-in Secretary tools that are dispatchable in this beta slice:
-`fs.read` and `secretary.echo` with their stable tool definitions. Broader
-built-ins may exist in future or runtime-backed slices, but they are not
-claimed by `ListRepertoire` until dispatch exists. Extension-backed repertoire
-entries remain a future slice.
+`fs.read` and `secretary.echo` as beta repertoire entries. Broader built-ins
+may exist in future or runtime-backed slices, but they are not claimed by
+`ListRepertoire` until dispatch exists. Extension-backed repertoire entries
+remain a future slice.
 
 For the beta slice, extension management APIs are operator-facing.
 Extension execution RPCs are not supported in beta. Endpoints may exist, but

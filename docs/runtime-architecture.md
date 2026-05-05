@@ -89,6 +89,7 @@ Required RPC groups:
 - `CheckPolicy`: preview whether a requested action is allowed, audited,
   approval-gated, or blocked.
 - `RenderToolOutput`: render a canonical tool result as TOON, JSON, or text.
+- `ListRepertoire`: inspect the beta repertoire projection.
 
 See [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md) for the computed projection of the live tool surface in the current context. `ListRepertoire` is the first beta protocol slice for that projection.
 
