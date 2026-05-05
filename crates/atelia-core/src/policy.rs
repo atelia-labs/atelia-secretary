@@ -343,7 +343,9 @@ impl Capability {
             }
             "filesystem.write" | "filesystem.patch" | "filesystem.delete" | "filesystem.move"
             | "fs.write" | "fs.patch" | "fs.delete" | "fs.move" => Self::FilesystemWrite,
-            "process.exec" | "process.execute" | "process.run" | "proc.exec" => Self::ProcessExec,
+            "process.exec" | "process.execute" | "process.run" | "proc.exec" | "proc.run" => {
+                Self::ProcessExec
+            }
             "repository.mutate.broad"
             | "repo.mutate.broad"
             | "repository.broad.mutation"
@@ -456,6 +458,7 @@ mod tests {
             "fs.write",
             "fs.delete",
             "fs.move",
+            "fs.patch",
         ] {
             let decision = decide(input(capability));
 
@@ -487,6 +490,17 @@ mod tests {
         assert_eq!(PolicyOutcome::Audited, decision.outcome);
         assert_eq!(RiskTier::R2, decision.risk_tier);
         assert_eq!("bounded_process_audited", decision.reason_code);
+    }
+
+    #[test]
+    fn process_run_aliases_are_audited_as_process_execution() {
+        for capability in ["process.run", "proc.run"] {
+            let decision = decide(input(capability));
+
+            assert_eq!(PolicyOutcome::Audited, decision.outcome);
+            assert_eq!(RiskTier::R2, decision.risk_tier);
+            assert_eq!("bounded_process_audited", decision.reason_code);
+        }
     }
 
     #[test]
