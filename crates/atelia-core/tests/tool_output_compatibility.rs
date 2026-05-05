@@ -97,6 +97,24 @@ fn customizer_fixture_result() -> ToolResult {
     }
 }
 
+fn customizer_fixture_policy(format: OutputFormat) -> ToolOutputRenderPolicy {
+    ToolOutputRenderPolicy {
+        render_options: RenderOptions {
+            format,
+            include_policy: true,
+            include_diagnostics: true,
+            include_cost: true,
+        },
+        max_fields: Some(2),
+        max_inline_lines: None,
+        max_inline_bytes: None,
+        oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
+        include_evidence_refs: false,
+        include_output_refs: false,
+        include_redactions: false,
+    }
+}
+
 #[test]
 fn tool_output_compatibility_fixtures_cover_toon_and_json_defaults() {
     let result = fixed_tool_result();
@@ -124,42 +142,12 @@ fn tool_output_compatibility_fixtures_cover_toon_and_json_defaults() {
 #[test]
 fn tool_output_compatibility_fixtures_cover_customizer_style_field_filtering() {
     let result = customizer_fixture_result();
-    let policy = ToolOutputRenderPolicy {
-        render_options: RenderOptions {
-            format: OutputFormat::Toon,
-            include_policy: true,
-            include_diagnostics: true,
-            include_cost: true,
-        },
-        max_fields: Some(2),
-        max_inline_lines: None,
-        max_inline_bytes: None,
-        oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
-        include_evidence_refs: false,
-        include_output_refs: false,
-        include_redactions: false,
-    };
+    let policy = customizer_fixture_policy(OutputFormat::Toon);
 
     let toon = render_tool_result_with_policy(&result, &policy).unwrap();
-    let json = render_tool_result_with_policy(
-        &result,
-        &ToolOutputRenderPolicy {
-            render_options: RenderOptions {
-                format: OutputFormat::Json,
-                include_policy: true,
-                include_diagnostics: true,
-                include_cost: true,
-            },
-            max_fields: Some(2),
-            max_inline_lines: None,
-            max_inline_bytes: None,
-            oversize_policy: OversizeOutputPolicy::TruncateWithMetadata,
-            include_evidence_refs: false,
-            include_output_refs: false,
-            include_redactions: false,
-        },
-    )
-    .unwrap();
+    let json =
+        render_tool_result_with_policy(&result, &customizer_fixture_policy(OutputFormat::Json))
+            .unwrap();
 
     assert_eq!(toon.schema_version, "tool_result.v1");
     assert_eq!(toon.format, OutputFormat::Toon);
