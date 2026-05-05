@@ -358,7 +358,7 @@ pub struct RepertoireEntry {
     pub cancellable: bool,
     /// Whether the tool streams partial results.
     pub streaming: bool,
-    /// Default timeout in milliseconds.
+    /// Advertised timeout budget in milliseconds; `0` means not enforced yet.
     pub timeout_ms: u32,
 }
 
@@ -1188,7 +1188,7 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
             "R1",
             "idempotent",
             false,
-            10_000,
+            0,
         ),
         entry(
             SECRETARY_ECHO_TOOL_ID,
@@ -1197,7 +1197,7 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
             "R0",
             "idempotent",
             false,
-            5_000,
+            0,
         ),
     ];
 
@@ -1994,6 +1994,7 @@ mod tests {
             read.supported_result_formats,
             vec!["toon".to_string(), "json".to_string()]
         );
+        assert_eq!(read.timeout_ms, 0);
         let echo = repertoire
             .entries
             .iter()
@@ -2001,7 +2002,7 @@ mod tests {
             .expect("secretary.echo repertoire entry");
         assert_eq!(echo.risk_tier, "R0");
         assert!(!echo.cancellable);
-        assert_eq!(echo.timeout_ms, 5_000);
+        assert_eq!(echo.timeout_ms, 0);
         assert!(repertoire
             .entries
             .iter()

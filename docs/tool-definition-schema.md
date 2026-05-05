@@ -35,7 +35,7 @@ effects:
 idempotency: idempotent
 streaming: false
 cancellable: true
-timeout_ms: 10000
+timeout_ms: 0
 artifact_policy:
   max_primary_tokens: 1200
   large_payload: artifact_ref

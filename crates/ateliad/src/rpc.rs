@@ -795,7 +795,7 @@ pub struct RepertoireEntry {
     pub cancellable: bool,
     /// Whether the tool streams partial results.
     pub streaming: bool,
-    /// Default timeout in milliseconds.
+    /// Advertised timeout budget in milliseconds; `0` means not enforced yet.
     pub timeout_ms: u32,
 }
 
@@ -2606,6 +2606,7 @@ mod tests {
             .expect("secretary.echo repertoire entry");
         assert_eq!(echo.risk_tier, "R0");
         assert!(!echo.cancellable);
+        assert_eq!(echo.timeout_ms, 0);
         assert!(response
             .entries
             .iter()

@@ -4443,6 +4443,8 @@ mod tests {
             .map(|entry| entry["tool_id"].as_str().expect("tool id"))
             .collect();
         assert_eq!(tool_ids, vec!["fs.read", "secretary.echo"]);
+        assert_eq!(entries[0]["timeout_ms"].as_u64(), Some(0));
+        assert_eq!(entries[1]["timeout_ms"].as_u64(), Some(0));
     }
 
     #[tokio::test]
