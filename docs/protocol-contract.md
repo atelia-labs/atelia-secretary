@@ -47,8 +47,8 @@ diagnostic metadata.
 This table is the required service contract, not merely a description of the
 current protobuf implementation. The current daemon exposes the health,
 repository, job, policy, event replay, project status, tool-output settings,
-`RenderToolOutput`, and extension RPC groups. Extension installation and
-blocklist operations are currently exposed through the daemon HTTP/JSON beta
+`RenderToolOutput`, and extension RPC groups. Extension registry and blocklist
+operations are currently exposed through the daemon HTTP/JSON beta
 transport. The Rust RPC boundary in `ateliad` stays transport-neutral so a
 future proto/gRPC client path can bind to the same contract instead of
 redefining it. `WatchEvents` is implemented as a cursor replay surface today;
