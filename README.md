@@ -72,9 +72,9 @@ Release and research:
 Project-level docs:
 
 - [Atelia](https://github.com/atelia-labs/atelia)
-- [Atelia Extension Protocol](https://github.com/atelia-labs/atelia/pull/4)
-- [AEP Manifest](https://github.com/atelia-labs/atelia/pull/4)
-- [AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
+- [Atelia Extension Protocol / AEP Manifest / AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
+  is a temporary link to `atelia` PR `#4` until the individual docs land on
+  `atelia` main.
 - [AX Feedback](https://github.com/atelia-labs/atelia/blob/main/docs/ax-feedback.md)
 - [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
 - [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md)
