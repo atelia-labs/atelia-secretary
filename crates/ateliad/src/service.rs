@@ -1187,7 +1187,7 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
             SECRETARY_FS_READ_TOOL_DESCRIPTION,
             "R1",
             "idempotent",
-            true,
+            false,
             10_000,
         ),
         entry(
@@ -1989,6 +1989,7 @@ mod tests {
         assert_eq!(read.provider_kind, "builtin");
         assert_eq!(read.provider_id, "atelia-secretary");
         assert_eq!(read.default_result_format, "toon");
+        assert!(!read.cancellable);
         assert_eq!(
             read.supported_result_formats,
             vec!["toon".to_string(), "json".to_string()]

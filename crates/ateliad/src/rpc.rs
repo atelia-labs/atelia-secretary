@@ -2598,6 +2598,7 @@ mod tests {
         assert_eq!(read.name, "Filesystem Read");
         assert_eq!(read.risk_tier, "R1");
         assert_eq!(read.provider_id, "atelia-secretary");
+        assert!(!read.cancellable);
         let echo = response
             .entries
             .iter()
