@@ -649,6 +649,9 @@ impl SecretaryService {
             kind: "repository".to_string(),
             value: ".".to_string(),
         });
+        if matches!(tool_kind, SubmitJobToolKind::FsRead) {
+            validate_filesystem_read_scope(&repository, &resource_scope)?;
+        }
 
         let runtime_request = RuntimeJobRequest::new(
             request.requester,
@@ -1114,12 +1117,15 @@ fn resolve_submit_job_tool_kind(
                     .resource_scope
                     .as_ref()
                     .ok_or_else(|| ServiceError::InvalidArgument {
-                        reason: "filesystem.read requires a path resource_scope".to_string(),
+                        reason: "filesystem.read requires a path_scope/resource_scope".to_string(),
                     })?;
 
-            if resource_scope.kind.trim() != "path" {
+            if !matches!(
+                resource_scope.kind.trim(),
+                "repository" | "explicit_paths" | "read_only"
+            ) {
                 return Err(ServiceError::InvalidArgument {
-                    reason: "filesystem.read requires resource_scope.kind = \"path\"".to_string(),
+                    reason: "filesystem.read requires resource_scope.kind to be repository, explicit_paths, or read_only".to_string(),
                 });
             }
 
@@ -1132,6 +1138,37 @@ fn resolve_submit_job_tool_kind(
             reason: "requested_capabilities must resolve to exactly one supported capability"
                 .to_string(),
         }),
+    }
+}
+
+fn validate_filesystem_read_scope(
+    repository: &RepositoryRecord,
+    resource_scope: &ResourceScope,
+) -> ServiceResult<()> {
+    let root = Path::new(&repository.root_path);
+    let requested =
+        canonicalize_within_scope(root, Path::new(&resource_scope.value)).map_err(|err| {
+            ServiceError::InvalidArgument {
+                reason: format!("filesystem.read path is outside repository scope: {err}"),
+            }
+        })?;
+
+    let allowed = repository
+        .allowed_path_scope
+        .allowed_paths
+        .iter()
+        .any(|allowed_path| {
+            canonicalize_within_scope(root, Path::new(allowed_path))
+                .map(|allowed| requested.canonical.starts_with(&allowed.canonical))
+                .unwrap_or(false)
+        });
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(ServiceError::InvalidArgument {
+            reason: "filesystem.read path is outside allowed_path_scope".to_string(),
+        })
     }
 }
 
@@ -2950,7 +2987,7 @@ mod tests {
                 kind: JobKind::Read,
                 goal: "read repository notes".to_string(),
                 resource_scope: Some(ResourceScope {
-                    kind: "path".to_string(),
+                    kind: "explicit_paths".to_string(),
                     value: "README.md".to_string(),
                 }),
                 requested_capabilities: vec!["filesystem.read".to_string()],
@@ -2980,6 +3017,67 @@ mod tests {
             field.key == "content"
                 && matches!(&field.value, atelia_core::StructuredValue::String(value) if value == "alpha\nbeta")
         }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_read_outside_allowed_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-read-allowed-scope");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("README.md"), "root\n").unwrap();
+        fs::write(root.join("docs/guide.md"), "docs\n").unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "read-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: Some(PathScope {
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_paths: vec!["docs".to_string()],
+                }),
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let allowed = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "read scoped notes".to_string(),
+                resource_scope: Some(ResourceScope {
+                    kind: "explicit_paths".to_string(),
+                    value: "docs/guide.md".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.read".to_string()],
+                idempotency_key: None,
+            })
+            .expect("read inside allowed scope should succeed");
+        assert_eq!(
+            allowed
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.read"
+        );
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "read root notes".to_string(),
+                resource_scope: Some(ResourceScope {
+                    kind: "explicit_paths".to_string(),
+                    value: "README.md".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.read".to_string()],
+                idempotency_key: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
         let _ = fs::remove_dir_all(root);
     }
 

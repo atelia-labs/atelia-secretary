@@ -3720,6 +3720,41 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_dispatches_filesystem_read_with_explicit_path_scope() {
+        let server = ready_server();
+        let root = test_repo_dir("filesystem-read-rpc-dispatch");
+        fs::write(root.join("README.md"), "alpha\nbeta\n").unwrap();
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "read-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let response = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id,
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: "read repository notes".to_string(),
+                path_scope: Some(RpcPathScope {
+                    kind: RpcPathScopeKind::ExplicitPaths,
+                    roots: vec!["README.md".to_string()],
+                    include_patterns: Vec::new(),
+                    exclude_patterns: Vec::new(),
+                }),
+                requested_capabilities: vec!["filesystem.read".to_string()],
+                idempotency_key: None,
+            })
+            .expect("filesystem.read should dispatch through RPC path_scope");
+
+        assert_eq!(response.policy.requested_capability, "filesystem.read");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn duplicate_repository_maps_to_conflict() {
         let server = ready_server();
         let root = test_repo_dir("duplicate-conflict");
