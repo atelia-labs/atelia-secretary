@@ -25,11 +25,17 @@ Beta releases should require the following local and CI gates:
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `cargo test --workspace --all-features`
 - `docker build --file Dockerfile .`
+- `docker run` smoke that starts `ateliad` with `ATELIA_DAEMON_LISTEN_ADDR=0.0.0.0:8080` and `ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN=1`, then probes `/v1/health`
 
 The CI workflow runs the same gate set in `.github/workflows/ci.yml` as the
-`Beta Release Gates` job. If a future shared workflow absorbs the Rust
-checks, keep this job as the packaging check or mark the relevant step manual
-in both CI and this document.
+`Beta Release Gates` job, including the container smoke. If a future shared
+workflow absorbs the Rust checks, keep this job as the packaging check or mark
+the relevant step manual in both CI and this document.
+
+An explicit non-loopback `ATELIA_DAEMON_LISTEN_ADDR` must fail at startup
+unless `ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN` is set to a truthy
+value such as `1` or `true`. Loopback and default-local binds stay allowed
+without the unsafe opt-in.
 
 In addition to the beta gate, a release should require:
 

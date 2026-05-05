@@ -24,11 +24,17 @@ beta release では、ローカルと CI で次の gate を通します。
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `cargo test --workspace --all-features`
 - `docker build --file Dockerfile .`
+- `docker run` の smoke。`ATELIA_DAEMON_LISTEN_ADDR=0.0.0.0:8080` と `ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN=1` を付けて `ateliad` を起動し、`/v1/health` を確認します
 
-CI では `.github/workflows/ci.yml` の `Beta Release Gates` job が同じ
-gate 群を実行します。将来、shared workflow が Rust の checks を吸収しても、
-この job は packaging check として残すか、該当 step を manual として
-docs と CI の両方で明記してください。
+CI では `.github/workflows/ci.yml` の `Beta Release Gates` job が、smoke
+を含む同じ gate 群を実行します。将来、shared workflow が Rust の
+checks を吸収しても、この job は packaging check として残すか、
+該当 step を manual として docs と CI の両方で明記してください。
+
+明示的な non-loopback の `ATELIA_DAEMON_LISTEN_ADDR` は、
+`ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN` が `1` や `true` の
+ような truthy 値でない限り、起動時に失敗させます。loopback と
+default の local bind は unsafe opt-in なしで許可します。
 
 beta gate に加えて、release には次のものが必要です。
 
