@@ -369,7 +369,8 @@ impl SecretaryStore for InMemoryStore {
             .collect::<Vec<_>>();
         filtered.sort_by(|left, right| left.id.cmp(&right.id));
 
-        let (jobs, next_page_token) = page_records(filtered.into_iter().cloned(), start, page_size);
+        let (job_refs, next_page_token) = page_records(filtered.into_iter(), start, page_size);
+        let jobs = job_refs.into_iter().cloned().collect();
 
         Ok(JobPage {
             jobs,
