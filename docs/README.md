@@ -65,9 +65,9 @@ Atelia Secretary is the AEP backend host reference implementation. Normative
 AEP, extension, hook, and extension composition specs live in the project
 repository:
 
-- [Atelia Extension Protocol](https://github.com/atelia-labs/atelia/pull/4)
-- [AEP Manifest](https://github.com/atelia-labs/atelia/pull/4)
-- [AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
+- [Atelia Extension Protocol / AEP Manifest / AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
+  is a temporary link to `atelia` PR `#4` until the individual docs land on
+  `atelia` main.
 - [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
 - [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md)
