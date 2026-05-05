@@ -225,7 +225,7 @@ Secretary は tool output に関する preference を持てます。
 preference は Secretary の仕事場の好みであり、繰り返しの修正や AX Feedback から改善される対象です。
 
 これらの preference は、Secretary が自分の仕事場に対して持つ professional judgment を表します。client、extension、支援エージェントは変更を提案できます。永続 preference は Secretary が所有します。
-daemon は workspace、repository、project、session、agent-profile、optional な tool-id scope に対して、shipped している `get`、`update`、`history:list` の settings operation を公開します。各 persistent update は `actor`、`reason`、`old_defaults`、`new_defaults`、`changed_at`、`changed_at_unix_ms` を記録します。
+daemon は workspace、repository、project、session、`agent_profile`、optional な `tool_id` scope に対して、shipped している `get`、`update`、`history:list` の settings operation を公開します。各 persistent update は `actor`、`reason`、`old_defaults`、`new_defaults`、`changed_at`、`changed_at_unix_ms` を記録します。
 
 ## Recovery Contract
 

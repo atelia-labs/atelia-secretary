@@ -237,7 +237,7 @@ Clients, extensions, and supporting agents can propose changes; Secretary owns
 the persistent preference.
 The daemon exposes these defaults through the shipped `get`, `update`, and
 `history:list` settings operations across workspace, repository, project,
-session, agent-profile, and optional tool-id scopes, and each persistent update
+session, `agent_profile`, and optional `tool_id` scopes, and each persistent update
 records `actor`, `reason`, `old_defaults`, `new_defaults`, `changed_at`, and
 `changed_at_unix_ms`.
 
