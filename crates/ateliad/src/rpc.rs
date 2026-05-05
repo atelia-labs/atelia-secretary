@@ -17,6 +17,7 @@ use crate::service::{
     RenderToolOutputRequest as ServiceRenderToolOutputRequest, SecretaryService, ServiceError,
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
 };
+pub use crate::service::{ExtensionExecutionRequest, ExtensionExecutionResponse};
 use atelia_core::{
     Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState,
     DisableExtensionRequest, EnableExtensionRequest, EventCursor as CoreEventCursor, EventQuery,
@@ -360,6 +361,16 @@ impl SecretaryRpcServer {
         })
     }
 
+    pub fn execute_extension(
+        &self,
+        request: ExtensionExecutionRequest,
+    ) -> RpcResult<ExtensionExecutionResponse> {
+        let response = self.service.execute_extension(request)?;
+        Ok(ExtensionExecutionResponse {
+            metadata: response.metadata,
+        })
+    }
+
     pub fn get_job(&self, request: GetJobRequest) -> RpcResult<GetJobResponse> {
         let job_id = parse_job_id(&request.job_id)?;
         let job = self.service.get_job(&job_id)?;
@@ -547,6 +558,10 @@ impl From<ServiceError> for RpcError {
                 code: RpcErrorCode::InvalidArgument,
                 reason: err.to_string(),
             },
+            ServiceError::UnsupportedCapability { reason } => Self {
+                code: RpcErrorCode::UnsupportedCapability,
+                reason,
+            },
             ServiceError::Store(error) => store_error_to_rpc(error),
             ServiceError::Runtime(error) => Self {
                 code: RpcErrorCode::Internal,
@@ -597,6 +612,7 @@ pub enum RpcErrorCode {
     InvalidArgument,
     NotFound,
     Conflict,
+    UnsupportedCapability,
     Internal,
 }
 
@@ -4305,5 +4321,20 @@ mod tests {
 
         assert_eq!(error.code, RpcErrorCode::Internal);
         assert!(error.reason.contains("services.provides"));
+    }
+
+    #[test]
+    fn extension_execution_maps_to_unsupported_capability() {
+        let server = ready_server();
+        let error = server
+            .execute_extension(ExtensionExecutionRequest {
+                extension_id: "com.example.review.extension".to_string(),
+            })
+            .expect_err("extension execution should remain gated");
+
+        assert_eq!(error.code, RpcErrorCode::UnsupportedCapability);
+        assert!(error
+            .reason
+            .contains("install, status, and blocklist management APIs"));
     }
 }

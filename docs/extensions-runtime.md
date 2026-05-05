@@ -125,7 +125,10 @@ Initial backend enforcement lives in `atelia-core::extensions` as
 first slice accepts backend `wasm-rust` / `wasm` manifests, explicit
 local-development process manifests, per-version provenance digests, blocklist
 checks, rollback pointers, and brokered service-call authorization. It does not
-execute WASM yet.
+execute WASM yet. In this beta slice, extension install, status, and blocklist
+management are available to operator-facing clients; execution-oriented
+requests are intentionally unavailable and return structured
+unsupported-capability errors instead of silently pretending to run.
 
 The initial implementation also reserves concrete id boundaries:
 
