@@ -182,6 +182,9 @@ process-local: within the same daemon process, clients can resume the live
 surface without losing job history. After a daemon restart, call
 `GetProjectStatus` to discover the latest durable state, or `ReplayEvents` if
 you need the bounded replay-only compatibility path.
+If a previously valid retained event id is no longer available, `WatchEvents`
+returns `CURSOR_EXPIRED` and clients should refresh status. Malformed page
+tokens or cursor syntax still return `INVALID_REQUEST`.
 
 ### Policy Decision
 

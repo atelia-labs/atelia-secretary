@@ -152,7 +152,7 @@ impl fmt::Display for StoreError {
                 write!(f, "{collection} invalid reference: {reason}")
             }
             StoreError::InvalidCursor { reason } => write!(f, "invalid event cursor: {reason}"),
-            StoreError::CursorExpired { reason } => write!(f, "cursor expired: {reason}"),
+            StoreError::CursorExpired { reason } => write!(f, "expired event cursor: {reason}"),
             StoreError::SequenceOverflow => write!(f, "job event sequence overflowed"),
             StoreError::InvalidRecord { collection, reason } => {
                 write!(f, "{collection} invalid record: {reason}")
@@ -6813,6 +6813,42 @@ mod tests {
                 .unwrap(),
             vec![third]
         );
+    }
+
+    #[test]
+    fn replay_after_retained_event_is_removed_returns_cursor_expired() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+
+        store.create_repository(repository.clone()).unwrap();
+
+        let event = store.append_job_event(job_event(repository.id)).unwrap();
+        {
+            let mut inner = store.lock().unwrap();
+            inner.job_events_by_id.remove(&event.id);
+        }
+
+        let cursor = EventCursor::AfterEventId(event.id.clone());
+        assert!(matches!(
+            store.replay_job_events(cursor, None),
+            Err(StoreError::CursorExpired { reason }) if reason.contains("event id is no longer retained")
+        ));
+    }
+
+    #[test]
+    fn query_jobs_rejects_bad_page_token_syntax_as_invalid_cursor() {
+        let store = InMemoryStore::new();
+
+        assert!(matches!(
+            store.query_jobs(JobQuery {
+                repository_id: None,
+                status: None,
+                requester: None,
+                page_size: Some(1),
+                page_token: Some("not-a-number".to_string()),
+            }),
+            Err(StoreError::InvalidCursor { reason }) if reason.contains("page token is not a numeric offset")
+        ));
     }
 
     #[test]

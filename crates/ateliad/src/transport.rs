@@ -1901,9 +1901,9 @@ fn rpc_error_status(code: rpc::RpcErrorCode) -> (StatusCode, bool) {
     match code {
         rpc::RpcErrorCode::InvalidArgument => (StatusCode::BAD_REQUEST, false),
         rpc::RpcErrorCode::NotFound => (StatusCode::NOT_FOUND, false),
+        rpc::RpcErrorCode::CursorExpired => (StatusCode::GONE, true),
         rpc::RpcErrorCode::Conflict => (StatusCode::CONFLICT, true),
         rpc::RpcErrorCode::UnsupportedCapability => (StatusCode::NOT_IMPLEMENTED, true),
-        rpc::RpcErrorCode::CursorExpired => (StatusCode::BAD_REQUEST, true),
         rpc::RpcErrorCode::Internal => (StatusCode::INTERNAL_SERVER_ERROR, false),
     }
 }
@@ -4891,7 +4891,7 @@ mod tests {
         );
         assert_eq!(
             rpc_error_status(rpc::RpcErrorCode::CursorExpired),
-            (StatusCode::BAD_REQUEST, true)
+            (StatusCode::GONE, true)
         );
     }
 
