@@ -73,6 +73,9 @@ protocol は、現在の health endpoint から versioned service surface へ育
 - `WatchEvents`: job、policy、audit、repository event を stream する
 - `CheckPolicy`: requested action が allowed / audited / approval-gated / blocked のどれかを事前確認する
 - `RenderToolOutput`: canonical tool result を TOON、JSON、text として render する
+
+Beta RPC groups:
+
 - `ListRepertoire`: beta repertoire projection を inspect する
 
 Agent が現在の context にある live tool surface の computed projection については [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.ja.md) を参照します。`ListRepertoire` はその projection の最初の beta protocol slice です。
