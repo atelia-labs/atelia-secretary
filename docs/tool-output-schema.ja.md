@@ -144,6 +144,12 @@ policy
 audit_ref audit:tool-call:01h
 ```
 
+## Text Rendering
+
+text rendering は、compact な summary、diagnosis、小さな one-off result のための human-readable fallback です。
+高 signal な status と summary context を保ちながら、table structure より plain prose を優先します。
+rich な policy、recovery、長い payload detail は引き続き TOON、JSON、artifact に置きます。
+
 ## JSON Rendering
 
 JSON は Secretary が選べる別形式です。
