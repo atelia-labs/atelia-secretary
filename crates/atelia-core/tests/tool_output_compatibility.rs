@@ -8,6 +8,7 @@ use atelia_core::tool_output::{
 };
 use atelia_core::OversizeOutputPolicy;
 
+/// Builds the canonical tool-result fixture used by the default render tests.
 fn fixed_tool_result() -> ToolResult {
     ToolResult {
         id: ToolResultId::try_from_string("res_00000000-0000-4000-8000-000000000001")
@@ -59,6 +60,7 @@ fn fixed_tool_result() -> ToolResult {
     }
 }
 
+/// Builds the fixture used to exercise customizer-style field filtering.
 fn customizer_fixture_result() -> ToolResult {
     ToolResult {
         id: ToolResultId::try_from_string("res_00000000-0000-4000-8000-000000000005")
@@ -97,6 +99,7 @@ fn customizer_fixture_result() -> ToolResult {
     }
 }
 
+/// Returns the render policy used for the customizer fixture assertions.
 fn customizer_fixture_policy(format: OutputFormat) -> ToolOutputRenderPolicy {
     ToolOutputRenderPolicy {
         render_options: RenderOptions {
@@ -115,6 +118,7 @@ fn customizer_fixture_policy(format: OutputFormat) -> ToolOutputRenderPolicy {
     }
 }
 
+/// Verifies the canonical fixture renders identically for Toon and JSON defaults.
 #[test]
 fn tool_output_compatibility_fixtures_cover_toon_and_json_defaults() {
     let result = fixed_tool_result();
@@ -139,6 +143,7 @@ fn tool_output_compatibility_fixtures_cover_toon_and_json_defaults() {
     );
 }
 
+/// Verifies customizer-style field filtering stays stable across formats.
 #[test]
 fn tool_output_compatibility_fixtures_cover_customizer_style_field_filtering() {
     let result = customizer_fixture_result();
