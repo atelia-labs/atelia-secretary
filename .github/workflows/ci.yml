@@ -27,8 +27,6 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-        with:
-          toolchain: stable
           components: rustfmt, clippy
 
       - name: Format
@@ -53,7 +51,6 @@ jobs:
 
           docker run --detach --name atelia-secretary-beta-gate \
             --env ATELIA_DAEMON_LISTEN_ADDR=0.0.0.0:8080 \
-            --env ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN=1 \
             --publish 127.0.0.1::8080 \
             atelia-secretary-beta-gate
           host_port="$(docker port atelia-secretary-beta-gate 8080/tcp | sed -n 's/.*://p' | head -n1)"
