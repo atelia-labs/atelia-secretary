@@ -7065,6 +7065,7 @@ mod tests {
         env.cleanup();
     }
 
+    #[cfg(unix)]
     #[test]
     fn fs_delete_allows_missing_when_configured() {
         let env = TestEnv::new("delete-missing");
@@ -7077,6 +7078,28 @@ mod tests {
         assert_eq!(ToolResultStatus::Succeeded, result.status);
         let missing = result.fields.iter().find(|f| f.key == "missing").unwrap();
         assert_eq!(StructuredValue::Bool(true), missing.value);
+        env.cleanup();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn fs_delete_rejects_missing_path_on_non_unix_platforms() {
+        let env = TestEnv::new("delete-missing-non-unix");
+
+        let tool = FsDeleteTool::new(&env.root).with_allow_missing(true);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("already-gone.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        let safety = result
+            .fields
+            .iter()
+            .find(|f| f.key == "platform_safety")
+            .unwrap();
+        assert_eq!("unsupported-non-unix", string_value(&safety.value));
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("Unix no-follow validation"));
         env.cleanup();
     }
 
@@ -7352,6 +7375,7 @@ mod tests {
         env.cleanup();
     }
 
+    #[cfg(unix)]
     #[test]
     fn fs_move_rejects_out_of_scope_destination() {
         let env = TestEnv::new("move-out-of-scope-destination");
@@ -7366,6 +7390,30 @@ mod tests {
         assert!(env.root.join("from.txt").exists());
         let error = result.fields.iter().find(|f| f.key == "error").unwrap();
         assert!(string_value(&error.value).contains("outside repository root"));
+        env.cleanup();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn fs_move_rejects_out_of_scope_destination_on_non_unix_platforms() {
+        let env = TestEnv::new("move-out-of-scope-destination-non-unix");
+        env.create_file("from.txt", "source");
+
+        let tool = FsMoveTool::new(&env.root, "../outside.txt");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("from.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        assert!(env.root.join("from.txt").exists());
+        let safety = result
+            .fields
+            .iter()
+            .find(|f| f.key == "platform_safety")
+            .unwrap();
+        assert_eq!("unsupported-non-unix", string_value(&safety.value));
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("Unix no-follow validation"));
         env.cleanup();
     }
 
