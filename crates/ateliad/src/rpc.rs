@@ -221,6 +221,7 @@ impl SecretaryRpcServer {
             repository_id: Some(parse_repository_id(&request.repository_id)?),
             cursor: parse_event_cursor(incoming_cursor.clone())?,
             subject_ids: request.subject_ids,
+            job_ids: Vec::new(),
             min_severity: request.min_severity.map(parse_event_severity),
             page_size: Some(
                 request
@@ -1159,6 +1160,7 @@ pub struct ListEventsRequest {
     pub repository_id: Option<String>,
     pub cursor: Option<EventCursorRequest>,
     pub subject_ids: Vec<String>,
+    pub job_ids: Vec<String>,
     pub min_severity: Option<RpcEventSeverity>,
     pub page_size: Option<usize>,
     pub page_token: Option<String>,
@@ -1493,6 +1495,11 @@ fn parse_event_query(request: ListEventsRequest) -> RpcResult<EventQuery> {
         repository_id,
         cursor,
         subject_ids: request.subject_ids,
+        job_ids: request
+            .job_ids
+            .into_iter()
+            .map(|job_id| parse_job_id(&job_id))
+            .collect::<RpcResult<Vec<_>>>()?,
         min_severity: request.min_severity.map(parse_event_severity),
         page_size,
         page_token: request.page_token,
@@ -3033,6 +3040,7 @@ mod tests {
                 repository_id: Some(registered.repository.repository_id.clone()),
                 cursor: Some(EventCursorRequest::Beginning),
                 subject_ids: Vec::new(),
+                job_ids: Vec::new(),
                 min_severity: None,
                 page_size: Some(1),
                 page_token: None,
@@ -3071,6 +3079,7 @@ mod tests {
                 repository_id: Some(registered.repository.repository_id.clone()),
                 cursor: Some(EventCursorRequest::Beginning),
                 subject_ids: Vec::new(),
+                job_ids: Vec::new(),
                 min_severity: None,
                 page_size: None,
                 page_token: None,
@@ -3451,6 +3460,7 @@ mod tests {
             repository_id: None,
             cursor: None,
             subject_ids: Vec::new(),
+            job_ids: Vec::new(),
             min_severity: None,
             page_size: Some(0),
             page_token: None,
@@ -3466,6 +3476,7 @@ mod tests {
             repository_id: None,
             cursor: None,
             subject_ids: Vec::new(),
+            job_ids: Vec::new(),
             min_severity: None,
             page_size: Some(MAX_WATCH_EVENTS_PAGE + 1),
             page_token: None,
