@@ -126,6 +126,7 @@ pub enum StoreError {
     InvalidCursor {
         reason: String,
     },
+    /// The cursor refers to an event that used to exist but is no longer retained.
     CursorExpired {
         reason: String,
     },
@@ -6821,6 +6822,7 @@ mod tests {
     }
 
     #[test]
+    /// Reject replay requests that point at an event ID the store no longer retains.
     fn replay_after_unknown_event_id_returns_invalid_cursor() {
         let store = InMemoryStore::new();
         let cursor = EventCursor::AfterEventId(
@@ -6833,6 +6835,7 @@ mod tests {
     }
 
     #[test]
+    /// Reject malformed page tokens before they reach pagination logic.
     fn query_jobs_rejects_bad_page_token_syntax_as_invalid_cursor() {
         let store = InMemoryStore::new();
 
