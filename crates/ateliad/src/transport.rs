@@ -463,6 +463,11 @@ pub fn resolve_local_auth(storage_dir: &std::path::Path) -> Result<LocalAuthConf
         if token.is_empty() {
             return Err(anyhow!("{AUTH_TOKEN_ENV} must not be empty"));
         }
+        if token.chars().any(|ch| ch.is_whitespace()) {
+            return Err(anyhow!(
+                "{AUTH_TOKEN_ENV} must not contain internal whitespace"
+            ));
+        }
 
         return Ok(LocalAuthConfig::BearerToken { token });
     }
@@ -483,10 +488,9 @@ fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String>
     match std::fs::read_to_string(&token_path) {
         Ok(token) => {
             set_restrictive_permissions(&token_path)?;
-            let token = token.trim().to_string();
-            if token.is_empty() {
+            if token.len() != 64 || !token.chars().all(|ch| ch.is_ascii_hexdigit()) {
                 Err(anyhow!(
-                    "session token file {token_path:?} is empty; delete it and restart to regenerate"
+                    "session token file {token_path:?} must contain exactly 64 hexadecimal characters; delete it and restart to regenerate"
                 ))
             } else {
                 Ok(token)
@@ -3568,10 +3572,7 @@ mod tests {
         let storage_dir = test_repo_dir("local-auth");
         let resolved = resolve_local_auth(&storage_dir).expect("resolve local auth");
         let token_path = local_auth_token_path(&storage_dir);
-        let token = fs::read_to_string(&token_path)
-            .expect("session token file")
-            .trim()
-            .to_string();
+        let token = fs::read_to_string(&token_path).expect("session token file");
 
         match resolved {
             LocalAuthConfig::BearerToken {
@@ -3585,6 +3586,44 @@ mod tests {
 
         let resolved_again = resolve_local_auth(&storage_dir).expect("resolve local auth again");
         assert_eq!(resolved_again, LocalAuthConfig::BearerToken { token });
+    }
+
+    #[test]
+    fn resolve_local_auth_rejects_bearer_token_with_internal_whitespace() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::set_var(AUTH_TOKEN_ENV, "abc def");
+
+        let err = resolve_local_auth(&test_repo_dir("local-auth-env-token"))
+            .expect_err("internal whitespace should be rejected");
+
+        assert!(err
+            .to_string()
+            .contains("ATELIA_DAEMON_AUTH_TOKEN must not contain internal whitespace"));
+    }
+
+    #[test]
+    fn resolve_local_auth_rejects_invalid_persisted_session_token_file() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::remove_var(AUTH_TOKEN_ENV);
+
+        for (name, contents) in [
+            ("empty", String::new()),
+            ("truncated", String::from("abc123")),
+            ("corrupt", "z".repeat(64)),
+        ] {
+            let storage_dir = test_repo_dir(&format!("local-auth-invalid-{name}"));
+            let token_path = local_auth_token_path(&storage_dir);
+            fs::write(&token_path, contents).expect("seed invalid session token");
+
+            let err = resolve_local_auth(&storage_dir)
+                .expect_err("invalid session token file should fail closed");
+
+            let message = err.to_string();
+            assert!(message.contains("session token file"));
+            assert!(message.contains("must contain exactly 64 hexadecimal characters"));
+        }
     }
 
     #[test]
@@ -3607,8 +3646,8 @@ mod tests {
 
         let storage_dir = test_repo_dir("local-auth-permissions");
         let token_path = local_auth_token_path(&storage_dir);
-        let token = "existing-session-token";
-        fs::write(&token_path, format!("  {token}\n")).expect("seed session token");
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        fs::write(&token_path, token).expect("seed session token");
         let mut permissions = fs::metadata(&token_path)
             .expect("seed token metadata")
             .permissions();
