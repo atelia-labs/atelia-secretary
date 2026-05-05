@@ -106,30 +106,16 @@ See [Tool Catalog](tool-catalog.md) for the built-in surface boundary.
 Secretary built-ins are intentionally small. Each built-in tool must have a
 definition using this schema before implementation.
 
-Initial built-ins:
+Current shipped beta built-ins:
 
 - `secretary.echo`
 - `fs.read`
-- `fs.list`
-- `fs.stat`
-- `fs.search`
-- `fs.diff`
-- `fs.write`
-- `fs.patch`
-- `fs.delete`
-- `fs.move`
-- `proc.exec`
-- `proc.run`
-- `proc.spawn`
-- `proc.kill`
-- `proc.status`
-- `proc.stream`
-- `search.files`
-- `search.text`
-- `search.symbols`
-- `job.create`
-- `job.status`
-- `job.cancel`
+
+Other built-ins may exist in future or non-shipped slices, but the current
+beta repertoire projection only exposes the tools above until dispatch exists.
+
+Future or non-shipped built-ins:
+
 - `job.events`
 - `event.subscribe`
 - `event.publish_internal`

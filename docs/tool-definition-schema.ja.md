@@ -102,30 +102,16 @@ fields:
 
 Secretary built-in は意図的に小さくします。すべての built-in tool は、実装前にこの schema に従う definition を持ちます。
 
-初期 built-ins:
+現行 beta で shipped されている built-ins:
 
 - `secretary.echo`
 - `fs.read`
-- `fs.list`
-- `fs.stat`
-- `fs.search`
-- `fs.diff`
-- `fs.write`
-- `fs.patch`
-- `fs.delete`
-- `fs.move`
-- `proc.exec`
-- `proc.run`
-- `proc.spawn`
-- `proc.kill`
-- `proc.status`
-- `proc.stream`
-- `search.files`
-- `search.text`
-- `search.symbols`
-- `job.create`
-- `job.status`
-- `job.cancel`
+
+その他の built-in は future または non-shipped slice に存在しうりますが、現行の beta repertoire projection が
+公開するのは上記の tool のみで、dispatch が揃うまでは含めません。
+
+future または non-shipped built-ins:
+
 - `job.events`
 - `event.subscribe`
 - `event.publish_internal`
