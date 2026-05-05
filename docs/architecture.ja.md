@@ -76,8 +76,8 @@ R0/R1 capability は contract が許す範囲で daemon policy により自動 g
 
 規範的な extension / Hook 仕様は Atelia 本体の文書を参照します。
 
-- [Atelia Extension Protocol](https://github.com/atelia-labs/atelia/pull/4)
-- [AEP Manifest](https://github.com/atelia-labs/atelia/pull/4)
+- [Atelia Extension Protocol / AEP Manifest / AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
+  は、個別 docs が `atelia` main に入るまで同じ `atelia` PR `#4` を指す一時リンクです。
 - [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.ja.md)
 - [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.ja.md)
 - [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.ja.md)
