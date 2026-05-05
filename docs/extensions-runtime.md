@@ -1,7 +1,8 @@
 # Extensions Runtime
 
-This document defines how Atelia Secretary validates, installs, executes,
-audits, and rolls back Custom Extensions.
+This document defines how Atelia Secretary validates, installs, audits,
+rolls back, and manages Custom Extensions. Extension execution is disabled in
+beta and reserved for a future release.
 
 The normative AEP, extension, composition, hook, tool-output, and security
 contracts live in the [`atelia`](https://github.com/atelia-labs/atelia)

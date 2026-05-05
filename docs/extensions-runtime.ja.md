@@ -1,6 +1,6 @@
 # Extensions Runtime
 
-この文書は、Atelia Secretary が Custom Extensions をどのように検証、導入、実行、監査、rollback するかを定義します。
+この文書は、Atelia Secretary が Custom Extensions をどのように検証、導入、監査、rollback、管理するかを定義します。extension の実行は beta では無効で、将来のリリース向けです。
 
 規範的な AEP / extension / composition / hook / tool-output / security contract は [`atelia`](https://github.com/atelia-labs/atelia/blob/main/README.ja.md) repository が所有します。[Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.ja.md)、[Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.ja.md)、[Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.ja.md)、[Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.ja.md)、[Extension Security](https://github.com/atelia-labs/atelia/blob/main/docs/extension-security.ja.md) を参照します。AEP overview と manifest docs は [atelia PR #4](https://github.com/atelia-labs/atelia/pull/4) で追加されるため、その PR が `atelia` repository に入った後で直接リンクします。この文書は、Secretary が信頼できる拡張機能の仕事場を持つための daemon-side enforcement を定義します。AEP において、これは backend host reference implementation slice です。
 
