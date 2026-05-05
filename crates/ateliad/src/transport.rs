@@ -59,7 +59,7 @@ fn route_for_path(path: &str) -> Route {
     if let Some(job_id) = path
         .strip_prefix("/v1/jobs/")
         .and_then(|path| path.strip_suffix("/cancel"))
-        .and_then(valid_path_id)
+        .and_then(valid_job_id)
     {
         return Route::CancelJob {
             job_id: job_id.to_string(),
@@ -806,7 +806,7 @@ fn serialize_tool_output_change(
     if let serde_json::Value::Object(ref mut map) = value {
         map.insert("actor".to_string(), serialize_actor(&change.actor));
 
-        if let Some(serde_json::Value::Object(changed_at)) = map.remove("changed_at") {
+        if let Some(serde_json::Value::Object(changed_at)) = map.get("changed_at") {
             if let Some(unix_millis) = changed_at.get("unix_millis").cloned() {
                 map.insert("changed_at_unix_ms".to_string(), unix_millis);
             }
@@ -2819,9 +2819,9 @@ mod tests {
             }
         );
         assert_eq!(
-            route_for_path("/v1/jobs/job_123/cancel"),
+            route_for_path(&format!("/v1/jobs/{job_id}/cancel")),
             Route::CancelJob {
-                job_id: "job_123".to_string()
+                job_id: job_id.clone()
             }
         );
         assert_eq!(
@@ -2914,6 +2914,10 @@ mod tests {
         assert_eq!(route_for_path("/v1/health/"), Route::Unsupported);
         assert_eq!(route_for_path("/v1/jobs//cancel"), Route::Unsupported);
         assert_eq!(route_for_path("/v1/jobs/a/b/cancel"), Route::Unsupported);
+        assert_eq!(
+            route_for_path("/v1/jobs/not-a-job-id/cancel"),
+            Route::Unsupported
+        );
     }
 
     #[test]
@@ -3396,7 +3400,7 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(cancel_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(cancel_response.status(), StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3465,6 +3469,7 @@ mod tests {
             Value::from(42)
         );
         assert!(update_payload["data"]["change"]["changed_at_unix_ms"].is_i64());
+        assert!(update_payload["data"]["change"]["changed_at"]["unix_millis"].is_i64());
         assert_eq!(
             update_payload["data"]["change"]["actor"]["id"],
             Value::String("user:tool-output".to_string())
@@ -3500,6 +3505,7 @@ mod tests {
             Value::from(42)
         );
         assert!(history_payload["data"]["changes"][0]["changed_at_unix_ms"].is_i64());
+        assert!(history_payload["data"]["changes"][0]["changed_at"]["unix_millis"].is_i64());
 
         let defaults_again = send_json_request(
             &rpc_server,
