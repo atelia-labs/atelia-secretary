@@ -86,7 +86,7 @@ Required RPC groups:
   - `scope`
   - `durability`
   - `restart_semantics`
-  - `limits`
+  - `limits` stable code tokens describing the limits attached to this beta state
 - capability names
 
 ### Repository

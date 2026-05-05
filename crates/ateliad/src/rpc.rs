@@ -8,8 +8,8 @@
 #![allow(dead_code)]
 
 use crate::service::{
-    BetaStateHint, CheckPolicyRequest as ServiceCheckPolicyRequest, DaemonHealth, DaemonStatus,
-    GetProjectStatusRequest as ServiceGetProjectStatusRequest,
+    BetaStateHint as ServiceBetaStateHint, CheckPolicyRequest as ServiceCheckPolicyRequest,
+    DaemonHealth, DaemonStatus, GetProjectStatusRequest as ServiceGetProjectStatusRequest,
     ListRepositoriesRequest as ServiceListRepositoriesRequest,
     ListToolOutputSettingsHistoryRequest as ServiceListToolOutputSettingsHistoryRequest,
     ProtocolMetadata as ServiceProtocolMetadata,
@@ -612,7 +612,7 @@ pub struct HealthResponse {
     pub storage_status: String,
     pub daemon_status: String,
     /// Beta-only state durability hint for clients that need restart semantics.
-    pub beta_state: Option<BetaStateHint>,
+    pub beta_state: Option<RpcBetaStateHint>,
     pub capabilities: Vec<String>,
 }
 
@@ -625,8 +625,27 @@ impl From<DaemonHealth> for HealthResponse {
             storage_version: health.storage_version,
             storage_status: storage_status_label(health.storage_status).to_string(),
             daemon_status: daemon_status_label(health.daemon_status).to_string(),
-            beta_state: health.beta_state,
+            beta_state: health.beta_state.map(RpcBetaStateHint::from),
             capabilities: health.capabilities,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcBetaStateHint {
+    pub scope: String,
+    pub durability: String,
+    pub restart_semantics: String,
+    pub limits: Vec<String>,
+}
+
+impl From<ServiceBetaStateHint> for RpcBetaStateHint {
+    fn from(hint: ServiceBetaStateHint) -> Self {
+        Self {
+            scope: hint.scope,
+            durability: hint.durability,
+            restart_semantics: hint.restart_semantics,
+            limits: hint.limits,
         }
     }
 }
@@ -2380,7 +2399,7 @@ mod tests {
         let unavailable = HealthResponse::from(DaemonHealth {
             daemon_status: DaemonStatus::Ready,
             storage_status: StorageStatus::Unavailable,
-            beta_state: Some(BetaStateHint::in_memory_process_local()),
+            beta_state: Some(ServiceBetaStateHint::in_memory_process_local()),
             daemon_version: "daemon".to_string(),
             protocol_version: "protocol".to_string(),
             storage_version: "storage".to_string(),
@@ -2393,7 +2412,7 @@ mod tests {
         let read_only = HealthResponse::from(DaemonHealth {
             daemon_status: DaemonStatus::Ready,
             storage_status: StorageStatus::ReadOnly,
-            beta_state: Some(BetaStateHint::in_memory_process_local()),
+            beta_state: Some(ServiceBetaStateHint::in_memory_process_local()),
             daemon_version: "daemon".to_string(),
             protocol_version: "protocol".to_string(),
             storage_version: "storage".to_string(),
@@ -2409,6 +2428,17 @@ mod tests {
                 .expect("beta state hint")
                 .restart_semantics,
             "reset_on_restart"
+        );
+        assert_eq!(
+            read_only
+                .beta_state
+                .as_ref()
+                .expect("beta state hint")
+                .limits,
+            vec![
+                "state_is_limited_to_the_current_daemon_process".to_string(),
+                "state_is_not_recovered_after_restart".to_string(),
+            ]
         );
     }
 

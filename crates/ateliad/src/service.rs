@@ -96,7 +96,7 @@ pub struct BetaStateHint {
     pub durability: String,
     /// Observable behavior clients should expect across daemon restarts.
     pub restart_semantics: String,
-    /// Human-readable limits attached to this beta durability class.
+    /// Stable code tokens attached to this beta durability class.
     pub limits: Vec<String>,
 }
 
