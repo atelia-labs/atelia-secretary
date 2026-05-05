@@ -304,7 +304,7 @@ impl SecretaryRpcServer {
         } else {
             Some(incoming_cursor)
         };
-        let last_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
+        let last_sequence = watch_events_last_sequence(&events, replay_max_sequence);
 
         Ok(WatchEventsLiveResponse {
             metadata: self.metadata(),
@@ -1353,6 +1353,13 @@ pub struct WatchEventsReplayResponse {
     pub metadata: ProtocolMetadata,
     pub events: Vec<RpcEvent>,
     pub cursor: Option<EventCursorRequest>,
+}
+
+fn watch_events_last_sequence(events: &[RpcEvent], replay_max_sequence: u64) -> u64 {
+    events
+        .last()
+        .map(|event| event.sequence)
+        .unwrap_or(replay_max_sequence)
 }
 
 #[allow(dead_code)]
@@ -3591,6 +3598,11 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watch_events_last_sequence_falls_back_to_replay_max_sequence_when_empty() {
+        assert_eq!(watch_events_last_sequence(&[], 42), 42);
     }
 
     #[test]
