@@ -3487,6 +3487,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_event_query_parses_job_ids() {
+        let job_id = JobId::new();
+
+        let query = parse_event_query(ListEventsRequest {
+            repository_id: None,
+            cursor: None,
+            subject_ids: Vec::new(),
+            job_ids: vec![job_id.as_str().to_string()],
+            min_severity: None,
+            page_size: None,
+            page_token: None,
+        })
+        .expect("valid job_ids should parse");
+
+        assert_eq!(query.job_ids, vec![job_id]);
+    }
+
+    #[test]
+    fn parse_event_query_rejects_invalid_job_ids() {
+        let err = parse_event_query(ListEventsRequest {
+            repository_id: None,
+            cursor: None,
+            subject_ids: Vec::new(),
+            job_ids: vec!["not-a-job-id".to_string()],
+            min_severity: None,
+            page_size: None,
+            page_token: None,
+        })
+        .unwrap_err();
+
+        assert_eq!(err.code, RpcErrorCode::InvalidArgument);
+    }
+
+    #[test]
     fn cancel_terminal_job_maps_to_conflict() {
         let server = ready_server();
         let root = test_repo_dir("cancel-terminal");
