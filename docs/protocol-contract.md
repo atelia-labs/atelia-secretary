@@ -85,8 +85,8 @@ Required RPC groups:
 It will return a computed projection, not a persisted store.
 
 For the beta slice, extension management APIs are operator-facing.
-Extension execution RPCs are intentionally absent and should be treated as
-unsupported-capability failures when clients probe the execution RPCs.
+Extension execution RPCs are not supported in beta. Endpoints may exist, but
+they must return unsupported-capability when invoked.
 
 ## Core Messages
 
