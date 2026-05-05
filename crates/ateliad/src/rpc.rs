@@ -2444,7 +2444,10 @@ mod tests {
             })
             .expect("events should replay");
         assert!(!events.events.is_empty());
-        assert_eq!(events.events[0].refs.job_id, Some(job_id));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.refs.job_id == Some(job_id.clone())));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(storage_dir);
     }

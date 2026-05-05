@@ -293,6 +293,10 @@ impl InMemoryStore {
         })
     }
 
+    pub fn uses_durable_snapshot(&self) -> bool {
+        self.durable_snapshot_path.is_some()
+    }
+
     fn mutate<R>(
         &self,
         mutator: impl FnOnce(&mut InMemoryInner) -> StoreResult<R>,

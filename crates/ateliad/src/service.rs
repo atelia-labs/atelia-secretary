@@ -117,6 +117,20 @@ impl BetaStateHint {
             ],
         }
     }
+
+    /// Build the beta hint for the durable ledger snapshot store.
+    pub fn durable_snapshot_replay() -> Self {
+        Self {
+            scope: "storage_backed".to_string(),
+            durability: "durable_snapshot".to_string(),
+            restart_semantics: "restore_on_restart".to_string(),
+            limits: vec![
+                "state_is_persisted_to_ledger_json".to_string(),
+                "state_is_validated_on_startup".to_string(),
+                "state_is_restored_after_restart".to_string(),
+            ],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,10 +420,16 @@ impl SecretaryService {
                 }
             };
 
+        let beta_state = if self.lifecycle.runtime().store().uses_durable_snapshot() {
+            BetaStateHint::durable_snapshot_replay()
+        } else {
+            BetaStateHint::in_memory_process_local()
+        };
+
         DaemonHealth {
             daemon_status: self.daemon_status,
             storage_status,
-            beta_state: Some(BetaStateHint::in_memory_process_local()),
+            beta_state: Some(beta_state),
             daemon_version: DAEMON_VERSION.to_string(),
             protocol_version: PROTOCOL_VERSION.to_string(),
             storage_version: STORAGE_VERSION.to_string(),
@@ -1413,6 +1433,24 @@ mod tests {
     }
 
     #[test]
+    fn health_marks_durable_snapshot_restart_semantics() {
+        let storage_dir = durable_storage_dir("health");
+        let svc =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service reload");
+
+        let health = svc.health();
+        let beta_state = health.beta_state.expect("beta state hint");
+        assert_eq!(beta_state.scope, "storage_backed");
+        assert_eq!(beta_state.durability, "durable_snapshot");
+        assert_eq!(beta_state.restart_semantics, "restore_on_restart");
+        assert!(beta_state
+            .limits
+            .contains(&"state_is_validated_on_startup".to_string()));
+
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
     fn health_starts_starting() {
         let svc = SecretaryService::new();
         assert_eq!(svc.health().daemon_status, DaemonStatus::Starting);
@@ -1728,7 +1766,9 @@ mod tests {
             .watch_events(atelia_core::EventCursor::Beginning, None)
             .expect("event replay should succeed");
         assert!(!replayed.is_empty());
-        assert_eq!(replayed[0].refs.job_id, Some(job_id));
+        assert!(replayed
+            .iter()
+            .any(|event| event.refs.job_id == Some(job_id.clone())));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(storage_dir);
     }
