@@ -34,6 +34,50 @@ Secretary は beta では local bearer token も要求します。startup 時に
 再利用前に restrictive permissions に正規化され、auth-disabled の opt-out
 は unsafe な non-loopback listener override と組み合わせると拒否されます。
 
+## Local token の lifecycle
+
+- local bearer token は自動では期限切れになりません。
+  `<storage_dir>/daemon-auth.token` は削除または置換されるまで再利用され、
+  `ATELIA_DAEMON_AUTH_TOKEN` も process がその値を読む限り有効です。
+- 自動 rotation はありません。生成済み token を安全に rotate するには、
+  依存 client を停止または静止させ、`<storage_dir>/daemon-auth.token` を削除し、
+  Secretary を再起動してから、新しく生成された token を client に配布します。
+- pinned token を rotate する場合は、新しい `ATELIA_DAEMON_AUTH_TOKEN` に切り替え、
+  すべての client を同じ値へ更新し、Secretary と client を段階的に切り替えます。
+  cutover 後は旧 token を再利用しません。
+- token が露出した、または漏えいした疑いがある場合は revoke 済みとみなし、
+  daemon 側の token を差し替え、保存済み file か pinned env value を無効化し、
+  daemon を再起動して、依存する automation もすべて更新し、漏えい経路を確認します。
+- automation で pinned token を使うのは、secret manager などの access-controlled な
+  runtime secret store に安全に保持できる場合に限ります。token を version control、
+  shared config、CI の variable / secret に commit してはいけません。backup や shared
+  machine image には token を plaintext のまま含めてはいけません。読み取り側の
+  automation は最小権限で実行します。
+- Unix では token file は owning user が読めるように作成され、再利用前に
+  `0600` に正規化されます。別の場所から copy, restore, mount した file を使う場合は、
+  Secretary を実行する user が ownership を持ち、実際に read できることを確認してから
+  再利用します。環境により `0400` しか使えない場合でも、少なくとも owner-only read に
+  してください。
+
+## Replay protection
+
+Secretary が現在提供している local boundary の mitigation は次の 2 つです。
+
+- daemon は default で loopback のみに bind し、unsafe な non-loopback override を
+  有効にしない限り traffic を local host に限定します。
+- local auth opt-out を有効にしない限り、各 request で bearer token を要求します。
+
+一方で、nonce, timestamp, request signing, token expiry のような replay 専用の
+protective mechanism は提供していません。認証済み request を取得した側は、
+token が変わるか local boundary が外れるまで replay できます。
+
+推奨 mitigation:
+
+- daemon は loopback-only のまま使い、local auth は有効のままにする
+- host ごと、または daemon instance ごとに一意の token を使う
+- token が露出した、または盗聴された疑いがある場合は直ちに rotate する
+- shared listener, reverse proxy, それ以外の replay しやすい boundary の背後に daemon を置かない
+
 ## threat model の種
 
 初期の threat model work では次のものを扱うべきです。
