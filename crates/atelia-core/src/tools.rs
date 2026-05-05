@@ -242,6 +242,11 @@ fn failed_result(
     )
 }
 
+#[cfg(unix)]
+fn mutation_platform_safety_label() -> &'static str {
+    "unix-validated"
+}
+
 fn open_canonical_file_within_scope(canonical: &CanonicalPath) -> io::Result<File> {
     let file = open_file_no_follow(&canonical.canonical)?;
 
@@ -4486,8 +4491,40 @@ impl crate::runtime::RuntimeTool for FsDeleteTool {
         };
 
         #[cfg(not(unix))]
-        let delete_result = fs::remove_file(path);
+        {
+            return make_tool_result(
+                invocation,
+                ToolResultStatus::Failed,
+                schema_ref,
+                vec![
+                    ToolResultField {
+                        key: "summary".to_string(),
+                        value: StructuredValue::String(
+                            "delete failed: unsupported on this platform".to_string(),
+                        ),
+                    },
+                    ToolResultField {
+                        key: "error".to_string(),
+                        value: StructuredValue::String(format!(
+                            "{}: safe delete requires Unix no-follow validation",
+                            target.display_path()
+                        )),
+                    },
+                    ToolResultField {
+                        key: "platform_safety".to_string(),
+                        value: StructuredValue::String("unsupported-non-unix".to_string()),
+                    },
+                    ToolResultField {
+                        key: "path".to_string(),
+                        value: StructuredValue::String(target.display_path().to_string()),
+                    },
+                ],
+                None,
+                Vec::new(),
+            );
+        }
 
+        #[cfg(unix)]
         if let Err(err) = delete_result {
             if err.kind() == io::ErrorKind::NotFound && self.allow_missing {
                 return make_tool_result(
@@ -4527,31 +4564,43 @@ impl crate::runtime::RuntimeTool for FsDeleteTool {
             );
         }
 
-        make_tool_result(
-            invocation,
-            ToolResultStatus::Succeeded,
-            schema_ref,
-            vec![
-                ToolResultField {
-                    key: "summary".to_string(),
-                    value: StructuredValue::String(format!("deleted {}", target.display_path())),
-                },
-                ToolResultField {
-                    key: "path".to_string(),
-                    value: StructuredValue::String(target.display_path().to_string()),
-                },
-                ToolResultField {
-                    key: "deleted".to_string(),
-                    value: StructuredValue::Bool(true),
-                },
-                ToolResultField {
-                    key: "missing".to_string(),
-                    value: StructuredValue::Bool(false),
-                },
-            ],
-            None,
-            Vec::new(),
-        )
+        #[cfg(unix)]
+        {
+            make_tool_result(
+                invocation,
+                ToolResultStatus::Succeeded,
+                schema_ref,
+                vec![
+                    ToolResultField {
+                        key: "summary".to_string(),
+                        value: StructuredValue::String(format!(
+                            "deleted {}",
+                            target.display_path()
+                        )),
+                    },
+                    ToolResultField {
+                        key: "platform_safety".to_string(),
+                        value: StructuredValue::String(
+                            mutation_platform_safety_label().to_string(),
+                        ),
+                    },
+                    ToolResultField {
+                        key: "path".to_string(),
+                        value: StructuredValue::String(target.display_path().to_string()),
+                    },
+                    ToolResultField {
+                        key: "deleted".to_string(),
+                        value: StructuredValue::Bool(true),
+                    },
+                    ToolResultField {
+                        key: "missing".to_string(),
+                        value: StructuredValue::Bool(false),
+                    },
+                ],
+                None,
+                Vec::new(),
+            )
+        }
     }
 }
 
@@ -4684,6 +4733,45 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
             );
         }
 
+        #[cfg(not(unix))]
+        {
+            return make_tool_result(
+                invocation,
+                ToolResultStatus::Failed,
+                schema_ref,
+                vec![
+                    ToolResultField {
+                        key: "summary".to_string(),
+                        value: StructuredValue::String(
+                            "move failed: unsupported on this platform".to_string(),
+                        ),
+                    },
+                    ToolResultField {
+                        key: "error".to_string(),
+                        value: StructuredValue::String(format!(
+                            "{} -> {}: safe move requires Unix no-follow validation",
+                            source.display_path(),
+                            destination.display_path()
+                        )),
+                    },
+                    ToolResultField {
+                        key: "platform_safety".to_string(),
+                        value: StructuredValue::String("unsupported-non-unix".to_string()),
+                    },
+                    ToolResultField {
+                        key: "source_path".to_string(),
+                        value: StructuredValue::String(source.display_path().to_string()),
+                    },
+                    ToolResultField {
+                        key: "destination_path".to_string(),
+                        value: StructuredValue::String(destination.display_path().to_string()),
+                    },
+                ],
+                None,
+                Vec::new(),
+            );
+        }
+
         #[cfg(unix)]
         let move_result: io::Result<bool> = {
             let source_parent = source.path().parent().ok_or_else(|| {
@@ -4796,38 +4884,7 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
             }
         };
 
-        #[cfg(not(unix))]
-        let move_result: io::Result<bool> = {
-            let destination_exists = match fs::symlink_metadata(destination.path()) {
-                Ok(metadata) if metadata.is_file() => true,
-                Ok(_) => {
-                    return failed_result(
-                        invocation,
-                        schema_ref,
-                        "move failed: destination is not a file".to_string(),
-                        destination.display_path().to_string(),
-                    );
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                Err(error) => {
-                    return failed_result(
-                        invocation,
-                        schema_ref,
-                        "move failed: cannot read destination metadata".to_string(),
-                        format!("{}: {}", destination.display_path(), error),
-                    );
-                }
-            };
-            if destination_exists && !self.allow_overwrite {
-                Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "destination already exists",
-                ))
-            } else {
-                fs::rename(source.path(), destination.path()).map(|_| destination_exists)
-            }
-        };
-
+        #[cfg(unix)]
         let overwritten = match move_result {
             Ok(overwritten) => overwritten,
             Err(err) => {
@@ -4845,35 +4902,44 @@ impl crate::runtime::RuntimeTool for FsMoveTool {
             }
         };
 
-        make_tool_result(
-            invocation,
-            ToolResultStatus::Succeeded,
-            schema_ref,
-            vec![
-                ToolResultField {
-                    key: "summary".to_string(),
-                    value: StructuredValue::String(format!(
-                        "moved {} to {}",
-                        source.display_path(),
-                        destination.display_path()
-                    )),
-                },
-                ToolResultField {
-                    key: "source_path".to_string(),
-                    value: StructuredValue::String(source.display_path().to_string()),
-                },
-                ToolResultField {
-                    key: "destination_path".to_string(),
-                    value: StructuredValue::String(destination.display_path().to_string()),
-                },
-                ToolResultField {
-                    key: "overwritten".to_string(),
-                    value: StructuredValue::Bool(overwritten),
-                },
-            ],
-            None,
-            Vec::new(),
-        )
+        #[cfg(unix)]
+        {
+            make_tool_result(
+                invocation,
+                ToolResultStatus::Succeeded,
+                schema_ref,
+                vec![
+                    ToolResultField {
+                        key: "summary".to_string(),
+                        value: StructuredValue::String(format!(
+                            "moved {} to {}",
+                            source.display_path(),
+                            destination.display_path()
+                        )),
+                    },
+                    ToolResultField {
+                        key: "platform_safety".to_string(),
+                        value: StructuredValue::String(
+                            mutation_platform_safety_label().to_string(),
+                        ),
+                    },
+                    ToolResultField {
+                        key: "source_path".to_string(),
+                        value: StructuredValue::String(source.display_path().to_string()),
+                    },
+                    ToolResultField {
+                        key: "destination_path".to_string(),
+                        value: StructuredValue::String(destination.display_path().to_string()),
+                    },
+                    ToolResultField {
+                        key: "overwritten".to_string(),
+                        value: StructuredValue::Bool(overwritten),
+                    },
+                ],
+                None,
+                Vec::new(),
+            )
+        }
     }
 }
 
@@ -6896,6 +6962,12 @@ mod tests {
         assert!(!env.root.join("notes.txt").exists());
         let deleted = result.fields.iter().find(|f| f.key == "deleted").unwrap();
         assert_eq!(StructuredValue::Bool(true), deleted.value);
+        let platform_safety = result
+            .fields
+            .iter()
+            .find(|f| f.key == "platform_safety")
+            .unwrap();
+        assert_eq!("unix-validated", string_value(&platform_safety.value));
         env.cleanup();
     }
 
@@ -6928,6 +7000,30 @@ mod tests {
         assert_eq!(ToolResultStatus::Succeeded, result.status);
         let missing = result.fields.iter().find(|f| f.key == "missing").unwrap();
         assert_eq!(StructuredValue::Bool(true), missing.value);
+        env.cleanup();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn fs_delete_rejects_mutation_on_non_unix_platforms() {
+        let env = TestEnv::new("delete-non-unix-unsupported");
+        env.create_file("notes.txt", "remove me");
+
+        let tool = FsDeleteTool::new(&env.root);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("notes.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        assert!(env.root.join("notes.txt").exists());
+        let safety = result
+            .fields
+            .iter()
+            .find(|f| f.key == "platform_safety")
+            .unwrap();
+        assert_eq!("unsupported-non-unix", string_value(&safety.value));
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("Unix no-follow validation"));
         env.cleanup();
     }
 
@@ -7049,6 +7145,12 @@ mod tests {
             "move me",
             fs::read_to_string(env.root.join("archive/notes.txt")).unwrap()
         );
+        let platform_safety = result
+            .fields
+            .iter()
+            .find(|f| f.key == "platform_safety")
+            .unwrap();
+        assert_eq!("unix-validated", string_value(&platform_safety.value));
         let overwritten = result
             .fields
             .iter()
@@ -7098,6 +7200,12 @@ mod tests {
             "source",
             fs::read_to_string(env.root.join("to.txt")).unwrap()
         );
+        let platform_safety = result
+            .fields
+            .iter()
+            .find(|f| f.key == "platform_safety")
+            .unwrap();
+        assert_eq!("unix-validated", string_value(&platform_safety.value));
         let overwritten = result
             .fields
             .iter()
@@ -7130,6 +7238,38 @@ mod tests {
         );
         let error = result.fields.iter().find(|f| f.key == "error").unwrap();
         assert!(string_value(&error.value).contains("same file"));
+        env.cleanup();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn fs_move_rejects_mutation_on_non_unix_platforms() {
+        let env = TestEnv::new("move-non-unix-unsupported");
+        env.create_file("from.txt", "source");
+        env.create_file("to.txt", "destination");
+
+        let tool = FsMoveTool::new(&env.root, "to.txt");
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_mutation_path("from.txt");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Failed, result.status);
+        assert_eq!(
+            "source",
+            fs::read_to_string(env.root.join("from.txt")).unwrap()
+        );
+        assert_eq!(
+            "destination",
+            fs::read_to_string(env.root.join("to.txt")).unwrap()
+        );
+        let safety = result
+            .fields
+            .iter()
+            .find(|f| f.key == "platform_safety")
+            .unwrap();
+        assert_eq!("unsupported-non-unix", string_value(&safety.value));
+        let error = result.fields.iter().find(|f| f.key == "error").unwrap();
+        assert!(string_value(&error.value).contains("Unix no-follow validation"));
         env.cleanup();
     }
 
