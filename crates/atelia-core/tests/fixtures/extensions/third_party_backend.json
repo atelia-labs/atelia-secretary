@@ -1,0 +1,82 @@
+{
+  "schema": "atelia.extension.v1",
+  "id": "com.example.extension",
+  "name": "Example Extension",
+  "version": "1.2.3",
+  "publisher": {
+    "name": "Example Org",
+    "url": "https://example.com"
+  },
+  "description": "Short purpose",
+  "types": [
+    "tool",
+    "service"
+  ],
+  "compatibility": {
+    "atelia_protocol": ">=0.1 <0.3",
+    "atelia_secretary": ">=0.1 <0.2"
+  },
+  "entrypoints": {
+    "realm": "backend",
+    "runtime": "wasm-rust",
+    "command": null,
+    "image": null,
+    "wasm": "extension.wasm",
+    "protocol": "atelia-extension-rpc.v1"
+  },
+  "permissions": {
+    "service.review.comments": {
+      "description": "Provides review comments service",
+      "risk_tier": "R2"
+    },
+    "tool.ping": {
+      "description": "Exposes the ping tool",
+      "risk_tier": "R2"
+    }
+  },
+  "tools": [
+    {
+      "id": "ping",
+      "permissions": [
+        "tool.ping"
+      ],
+      "permissions_required": []
+    }
+  ],
+  "services": {
+    "provides": [
+      {
+        "service": "review.comments",
+        "method": "summarize",
+        "schema_version": "v1",
+        "required_permission": "service.review.comments"
+      }
+    ],
+    "consumes": []
+  },
+  "tool_output": [],
+  "hooks": [],
+  "webhooks": [],
+  "composition": {
+    "attachments": []
+  },
+  "failure": {
+    "degrade": "return_unavailable",
+    "retry_policy": "bounded"
+  },
+  "provenance": {
+    "source": "registry",
+    "repository": null,
+    "commit": null,
+    "registry_identity": "third-party-registry",
+    "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "manifest_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "signature": "signature",
+    "signer": "signer@example.com"
+  },
+  "bundle": null,
+  "migration": {
+    "from": [],
+    "notes": null
+  }
+}
