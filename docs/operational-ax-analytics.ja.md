@@ -147,8 +147,8 @@ collect:
 - actual format returned
 - temporary override vs persistent setting
 - format switch reason
-- persistent update が触れた settings scope
-- actor、reason、old defaults、new defaults、`changed_at`、`changed_at_unix_ms` を持つ settings history entries
+- persistent update が触れた `scope`
+- `actor`、`reason`、`old_defaults`、`new_defaults`、`changed_at`、`changed_at_unix_ms` を持つ settings history entries
 - parse success by format
 - token cost by format
 - repeated-call rate by format
