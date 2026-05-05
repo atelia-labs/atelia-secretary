@@ -104,7 +104,7 @@ WASM execution はまだ実装しません。
   明示的な unsigned dev-mode approval を必要とする
 - third-party extension は official / local namespace を使えない
 
-この beta slice では、extension install、status、blocklist management だけを
+この beta slice では、extension management API を operator-facing client に
 提供します。execution を伴う request は意図的に未実装であり、黙って実行した
 ふりをせず、structured unsupported-capability error を返します。
 

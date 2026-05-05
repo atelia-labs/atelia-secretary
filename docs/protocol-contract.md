@@ -84,8 +84,7 @@ Required RPC groups:
 [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md).
 It will return a computed projection, not a persisted store.
 
-For the beta slice, extension install, status, and blocklist APIs are
-operator-facing management APIs discovered through `capability.discovery`.
+For the beta slice, extension management APIs are operator-facing.
 Extension execution RPCs are intentionally absent and should be treated as
 unsupported-capability failures when clients probe the execution RPCs.
 
