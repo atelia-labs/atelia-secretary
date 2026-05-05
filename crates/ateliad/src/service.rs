@@ -1160,6 +1160,13 @@ fn validate_filesystem_read_scope(
             }
         })?;
 
+    if requested.canonical == requested.root {
+        return Err(ServiceError::InvalidArgument {
+            reason: "filesystem.read requires a concrete path_scope/resource_scope root"
+                .to_string(),
+        });
+    }
+
     let allowed = repository
         .allowed_path_scope
         .allowed_paths
@@ -3127,6 +3134,7 @@ mod tests {
     fn submit_job_rejects_filesystem_read_repository_root_before_side_effects() {
         let svc = ready_service();
         let root = test_repo_dir("filesystem-read-root-rejected");
+        fs::create_dir_all(root.join("docs")).unwrap();
         let repository = svc
             .register_repository(RegisterRepositoryRequest {
                 display_name: "read-repo".to_string(),
@@ -3137,22 +3145,24 @@ mod tests {
             })
             .expect("register should succeed");
 
-        let err = svc
-            .submit_job(SubmitJobRequest {
-                requester: actor(),
-                repository_id: repository.id,
-                kind: JobKind::Read,
-                goal: "read repository root".to_string(),
-                resource_scope: Some(ResourceScope {
-                    kind: "repository".to_string(),
-                    value: ".".to_string(),
-                }),
-                requested_capabilities: vec!["filesystem.read".to_string()],
-                idempotency_key: None,
-            })
-            .unwrap_err();
+        for value in [".", "./", "docs/.."] {
+            let err = svc
+                .submit_job(SubmitJobRequest {
+                    requester: actor(),
+                    repository_id: repository.id.clone(),
+                    kind: JobKind::Read,
+                    goal: "read repository root".to_string(),
+                    resource_scope: Some(ResourceScope {
+                        kind: "repository".to_string(),
+                        value: value.to_string(),
+                    }),
+                    requested_capabilities: vec!["filesystem.read".to_string()],
+                    idempotency_key: None,
+                })
+                .unwrap_err();
 
-        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+            assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        }
         assert!(svc
             .list_jobs(None, None, None, None, None)
             .expect("job query should succeed")
