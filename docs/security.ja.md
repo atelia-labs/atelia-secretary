@@ -14,6 +14,16 @@ Extension / Hook の規範的な安全モデルは [`atelia/docs/extension-secur
 - client には、その役割に必要な最小限の状態だけを渡すべきです
 - Secretary や人間が誤る前提で、確認、監査、復旧の経路を daemon 側にも持たせます
 
+## Beta の network boundary
+
+beta では、Secretary は原則として同一ホスト内で使う daemon です。
+`ATELIA_DAEMON_LISTEN_ADDR` を別の loopback アドレスに設定しない限り、
+`127.0.0.1:8080` で listen します。non-loopback への bind は、
+明示的な unsafe escape hatch である
+`ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN=1` が設定されている場合
+にのみ許可されます。この override は制御された local test 向けであり、
+通常の deployment mode として扱うべきではありません。
+
 ## threat model の種
 
 初期の threat model work では次のものを扱うべきです。
