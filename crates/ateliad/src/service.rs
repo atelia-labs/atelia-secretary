@@ -514,6 +514,7 @@ impl SecretaryService {
         }
     }
 
+    /// Find a blocked policy decision that covers the repository root being registered.
     fn blocking_policy_decision_for_root(
         &self,
         root_path: &str,
@@ -1274,10 +1275,12 @@ fn validate_repository_allowed_scope(
     Ok(())
 }
 
+/// Return `true` for resource-scope kinds that name filesystem-like paths.
 fn is_path_like_resource_scope_kind(kind: &str) -> bool {
     matches!(kind, "repository" | "explicit_paths" | "read_only" | "path")
 }
 
+/// Find the first blocked policy decision whose canonical scope contains the candidate root.
 fn blocking_policy_decision_for_candidate_root(
     candidate_root: &Path,
     repository_roots: HashMap<RepositoryId, PathBuf>,
@@ -3318,6 +3321,7 @@ mod tests {
         }
     }
 
+    /// Build a blocked policy decision fixture for repository registration tests.
     fn blocked_policy_decision(
         repository_id: RepositoryId,
         resource_scope_value: &str,
