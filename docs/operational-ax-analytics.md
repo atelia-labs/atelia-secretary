@@ -148,7 +148,7 @@ Collect:
 - temporary override vs persistent setting
 - format switch reason
 - settings scope touched by the persistent update
-- settings history entries with actor, reason, and timestamp
+- settings history entries with actor, reason, old defaults, new defaults, and timestamp
 - parse success by format
 - token cost by format
 - repeated-call rate by format
