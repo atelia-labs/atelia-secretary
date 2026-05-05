@@ -47,6 +47,7 @@ beta gate に加えて、release には次のものが必要です。
 - extension runtime compatibility checks
 - tool-output TOON / JSON golden fixtures
 - tool-output customizer compatibility fixtures
+- `crates/atelia-core/tests/fixtures/tool_output/` 配下の tool-output compatibility fixture checks
 - extension compatibility matrix updates
 - tool-output default、permission model、extension contract、Hook behavior が変わる場合の AX impact review
 - permission name または risk tier が変わる場合の permission migration tests

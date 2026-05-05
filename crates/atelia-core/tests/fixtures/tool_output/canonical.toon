@@ -1,0 +1,15 @@
+status succeeded
+schema_version tool_result.v1
+format toon
+tool_id git_status
+result_id res_00000000-0000-4000-8000-000000000001
+invocation_id tool_00000000-0000-4000-8000-000000000002
+schema_ref "schema:git.status.v1"
+fields[3]{key,value}
+  summary,"2 modified files"
+  changed_files,[crates/atelia-core/src/lib.rs,docs/tool-output-schema.md]
+  exit_code,0
+evidence_refs[1]{id,uri,media_type,label,digest}
+  art_00000000-0000-4000-8000-000000000003,/tmp/evidence.txt,text/plain,"status evidence","sha256:abc123"
+output_refs[1]{id,uri,media_type,label,digest}
+  out_00000000-0000-4000-8000-000000000004,/tmp/stdout.txt,text/plain,stdout,null

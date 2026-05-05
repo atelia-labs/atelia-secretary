@@ -174,6 +174,7 @@ compatibility rules:
 - unsupported customizer version では canonical Secretary output に戻す
 - TOON renderer と JSON renderer は同じ canonical schema version を共有する
 - default format の変更は release note に出る behavior change として扱う
+- release gate は `crates/atelia-core/tests/fixtures/tool_output/` に TOON、JSON、customizer 風の field filtering 用 golden compatibility fixtures を保持する
 
 ## Schema Negotiation
 
