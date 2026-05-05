@@ -85,6 +85,10 @@ Required RPC groups:
 It returns the computed projection of the live tool surface in the current
 context, not a persisted store.
 
+The first beta server surface is intentionally small and currently projects the
+built-in Secretary tools `fs.read` and `secretary.echo` with their stable tool
+definitions. Extension-backed repertoire entries remain a future slice.
+
 For the beta slice, extension management APIs are operator-facing.
 Extension execution RPCs are not supported in beta. Endpoints may exist, but
 they must return unsupported-capability when invoked.

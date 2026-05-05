@@ -10,6 +10,7 @@
 use crate::service::{
     BetaStateHint as ServiceBetaStateHint, CheckPolicyRequest as ServiceCheckPolicyRequest,
     DaemonHealth, DaemonStatus, GetProjectStatusRequest as ServiceGetProjectStatusRequest,
+    ListRepertoireRequest as ServiceListRepertoireRequest,
     ListRepositoriesRequest as ServiceListRepositoriesRequest,
     ListToolOutputSettingsHistoryRequest as ServiceListToolOutputSettingsHistoryRequest,
     ProtocolMetadata as ServiceProtocolMetadata,
@@ -106,6 +107,22 @@ impl SecretaryRpcServer {
             metadata: self.metadata(),
             repositories,
             next_page_token: page.next_page_token,
+        })
+    }
+
+    pub fn list_repertoire(
+        &self,
+        _request: ListRepertoireRequest,
+    ) -> RpcResult<ListRepertoireResponse> {
+        let response = self.service.list_repertoire(ServiceListRepertoireRequest)?;
+
+        Ok(ListRepertoireResponse {
+            metadata: self.metadata(),
+            entries: response
+                .entries
+                .into_iter()
+                .map(RepertoireEntry::from)
+                .collect(),
         })
     }
 
@@ -739,6 +756,31 @@ pub struct ListRepositoriesResponse {
     pub next_page_token: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ListRepertoireRequest;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListRepertoireResponse {
+    pub metadata: ProtocolMetadata,
+    pub entries: Vec<RepertoireEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepertoireEntry {
+    pub tool_id: String,
+    pub name: String,
+    pub description: String,
+    pub provider_kind: String,
+    pub provider_id: String,
+    pub risk_tier: String,
+    pub default_result_format: String,
+    pub supported_result_formats: Vec<String>,
+    pub idempotency: String,
+    pub cancellable: bool,
+    pub streaming: bool,
+    pub timeout_ms: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetToolOutputDefaultsRequest {
     pub scope: RpcToolOutputScope,
@@ -1114,6 +1156,25 @@ impl From<RepositoryRecord> for Repository {
             trust_state: record.trust_state.into(),
             created_at_unix_ms: record.created_at.unix_millis,
             updated_at_unix_ms: record.updated_at.unix_millis,
+        }
+    }
+}
+
+impl From<crate::service::RepertoireEntry> for RepertoireEntry {
+    fn from(entry: crate::service::RepertoireEntry) -> Self {
+        Self {
+            tool_id: entry.tool_id,
+            name: entry.name,
+            description: entry.description,
+            provider_kind: entry.provider_kind,
+            provider_id: entry.provider_id,
+            risk_tier: entry.risk_tier,
+            default_result_format: entry.default_result_format,
+            supported_result_formats: entry.supported_result_formats,
+            idempotency: entry.idempotency,
+            cancellable: entry.cancellable,
+            streaming: entry.streaming,
+            timeout_ms: entry.timeout_ms,
         }
     }
 }
@@ -2495,6 +2556,24 @@ mod tests {
         assert!(response
             .capabilities
             .contains(&"project_status.v1".to_string()));
+    }
+
+    #[test]
+    fn list_repertoire_projects_static_builtin_tools() {
+        let server = ready_server();
+
+        let response = server
+            .list_repertoire(ListRepertoireRequest)
+            .expect("repertoire projection should succeed");
+
+        assert_eq!(response.entries.len(), 2);
+        assert_eq!(response.entries[0].tool_id, "fs.read");
+        assert_eq!(response.entries[0].name, "Filesystem Read");
+        assert_eq!(response.entries[0].risk_tier, "R1");
+        assert_eq!(response.entries[1].tool_id, "secretary.echo");
+        assert_eq!(response.entries[1].risk_tier, "R0");
+        assert!(!response.entries[1].cancellable);
+        assert_eq!(response.entries[0].provider_id, "atelia-secretary");
     }
 
     #[test]

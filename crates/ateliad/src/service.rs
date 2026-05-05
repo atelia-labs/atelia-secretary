@@ -38,6 +38,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "jobs.v1",
     "events.v1",
     "policy.v1",
+    "repertoire.v1",
     "extensions.registry.v1",
     "tool_output_settings.v1",
     "tool_output_render.v1",
@@ -45,7 +46,16 @@ const DAEMON_CAPABILITIES: &[&str] = &[
 ];
 const MAX_HISTORY_PAGE: usize = 1000;
 const SECRETARY_ECHO_TOOL_ID: &str = "secretary.echo";
+const SECRETARY_ECHO_TOOL_NAME: &str = "Secretary Echo";
+const SECRETARY_ECHO_TOOL_DESCRIPTION: &str =
+    "Echo input for daemon smoke tests and context probes.";
 const SECRETARY_FS_READ_TOOL_ID: &str = "fs.read";
+const SECRETARY_FS_READ_TOOL_NAME: &str = "Filesystem Read";
+const SECRETARY_FS_READ_TOOL_DESCRIPTION: &str = "Read a file from an allowed repository scope.";
+const SECRETARY_TOOL_PROVIDER_KIND: &str = "builtin";
+const SECRETARY_TOOL_PROVIDER_ID: &str = "atelia-secretary";
+const SECRETARY_TOON_FORMAT: &str = "toon";
+const SECRETARY_JSON_FORMAT: &str = "json";
 const SECRETARY_FS_READ_CAPABILITY: &str = "filesystem.read";
 const SECRETARY_CAPABILITY_DISCOVERY: &str = "capability.discovery";
 
@@ -313,6 +323,30 @@ pub struct ListRepositoriesPage {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct ListRepertoireRequest;
+
+#[derive(Debug, Clone)]
+pub struct ListRepertoireResponse {
+    pub entries: Vec<RepertoireEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepertoireEntry {
+    pub tool_id: String,
+    pub name: String,
+    pub description: String,
+    pub provider_kind: String,
+    pub provider_id: String,
+    pub risk_tier: String,
+    pub default_result_format: String,
+    pub supported_result_formats: Vec<String>,
+    pub idempotency: String,
+    pub cancellable: bool,
+    pub streaming: bool,
+    pub timeout_ms: u32,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ListToolOutputSettingsHistoryRequest {
     pub scope: Option<ToolOutputSettingsScope>,
     pub limit: Option<usize>,
@@ -553,6 +587,16 @@ impl SecretaryService {
                 repositories,
                 next_page_token,
             })
+    }
+
+    /// Project the current built-in tool surface for beta repertoire clients.
+    pub fn list_repertoire(
+        &self,
+        _request: ListRepertoireRequest,
+    ) -> ServiceResult<ListRepertoireResponse> {
+        Ok(ListRepertoireResponse {
+            entries: list_repertoire_entries(),
+        })
     }
 
     /// Look up a single repository by id.
@@ -1089,6 +1133,48 @@ fn paginate_records<T>(
     };
 
     (retained, next_page_token)
+}
+
+fn list_repertoire_entries() -> Vec<RepertoireEntry> {
+    let mut entries = vec![
+        RepertoireEntry {
+            tool_id: SECRETARY_ECHO_TOOL_ID.to_string(),
+            name: SECRETARY_ECHO_TOOL_NAME.to_string(),
+            description: SECRETARY_ECHO_TOOL_DESCRIPTION.to_string(),
+            provider_kind: SECRETARY_TOOL_PROVIDER_KIND.to_string(),
+            provider_id: SECRETARY_TOOL_PROVIDER_ID.to_string(),
+            risk_tier: "R0".to_string(),
+            default_result_format: SECRETARY_TOON_FORMAT.to_string(),
+            supported_result_formats: vec![
+                SECRETARY_TOON_FORMAT.to_string(),
+                SECRETARY_JSON_FORMAT.to_string(),
+            ],
+            idempotency: "idempotent".to_string(),
+            cancellable: false,
+            streaming: false,
+            timeout_ms: 5_000,
+        },
+        RepertoireEntry {
+            tool_id: SECRETARY_FS_READ_TOOL_ID.to_string(),
+            name: SECRETARY_FS_READ_TOOL_NAME.to_string(),
+            description: SECRETARY_FS_READ_TOOL_DESCRIPTION.to_string(),
+            provider_kind: SECRETARY_TOOL_PROVIDER_KIND.to_string(),
+            provider_id: SECRETARY_TOOL_PROVIDER_ID.to_string(),
+            risk_tier: "R1".to_string(),
+            default_result_format: SECRETARY_TOON_FORMAT.to_string(),
+            supported_result_formats: vec![
+                SECRETARY_TOON_FORMAT.to_string(),
+                SECRETARY_JSON_FORMAT.to_string(),
+            ],
+            idempotency: "idempotent".to_string(),
+            cancellable: true,
+            streaming: false,
+            timeout_ms: 10_000,
+        },
+    ];
+
+    entries.sort_by(|left, right| left.tool_id.cmp(&right.tool_id));
+    entries
 }
 
 fn canonical_repository_root(root_path: &str) -> ServiceResult<String> {
@@ -1835,6 +1921,7 @@ mod tests {
             .contains(&"repositories.v1".to_string()));
         assert!(metadata.capabilities.contains(&"jobs.v1".to_string()));
         assert!(metadata.capabilities.contains(&"policy.v1".to_string()));
+        assert!(metadata.capabilities.contains(&"repertoire.v1".to_string()));
         assert!(metadata
             .capabilities
             .contains(&"extensions.registry.v1".to_string()));
@@ -1847,6 +1934,30 @@ mod tests {
         assert!(metadata
             .capabilities
             .contains(&"project_status.v1".to_string()));
+    }
+
+    #[test]
+    fn list_repertoire_projects_static_builtin_tools() {
+        let svc = ready_service();
+        let repertoire = svc
+            .list_repertoire(ListRepertoireRequest)
+            .expect("repertoire projection should succeed");
+
+        assert_eq!(repertoire.entries.len(), 2);
+        assert_eq!(repertoire.entries[0].tool_id, "fs.read");
+        assert_eq!(repertoire.entries[0].name, "Filesystem Read");
+        assert_eq!(repertoire.entries[0].risk_tier, "R1");
+        assert_eq!(repertoire.entries[0].provider_kind, "builtin");
+        assert_eq!(repertoire.entries[0].provider_id, "atelia-secretary");
+        assert_eq!(repertoire.entries[0].default_result_format, "toon");
+        assert_eq!(
+            repertoire.entries[0].supported_result_formats,
+            vec!["toon".to_string(), "json".to_string()]
+        );
+        assert_eq!(repertoire.entries[1].tool_id, "secretary.echo");
+        assert_eq!(repertoire.entries[1].risk_tier, "R0");
+        assert!(!repertoire.entries[1].cancellable);
+        assert_eq!(repertoire.entries[1].timeout_ms, 5_000);
     }
 
     // -- register / list round trip -----------------------------------------

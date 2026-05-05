@@ -38,6 +38,7 @@ enum Route {
     ListJobEvents { job_id: String },
     CancelJob { job_id: String },
     ListRepositories,
+    ListRepertoire,
     ListEvents,
     ReplayEvents,
     GetToolOutputDefaults,
@@ -146,6 +147,7 @@ fn route_for_path(path: &str) -> Route {
         "/v1/jobs/submit" => Route::SubmitJob,
         "/v1/jobs/list" => Route::ListJobs,
         "/v1/repositories:list" => Route::ListRepositories,
+        "/v1/repertoire:list" => Route::ListRepertoire,
         "/v1/events/list" => Route::ListEvents,
         "/v1/events/replay" => Route::ReplayEvents,
         "/v1/tool-output/settings/get" => Route::GetToolOutputDefaults,
@@ -223,6 +225,9 @@ struct ListRepositoriesRequestPayload {
     page_size: Option<usize>,
     page_token: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+struct ListRepertoireRequestPayload {}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -449,6 +454,12 @@ fn parse_list_repositories_payload(
         page_size: payload.page_size,
         page_token: payload.page_token,
     })
+}
+
+fn parse_list_repertoire_payload(
+    _payload: ListRepertoireRequestPayload,
+) -> rpc::ListRepertoireRequest {
+    rpc::ListRepertoireRequest
 }
 
 fn parse_path_scope_kind(value: Option<String>) -> Result<rpc::RpcPathScopeKind, String> {
@@ -1084,6 +1095,34 @@ fn serialize_list_repositories_response(
     })
 }
 
+fn serialize_repertoire_entry(entry: &rpc::RepertoireEntry) -> serde_json::Value {
+    serde_json::json!({
+        "tool_id": entry.tool_id,
+        "name": entry.name,
+        "description": entry.description,
+        "provider_kind": entry.provider_kind,
+        "provider_id": entry.provider_id,
+        "risk_tier": entry.risk_tier,
+        "default_result_format": entry.default_result_format,
+        "supported_result_formats": entry.supported_result_formats,
+        "idempotency": entry.idempotency,
+        "cancellable": entry.cancellable,
+        "streaming": entry.streaming,
+        "timeout_ms": entry.timeout_ms,
+    })
+}
+
+fn serialize_list_repertoire_response(response: rpc::ListRepertoireResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "entries": response
+            .entries
+            .iter()
+            .map(serialize_repertoire_entry)
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn serialize_submit_job_response(response: rpc::SubmitJobResponse) -> serde_json::Value {
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
@@ -1647,6 +1686,35 @@ async fn dispatch_list_repositories(state: RpcServerState, request: Request<Body
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_list_repositories_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_list_repertoire(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<ListRepertoireRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let parsed = parse_list_repertoire_payload(payload);
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.list_repertoire(parsed) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_list_repertoire_response(
                 response,
             ))),
         )
@@ -2375,6 +2443,26 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                     dispatch_list_repositories(state, request).await
                 }
             }
+            Route::ListRepertoire => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_list_repertoire(state, request).await
+                }
+            }
             Route::ListEvents => {
                 if method != Method::POST {
                     let mut response = make_error_response(
@@ -2793,6 +2881,7 @@ pub fn build_router(rpc_server: RpcServerState) -> Router {
         .route("/v1/jobs/list", any(dispatch_route))
         .route("/v1/jobs/*path", any(dispatch_route))
         .route("/v1/repositories:list", any(dispatch_route))
+        .route("/v1/repertoire:list", any(dispatch_route))
         .route("/v1/events/list", any(dispatch_route))
         .route("/v1/events/replay", any(dispatch_route))
         .route("/v1/tool-output/settings/get", any(dispatch_route))
@@ -3054,6 +3143,7 @@ mod tests {
             route_for_path("/v1/repositories:list"),
             Route::ListRepositories
         );
+        assert_eq!(route_for_path("/v1/repertoire:list"), Route::ListRepertoire);
         assert_eq!(route_for_path("/v1/events/list"), Route::ListEvents);
         assert_eq!(route_for_path("/v1/events/replay"), Route::ReplayEvents);
         assert_eq!(
@@ -4326,6 +4416,31 @@ mod tests {
         let payload = serde_json::from_slice::<Value>(&body).expect("response json");
         assert_eq!(payload["status"], "error");
         assert_eq!(payload["error"]["code"], "request_too_large");
+    }
+
+    #[tokio::test]
+    async fn list_repertoire_route_returns_builtin_projection() {
+        let rpc_server = ready_rpc_server();
+        let response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/repertoire:list",
+            serde_json::json!({}),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(
+            payload["data"]["entries"].as_array().map(|v| v.len()),
+            Some(2)
+        );
+        assert_eq!(payload["data"]["entries"][0]["tool_id"], "fs.read");
+        assert_eq!(payload["data"]["entries"][1]["tool_id"], "secretary.echo");
     }
 
     #[tokio::test]

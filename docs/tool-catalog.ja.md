@@ -6,6 +6,8 @@
 
 Secretary core は general harness を提供します。filesystem、shell、search、job、event、policy、extension hosting、service broker、hook intake、output rendering、agent delegation substrate が中心です。Git、GitHub、Linear、memory provider、memory strategy、notification、review agent、approval agent は extension-provided surface として扱います。
 
+現在の beta repertoire surface は、初期の live tool surface として built-in Secretary tool の `fs.read` と `secretary.echo` を projection します。
+
 ## Risk Scale
 
 - `R0`: status / capability discovery
