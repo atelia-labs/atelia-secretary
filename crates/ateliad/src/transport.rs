@@ -33,10 +33,22 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type RpcServerState = Arc<RwLock<rpc::SecretaryRpcServer>>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum LocalAuthConfig {
     BearerToken { token: String },
     Disabled,
+}
+
+impl std::fmt::Debug for LocalAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BearerToken { .. } => f
+                .debug_struct("LocalAuthConfig")
+                .field("token", &"<redacted>")
+                .finish(),
+            Self::Disabled => f.write_str("LocalAuthConfig::Disabled"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,8 +476,7 @@ fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String>
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let token = generate_session_token()?;
-            std::fs::write(&token_path, token.as_bytes())
-                .with_context(|| format!("failed to write session token file {token_path:?}"))?;
+            write_session_token(&token_path, token.as_bytes())?;
             set_restrictive_permissions(&token_path)?;
             Ok(token)
         }
@@ -473,6 +484,36 @@ fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String>
             Err(error).with_context(|| format!("failed to read session token file {token_path:?}"))
         }
     }
+}
+
+fn write_session_token(token_path: &std::path::Path, token: &[u8]) -> Result<()> {
+    let mut file = open_session_token_file(token_path)?;
+    use std::io::Write;
+    file.write_all(token)
+        .with_context(|| format!("failed to write session token file {token_path:?}"))
+}
+
+#[cfg(unix)]
+fn open_session_token_file(token_path: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(token_path)
+        .with_context(|| format!("failed to create session token file {token_path:?}"))
+}
+
+#[cfg(not(unix))]
+fn open_session_token_file(token_path: &std::path::Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(token_path)
+        .with_context(|| format!("failed to create session token file {token_path:?}"))?;
+    set_restrictive_permissions(token_path)?;
+    Ok(file)
 }
 
 fn generate_session_token() -> Result<String> {
@@ -3127,6 +3168,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_auth_config_debug_redacts_token() {
+        let debug = format!("{:?}", bearer_auth("super-secret-token"));
+        assert!(!debug.contains("super-secret-token"));
+        assert!(debug.contains("<redacted>"));
+    }
+
     fn test_router(state: &RpcServerState) -> Router {
         build_router(state.clone(), disabled_auth())
     }
@@ -3512,6 +3560,27 @@ mod tests {
 
         let resolved_again = resolve_local_auth(&storage_dir).expect("resolve local auth again");
         assert_eq!(resolved_again, LocalAuthConfig::BearerToken { token });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_auth_creates_token_file_with_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::remove_var(AUTH_TOKEN_ENV);
+
+        let storage_dir = test_repo_dir("local-auth-permissions");
+        let _ = resolve_local_auth(&storage_dir).expect("resolve local auth");
+        let token_path = local_auth_token_path(&storage_dir);
+        let mode = fs::metadata(&token_path)
+            .expect("session token metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
