@@ -323,32 +323,9 @@ struct InMemoryInner {
 }
 
 #[derive(Debug, Clone)]
-struct EventQuerySnapshot {
-    repositories: HashMap<RepositoryId, RepositoryRecord>,
-    jobs: HashMap<JobId, JobRecord>,
-    job_events_by_id: HashMap<JobEventId, JobEvent>,
-    job_events_by_sequence: BTreeMap<u64, JobEventId>,
-    policy_decisions: HashMap<PolicyDecisionId, PolicyDecision>,
-    lock_decisions: HashMap<LockDecisionId, LockDecision>,
-    tool_invocations: HashMap<ToolInvocationId, ToolInvocation>,
-    tool_results: HashMap<ToolResultId, ToolResult>,
-    audit_records: HashMap<AuditRecordId, AuditRecord>,
-}
-
-impl From<&InMemoryInner> for EventQuerySnapshot {
-    fn from(inner: &InMemoryInner) -> Self {
-        Self {
-            repositories: inner.repositories.clone(),
-            jobs: inner.jobs.clone(),
-            job_events_by_id: inner.job_events_by_id.clone(),
-            job_events_by_sequence: inner.job_events_by_sequence.clone(),
-            policy_decisions: inner.policy_decisions.clone(),
-            lock_decisions: inner.lock_decisions.clone(),
-            tool_invocations: inner.tool_invocations.clone(),
-            tool_results: inner.tool_results.clone(),
-            audit_records: inner.audit_records.clone(),
-        }
-    }
+struct EventQueryCandidate {
+    event: JobEvent,
+    repository_id: Option<RepositoryId>,
 }
 
 /// Durable replay payload for a successful `submit_job` call.
@@ -914,7 +891,7 @@ impl SecretaryStore for InMemoryStore {
             Some(repository_id) => self.subscribe_repository_job_events(repository_id)?,
             None => self.event_broadcaster.subscribe(),
         };
-        let (snapshot, resolved_cursor_sequence, live_cutoff_sequence) = {
+        let (candidates, resolved_cursor_sequence, live_cutoff_sequence) = {
             let inner = self.lock()?;
             let resolved_cursor_sequence = match query.cursor.clone() {
                 EventCursor::Beginning => None,
@@ -924,20 +901,43 @@ impl SecretaryStore for InMemoryStore {
                     EventCursor::AfterEventId(id),
                 )?),
             };
-            let highest_retained_sequence = inner.next_event_sequence.checked_sub(1);
-            let live_cutoff_sequence = match (resolved_cursor_sequence, highest_retained_sequence) {
-                (Some(resolved), Some(highest)) => Some(resolved.max(highest)),
-                (Some(resolved), None) => Some(resolved),
-                (None, Some(highest)) => Some(highest),
-                (None, None) => None,
+            let after_sequence = event_cursor_sequence(&inner, query.cursor.clone())?;
+            let mut candidates = Vec::new();
+            let needs_repository_resolution = query.repository_id.is_some();
+            if let Some(start_sequence) = after_sequence.checked_add(1) {
+                for (_, id) in inner.job_events_by_sequence.range(start_sequence..) {
+                    let event =
+                        inner
+                            .job_events_by_id
+                            .get(id)
+                            .ok_or_else(|| StoreError::Conflict {
+                                collection: "job_events",
+                                reason: format!(
+                                    "sequence index references missing id {}",
+                                    id_debug(id)
+                                ),
+                            })?;
+                    candidates.push(EventQueryCandidate {
+                        event: event.clone(),
+                        repository_id: if needs_repository_resolution {
+                            event_repository_id(&inner, event)?
+                        } else {
+                            None
+                        },
+                    });
+                }
+            }
+            let live_cutoff_sequence = match resolved_cursor_sequence {
+                Some(resolved) => Some(resolved.max(inner.next_event_sequence)),
+                None => Some(inner.next_event_sequence),
             };
-            (
-                EventQuerySnapshot::from(&*inner),
-                resolved_cursor_sequence,
-                live_cutoff_sequence,
-            )
+            (candidates, resolved_cursor_sequence, live_cutoff_sequence)
         };
-        let events = collect_filtered_job_events_snapshot(&snapshot, &query)?;
+        let events = candidates
+            .into_iter()
+            .filter(|candidate| event_candidate_matches_query(candidate, &query))
+            .map(|candidate| candidate.event)
+            .collect::<Vec<_>>();
         let receiver = self.filtered_job_event_receiver(raw_receiver, query, live_cutoff_sequence);
 
         Ok((events, receiver, resolved_cursor_sequence))
@@ -2917,32 +2917,6 @@ fn collect_filtered_job_events<'a>(
     Ok(filtered)
 }
 
-fn collect_filtered_job_events_snapshot(
-    snapshot: &EventQuerySnapshot,
-    query: &EventQuery,
-) -> StoreResult<Vec<JobEvent>> {
-    let after_sequence = snapshot_event_cursor_sequence(snapshot, query.cursor.clone())?;
-
-    let mut filtered = Vec::new();
-    if let Some(start_sequence) = after_sequence.checked_add(1) {
-        for (_, id) in snapshot.job_events_by_sequence.range(start_sequence..) {
-            let event = snapshot
-                .job_events_by_id
-                .get(id)
-                .ok_or_else(|| StoreError::Conflict {
-                    collection: "job_events",
-                    reason: format!("sequence index references missing id {}", id_debug(id)),
-                })?;
-
-            if snapshot_event_matches_query(snapshot, event, query)? {
-                filtered.push(event.clone());
-            }
-        }
-    }
-
-    Ok(filtered)
-}
-
 fn event_cursor_sequence(inner: &InMemoryInner, cursor: EventCursor) -> StoreResult<u64> {
     match cursor {
         EventCursor::Beginning => Ok(0),
@@ -2950,26 +2924,6 @@ fn event_cursor_sequence(inner: &InMemoryInner, cursor: EventCursor) -> StoreRes
         EventCursor::AfterEventId(id) => {
             let event =
                 inner
-                    .job_events_by_id
-                    .get(&id)
-                    .ok_or_else(|| StoreError::CursorExpired {
-                        reason: format!("event id is not retained: {}", id_debug(&id)),
-                    })?;
-            Ok(event.sequence_number)
-        }
-    }
-}
-
-fn snapshot_event_cursor_sequence(
-    snapshot: &EventQuerySnapshot,
-    cursor: EventCursor,
-) -> StoreResult<u64> {
-    match cursor {
-        EventCursor::Beginning => Ok(0),
-        EventCursor::AfterSequence(sequence) => Ok(sequence),
-        EventCursor::AfterEventId(id) => {
-            let event =
-                snapshot
                     .job_events_by_id
                     .get(&id)
                     .ok_or_else(|| StoreError::CursorExpired {
@@ -3015,19 +2969,12 @@ fn event_matches_query(
     Ok(repository_matches && subject_matches && job_matches && severity_matches)
 }
 
-fn snapshot_event_matches_query(
-    snapshot: &EventQuerySnapshot,
-    event: &JobEvent,
-    query: &EventQuery,
-) -> StoreResult<bool> {
+fn event_candidate_matches_query(candidate: &EventQueryCandidate, query: &EventQuery) -> bool {
+    let event = &candidate.event;
     let repository_matches = query
         .repository_id
         .as_ref()
-        .map(|repository_id| {
-            snapshot_event_repository_id(snapshot, event)
-                .map(|event_repository_id| event_repository_id.as_ref() == Some(repository_id))
-        })
-        .transpose()?
+        .map(|repository_id| candidate.repository_id.as_ref() == Some(repository_id))
         .unwrap_or(true);
     let subject_matches =
         query.subject_ids.is_empty() || query.subject_ids.contains(&event.subject.subject_id);
@@ -3047,222 +2994,7 @@ fn snapshot_event_matches_query(
         .map(|min_severity| severity_rank(event.severity) >= severity_rank(min_severity))
         .unwrap_or(true);
 
-    Ok(repository_matches && subject_matches && job_matches && severity_matches)
-}
-
-fn snapshot_event_repository_id(
-    snapshot: &EventQuerySnapshot,
-    event: &JobEvent,
-) -> StoreResult<Option<RepositoryId>> {
-    if let Some(repository_id) = &event.refs.repository_id {
-        return Ok(Some(repository_id.clone()));
-    }
-
-    let mut event_repository_id = snapshot_subject_repository_id(snapshot, event)?;
-    snapshot_derive_event_repository_from_refs(snapshot, event, &mut event_repository_id)?;
-
-    Ok(event_repository_id)
-}
-
-fn snapshot_subject_repository_id(
-    snapshot: &EventQuerySnapshot,
-    event: &JobEvent,
-) -> StoreResult<Option<RepositoryId>> {
-    match event.subject.subject_type {
-        EventSubjectType::Repository => {
-            let repository = snapshot
-                .repositories
-                .keys()
-                .find(|id| id.as_str() == event.subject.subject_id)
-                .ok_or_else(|| subject_not_found("repositories", event))?;
-            Ok(Some(repository.clone()))
-        }
-        EventSubjectType::Job => {
-            let job = snapshot
-                .jobs
-                .values()
-                .find(|job| job.id.as_str() == event.subject.subject_id)
-                .ok_or_else(|| subject_not_found("jobs", event))?;
-            Ok(Some(job.repository_id.clone()))
-        }
-        EventSubjectType::PolicyDecision => {
-            let policy_decision = snapshot
-                .policy_decisions
-                .values()
-                .find(|policy_decision| policy_decision.id.as_str() == event.subject.subject_id)
-                .ok_or_else(|| subject_not_found("policy_decisions", event))?;
-            Ok(Some(policy_decision.repository_id.clone()))
-        }
-        EventSubjectType::LockDecision => {
-            let lock_decision = snapshot
-                .lock_decisions
-                .values()
-                .find(|lock_decision| lock_decision.id.as_str() == event.subject.subject_id)
-                .ok_or_else(|| subject_not_found("lock_decisions", event))?;
-            Ok(Some(lock_decision.repository_id.clone()))
-        }
-        EventSubjectType::ToolInvocation => {
-            let tool_invocation = snapshot
-                .tool_invocations
-                .values()
-                .find(|tool_invocation| tool_invocation.id.as_str() == event.subject.subject_id)
-                .ok_or_else(|| subject_not_found("tool_invocations", event))?;
-            Ok(Some(tool_invocation.repository_id.clone()))
-        }
-        EventSubjectType::ToolResult => {
-            let tool_result = snapshot
-                .tool_results
-                .values()
-                .find(|tool_result| tool_result.id.as_str() == event.subject.subject_id)
-                .ok_or_else(|| subject_not_found("tool_results", event))?;
-            let tool_invocation = snapshot
-                .tool_invocations
-                .get(&tool_result.invocation_id)
-                .ok_or_else(|| StoreError::Conflict {
-                    collection: "tool_results",
-                    reason: format!(
-                        "tool_result {} references missing invocation {}",
-                        event.subject.subject_id,
-                        id_debug(&tool_result.invocation_id)
-                    ),
-                })?;
-            Ok(Some(tool_invocation.repository_id.clone()))
-        }
-        EventSubjectType::AuditRecord => {
-            let audit_record = snapshot
-                .audit_records
-                .values()
-                .find(|audit_record| audit_record.id.as_str() == event.subject.subject_id)
-                .ok_or_else(|| subject_not_found("audit_records", event))?;
-            Ok(Some(audit_record.repository_id.clone()))
-        }
-    }
-}
-
-fn snapshot_derive_event_repository_from_refs(
-    snapshot: &EventQuerySnapshot,
-    event: &JobEvent,
-    event_repository_id: &mut Option<RepositoryId>,
-) -> StoreResult<()> {
-    if let Some(job_id) = &event.refs.job_id {
-        let job = snapshot
-            .jobs
-            .get(job_id)
-            .ok_or_else(|| StoreError::NotFound {
-                collection: "jobs",
-                id: format!("{} (job_event.refs.job_id)", id_debug(job_id)),
-            })?;
-        ensure_owned_event_repository_consistency(
-            event_repository_id,
-            &job.repository_id,
-            "job_event.refs.job_id",
-        )?;
-    }
-
-    if let Some(policy_decision_id) = &event.refs.policy_decision_id {
-        let policy_decision = snapshot
-            .policy_decisions
-            .get(policy_decision_id)
-            .ok_or_else(|| StoreError::NotFound {
-                collection: "policy_decisions",
-                id: format!(
-                    "{} (job_event.refs.policy_decision_id)",
-                    id_debug(policy_decision_id)
-                ),
-            })?;
-        ensure_owned_event_repository_consistency(
-            event_repository_id,
-            &policy_decision.repository_id,
-            "job_event.refs.policy_decision_id",
-        )?;
-    }
-
-    if let Some(lock_decision_id) = &event.refs.lock_decision_id {
-        let lock_decision = snapshot
-            .lock_decisions
-            .get(lock_decision_id)
-            .ok_or_else(|| StoreError::NotFound {
-                collection: "lock_decisions",
-                id: format!(
-                    "{} (job_event.refs.lock_decision_id)",
-                    id_debug(lock_decision_id)
-                ),
-            })?;
-        ensure_owned_event_repository_consistency(
-            event_repository_id,
-            &lock_decision.repository_id,
-            "job_event.refs.lock_decision_id",
-        )?;
-    }
-
-    if let Some(tool_invocation_id) = &event.refs.tool_invocation_id {
-        let tool_invocation = snapshot
-            .tool_invocations
-            .get(tool_invocation_id)
-            .ok_or_else(|| StoreError::NotFound {
-                collection: "tool_invocations",
-                id: format!(
-                    "{} (job_event.refs.tool_invocation_id)",
-                    id_debug(tool_invocation_id)
-                ),
-            })?;
-        ensure_owned_event_repository_consistency(
-            event_repository_id,
-            &tool_invocation.repository_id,
-            "job_event.refs.tool_invocation_id",
-        )?;
-    }
-
-    if let Some(tool_result_id) = &event.refs.tool_result_id {
-        let tool_result =
-            snapshot
-                .tool_results
-                .get(tool_result_id)
-                .ok_or_else(|| StoreError::NotFound {
-                    collection: "tool_results",
-                    id: format!(
-                        "{} (job_event.refs.tool_result_id)",
-                        id_debug(tool_result_id)
-                    ),
-                })?;
-        let tool_invocation = snapshot
-            .tool_invocations
-            .get(&tool_result.invocation_id)
-            .ok_or_else(|| StoreError::Conflict {
-                collection: "tool_results",
-                reason: format!(
-                    "tool_result {} references missing invocation {}",
-                    id_debug(tool_result_id),
-                    id_debug(&tool_result.invocation_id)
-                ),
-            })?;
-        ensure_owned_event_repository_consistency(
-            event_repository_id,
-            &tool_invocation.repository_id,
-            "job_event.refs.tool_result_id",
-        )?;
-    }
-
-    if let Some(audit_record_id) = &event.refs.audit_record_id {
-        let audit_record =
-            snapshot
-                .audit_records
-                .get(audit_record_id)
-                .ok_or_else(|| StoreError::NotFound {
-                    collection: "audit_records",
-                    id: format!(
-                        "{} (job_event.refs.audit_record_id)",
-                        id_debug(audit_record_id)
-                    ),
-                })?;
-        ensure_owned_event_repository_consistency(
-            event_repository_id,
-            &audit_record.repository_id,
-            "job_event.refs.audit_record_id",
-        )?;
-    }
-
-    Ok(())
+    repository_matches && subject_matches && job_matches && severity_matches
 }
 
 #[cfg(test)]
