@@ -21,7 +21,7 @@ use atelia_core::{
     RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
     SubmitJobIdempotencyRecord, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
-    TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse,
+    TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse, WatchJobEvent,
 };
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -424,7 +424,7 @@ pub struct SecretaryService {
 #[allow(dead_code)]
 pub struct LiveEventSubscription {
     pub events: Vec<JobEvent>,
-    pub receiver: broadcast::Receiver<JobEvent>,
+    pub receiver: broadcast::Receiver<WatchJobEvent>,
     pub replay_max_sequence: Option<u64>,
     pub resolved_cursor_sequence: Option<u64>,
 }
@@ -3215,7 +3215,8 @@ mod tests {
             .receiver
             .recv()
             .await
-            .expect("live receiver should get post-snapshot event");
+            .expect("live receiver should get post-snapshot event")
+            .expect("post-snapshot event should not be a terminal error");
         assert_eq!(received.sequence_number, live_event.sequence_number);
         assert!(
             received.sequence_number > live.replay_max_sequence.expect("replay boundary"),

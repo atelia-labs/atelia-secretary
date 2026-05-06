@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::broadcast;
 
 pub type StoreResult<T> = Result<T, StoreError>;
+pub type WatchJobEvent = Result<JobEvent, StoreError>;
 
 const DURABLE_STORE_SCHEMA_VERSION: u32 = 2;
 const DURABLE_STORE_LEGACY_SCHEMA_VERSION: u32 = 1;
@@ -222,7 +223,11 @@ pub trait SecretaryStore: Send + Sync + 'static {
     fn watch_job_events_live(
         &self,
         query: EventQuery,
-    ) -> StoreResult<(Vec<JobEvent>, broadcast::Receiver<JobEvent>, Option<u64>)>;
+    ) -> StoreResult<(
+        Vec<JobEvent>,
+        broadcast::Receiver<WatchJobEvent>,
+        Option<u64>,
+    )>;
     fn query_job_events(&self, query: EventQuery) -> StoreResult<EventPage>;
     fn get_job_event(&self, id: &JobEventId) -> StoreResult<JobEvent>;
 
@@ -335,6 +340,11 @@ impl InMemoryStore {
         sender
     }
 
+    fn new_filtered_event_broadcaster() -> broadcast::Sender<WatchJobEvent> {
+        let (sender, _) = broadcast::channel(1024);
+        sender
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -435,8 +445,8 @@ impl InMemoryStore {
         receiver: broadcast::Receiver<JobEvent>,
         query: EventQuery,
         resolved_cursor_sequence: Option<u64>,
-    ) -> broadcast::Receiver<JobEvent> {
-        let sender = Self::new_event_broadcaster();
+    ) -> broadcast::Receiver<WatchJobEvent> {
+        let sender = Self::new_filtered_event_broadcaster();
         let filtered_receiver = sender.subscribe();
         let store = self.clone();
 
@@ -522,7 +532,7 @@ impl Default for InMemoryStore {
 
 async fn forward_filtered_job_events(
     mut receiver: broadcast::Receiver<JobEvent>,
-    sender: broadcast::Sender<JobEvent>,
+    sender: broadcast::Sender<WatchJobEvent>,
     store: InMemoryStore,
     query: EventQuery,
     resolved_cursor_sequence: Option<u64>,
@@ -535,7 +545,14 @@ async fn forward_filtered_job_events(
             _ = sender.closed() => break,
             received = receiver.recv() => match received {
                 Ok(event) => event,
-                Err(broadcast::error::RecvError::Lagged(_)) => break,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let _ = sender.send(Err(StoreError::CursorExpired {
+                        reason: format!(
+                            "watch_events live filter fell behind and missed {skipped} events"
+                        ),
+                    }));
+                    break;
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
         };
@@ -547,7 +564,7 @@ async fn forward_filtered_job_events(
             .and_then(|inner| event_matches_query(&inner, &event, &query))
             .unwrap_or(false);
         if should_forward {
-            let _ = sender.send(event);
+            let _ = sender.send(Ok(event));
         }
     }
 }
@@ -869,7 +886,11 @@ impl SecretaryStore for InMemoryStore {
     fn watch_job_events_live(
         &self,
         query: EventQuery,
-    ) -> StoreResult<(Vec<JobEvent>, broadcast::Receiver<JobEvent>, Option<u64>)> {
+    ) -> StoreResult<(
+        Vec<JobEvent>,
+        broadcast::Receiver<WatchJobEvent>,
+        Option<u64>,
+    )> {
         let inner = self.lock()?;
         let raw_receiver = match query.repository_id.as_ref() {
             Some(repository_id) => self.subscribe_repository_job_events(repository_id)?,
@@ -5300,7 +5321,11 @@ mod tests {
                 assert_eq!(resolved_cursor_sequence, None);
 
                 let third = store.append_job_event(job_event(repository.id)).unwrap();
-                let received = receiver.recv().await.expect("future event should arrive");
+                let received = receiver
+                    .recv()
+                    .await
+                    .expect("future event should arrive")
+                    .expect("future event should not be a terminal error");
 
                 assert_eq!(received.sequence_number, third.sequence_number);
                 assert!(receiver.try_recv().is_err());
@@ -5350,7 +5375,8 @@ mod tests {
                 let received = receiver
                     .recv()
                     .await
-                    .expect("filtered watch should stay open for matching event");
+                    .expect("filtered watch should stay open for matching event")
+                    .expect("matching event should not be a terminal error");
 
                 assert_eq!(received.id, expected.id);
                 assert_eq!(
@@ -5395,7 +5421,8 @@ mod tests {
                 let received = receiver
                     .recv()
                     .await
-                    .expect("matching future event should arrive");
+                    .expect("matching future event should arrive")
+                    .expect("matching future event should not be a terminal error");
 
                 assert_eq!(received.id, matching_event.id);
                 assert_eq!(received.severity, EventSeverity::Warning);

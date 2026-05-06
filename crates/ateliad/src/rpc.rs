@@ -29,7 +29,7 @@ use atelia_core::{
     RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier, RollbackExtensionRequest,
     StoreError, ToolInvocationId, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity, ToolResultId,
-    TruncationMetadata, UpdateExtensionRequest,
+    TruncationMetadata, UpdateExtensionRequest, WatchJobEvent,
 };
 use std::convert::TryFrom;
 use tokio::sync::broadcast;
@@ -290,7 +290,7 @@ impl SecretaryRpcServer {
             subscription: WatchEventsLiveSubscription {
                 receiver: live.receiver,
                 replay_max_sequence,
-                resolved_cursor_sequence: live.resolved_cursor_sequence,
+                resolved_cursor_sequence: last_sequence.or(live.resolved_cursor_sequence),
                 last_sequence,
             },
         })
@@ -1367,7 +1367,7 @@ pub struct WatchEventsLiveResponse {
 
 #[allow(dead_code)]
 pub struct WatchEventsLiveSubscription {
-    pub receiver: broadcast::Receiver<JobEvent>,
+    pub receiver: broadcast::Receiver<WatchJobEvent>,
     pub replay_max_sequence: Option<u64>,
     pub resolved_cursor_sequence: Option<u64>,
     pub last_sequence: Option<u64>,
@@ -3588,7 +3588,10 @@ mod tests {
                     .sequence
             )
         );
-        assert_eq!(live.subscription.resolved_cursor_sequence, None);
+        assert_eq!(
+            live.subscription.resolved_cursor_sequence,
+            live.subscription.last_sequence
+        );
 
         let _ = fs::remove_dir_all(first_root);
         let _ = fs::remove_dir_all(second_root);
@@ -3635,7 +3638,8 @@ mod tests {
         let received = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
             .await
             .expect("expected future event")
-            .expect("receiver should stay open");
+            .expect("receiver should stay open")
+            .expect("future event should not be a terminal error");
         match last_sequence {
             None => {}
             Some(seq) => assert!(received.sequence_number > seq),
@@ -3708,6 +3712,7 @@ mod tests {
         assert!(live.events.is_empty());
         assert_eq!(live.cursor, Some(EventCursorRequest::AfterSequence(42)));
         assert_eq!(live.subscription.last_sequence, Some(42));
+        assert_eq!(live.subscription.resolved_cursor_sequence, Some(42));
 
         let _ = fs::remove_dir_all(root);
     }
