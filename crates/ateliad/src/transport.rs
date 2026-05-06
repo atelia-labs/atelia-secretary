@@ -2332,7 +2332,7 @@ fn watch_events_stream_body(
             .or(subscription.resolved_cursor_sequence);
         loop {
             match receiver.recv().await {
-                Ok(Ok(event)) => {
+                Some(Ok(event)) => {
                     if replay_max_sequence.is_some_and(|max| event.sequence_number <= max) {
                         continue;
                     }
@@ -2353,10 +2353,10 @@ fn watch_events_stream_body(
                             yield Err::<Vec<u8>, std::io::Error>(std::io::Error::other(error));
                             return;
                         }
+                    }
+                    yield Ok::<Vec<u8>, std::io::Error>(b"\n".to_vec());
                 }
-                yield Ok::<Vec<u8>, std::io::Error>(b"\n".to_vec());
-            }
-                Ok(Err(StoreError::CursorExpired { reason })) => {
+                Some(Err(StoreError::CursorExpired { reason })) => {
                     let frame = serialize_watch_events_recovery_error(reason);
                     match serde_json::to_vec(&frame) {
                         Ok(bytes) => {
@@ -2370,31 +2370,13 @@ fn watch_events_stream_body(
                     yield Ok::<Vec<u8>, std::io::Error>(b"\n".to_vec());
                     return;
                 }
-                Ok(Err(error)) => {
+                Some(Err(error)) => {
                     yield Err::<Vec<u8>, std::io::Error>(std::io::Error::other(error));
                     return;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                let frame = serialize_watch_events_recovery_error(
-                    format!("watch_events live stream fell behind and missed {skipped} events"),
-                );
-                match serde_json::to_vec(&frame) {
-                    Ok(bytes) => {
-                        yield Ok::<Vec<u8>, std::io::Error>(bytes);
-                    }
-                    Err(error) => {
-                        yield Err::<Vec<u8>, std::io::Error>(std::io::Error::other(error));
-                        return;
-                    }
-                }
-                yield Ok::<Vec<u8>, std::io::Error>(b"\n".to_vec());
-                return;
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                break;
+                None => break,
             }
         }
-    }
     };
 
     Body::from_stream(stream)
@@ -4437,12 +4419,12 @@ mod tests {
         let live_event = test_job_event(&repository_id, 2);
         let metadata =
             rpc::ProtocolMetadata::from(service::SecretaryService::new().protocol_metadata());
-        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
         sender
-            .send(Ok(duplicate_event))
+            .try_send(Ok(duplicate_event))
             .expect("duplicate event should broadcast");
         sender
-            .send(Ok(live_event.clone()))
+            .try_send(Ok(live_event.clone()))
             .expect("live event should broadcast");
         drop(sender);
 
@@ -4499,68 +4481,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_events_stream_reports_broadcast_lag() {
-        let repository_id = RepositoryId::new();
-        let replay_event = test_job_event(&repository_id, 1);
-        let lagged_event = test_job_event(&repository_id, 2);
-        let metadata =
-            rpc::ProtocolMetadata::from(service::SecretaryService::new().protocol_metadata());
-        let (sender, receiver) = tokio::sync::broadcast::channel(1);
-        sender
-            .send(Ok(lagged_event.clone()))
-            .expect("first event should broadcast");
-        sender
-            .send(Ok(test_job_event(&repository_id, 3)))
-            .expect("second event should broadcast");
-        drop(sender);
-
-        let response = rpc::WatchEventsLiveResponse {
-            metadata,
-            events: vec![rpc::RpcEvent::from(replay_event.clone())],
-            cursor: Some(rpc::EventCursorRequest::AfterSequence(
-                replay_event.sequence_number,
-            )),
-            subscription: rpc::WatchEventsLiveSubscription {
-                receiver,
-                replay_max_sequence: Some(replay_event.sequence_number),
-                resolved_cursor_sequence: Some(replay_event.sequence_number),
-                last_sequence: Some(replay_event.sequence_number),
-            },
-        };
-        let request = rpc::WatchEventsRequest {
-            repository_id: repository_id.as_str().to_string(),
-            cursor: Some(rpc::EventCursorRequest::Beginning),
-            subject_ids: Vec::new(),
-            min_severity: None,
-            limit: Some(1),
-        };
-
-        let body = watch_events_stream_body(response, request);
-        let payload = to_bytes(body, usize::MAX)
-            .await
-            .expect("watch events stream should serialize");
-        let lines = std::str::from_utf8(&payload)
-            .expect("stream should be utf8")
-            .lines()
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2);
-
-        let error_frame: Value = serde_json::from_str(lines[1]).expect("error frame should parse");
-        assert_eq!(error_frame["kind"], "error");
-        assert_eq!(error_frame["error"]["code"], "cursor_expired");
-        assert_eq!(error_frame["error"]["recoverable"], true);
-        assert_eq!(error_frame["error"]["next_state"], "refresh_status");
-    }
-
-    #[tokio::test]
     async fn watch_events_stream_reports_filtered_terminal_cursor_expiry() {
         let repository_id = RepositoryId::new();
         let metadata =
             rpc::ProtocolMetadata::from(service::SecretaryService::new().protocol_metadata());
-        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
         sender
-            .send(Err(StoreError::CursorExpired {
+            .try_send(Err(StoreError::CursorExpired {
                 reason: "watch_events live filter fell behind and missed 7 events".to_string(),
             }))
             .expect("terminal error should broadcast");
@@ -4642,9 +4569,9 @@ mod tests {
         let live_event = test_job_event(&repository_id, 1);
         let metadata =
             rpc::ProtocolMetadata::from(service::SecretaryService::new().protocol_metadata());
-        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
         sender
-            .send(Ok(live_event.clone()))
+            .try_send(Ok(live_event.clone()))
             .expect("live event should broadcast");
         drop(sender);
 
@@ -4690,12 +4617,12 @@ mod tests {
         let live_event = test_job_event(&repository_id, 2);
         let metadata =
             rpc::ProtocolMetadata::from(service::SecretaryService::new().protocol_metadata());
-        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
         sender
-            .send(Ok(anchor_event.clone()))
+            .try_send(Ok(anchor_event.clone()))
             .expect("anchor event should broadcast");
         sender
-            .send(Ok(live_event.clone()))
+            .try_send(Ok(live_event.clone()))
             .expect("live event should broadcast");
         drop(sender);
 

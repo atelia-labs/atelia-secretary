@@ -16,7 +16,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 pub type StoreResult<T> = Result<T, StoreError>;
 pub type WatchJobEvent = Result<JobEvent, StoreError>;
@@ -24,6 +24,7 @@ pub type WatchJobEvent = Result<JobEvent, StoreError>;
 const DURABLE_STORE_SCHEMA_VERSION: u32 = 2;
 const DURABLE_STORE_LEGACY_SCHEMA_VERSION: u32 = 1;
 const DURABLE_STORE_FILE_NAME: &str = "ledger.json";
+const FILTERED_WATCH_EVENT_BUFFER: usize = 1024;
 
 /// Cursor used by clients to replay the ordered job-event ledger.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -223,11 +224,7 @@ pub trait SecretaryStore: Send + Sync + 'static {
     fn watch_job_events_live(
         &self,
         query: EventQuery,
-    ) -> StoreResult<(
-        Vec<JobEvent>,
-        broadcast::Receiver<WatchJobEvent>,
-        Option<u64>,
-    )>;
+    ) -> StoreResult<(Vec<JobEvent>, mpsc::Receiver<WatchJobEvent>, Option<u64>)>;
     fn query_job_events(&self, query: EventQuery) -> StoreResult<EventPage>;
     fn get_job_event(&self, id: &JobEventId) -> StoreResult<JobEvent>;
 
@@ -340,11 +337,6 @@ impl InMemoryStore {
         sender
     }
 
-    fn new_filtered_event_broadcaster() -> broadcast::Sender<WatchJobEvent> {
-        let (sender, _) = broadcast::channel(1024);
-        sender
-    }
-
     pub fn new() -> Self {
         Self::default()
     }
@@ -445,9 +437,8 @@ impl InMemoryStore {
         receiver: broadcast::Receiver<JobEvent>,
         query: EventQuery,
         resolved_cursor_sequence: Option<u64>,
-    ) -> broadcast::Receiver<WatchJobEvent> {
-        let sender = Self::new_filtered_event_broadcaster();
-        let filtered_receiver = sender.subscribe();
+    ) -> mpsc::Receiver<WatchJobEvent> {
+        let (sender, filtered_receiver) = mpsc::channel(FILTERED_WATCH_EVENT_BUFFER);
         let store = self.clone();
 
         match tokio::runtime::Handle::try_current() {
@@ -532,14 +523,11 @@ impl Default for InMemoryStore {
 
 async fn forward_filtered_job_events(
     mut receiver: broadcast::Receiver<JobEvent>,
-    sender: broadcast::Sender<WatchJobEvent>,
+    sender: mpsc::Sender<WatchJobEvent>,
     store: InMemoryStore,
     query: EventQuery,
     resolved_cursor_sequence: Option<u64>,
 ) {
-    if sender.receiver_count() == 0 {
-        return;
-    }
     loop {
         let event = tokio::select! {
             _ = sender.closed() => break,
@@ -550,7 +538,7 @@ async fn forward_filtered_job_events(
                         reason: format!(
                             "watch_events live filter fell behind and missed {skipped} events"
                         ),
-                    }));
+                    })).await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -565,12 +553,14 @@ async fn forward_filtered_job_events(
         {
             Ok(should_forward) => should_forward,
             Err(error) => {
-                let _ = sender.send(Err(error));
+                let _ = sender.send(Err(error)).await;
                 break;
             }
         };
         if should_forward {
-            let _ = sender.send(Ok(event));
+            if sender.send(Ok(event)).await.is_err() {
+                break;
+            }
         }
     }
 }
@@ -892,28 +882,35 @@ impl SecretaryStore for InMemoryStore {
     fn watch_job_events_live(
         &self,
         query: EventQuery,
-    ) -> StoreResult<(
-        Vec<JobEvent>,
-        broadcast::Receiver<WatchJobEvent>,
-        Option<u64>,
-    )> {
-        let inner = self.lock()?;
+    ) -> StoreResult<(Vec<JobEvent>, mpsc::Receiver<WatchJobEvent>, Option<u64>)> {
         let raw_receiver = match query.repository_id.as_ref() {
             Some(repository_id) => self.subscribe_repository_job_events(repository_id)?,
             None => self.event_broadcaster.subscribe(),
         };
-        let resolved_cursor_sequence = match query.cursor.clone() {
-            EventCursor::Beginning => None,
-            EventCursor::AfterSequence(sequence) => Some(sequence),
-            EventCursor::AfterEventId(id) => Some(event_cursor_sequence(
-                &inner,
-                EventCursor::AfterEventId(id),
-            )?),
+        let (events, resolved_cursor_sequence, live_cutoff_sequence) = {
+            let inner = self.lock()?;
+            let resolved_cursor_sequence = match query.cursor.clone() {
+                EventCursor::Beginning => None,
+                EventCursor::AfterSequence(sequence) => Some(sequence),
+                EventCursor::AfterEventId(id) => Some(event_cursor_sequence(
+                    &inner,
+                    EventCursor::AfterEventId(id),
+                )?),
+            };
+            let events = collect_filtered_job_events(&inner, &query)?
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let highest_retained_sequence = inner.next_event_sequence.checked_sub(1);
+            let live_cutoff_sequence = match (resolved_cursor_sequence, highest_retained_sequence) {
+                (Some(resolved), Some(highest)) => Some(resolved.max(highest)),
+                (Some(resolved), None) => Some(resolved),
+                (None, Some(highest)) => Some(highest),
+                (None, None) => None,
+            };
+            (events, resolved_cursor_sequence, live_cutoff_sequence)
         };
-        let filtered = collect_filtered_job_events(&inner, &query)?;
-        let events = filtered.into_iter().cloned().collect::<Vec<_>>();
-        let receiver =
-            self.filtered_job_event_receiver(raw_receiver, query, resolved_cursor_sequence);
+        let receiver = self.filtered_job_event_receiver(raw_receiver, query, live_cutoff_sequence);
 
         Ok((events, receiver, resolved_cursor_sequence))
     }
@@ -5497,7 +5494,7 @@ mod tests {
             runtime.block_on(async move {
                 let repository = repository_record();
                 let (raw_sender, raw_receiver) = broadcast::channel(16);
-                let (filtered_sender, mut filtered_receiver) = broadcast::channel(16);
+                let (filtered_sender, mut filtered_receiver) = mpsc::channel(16);
 
                 let forwarder = tokio::spawn(forward_filtered_job_events(
                     raw_receiver,
@@ -6521,7 +6518,7 @@ mod tests {
             runtime.block_on(async move {
                 let store = InMemoryStore::new();
                 let (_raw_sender, raw_receiver) = broadcast::channel(16);
-                let (filtered_sender, filtered_receiver) = broadcast::channel(16);
+                let (filtered_sender, filtered_receiver) = mpsc::channel(16);
 
                 let forwarder = tokio::spawn(forward_filtered_job_events(
                     raw_receiver,

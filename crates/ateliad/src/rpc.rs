@@ -32,7 +32,7 @@ use atelia_core::{
     TruncationMetadata, UpdateExtensionRequest, WatchJobEvent,
 };
 use std::convert::TryFrom;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 const MAX_WATCH_EVENTS_PAGE: usize = 1000;
 
@@ -1367,7 +1367,7 @@ pub struct WatchEventsLiveResponse {
 
 #[allow(dead_code)]
 pub struct WatchEventsLiveSubscription {
-    pub receiver: broadcast::Receiver<WatchJobEvent>,
+    pub receiver: mpsc::Receiver<WatchJobEvent>,
     pub replay_max_sequence: Option<u64>,
     pub resolved_cursor_sequence: Option<u64>,
     pub last_sequence: Option<u64>,

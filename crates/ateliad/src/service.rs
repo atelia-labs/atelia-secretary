@@ -27,7 +27,7 @@ use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "1.0.0";
@@ -424,7 +424,7 @@ pub struct SecretaryService {
 #[allow(dead_code)]
 pub struct LiveEventSubscription {
     pub events: Vec<JobEvent>,
-    pub receiver: broadcast::Receiver<WatchJobEvent>,
+    pub receiver: mpsc::Receiver<WatchJobEvent>,
     pub replay_max_sequence: Option<u64>,
     pub resolved_cursor_sequence: Option<u64>,
 }
