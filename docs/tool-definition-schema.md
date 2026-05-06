@@ -35,7 +35,7 @@ effects:
 idempotency: idempotent
 streaming: false
 cancellable: true
-timeout_ms: 0 # no explicit per-tool timeout; runtime-service defaults apply
+timeout_ms: 0 # no explicit per-tool timeout budget yet; 0 means not enforced
 artifact_policy:
   max_primary_tokens: 1200
   large_payload: artifact_ref
