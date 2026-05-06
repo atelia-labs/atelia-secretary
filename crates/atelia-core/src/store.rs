@@ -448,7 +448,7 @@ impl InMemoryStore {
         &self,
         receiver: broadcast::Receiver<JobEvent>,
         query: EventQuery,
-        resolved_cursor_sequence: Option<u64>,
+        live_cutoff_sequence: Option<u64>,
     ) -> StoreResult<mpsc::Receiver<WatchJobEvent>> {
         let (sender, filtered_receiver) = mpsc::channel(FILTERED_WATCH_EVENT_BUFFER);
         let store = self.clone();
@@ -460,7 +460,7 @@ impl InMemoryStore {
                     sender,
                     store,
                     query,
-                    resolved_cursor_sequence,
+                    live_cutoff_sequence,
                 ));
             }
             Err(_) => {
@@ -487,7 +487,7 @@ impl InMemoryStore {
                             sender,
                             store,
                             query,
-                            resolved_cursor_sequence,
+                            live_cutoff_sequence,
                         ));
                     })
                     .map_err(|error| StoreError::Conflict {
@@ -565,7 +565,7 @@ async fn forward_filtered_job_events(
     sender: mpsc::Sender<WatchJobEvent>,
     store: InMemoryStore,
     query: EventQuery,
-    resolved_cursor_sequence: Option<u64>,
+    live_cutoff_sequence: Option<u64>,
 ) {
     loop {
         let event = tokio::select! {
@@ -581,7 +581,7 @@ async fn forward_filtered_job_events(
                 Err(broadcast::error::RecvError::Closed) => break,
             },
         };
-        if resolved_cursor_sequence.is_some_and(|sequence| event.sequence_number <= sequence) {
+        if live_cutoff_sequence.is_some_and(|sequence| event.sequence_number <= sequence) {
             continue;
         }
         let should_forward = match tokio::task::spawn_blocking({
