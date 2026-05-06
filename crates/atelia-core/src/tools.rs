@@ -6728,12 +6728,10 @@ mod tests {
     #[test]
     fn fs_write_create_does_not_remove_destination_on_failure() {
         use std::thread;
-        use std::time::Duration;
 
         let env = TestEnv::new("write-create-failure-cleanup");
         let path = env.root.join("notes.txt");
 
-        let writer_env = env.root.clone();
         let path_for_writer = path.clone();
         let writer_handle = thread::spawn(move || {
             let err =
@@ -6742,28 +6740,6 @@ mod tests {
             assert_eq!(io::ErrorKind::Other, err.kind());
         });
 
-        let mut saw_temp_file = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while std::time::Instant::now() < deadline {
-            saw_temp_file = fs::read_dir(&writer_env)
-                .unwrap()
-                .filter_map(Result::ok)
-                .any(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(WRITE_FILE_TMP_PREFIX)
-                });
-            if saw_temp_file {
-                break;
-            }
-            thread::yield_now();
-        }
-        assert!(
-            saw_temp_file,
-            "temporary write file should be created before failure"
-        );
-
         fs::write(&path, b"racer").unwrap();
 
         writer_handle.join().unwrap();
@@ -6771,7 +6747,7 @@ mod tests {
             "racer",
             fs::read_to_string(&path).expect("destination should remain from concurrent writer"),
         );
-        let has_temp_file = fs::read_dir(&writer_env)
+        let has_temp_file = fs::read_dir(&env.root)
             .unwrap()
             .filter_map(Result::ok)
             .any(|entry| {

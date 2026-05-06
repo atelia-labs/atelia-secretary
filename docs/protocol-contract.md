@@ -155,8 +155,8 @@ policy and idempotency, but they are not echoed on `Job` yet.
 
 `SubmitJob` must not execute work immediately before policy has been evaluated.
 The first observable effect is a persisted `job` and `job_event`.
-Successful submissions may be replayed by `idempotency_key`; failed submissions
-are not currently cached as replay results.
+Successful submissions may be replayed by `idempotency_key`, including after a
+durable restart; failed submissions are not currently cached as replay results.
 
 ### Event
 

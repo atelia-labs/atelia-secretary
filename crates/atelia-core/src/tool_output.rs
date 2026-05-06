@@ -85,7 +85,7 @@ impl ToolOutputRenderPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderedToolOutput {
     pub format: OutputFormat,
     pub schema_version: String,
