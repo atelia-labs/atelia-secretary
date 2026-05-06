@@ -25,6 +25,7 @@ const DURABLE_STORE_SCHEMA_VERSION: u32 = 2;
 const DURABLE_STORE_LEGACY_SCHEMA_VERSION: u32 = 1;
 const DURABLE_STORE_FILE_NAME: &str = "ledger.json";
 const FILTERED_WATCH_EVENT_BUFFER: usize = 1024;
+const MAX_LIVE_WATCH_SNAPSHOT: usize = 1000;
 
 /// Cursor used by clients to replay the ordered job-event ledger.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -948,7 +949,11 @@ impl SecretaryStore for InMemoryStore {
             let after_sequence = event_cursor_sequence(&inner, query.cursor.clone())?;
             let mut candidate_ids = Vec::new();
             if let Some(start_sequence) = after_sequence.checked_add(1) {
-                for (_, id) in inner.job_events_by_sequence.range(start_sequence..) {
+                for (_, id) in inner
+                    .job_events_by_sequence
+                    .range(start_sequence..)
+                    .take(MAX_LIVE_WATCH_SNAPSHOT + 1)
+                {
                     candidate_ids.push(id.clone());
                 }
             }
@@ -962,6 +967,13 @@ impl SecretaryStore for InMemoryStore {
                 live_cutoff_sequence,
             )
         };
+        if candidate_ids.len() > MAX_LIVE_WATCH_SNAPSHOT {
+            return Err(StoreError::CursorExpired {
+                reason: format!(
+                    "live watch snapshot exceeds {MAX_LIVE_WATCH_SNAPSHOT} retained events; use replay before opening a live watch"
+                ),
+            });
+        }
         let needs_repository_resolution = query.repository_id.is_some();
         let candidates = candidate_ids
             .into_iter()
@@ -5481,6 +5493,38 @@ mod tests {
             .lock()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn watch_job_events_live_rejects_oversized_snapshot() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+
+        store.create_repository(repository.clone()).unwrap();
+        for _ in 0..=MAX_LIVE_WATCH_SNAPSHOT {
+            store
+                .append_job_event(job_event(repository.id.clone()))
+                .unwrap();
+        }
+
+        let error = store
+            .watch_job_events_live(EventQuery {
+                repository_id: Some(repository.id),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: Vec::new(),
+                min_severity: None,
+                page_size: None,
+                page_token: None,
+            })
+            .expect_err("oversized live snapshots should be rejected");
+
+        assert!(matches!(
+            error,
+            StoreError::CursorExpired { reason }
+                if reason.contains("live watch snapshot exceeds")
+                    && reason.contains("use replay")
+        ));
     }
 
     #[test]
