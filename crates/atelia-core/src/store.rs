@@ -960,13 +960,15 @@ impl SecretaryStore for InMemoryStore {
         };
         let needs_repository_resolution = query.repository_id.is_some();
         let mut events = Vec::new();
-        if let Some(mut start_sequence) = after_sequence.checked_add(1) {
-            loop {
+        if let (Some(mut start_sequence), Some(live_cutoff_sequence)) =
+            (after_sequence.checked_add(1), live_cutoff_sequence)
+        {
+            while start_sequence <= live_cutoff_sequence {
                 let batch = {
                     let inner = self.lock()?;
                     inner
                         .job_events_by_sequence
-                        .range(start_sequence..)
+                        .range(start_sequence..=live_cutoff_sequence)
                         .take(LIVE_WATCH_SNAPSHOT_SCAN_BATCH)
                         .map(|(sequence, id)| (*sequence, id.clone()))
                         .collect::<Vec<_>>()
@@ -1013,8 +1015,9 @@ impl SecretaryStore for InMemoryStore {
                 }
 
                 start_sequence = match last_sequence.and_then(|sequence| sequence.checked_add(1)) {
-                    Some(sequence) => sequence,
+                    Some(sequence) if sequence <= live_cutoff_sequence => sequence,
                     None => break,
+                    Some(_) => break,
                 };
             }
         }
