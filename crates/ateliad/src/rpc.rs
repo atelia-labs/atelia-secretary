@@ -3533,18 +3533,28 @@ mod tests {
             })
             .expect("live watch should succeed");
 
-        assert_eq!(live.events.len(), 1);
-        assert_eq!(
-            live.events[0].refs.repository_id.as_deref(),
-            Some(second_repository.repository_id.as_str())
-        );
+        assert!(live.events.len() > 1);
+        assert!(live.events.iter().all(|event| {
+            event.refs.repository_id.as_ref().map(|id| id.as_str())
+                == Some(second_repository.repository_id.as_str())
+        }));
         assert_eq!(
             live.cursor,
-            Some(EventCursorRequest::AfterSequence(live.events[0].sequence))
+            Some(EventCursorRequest::AfterSequence(
+                live.events
+                    .last()
+                    .expect("retained replay should contain at least one event")
+                    .sequence
+            ))
         );
         assert_eq!(
             live.subscription.replay_max_sequence,
-            Some(live.events[0].sequence)
+            Some(
+                live.events
+                    .last()
+                    .expect("retained replay should contain at least one event")
+                    .sequence
+            )
         );
 
         let _ = fs::remove_dir_all(first_root);

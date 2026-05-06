@@ -10,16 +10,17 @@ use atelia_core::{
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
     CancelJobReceipt, DefaultPolicyEngine, DisableExtensionRequest, DisableExtensionResponse,
     EchoTool, EnableExtensionRequest, EnableExtensionResponse, EventCursor, EventPage, EventQuery,
-    ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, FsReadTool,
-    InMemoryStore, InMemoryToolOutputSettingsService, InstallExtensionRequest,
-    InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService, JobPage, JobQuery,
-    JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest, ListBlocklistResponse,
-    ListExtensionsRequest, ListExtensionsResponse, OutputFormat, PathScope, PolicyDecision,
-    PolicyEngine, PolicyInput, PolicyOutcome, RegistryError, RemoveExtensionRequest,
-    RemoveExtensionResponse, RenderedToolOutput, RepositoryId, RepositoryRecord,
-    RepositoryTrustState, ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse,
-    RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
-    SubmitJobIdempotencyRecord, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
+    EventRefs, EventSeverity, EventSubject, ExtensionRegistryService, ExtensionStatusRequest,
+    ExtensionStatusResponse, FsReadTool, InMemoryStore, InMemoryToolOutputSettingsService,
+    InstallExtensionRequest, InstallExtensionResponse, JobEvent, JobEventId, JobEventKind, JobId,
+    JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
+    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
+    OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput, PolicyOutcome,
+    RegistryError, RemoveExtensionRequest, RemoveExtensionResponse, RenderedToolOutput,
+    RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RollbackExtensionRequest,
+    RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore,
+    StoreError, SubmitJobIdempotencyRecord, ToolInvocationId, ToolOutputDefaults,
+    ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
     TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse,
 };
@@ -1158,7 +1159,22 @@ impl SecretaryService {
     #[allow(dead_code)]
     pub fn watch_events_live(&self, query: EventQuery) -> ServiceResult<LiveEventSubscription> {
         let receiver = self.lifecycle.runtime().store().subscribe_job_events();
-        let events = self.list_events_page(query)?.events;
+        let mut events = Vec::new();
+        let mut page_token = query.page_token.clone();
+
+        loop {
+            let page = self.list_events_page(EventQuery {
+                page_token: page_token.clone(),
+                ..query.clone()
+            })?;
+            page_token = page.next_page_token.clone();
+            events.extend(page.events);
+
+            if page_token.is_none() {
+                break;
+            }
+        }
+
         let replay_max_sequence = events.last().map(|event| event.sequence_number);
         Ok(LiveEventSubscription {
             events,
@@ -1749,6 +1765,24 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(dir.join(".git")).unwrap();
         dir
+    }
+
+    fn test_job_event(repository_id: &RepositoryId, sequence_number: u64) -> JobEvent {
+        JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number,
+            created_at: LedgerTimestamp::from_unix_millis(sequence_number as i64),
+            subject: EventSubject::repository(repository_id),
+            kind: JobEventKind::Message,
+            severity: EventSeverity::Info,
+            public_message: format!("event {sequence_number}"),
+            refs: EventRefs {
+                repository_id: Some(repository_id.clone()),
+                ..Default::default()
+            },
+            redactions: Vec::new(),
+        }
     }
 
     fn plain_test_dir(name: &str) -> PathBuf {
@@ -3094,6 +3128,75 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn watch_events_live_drains_retained_pages_before_streaming() {
+        let svc = ready_service();
+        let root = test_repo_dir("watch-events-live-retained-pages");
+
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-retained-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let first_event = svc
+            .lifecycle
+            .runtime()
+            .store()
+            .append_job_event(test_job_event(&repository.id, 1))
+            .expect("first retained event should append");
+        let second_event = svc
+            .lifecycle
+            .runtime()
+            .store()
+            .append_job_event(test_job_event(&repository.id, 2))
+            .expect("second retained event should append");
+
+        let live = svc
+            .watch_events_live(EventQuery {
+                repository_id: Some(repository.id.clone()),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: Vec::new(),
+                min_severity: None,
+                page_size: Some(1),
+                page_token: None,
+            })
+            .expect("live watch should succeed");
+
+        assert_eq!(live.events.len(), 2);
+        assert_eq!(
+            live.events
+                .iter()
+                .map(|event| event.sequence_number)
+                .collect::<Vec<_>>(),
+            vec![first_event.sequence_number, second_event.sequence_number]
+        );
+        assert_eq!(
+            live.events[0]
+                .refs
+                .repository_id
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some(repository.id.as_str())
+        );
+        assert_eq!(
+            live.events[1]
+                .refs
+                .repository_id
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some(repository.id.as_str())
+        );
+        assert_eq!(live.replay_max_sequence, Some(second_event.sequence_number));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
