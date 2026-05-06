@@ -648,6 +648,31 @@ impl SecretaryStore for InMemoryStore {
                 &record.repository_id,
                 "policy_decision.repository_id",
             )?;
+            if is_root_scoped_repository_block(&record) {
+                let repository =
+                    inner
+                        .repositories
+                        .get(&record.repository_id)
+                        .ok_or_else(|| StoreError::NotFound {
+                            collection: "repositories",
+                            id: id_debug(&record.repository_id),
+                        })?;
+                if let Some(conflicting_repository) = inner.repositories.values().find(|existing| {
+                    existing.id != repository.id
+                        && repository_roots_strictly_overlap(
+                            &repository.root_path,
+                            &existing.root_path,
+                        )
+                }) {
+                    return Err(StoreError::Conflict {
+                        collection: "policy_decisions",
+                        reason: format!(
+                            "repository root_path {} conflicts with repository root_path {}",
+                            repository.root_path, conflicting_repository.root_path
+                        ),
+                    });
+                }
+            }
             insert_record(
                 &mut inner.policy_decisions,
                 record.id.clone(),
@@ -5607,6 +5632,49 @@ mod tests {
             })
         ));
         assert_eq!(store.list_repositories().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn root_scoped_blocked_policy_rejects_overlap_with_existing_trusted_repository() {
+        let store = InMemoryStore::new();
+        let root = format!(
+            "/tmp/atelia-store-test-policy-write-overlap-{}",
+            std::process::id()
+        );
+        let parent_root = format!("{root}/parent");
+        let child_root = format!("{parent_root}/child");
+        let parent_repository = RepositoryRecord::new(
+            "store test parent repository",
+            &parent_root,
+            RepositoryTrustState::Trusted,
+            timestamp(1),
+        );
+        let child_repository = RepositoryRecord::new(
+            "store test child repository",
+            &child_root,
+            RepositoryTrustState::Trusted,
+            timestamp(2),
+        );
+
+        store.create_repository(parent_repository.clone()).unwrap();
+        store.create_repository(child_repository).unwrap();
+
+        let mut policy = policy_decision(parent_repository.id.clone());
+        policy.outcome = PolicyOutcome::Blocked;
+        policy.reason_code = "repository_blocked".to_string();
+        policy.resource_scope = ResourceScope {
+            kind: "repository".to_string(),
+            value: ".".to_string(),
+        };
+
+        assert!(matches!(
+            store.create_policy_decision(policy),
+            Err(StoreError::Conflict {
+                collection: "policy_decisions",
+                ..
+            })
+        ));
+        assert!(store.list_policy_decisions().unwrap().is_empty());
     }
 
     #[test]
