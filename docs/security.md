@@ -38,6 +38,10 @@ treated as a local secret. Existing token files are normalized to restrictive
 permissions before reuse, and the auth-disabled opt-out is rejected if it is
 paired with an unsafe non-loopback listener override.
 
+Token-file auto creation and reuse are Unix-only. On non-Unix platforms,
+`ATELIA_DAEMON_AUTH_TOKEN` is the supported way to keep auth enabled; if you
+intentionally disable auth there, treat it as local testing only.
+
 Token generation follows these requirements:
 
 - use the system CSPRNG;
@@ -72,6 +76,9 @@ Token generation follows these requirements:
   read it before relying on reuse. If the environment can only provide
   `0400`, that is still acceptable as long as the file remains owner-only
   readable.
+- On non-Unix platforms, Secretary does not auto create or reuse the token
+  file. Keep auth enabled by setting `ATELIA_DAEMON_AUTH_TOKEN`, or use
+  `ATELIA_DAEMON_AUTH_DISABLED=1` only for controlled local testing.
 
 ## Replay Protection
 

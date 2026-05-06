@@ -34,6 +34,10 @@ Secretary は beta では local bearer token も要求します。startup 時に
 再利用前に restrictive permissions に正規化され、auth-disabled の opt-out
 は unsafe な non-loopback listener override と組み合わせると拒否されます。
 
+token file の自動作成と再利用は Unix のみです。non-Unix では
+`ATELIA_DAEMON_AUTH_TOKEN` を使って auth を有効に保ち、auth を無効化する
+場合も controlled な local testing に限ってください。
+
 token 生成の要件は次のとおりです。
 
 - system CSPRNG を使う
@@ -65,6 +69,9 @@ token 生成の要件は次のとおりです。
   Secretary を実行する user が ownership を持ち、実際に read できることを確認してから
   再利用します。環境により `0400` しか使えない場合でも、少なくとも owner-only read に
   してください。
+- non-Unix では Secretary は token file を自動作成・再利用しません。
+  auth を有効に保つには `ATELIA_DAEMON_AUTH_TOKEN` を設定し、`ATELIA_DAEMON_AUTH_DISABLED=1`
+  は controlled な local testing にのみ使ってください。
 
 ## Replay protection
 

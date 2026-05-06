@@ -525,7 +525,7 @@ fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String>
 
     let token_path = local_auth_token_path(storage_dir);
     match std::fs::symlink_metadata(&token_path) {
-        Ok(_) => read_and_validate_session_token(&token_path, storage_dir),
+        Ok(_) => read_and_validate_session_token_with_retry(&token_path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let token = generate_session_token()?;
             write_or_reuse_session_token(&token_path, token)
@@ -3701,6 +3701,7 @@ mod tests {
         assert_eq!(json["data"]["daemon_status"], "ready");
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_local_auth_creates_and_reuses_session_token() {
         let _guard = LocalAuthEnvGuard::lock();
@@ -3726,6 +3727,7 @@ mod tests {
         assert_eq!(resolved_again, LocalAuthConfig::BearerToken { token });
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_auth_write_or_reuse_session_token_recovers_from_already_exists() {
         let storage_dir = test_repo_dir("local-auth-already-exists");
@@ -3763,6 +3765,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_auth_write_or_reuse_session_token_retries_after_transient_invalid_read() {
         let storage_dir = test_repo_dir("local-auth-already-exists-transient");
@@ -3781,6 +3784,35 @@ mod tests {
 
         writer.join().expect("repair thread");
         assert_eq!(recovered, repaired_token);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_auth_retries_when_existing_token_is_repaired_during_read() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::remove_var(AUTH_TOKEN_ENV);
+
+        let storage_dir = test_repo_dir("local-auth-read-retry");
+        let token_path = local_auth_token_path(&storage_dir);
+        fs::write(&token_path, "broken-token").expect("seed invalid session token");
+
+        let repaired_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let writer_token_path = token_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            fs::write(&writer_token_path, repaired_token).expect("repair session token");
+        });
+
+        let resolved = resolve_local_auth(&storage_dir).expect("resolve repaired local auth");
+
+        writer.join().expect("repair thread");
+        assert_eq!(
+            resolved,
+            LocalAuthConfig::BearerToken {
+                token: repaired_token.to_string(),
+            }
+        );
     }
 
     #[test]
@@ -3879,6 +3911,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_local_auth_rejects_invalid_persisted_session_token_file() {
         let _guard = LocalAuthEnvGuard::lock();
