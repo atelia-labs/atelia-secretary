@@ -21,13 +21,13 @@ use atelia_core::{
     RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
     SubmitJobIdempotencyRecord, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
-    TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse,
+    TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse, WatchJobEvent,
 };
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "1.0.0";
@@ -419,6 +419,14 @@ pub struct SecretaryService {
     idempotent_submissions: Mutex<VecDeque<(String, IdempotentSubmitJob)>>,
     idempotent_submission_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     cancellation_requesters: Mutex<HashMap<JobId, Actor>>,
+}
+
+#[allow(dead_code)]
+pub struct LiveEventSubscription {
+    pub events: Vec<JobEvent>,
+    pub receiver: mpsc::Receiver<WatchJobEvent>,
+    pub replay_max_sequence: Option<u64>,
+    pub resolved_cursor_sequence: Option<u64>,
 }
 
 impl SecretaryService {
@@ -1147,6 +1155,29 @@ impl SecretaryService {
             .replay_job_events(cursor, limit)?)
     }
 
+    /// Atomically snapshot retained events and subscribe to future events.
+    #[allow(dead_code)]
+    pub fn watch_events_live(&self, query: EventQuery) -> ServiceResult<LiveEventSubscription> {
+        if query.page_size == Some(0) {
+            return Err(ServiceError::InvalidArgument {
+                reason: "page_size must be greater than 0".to_string(),
+            });
+        }
+        let (events, receiver, resolved_cursor_sequence) = self
+            .lifecycle
+            .runtime()
+            .store()
+            .watch_job_events_live(query)?;
+
+        let replay_max_sequence = events.last().map(|event| event.sequence_number);
+        Ok(LiveEventSubscription {
+            events,
+            receiver,
+            replay_max_sequence,
+            resolved_cursor_sequence,
+        })
+    }
+
     /// Request cancellation for a queued/running job.
     #[allow(dead_code)]
     pub fn cancel_job(
@@ -1695,12 +1726,13 @@ impl Default for SecretaryService {
 mod tests {
     use super::*;
     use atelia_core::{
-        ApplyBlocklistRequest, BlockKey, BlockReason, ExtensionCompatibility, ExtensionEntrypoints,
-        ExtensionFailure, ExtensionKind, ExtensionManifest, ExtensionPermission,
-        ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionServices,
-        InstallExtensionRequest, LedgerTimestamp, ListBlocklistRequest, ListExtensionsRequest,
-        PolicyDecision, PolicyDecisionId, PolicyOutcome, ProvenanceSource, RepositoryTrustState,
-        ResourceScope, RetryPolicy, RiskTier, RollbackExtensionRequest, EXTENSION_MANIFEST_SCHEMA,
+        ApplyBlocklistRequest, BlockKey, BlockReason, EventRefs, EventSeverity, EventSubject,
+        ExtensionCompatibility, ExtensionEntrypoints, ExtensionFailure, ExtensionKind,
+        ExtensionManifest, ExtensionPermission, ExtensionPublisher, ExtensionRealm,
+        ExtensionRuntime, ExtensionServices, InstallExtensionRequest, JobEventId, JobEventKind,
+        LedgerTimestamp, ListBlocklistRequest, ListExtensionsRequest, PolicyDecision,
+        PolicyDecisionId, PolicyOutcome, ProvenanceSource, RepositoryTrustState, ResourceScope,
+        RetryPolicy, RiskTier, RollbackExtensionRequest, EXTENSION_MANIFEST_SCHEMA,
         EXTENSION_RPC_PROTOCOL,
     };
     use std::collections::BTreeMap;
@@ -1729,6 +1761,24 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(dir.join(".git")).unwrap();
         dir
+    }
+
+    fn test_job_event(repository_id: &RepositoryId, sequence_number: u64) -> JobEvent {
+        JobEvent {
+            id: JobEventId::new(),
+            schema_version: 1,
+            sequence_number,
+            created_at: LedgerTimestamp::from_unix_millis(sequence_number as i64),
+            subject: EventSubject::repository(repository_id),
+            kind: JobEventKind::Message,
+            severity: EventSeverity::Info,
+            public_message: format!("event {sequence_number}"),
+            refs: EventRefs {
+                repository_id: Some(repository_id.clone()),
+                ..Default::default()
+            },
+            redactions: Vec::new(),
+        }
     }
 
     fn plain_test_dir(name: &str) -> PathBuf {
@@ -3074,6 +3124,106 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn watch_events_live_rejects_zero_page_size() {
+        let svc = ready_service();
+        match svc.watch_events_live(EventQuery {
+            page_size: Some(0),
+            ..EventQuery::default()
+        }) {
+            Err(ServiceError::InvalidArgument { .. }) => {}
+            _ => panic!("expected invalid page_size to be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_events_live_drains_retained_pages_before_streaming() {
+        let svc = ready_service();
+        let root = test_repo_dir("watch-events-live-retained-pages");
+
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-retained-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let first_event = svc
+            .lifecycle
+            .runtime()
+            .store()
+            .append_job_event(test_job_event(&repository.id, 1))
+            .expect("first retained event should append");
+        let second_event = svc
+            .lifecycle
+            .runtime()
+            .store()
+            .append_job_event(test_job_event(&repository.id, 2))
+            .expect("second retained event should append");
+
+        let mut live = svc
+            .watch_events_live(EventQuery {
+                repository_id: Some(repository.id.clone()),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: Vec::new(),
+                min_severity: None,
+                page_size: Some(1),
+                page_token: None,
+            })
+            .expect("live watch should succeed");
+
+        assert_eq!(live.events.len(), 2);
+        assert_eq!(
+            live.events
+                .iter()
+                .map(|event| event.sequence_number)
+                .collect::<Vec<_>>(),
+            vec![first_event.sequence_number, second_event.sequence_number]
+        );
+        assert_eq!(
+            live.events[0]
+                .refs
+                .repository_id
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some(repository.id.as_str())
+        );
+        assert_eq!(
+            live.events[1]
+                .refs
+                .repository_id
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some(repository.id.as_str())
+        );
+        assert_eq!(live.replay_max_sequence, Some(second_event.sequence_number));
+        assert_eq!(live.resolved_cursor_sequence, None);
+
+        let live_event = svc
+            .lifecycle
+            .runtime()
+            .store()
+            .append_job_event(test_job_event(&repository.id, 3))
+            .expect("post-snapshot event should append");
+        let received = live
+            .receiver
+            .recv()
+            .await
+            .expect("live receiver should get post-snapshot event")
+            .expect("post-snapshot event should not be a terminal error");
+        assert_eq!(received.sequence_number, live_event.sequence_number);
+        assert!(
+            received.sequence_number > live.replay_max_sequence.expect("replay boundary"),
+            "live delivery should advance beyond replay boundary"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

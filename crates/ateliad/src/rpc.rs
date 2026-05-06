@@ -29,9 +29,10 @@ use atelia_core::{
     RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier, RollbackExtensionRequest,
     StoreError, ToolInvocationId, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity, ToolResultId,
-    TruncationMetadata, UpdateExtensionRequest,
+    TruncationMetadata, UpdateExtensionRequest, WatchJobEvent,
 };
 use std::convert::TryFrom;
+use tokio::sync::mpsc;
 
 const MAX_WATCH_EVENTS_PAGE: usize = 1000;
 
@@ -232,25 +233,9 @@ impl SecretaryRpcServer {
         &self,
         request: WatchEventsRequest,
     ) -> RpcResult<WatchEventsReplayResponse> {
-        let incoming_cursor = request
-            .cursor
-            .clone()
-            .unwrap_or(EventCursorRequest::Beginning);
-        let query = EventQuery {
-            repository_id: Some(parse_repository_id(&request.repository_id)?),
-            cursor: parse_event_cursor(incoming_cursor.clone())?,
-            subject_ids: request.subject_ids,
-            job_ids: Vec::new(),
-            min_severity: request.min_severity.map(parse_event_severity),
-            page_size: Some(
-                request
-                    .limit
-                    .unwrap_or(MAX_WATCH_EVENTS_PAGE)
-                    .min(MAX_WATCH_EVENTS_PAGE),
-            ),
-            page_token: None,
-        };
+        let (query, incoming_cursor) = build_watch_event_query_from_request(&request)?;
         let page = self.service.list_events_page(query)?;
+        let resolved_cursor_sequence = page.resolved_cursor_sequence;
         let events = page
             .events
             .into_iter()
@@ -258,6 +243,8 @@ impl SecretaryRpcServer {
             .collect::<Vec<_>>();
         let cursor = if let Some(event) = events.last() {
             Some(EventCursorRequest::AfterSequence(event.sequence))
+        } else if matches!(incoming_cursor, EventCursorRequest::AfterEventId(_)) {
+            resolved_cursor_sequence.map(EventCursorRequest::AfterSequence)
         } else {
             Some(incoming_cursor)
         };
@@ -266,6 +253,46 @@ impl SecretaryRpcServer {
             metadata: self.metadata(),
             events,
             cursor,
+        })
+    }
+
+    pub fn watch_events_live(
+        &self,
+        request: WatchEventsRequest,
+    ) -> RpcResult<WatchEventsLiveResponse> {
+        let (query, incoming_cursor) = build_watch_event_query_from_request(&request)?;
+        let live = self.service.watch_events_live(query)?;
+        let replay_max_sequence = live.replay_max_sequence;
+        let events = live
+            .events
+            .into_iter()
+            .map(RpcEvent::from)
+            .collect::<Vec<_>>();
+        let mut last_sequence =
+            watch_events_last_sequence(&events, replay_max_sequence, live.resolved_cursor_sequence);
+        if events.is_empty() {
+            if let EventCursorRequest::AfterSequence(sequence) = &incoming_cursor {
+                last_sequence = Some(last_sequence.map_or(*sequence, |last| last.max(*sequence)));
+            }
+        }
+        let cursor = if let Some(event) = events.last() {
+            Some(EventCursorRequest::AfterSequence(event.sequence))
+        } else if let Some(last_sequence) = last_sequence {
+            Some(EventCursorRequest::AfterSequence(last_sequence))
+        } else {
+            Some(incoming_cursor)
+        };
+
+        Ok(WatchEventsLiveResponse {
+            metadata: self.metadata(),
+            events,
+            cursor,
+            subscription: WatchEventsLiveSubscription {
+                receiver: live.receiver,
+                replay_max_sequence,
+                resolved_cursor_sequence: last_sequence.or(live.resolved_cursor_sequence),
+                last_sequence,
+            },
         })
     }
 
@@ -631,6 +658,7 @@ pub enum RpcErrorCode {
     NotFound,
     Conflict,
     UnsupportedCapability,
+    CursorExpired,
     Internal,
 }
 
@@ -1306,6 +1334,45 @@ pub struct WatchEventsReplayResponse {
     pub cursor: Option<EventCursorRequest>,
 }
 
+fn watch_events_last_sequence(
+    events: &[RpcEvent],
+    replay_max_sequence: Option<u64>,
+    resolved_cursor_sequence: Option<u64>,
+) -> Option<u64> {
+    events.last().map(|event| event.sequence).or(
+        match (resolved_cursor_sequence, replay_max_sequence) {
+            (Some(resolved), Some(replay_max)) => Some(resolved.max(replay_max)),
+            (Some(resolved), None) => Some(resolved),
+            (None, Some(replay_max)) => Some(replay_max),
+            (None, None) => None,
+        },
+    )
+}
+
+fn parse_watch_events_limit(limit: Option<usize>) -> RpcResult<usize> {
+    match limit {
+        Some(0) => Err(RpcError::invalid_argument("limit must be greater than 0")),
+        Some(limit) => Ok(limit.min(MAX_WATCH_EVENTS_PAGE)),
+        None => Ok(MAX_WATCH_EVENTS_PAGE),
+    }
+}
+
+#[allow(dead_code)]
+pub struct WatchEventsLiveResponse {
+    pub metadata: ProtocolMetadata,
+    pub events: Vec<RpcEvent>,
+    pub cursor: Option<EventCursorRequest>,
+    pub subscription: WatchEventsLiveSubscription,
+}
+
+#[allow(dead_code)]
+pub struct WatchEventsLiveSubscription {
+    pub receiver: mpsc::Receiver<WatchJobEvent>,
+    pub replay_max_sequence: Option<u64>,
+    pub resolved_cursor_sequence: Option<u64>,
+    pub last_sequence: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventCursorRequest {
     Beginning,
@@ -1623,6 +1690,27 @@ fn parse_event_query(request: ListEventsRequest) -> RpcResult<EventQuery> {
     })
 }
 
+fn build_watch_event_query_from_request(
+    request: &WatchEventsRequest,
+) -> RpcResult<(EventQuery, EventCursorRequest)> {
+    let incoming_cursor = request
+        .cursor
+        .clone()
+        .unwrap_or(EventCursorRequest::Beginning);
+    Ok((
+        EventQuery {
+            repository_id: Some(parse_repository_id(&request.repository_id)?),
+            cursor: parse_event_cursor(incoming_cursor.clone())?,
+            subject_ids: request.subject_ids.clone(),
+            job_ids: Vec::new(),
+            min_severity: request.min_severity.map(parse_event_severity),
+            page_size: Some(parse_watch_events_limit(request.limit)?),
+            page_token: None,
+        },
+        incoming_cursor,
+    ))
+}
+
 fn parse_event_cursor(cursor: EventCursorRequest) -> RpcResult<CoreEventCursor> {
     Ok(match cursor {
         EventCursorRequest::Beginning => CoreEventCursor::Beginning,
@@ -1644,6 +1732,32 @@ fn parse_event_severity(value: RpcEventSeverity) -> EventSeverity {
         RpcEventSeverity::Info => EventSeverity::Info,
         RpcEventSeverity::Warning => EventSeverity::Warning,
         RpcEventSeverity::Error => EventSeverity::Error,
+    }
+}
+
+pub(crate) fn watch_event_matches_request(event: &RpcEvent, request: &WatchEventsRequest) -> bool {
+    if request.repository_id != event.refs.repository_id.as_deref().unwrap_or_default() {
+        return false;
+    }
+    if !request.subject_ids.is_empty()
+        && !request.subject_ids.iter().any(|id| id == &event.subject.id)
+    {
+        return false;
+    }
+    match request.min_severity {
+        Some(min_severity) => {
+            rpc_event_severity_rank(event.severity) >= rpc_event_severity_rank(min_severity)
+        }
+        None => true,
+    }
+}
+
+fn rpc_event_severity_rank(value: RpcEventSeverity) -> u8 {
+    match value {
+        RpcEventSeverity::Debug => 0,
+        RpcEventSeverity::Info => 1,
+        RpcEventSeverity::Warning => 2,
+        RpcEventSeverity::Error => 3,
     }
 }
 
@@ -2168,9 +2282,11 @@ fn store_error_to_rpc(error: StoreError) -> RpcError {
     let code = match error {
         StoreError::NotFound { .. } => RpcErrorCode::NotFound,
         StoreError::DuplicateId { .. } | StoreError::Conflict { .. } => RpcErrorCode::Conflict,
-        StoreError::InvalidReference { .. }
-        | StoreError::InvalidCursor { .. }
-        | StoreError::InvalidRecord { .. } => RpcErrorCode::InvalidArgument,
+        StoreError::InvalidReference { .. } | StoreError::InvalidRecord { .. } => {
+            RpcErrorCode::InvalidArgument
+        }
+        StoreError::InvalidCursor { .. } => RpcErrorCode::InvalidArgument,
+        StoreError::CursorExpired { .. } => RpcErrorCode::CursorExpired,
         StoreError::SequenceOverflow => RpcErrorCode::Internal,
     };
 
@@ -3366,9 +3482,369 @@ mod tests {
             watch_exhausted.cursor,
             Some(EventCursorRequest::AfterSequence(latest_sequence))
         );
+        let latest_event_id = all_events
+            .events
+            .last()
+            .expect("list should include at least one event")
+            .event_id
+            .clone();
+        let watch_after_event_id_exhausted = server
+            .watch_events(WatchEventsRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::AfterEventId(latest_event_id)),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: Some(1),
+            })
+            .expect("watch events should succeed when event-id cursor is at latest");
+        assert!(watch_after_event_id_exhausted.events.is_empty());
+        assert_eq!(
+            watch_after_event_id_exhausted.cursor,
+            Some(EventCursorRequest::AfterSequence(latest_sequence))
+        );
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(other_root);
+    }
+
+    #[tokio::test]
+    async fn watch_events_live_filters_replay_before_bootstrap() {
+        let server = ready_server();
+        let first_root = test_repo_dir("watch-events-live-filter-first");
+        let second_root = test_repo_dir("watch-events-live-filter-second");
+
+        let first_repository = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-first-repo".to_string(),
+                root_path: first_root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("first repository should register")
+            .repository;
+        let second_repository = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-second-repo".to_string(),
+                root_path: second_root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("second repository should register")
+            .repository;
+
+        server
+            .submit_job(SubmitJobRequest {
+                repository_id: first_repository.repository_id.clone(),
+                requester: actor_record().into(),
+                kind: "read".to_string(),
+                goal: "first repo job".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("first repository job should submit");
+
+        server
+            .submit_job(SubmitJobRequest {
+                repository_id: second_repository.repository_id.clone(),
+                requester: actor_record().into(),
+                kind: "read".to_string(),
+                goal: "second repo job".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("second repository job should submit");
+
+        let live = server
+            .watch_events_live(WatchEventsRequest {
+                repository_id: second_repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::Beginning),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: None,
+            })
+            .expect("live watch should succeed");
+
+        assert!(!live.events.is_empty());
+        assert!(live.events.iter().all(|event| {
+            event.refs.repository_id.as_deref() == Some(second_repository.repository_id.as_str())
+        }));
+        assert_eq!(
+            live.cursor,
+            Some(EventCursorRequest::AfterSequence(
+                live.events
+                    .last()
+                    .expect("retained replay should contain at least one event")
+                    .sequence
+            ))
+        );
+        assert_eq!(
+            live.subscription.replay_max_sequence,
+            Some(
+                live.events
+                    .last()
+                    .expect("retained replay should contain at least one event")
+                    .sequence
+            )
+        );
+        assert_eq!(
+            live.subscription.resolved_cursor_sequence,
+            live.subscription.last_sequence
+        );
+
+        let _ = fs::remove_dir_all(first_root);
+        let _ = fs::remove_dir_all(second_root);
+    }
+
+    #[tokio::test]
+    async fn watch_events_live_receives_future_events() {
+        let server = ready_server();
+        let root = test_repo_dir("watch-events-live");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let live = server
+            .watch_events_live(WatchEventsRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::Beginning),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: Some(1),
+            })
+            .expect("live watch should succeed");
+        let last_sequence = live.subscription.last_sequence;
+        let mut receiver = live.subscription.receiver;
+
+        let submitted = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor_record().into(),
+                kind: "read".to_string(),
+                goal: "watch live job".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("submit should succeed");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("expected future event")
+            .expect("receiver should stay open")
+            .expect("future event should not be a terminal error");
+        match last_sequence {
+            None => {}
+            Some(seq) => assert!(received.sequence_number > seq),
+        }
+        assert_eq!(
+            received.refs.job_id.as_ref().map(|id| id.as_str()),
+            Some(submitted.job.job_id.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn watch_events_live_uses_none_replay_sequence_when_empty() {
+        let server = ready_server();
+        let root = test_repo_dir("watch-events-live-empty");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-empty-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let live = server
+            .watch_events_live(WatchEventsRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::Beginning),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: Some(1),
+            })
+            .expect("live watch should succeed");
+
+        assert!(live.events.is_empty());
+        assert_eq!(live.cursor, Some(EventCursorRequest::Beginning));
+        assert_eq!(live.subscription.replay_max_sequence, None);
+        assert_eq!(live.subscription.resolved_cursor_sequence, None);
+        assert_eq!(live.subscription.last_sequence, None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn watch_events_live_preserves_after_sequence_anchor_when_empty() {
+        let server = ready_server();
+        let root = test_repo_dir("watch-events-live-empty-after-sequence");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-empty-after-sequence-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let live = server
+            .watch_events_live(WatchEventsRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::AfterSequence(42)),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: Some(1),
+            })
+            .expect("live watch should succeed");
+
+        assert!(live.events.is_empty());
+        assert_eq!(live.cursor, Some(EventCursorRequest::AfterSequence(42)));
+        assert_eq!(live.subscription.last_sequence, Some(42));
+        assert_eq!(live.subscription.resolved_cursor_sequence, Some(42));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watch_events_last_sequence_falls_back_to_replay_max_sequence_when_empty() {
+        assert_eq!(watch_events_last_sequence(&[], Some(42), None), Some(42));
+        assert_eq!(watch_events_last_sequence(&[], None, Some(42)), Some(42));
+        assert_eq!(
+            watch_events_last_sequence(&[], Some(41), Some(42)),
+            Some(42)
+        );
+        assert_eq!(
+            watch_events_last_sequence(&[], Some(42), Some(41)),
+            Some(42)
+        );
+        assert_eq!(watch_events_last_sequence(&[], None, None), None);
+    }
+
+    #[tokio::test]
+    async fn watch_events_live_uses_resolved_cursor_sequence_when_replay_is_empty() {
+        let server = ready_server();
+        let root = test_repo_dir("watch-events-live-empty-after-event-id");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-empty-after-event-id-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor_record().into(),
+                kind: "read".to_string(),
+                goal: "watch live anchor".to_string(),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("submit should succeed");
+
+        let anchor = server
+            .list_events(ListEventsRequest {
+                repository_id: Some(registered.repository.repository_id.clone()),
+                cursor: Some(EventCursorRequest::Beginning),
+                subject_ids: Vec::new(),
+                job_ids: Vec::new(),
+                min_severity: None,
+                page_size: Some(1),
+                page_token: None,
+            })
+            .expect("list events should succeed");
+        let anchor_event = anchor
+            .events
+            .first()
+            .expect("submit should emit at least one event");
+
+        let live = server
+            .watch_events_live(WatchEventsRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::AfterEventId(
+                    anchor_event.event_id.clone(),
+                )),
+                subject_ids: vec!["does-not-match".to_string()],
+                min_severity: None,
+                limit: Some(1),
+            })
+            .expect("live watch should succeed");
+
+        assert!(live.events.is_empty());
+        assert_eq!(
+            live.cursor,
+            Some(EventCursorRequest::AfterSequence(anchor_event.sequence))
+        );
+        assert_eq!(
+            live.subscription.resolved_cursor_sequence,
+            Some(anchor_event.sequence)
+        );
+        assert_eq!(live.subscription.last_sequence, Some(anchor_event.sequence));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watch_events_live_rejects_zero_limit() {
+        let server = ready_server();
+        let root = test_repo_dir("watch-events-live-zero-limit");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-zero-limit-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let watch_err = server.watch_events(WatchEventsRequest {
+            repository_id: registered.repository.repository_id.clone(),
+            cursor: Some(EventCursorRequest::Beginning),
+            subject_ids: Vec::new(),
+            min_severity: None,
+            limit: Some(0),
+        });
+        assert!(matches!(
+            watch_err,
+            Err(RpcError {
+                code: RpcErrorCode::InvalidArgument,
+                ..
+            })
+        ));
+
+        let live_err = server.watch_events_live(WatchEventsRequest {
+            repository_id: registered.repository.repository_id,
+            cursor: Some(EventCursorRequest::Beginning),
+            subject_ids: Vec::new(),
+            min_severity: None,
+            limit: Some(0),
+        });
+        assert!(matches!(
+            live_err,
+            Err(RpcError {
+                code: RpcErrorCode::InvalidArgument,
+                ..
+            })
+        ));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4413,6 +4889,15 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, RpcErrorCode::NotFound);
+    }
+
+    #[test]
+    fn cursor_expired_store_error_maps_to_cursor_expired_rpc_code() {
+        let error = store_error_to_rpc(StoreError::CursorExpired {
+            reason: "event id is not retained".to_string(),
+        });
+
+        assert_eq!(error.code, RpcErrorCode::CursorExpired);
     }
 
     #[test]

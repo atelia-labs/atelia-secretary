@@ -85,7 +85,8 @@ Required RPC groups:
 - `GetJob`: inspect one job.
 - `ListJobs`: inspect recent jobs with filters.
 - `CancelJob`: request cancellation.
-- `WatchEvents`: stream job, policy, audit, and repository events.
+- `WatchEvents`: stream job, policy, audit, and repository events live.
+- `ReplayEvents`: replay the same event ledger for compatibility clients.
 - `CheckPolicy`: preview whether a requested action is allowed, audited,
   approval-gated, or blocked.
 - `RenderToolOutput`: render a canonical tool result as TOON, JSON, or text.
