@@ -2565,13 +2565,12 @@ mod tests {
 
     #[test]
     fn blocking_policy_decision_ignores_non_path_scopes() {
-        let candidate_root = Path::new("/tmp/atelia-register-candidate");
+        let source_root = plain_test_dir("register-source-non-path-scope");
+        let candidate_root = source_root.join("candidate");
+        fs::create_dir_all(&candidate_root).unwrap();
         let repository_id = RepositoryId::new();
         let mut repository_roots = HashMap::new();
-        repository_roots.insert(
-            repository_id.clone(),
-            PathBuf::from("/tmp/atelia-register-source"),
-        );
+        repository_roots.insert(repository_id.clone(), source_root.clone());
 
         let non_path_decision = PolicyDecision {
             id: PolicyDecisionId::new(),
@@ -2602,23 +2601,23 @@ mod tests {
         };
 
         let matched = blocking_policy_decision_for_candidate_root(
-            candidate_root,
+            candidate_root.as_path(),
             repository_roots,
             vec![non_path_decision],
         );
 
         assert!(matched.is_none());
+        let _ = fs::remove_dir_all(source_root);
     }
 
     #[test]
     fn blocking_policy_decision_ignores_non_root_blocked_path_like_scope() {
-        let candidate_root = Path::new("/tmp/atelia-register-source/nested");
+        let source_root = plain_test_dir("register-source-non-root-path-like");
+        let candidate_root = source_root.join("nested");
+        fs::create_dir_all(&candidate_root).unwrap();
         let repository_id = RepositoryId::new();
         let mut repository_roots = HashMap::new();
-        repository_roots.insert(
-            repository_id.clone(),
-            PathBuf::from("/tmp/atelia-register-source"),
-        );
+        repository_roots.insert(repository_id.clone(), source_root.clone());
 
         let non_root_blocked_decision = PolicyDecision {
             id: PolicyDecisionId::new(),
@@ -2649,12 +2648,13 @@ mod tests {
         };
 
         let matched = blocking_policy_decision_for_candidate_root(
-            candidate_root,
+            candidate_root.as_path(),
             repository_roots,
             vec![non_root_blocked_decision],
         );
 
         assert!(matched.is_none());
+        let _ = fs::remove_dir_all(source_root);
     }
 
     #[test]
