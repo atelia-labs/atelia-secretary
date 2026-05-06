@@ -1799,26 +1799,17 @@ fn validate_loaded_submit_job_receipt_job(
         &stored_job.repository_id,
         &receipt_job.repository_id,
     )?;
-    ensure_immutable_job_field(
-        &receipt_job.id,
-        "schema_version",
-        stored_job.schema_version,
-        receipt_job.schema_version,
-    )?;
-    ensure_immutable_job_field(
-        &receipt_job.id,
-        "created_at",
-        stored_job.created_at,
-        receipt_job.created_at,
-    )?;
-    ensure_immutable_job_field(
-        &receipt_job.id,
-        "requester",
-        &stored_job.requester,
-        &receipt_job.requester,
-    )?;
-    ensure_immutable_job_field(&receipt_job.id, "kind", &stored_job.kind, &receipt_job.kind)?;
-    ensure_immutable_job_field(&receipt_job.id, "goal", &stored_job.goal, &receipt_job.goal)?;
+    let mut normalized_stored_job = stored_job.clone();
+    normalized_stored_job.updated_at = receipt_job.updated_at;
+    if normalized_stored_job != *receipt_job {
+        return Err(StoreError::Conflict {
+            collection: "jobs",
+            reason: format!(
+                "submit_job idempotency receipt job {} does not match stored job when ignoring updated_at",
+                id_debug(&receipt_job.id)
+            ),
+        });
+    }
 
     Ok(())
 }
@@ -6841,6 +6832,61 @@ mod tests {
             reopened.get_submit_job_idempotency("ledger-key").unwrap(),
             Some(submission)
         );
+    }
+
+    #[test]
+    fn durable_store_rejects_submit_job_idempotency_when_latest_event_id_diverges() {
+        let storage_dir = durable_storage_dir("idempotency-mutated-latest-event");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let store = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        let repository = repository_record();
+        store.create_repository(repository.clone()).unwrap();
+
+        let runtime = SecretaryRuntime::new(store.clone(), DefaultPolicyEngine::new());
+        let request =
+            RuntimeJobRequest::new(actor(), repository.id.clone(), JobKind::Read, "persist me")
+                .with_requested_capabilities(vec!["capability.discovery".to_string()]);
+        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+        let submission = SubmitJobIdempotencyRecord {
+            signature: "request-signature".to_string(),
+            receipt: receipt.clone(),
+        };
+
+        store
+            .record_submit_job_idempotency("ledger-key".to_string(), submission.clone())
+            .unwrap();
+
+        let mut mutated_inner = store.lock().unwrap().clone();
+        let stored_job = mutated_inner
+            .jobs
+            .get_mut(&receipt.job.id)
+            .expect("job should exist");
+        stored_job.latest_event_id = Some(
+            receipt
+                .events
+                .first()
+                .expect("receipt should include at least one event")
+                .id
+                .clone(),
+        );
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&DurableStoreSnapshot {
+                schema_version: DURABLE_STORE_SCHEMA_VERSION,
+                inner: mutated_inner,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::Conflict {
+                collection: "jobs",
+                ..
+            }
+        ));
     }
 
     #[test]
