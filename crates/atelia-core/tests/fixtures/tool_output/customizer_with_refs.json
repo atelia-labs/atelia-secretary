@@ -1,0 +1,51 @@
+{
+  "id": "res_00000000-0000-4000-8000-000000000007",
+  "schema_version": 1,
+  "created_at": {
+    "unix_millis": 1700000246000
+  },
+  "invocation_id": "tool_00000000-0000-4000-8000-000000000008",
+  "tool_id": "customizer",
+  "status": "succeeded",
+  "schema_ref": "schema:tool.customizer.v1",
+  "fields": [
+    {
+      "key": "summary",
+      "value": {
+        "string": "customizer keeps refs"
+      }
+    },
+    {
+      "key": "policy.state",
+      "value": {
+        "string": "allowed_with_audit"
+      }
+    },
+    {
+      "key": "diagnostics.parser_failure",
+      "value": {
+        "string": "none"
+      }
+    }
+  ],
+  "evidence_refs": [
+    {
+      "id": "art_00000000-0000-4000-8000-000000000009",
+      "uri": "/tmp/customizer-evidence.txt",
+      "media_type": "text/plain",
+      "label": "customizer evidence",
+      "digest": "sha256:feedbeef"
+    }
+  ],
+  "output_refs": [
+    {
+      "id": "out_00000000-0000-4000-8000-000000000010",
+      "uri": "/tmp/customizer-stdout.txt",
+      "media_type": "text/plain",
+      "label": "customizer stdout",
+      "digest": "sha256:c0ffee00"
+    }
+  ],
+  "truncation": null,
+  "redactions": []
+}

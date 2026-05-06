@@ -1,7 +1,7 @@
 status succeeded
 schema_version tool_result.v1
 format toon
-tool_id git_status
+tool_id customizer
 result_id res_00000000-0000-4000-8000-000000000005
 invocation_id tool_00000000-0000-4000-8000-000000000006
 schema_ref "schema:tool.customizer.v1"
