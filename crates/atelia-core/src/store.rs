@@ -390,12 +390,13 @@ impl InMemoryStore {
         &self,
         repository_id: &RepositoryId,
     ) -> StoreResult<broadcast::Receiver<JobEvent>> {
+        self.get_repository(repository_id)?;
         Ok(self
-            .repository_event_broadcaster(repository_id)?
+            .repository_event_broadcaster_for_existing(repository_id)?
             .subscribe())
     }
 
-    fn repository_event_broadcaster(
+    fn repository_event_broadcaster_for_existing(
         &self,
         repository_id: &RepositoryId,
     ) -> StoreResult<broadcast::Sender<JobEvent>> {
@@ -420,7 +421,10 @@ impl InMemoryStore {
         let mut targets = Vec::with_capacity(events.len());
         for event in events {
             let repository_broadcaster = match event_repository_id(inner, event)? {
-                Some(repository_id) => Some(self.repository_event_broadcaster(&repository_id)?),
+                Some(repository_id) => {
+                    get_record(&inner.repositories, &repository_id, "repositories")?;
+                    Some(self.repository_event_broadcaster_for_existing(&repository_id)?)
+                }
                 None => None,
             };
             targets.push((event.clone(), repository_broadcaster));
@@ -5392,6 +5396,37 @@ mod tests {
                     .iter()
                     .all(|event| event.sequence_number != third.sequence_number));
             });
+    }
+
+    #[test]
+    fn watch_job_events_live_rejects_unknown_repository_without_broadcaster() {
+        let store = InMemoryStore::new();
+        let missing_repository_id = RepositoryId::new();
+
+        let error = store
+            .watch_job_events_live(EventQuery {
+                repository_id: Some(missing_repository_id.clone()),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: Vec::new(),
+                min_severity: None,
+                page_size: Some(1),
+                page_token: None,
+            })
+            .expect_err("missing repository should be rejected");
+
+        assert_eq!(
+            error,
+            StoreError::NotFound {
+                collection: "repositories",
+                id: id_debug(&missing_repository_id),
+            }
+        );
+        assert!(store
+            .repository_event_broadcasters
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
