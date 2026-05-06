@@ -38,6 +38,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "jobs.v1",
     "events.v1",
     "policy.v1",
+    "repertoire.v1",
     "extensions.registry.v1",
     "tool_output_settings.v1",
     "tool_output_render.v1",
@@ -45,7 +46,16 @@ const DAEMON_CAPABILITIES: &[&str] = &[
 ];
 const MAX_HISTORY_PAGE: usize = 1000;
 const SECRETARY_ECHO_TOOL_ID: &str = "secretary.echo";
+const SECRETARY_ECHO_TOOL_NAME: &str = "Secretary Echo";
+const SECRETARY_ECHO_TOOL_DESCRIPTION: &str =
+    "Echo input for daemon smoke tests and context probes.";
 const SECRETARY_FS_READ_TOOL_ID: &str = "fs.read";
+const SECRETARY_FS_READ_TOOL_NAME: &str = "Filesystem Read";
+const SECRETARY_FS_READ_TOOL_DESCRIPTION: &str = "Read a file from an allowed repository scope.";
+const SECRETARY_TOOL_PROVIDER_KIND: &str = "builtin";
+const SECRETARY_TOOL_PROVIDER_ID: &str = "atelia-secretary";
+const SECRETARY_TOON_FORMAT: &str = "toon";
+const SECRETARY_JSON_FORMAT: &str = "json";
 const SECRETARY_FS_READ_CAPABILITY: &str = "filesystem.read";
 const SECRETARY_CAPABILITY_DISCOVERY: &str = "capability.discovery";
 
@@ -312,6 +322,46 @@ pub struct ListRepositoriesPage {
     pub next_page_token: Option<String>,
 }
 
+/// Request for the beta repertoire projection.
+#[derive(Debug, Clone, Default)]
+pub struct ListRepertoireRequest;
+
+/// Response containing the built-in tools exposed through the beta repertoire.
+#[derive(Debug, Clone)]
+pub struct ListRepertoireResponse {
+    /// Projected repertoire entries in stable display order.
+    pub entries: Vec<RepertoireEntry>,
+}
+
+/// Public repertoire view for a single built-in tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepertoireEntry {
+    /// Stable tool identifier.
+    pub tool_id: String,
+    /// Human-readable tool name.
+    pub name: String,
+    /// Concise description shown to clients.
+    pub description: String,
+    /// Provider category for the tool implementation.
+    pub provider_kind: String,
+    /// Stable provider identifier.
+    pub provider_id: String,
+    /// Risk tier used for client-side policy and presentation.
+    pub risk_tier: String,
+    /// Default result format returned by the tool.
+    pub default_result_format: String,
+    /// Result formats the tool can emit.
+    pub supported_result_formats: Vec<String>,
+    /// Idempotency classification for repeated calls.
+    pub idempotency: String,
+    /// Whether the tool can be cancelled after dispatch.
+    pub cancellable: bool,
+    /// Whether the tool streams partial results.
+    pub streaming: bool,
+    /// Advertised timeout budget in milliseconds; `0` means not enforced yet.
+    pub timeout_ms: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ListToolOutputSettingsHistoryRequest {
     pub scope: Option<ToolOutputSettingsScope>,
@@ -553,6 +603,16 @@ impl SecretaryService {
                 repositories,
                 next_page_token,
             })
+    }
+
+    /// Project the implemented built-in tool surface for beta repertoire clients.
+    pub fn list_repertoire(
+        &self,
+        _request: ListRepertoireRequest,
+    ) -> ServiceResult<ListRepertoireResponse> {
+        Ok(ListRepertoireResponse {
+            entries: list_repertoire_entries(),
+        })
     }
 
     /// Look up a single repository by id.
@@ -1089,6 +1149,60 @@ fn paginate_records<T>(
     };
 
     (retained, next_page_token)
+}
+
+fn list_repertoire_entries() -> Vec<RepertoireEntry> {
+    fn entry(
+        tool_id: &str,
+        name: &str,
+        description: &str,
+        risk_tier: &str,
+        idempotency: &str,
+        cancellable: bool,
+        timeout_ms: u32,
+    ) -> RepertoireEntry {
+        RepertoireEntry {
+            tool_id: tool_id.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+            provider_kind: SECRETARY_TOOL_PROVIDER_KIND.to_string(),
+            provider_id: SECRETARY_TOOL_PROVIDER_ID.to_string(),
+            risk_tier: risk_tier.to_string(),
+            default_result_format: SECRETARY_TOON_FORMAT.to_string(),
+            supported_result_formats: vec![
+                SECRETARY_TOON_FORMAT.to_string(),
+                SECRETARY_JSON_FORMAT.to_string(),
+            ],
+            idempotency: idempotency.to_string(),
+            cancellable,
+            streaming: false,
+            timeout_ms,
+        }
+    }
+
+    let mut entries = vec![
+        entry(
+            SECRETARY_FS_READ_TOOL_ID,
+            SECRETARY_FS_READ_TOOL_NAME,
+            SECRETARY_FS_READ_TOOL_DESCRIPTION,
+            "R1",
+            "idempotent",
+            false,
+            0,
+        ),
+        entry(
+            SECRETARY_ECHO_TOOL_ID,
+            SECRETARY_ECHO_TOOL_NAME,
+            SECRETARY_ECHO_TOOL_DESCRIPTION,
+            "R0",
+            "idempotent",
+            false,
+            0,
+        ),
+    ];
+
+    entries.sort_by(|left, right| left.tool_id.cmp(&right.tool_id));
+    entries
 }
 
 fn canonical_repository_root(root_path: &str) -> ServiceResult<String> {
@@ -1835,6 +1949,7 @@ mod tests {
             .contains(&"repositories.v1".to_string()));
         assert!(metadata.capabilities.contains(&"jobs.v1".to_string()));
         assert!(metadata.capabilities.contains(&"policy.v1".to_string()));
+        assert!(metadata.capabilities.contains(&"repertoire.v1".to_string()));
         assert!(metadata
             .capabilities
             .contains(&"extensions.registry.v1".to_string()));
@@ -1847,6 +1962,51 @@ mod tests {
         assert!(metadata
             .capabilities
             .contains(&"project_status.v1".to_string()));
+    }
+
+    fn repertoire_tool_ids(entries: &[RepertoireEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.tool_id.as_str()).collect()
+    }
+
+    #[test]
+    fn list_repertoire_projects_static_builtin_tools() {
+        let svc = ready_service();
+        let repertoire = svc
+            .list_repertoire(ListRepertoireRequest)
+            .expect("repertoire projection should succeed");
+
+        assert_eq!(
+            repertoire_tool_ids(&repertoire.entries),
+            vec!["fs.read", "secretary.echo"]
+        );
+        let read = repertoire
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "fs.read")
+            .expect("fs.read repertoire entry");
+        assert_eq!(read.name, "Filesystem Read");
+        assert_eq!(read.risk_tier, "R1");
+        assert_eq!(read.provider_kind, "builtin");
+        assert_eq!(read.provider_id, "atelia-secretary");
+        assert_eq!(read.default_result_format, "toon");
+        assert!(!read.cancellable);
+        assert_eq!(
+            read.supported_result_formats,
+            vec!["toon".to_string(), "json".to_string()]
+        );
+        assert_eq!(read.timeout_ms, 0);
+        let echo = repertoire
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "secretary.echo")
+            .expect("secretary.echo repertoire entry");
+        assert_eq!(echo.risk_tier, "R0");
+        assert!(!echo.cancellable);
+        assert_eq!(echo.timeout_ms, 0);
+        assert!(repertoire
+            .entries
+            .iter()
+            .all(|entry| { matches!(entry.tool_id.as_str(), "fs.read" | "secretary.echo") }));
     }
 
     // -- register / list round trip -----------------------------------------

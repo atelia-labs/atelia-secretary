@@ -13,21 +13,48 @@ use axum::{
     body::{to_bytes, Body},
     extract::{Request, State},
     http::{header, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
     Json, Router,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, RwLock};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const LISTEN_ADDR_ENV: &str = "ATELIA_DAEMON_LISTEN_ADDR";
 const UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV: &str = "ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN";
+const AUTH_DISABLED_ENV: &str = "ATELIA_DAEMON_AUTH_DISABLED";
+const AUTH_TOKEN_ENV: &str = "ATELIA_DAEMON_AUTH_TOKEN";
+const AUTH_TOKEN_FILE_NAME: &str = "daemon-auth.token";
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Shared RPC server state used by the HTTP router.
 pub type RpcServerState = Arc<RwLock<rpc::SecretaryRpcServer>>;
+
+/// Local authentication mode for the daemon boundary.
+#[derive(Clone, PartialEq, Eq)]
+pub enum LocalAuthConfig {
+    /// Require a bearer token on the `Authorization` header.
+    BearerToken { token: String },
+    /// Disable local authentication entirely.
+    Disabled,
+}
+
+impl std::fmt::Debug for LocalAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BearerToken { .. } => f
+                .debug_struct("LocalAuthConfig")
+                .field("token", &"<redacted>")
+                .finish(),
+            Self::Disabled => f.write_str("LocalAuthConfig::Disabled"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Route {
@@ -38,6 +65,7 @@ enum Route {
     ListJobEvents { job_id: String },
     CancelJob { job_id: String },
     ListRepositories,
+    ListRepertoire,
     ListEvents,
     ReplayEvents,
     GetToolOutputDefaults,
@@ -146,6 +174,7 @@ fn route_for_path(path: &str) -> Route {
         "/v1/jobs/submit" => Route::SubmitJob,
         "/v1/jobs/list" => Route::ListJobs,
         "/v1/repositories:list" => Route::ListRepositories,
+        "/v1/repertoire:list" => Route::ListRepertoire,
         "/v1/events/list" => Route::ListEvents,
         "/v1/events/replay" => Route::ReplayEvents,
         "/v1/tool-output/settings/get" => Route::GetToolOutputDefaults,
@@ -223,6 +252,10 @@ struct ListRepositoriesRequestPayload {
     page_size: Option<usize>,
     page_token: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListRepertoireRequestPayload {}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -398,6 +431,20 @@ pub fn validate_listen_addr(listen_addr: &SocketAddr, explicit_addr: bool) -> Re
     }
 }
 
+/// Refuse to combine auth-disabled mode with any non-loopback listener.
+pub fn validate_local_auth_binding(
+    local_auth: &LocalAuthConfig,
+    listen_addr: &SocketAddr,
+) -> Result<()> {
+    if matches!(local_auth, LocalAuthConfig::Disabled) && !is_loopback(listen_addr) {
+        Err(anyhow!(
+            "refusing to combine {AUTH_DISABLED_ENV}=1 with non-loopback listener address {listen_addr}; keep auth enabled or bind to loopback only"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Return whether the socket address binds only to the local host.
 pub fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
@@ -405,8 +452,305 @@ pub fn is_loopback(addr: &SocketAddr) -> bool {
 
 /// Return whether the unsafe beta escape hatch allows non-loopback binding.
 pub fn unsafe_allow_non_loopback_listen() -> bool {
+    env_var_is_truthy(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV)
+}
+
+/// Resolve the local bearer token boundary used by the beta daemon.
+pub fn resolve_local_auth(storage_dir: &std::path::Path) -> Result<LocalAuthConfig> {
+    let auth_disabled = env_var_is_truthy(AUTH_DISABLED_ENV);
+    let auth_token = std::env::var_os(AUTH_TOKEN_ENV);
+
+    if auth_disabled && auth_token.is_some() {
+        return Err(anyhow!(
+            "{AUTH_DISABLED_ENV} and {AUTH_TOKEN_ENV} are mutually exclusive"
+        ));
+    }
+
+    if auth_disabled {
+        return Ok(LocalAuthConfig::Disabled);
+    }
+
+    if let Some(raw_token) = auth_token {
+        let token = raw_token
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| anyhow!("{AUTH_TOKEN_ENV} must contain valid UTF-8"))?
+            .to_string();
+        if token.is_empty() {
+            return Err(anyhow!("{AUTH_TOKEN_ENV} must not be empty"));
+        }
+        if token.chars().next().is_some_and(|ch| ch.is_whitespace())
+            || token.chars().last().is_some_and(|ch| ch.is_whitespace())
+        {
+            return Err(anyhow!(
+                "{AUTH_TOKEN_ENV} must not have leading or trailing whitespace"
+            ));
+        }
+        if token.chars().any(|ch| ch.is_whitespace()) {
+            return Err(anyhow!(
+                "{AUTH_TOKEN_ENV} must not contain internal whitespace"
+            ));
+        }
+        if !token
+            .as_bytes()
+            .iter()
+            .all(|byte| (0x20..=0x7e).contains(byte))
+        {
+            return Err(anyhow!(
+                "{AUTH_TOKEN_ENV} must contain only visible ASCII characters"
+            ));
+        }
+        if !local_auth_token_is_strong(&token) {
+            return Err(anyhow!(
+                "{AUTH_TOKEN_ENV} must be either exactly 64 hexadecimal characters or at least 43 base64url characters using only ASCII alphanumeric, '-' or '_'"
+            ));
+        }
+
+        return Ok(LocalAuthConfig::BearerToken { token });
+    }
+
+    let token = load_or_create_session_token(storage_dir)?;
+    Ok(LocalAuthConfig::BearerToken { token })
+}
+
+fn local_auth_token_path(storage_dir: &std::path::Path) -> std::path::PathBuf {
+    storage_dir.join(AUTH_TOKEN_FILE_NAME)
+}
+
+/// Return whether an operator-provided token meets the beta strength floor.
+fn local_auth_token_is_strong(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    (bytes.len() == 64 && bytes.iter().all(|byte| byte.is_ascii_hexdigit()))
+        || (bytes.len() >= 43
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+}
+
+/// Load an existing generated session token or create one in the storage dir.
+fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String> {
+    std::fs::create_dir_all(storage_dir)
+        .with_context(|| format!("failed to create auth storage dir {storage_dir:?}"))?;
+
+    let token_path = local_auth_token_path(storage_dir);
+    match std::fs::symlink_metadata(&token_path) {
+        Ok(_) => read_and_validate_session_token_with_retry(&token_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let token = generate_session_token()?;
+            write_or_reuse_session_token(&token_path, token)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to read session token file {token_path:?}"))
+        }
+    }
+}
+
+/// Read a persisted session token after validating file safety properties.
+fn read_and_validate_session_token(
+    token_path: &std::path::Path,
+    storage_dir: &std::path::Path,
+) -> Result<String> {
+    let mut token_file = open_existing_session_token_file(token_path)?;
+    validate_existing_session_token_file(&token_file, storage_dir, token_path)?;
+
+    use std::io::Read;
+
+    let mut token = String::new();
+    token_file
+        .read_to_string(&mut token)
+        .with_context(|| format!("failed to read session token file {token_path:?}"))?;
+    validate_and_restrict_session_token(&token_file, token_path, token)
+}
+
+/// Validate that an existing token path is a safe regular file owned by this user.
+fn validate_existing_session_token_file(
+    token_file: &std::fs::File,
+    storage_dir: &std::path::Path,
+    token_path: &std::path::Path,
+) -> Result<()> {
+    let metadata = token_file
+        .metadata()
+        .with_context(|| format!("failed to inspect session token file {token_path:?}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(anyhow!(
+            "session token file {token_path:?} must be a regular file"
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let current_euid = unsafe { libc::geteuid() };
+        let storage_owner = std::fs::metadata(storage_dir)
+            .with_context(|| format!("failed to inspect auth storage dir {storage_dir:?}"))?
+            .uid();
+
+        if storage_owner != current_euid || metadata.uid() != current_euid {
+            return Err(anyhow!(
+                "session token file {token_path:?} must be owned by the current user and the auth storage dir owner"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Normalize permissions and validate the generated-token file contents.
+fn validate_and_restrict_session_token(
+    token_file: &std::fs::File,
+    token_path: &std::path::Path,
+    token: String,
+) -> Result<String> {
+    set_restrictive_permissions(token_file, token_path)?;
+    if token.len() != 64 || !token.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Err(anyhow!(
+            "session token file {token_path:?} must contain exactly 64 hexadecimal characters; delete it and restart to regenerate"
+        ))
+    } else {
+        Ok(token)
+    }
+}
+
+/// Atomically create a new session-token file.
+fn write_session_token(token_path: &std::path::Path, token: &[u8]) -> Result<()> {
+    let mut file = open_session_token_file(token_path)?;
+    use std::io::Write;
+    file.write_all(token)
+        .with_context(|| format!("failed to write session token file {token_path:?}"))
+        .and_then(|()| set_restrictive_permissions(&file, token_path))
+}
+
+/// Write a generated token, or reuse a concurrently created valid token file.
+fn write_or_reuse_session_token(token_path: &std::path::Path, token: String) -> Result<String> {
+    match write_session_token(token_path, token.as_bytes()) {
+        Ok(()) => Ok(token),
+        Err(error) if is_already_exists_error(&error) => {
+            read_and_validate_session_token_with_retry(token_path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Retry token reads briefly while another process may be repairing permissions.
+fn read_and_validate_session_token_with_retry(token_path: &std::path::Path) -> Result<String> {
+    let storage_dir = token_path
+        .parent()
+        .ok_or_else(|| anyhow!("session token file path {token_path:?} has no parent directory"))?;
+    const SESSION_TOKEN_READ_ATTEMPTS: usize = 10;
+    let retry_delay = Duration::from_millis(25);
+
+    for attempt in 0..SESSION_TOKEN_READ_ATTEMPTS {
+        match read_and_validate_session_token(token_path, storage_dir) {
+            Ok(token) => return Ok(token),
+            Err(_error) if attempt + 1 < SESSION_TOKEN_READ_ATTEMPTS => {
+                std::thread::sleep(retry_delay);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("retry loop must return on success or failure")
+}
+
+/// Return whether an error chain contains an already-exists filesystem error.
+fn is_already_exists_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+    })
+}
+
+#[cfg(unix)]
+/// Open a new token file with owner-only permissions on Unix.
+fn open_session_token_file(token_path: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(token_path)
+        .with_context(|| format!("failed to create session token file {token_path:?}"))
+}
+
+#[cfg(not(unix))]
+/// Refuse file-backed token creation where owner-only permissions are unavailable.
+fn open_session_token_file(_token_path: &std::path::Path) -> Result<std::fs::File> {
+    Err(anyhow!(
+        "refusing to create session token file on non-Unix platforms because restrictive permissions are not implemented"
+    ))
+}
+
+#[cfg(unix)]
+fn open_existing_session_token_file(token_path: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(token_path)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => Err(anyhow!(
+            "session token file {token_path:?} must be a regular file"
+        )),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to open session token file {token_path:?}"))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn open_existing_session_token_file(token_path: &std::path::Path) -> Result<std::fs::File> {
+    std::fs::File::open(token_path)
+        .with_context(|| format!("failed to open session token file {token_path:?}"))
+}
+
+/// Generate a fresh 32-byte local auth token encoded as lowercase hexadecimal.
+fn generate_session_token() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .context("failed to obtain secure randomness for local auth token generation")?;
+    Ok(encode_session_token(&bytes))
+}
+
+/// Encode raw token bytes as lowercase hexadecimal.
+fn encode_session_token(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        token.push(HEX[(byte >> 4) as usize] as char);
+        token.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    token
+}
+
+#[cfg(unix)]
+/// Set owner-read/write-only permissions on a token file.
+fn set_restrictive_permissions(file: &std::fs::File, path: &std::path::Path) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let result = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to set restrictive permissions on {path:?}"));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_restrictive_permissions(_file: &std::fs::File, _path: &std::path::Path) -> Result<()> {
+    Err(anyhow!(
+        "session token files require Unix restrictive permissions and cannot be safely used on non-Unix platforms"
+    ))
+}
+
+fn env_var_is_truthy(name: &str) -> bool {
     matches!(
-        std::env::var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV)
+        std::env::var(name)
             .ok()
             .as_deref()
             .map(str::trim)
@@ -449,6 +793,12 @@ fn parse_list_repositories_payload(
         page_size: payload.page_size,
         page_token: payload.page_token,
     })
+}
+
+fn parse_list_repertoire_payload(
+    _payload: ListRepertoireRequestPayload,
+) -> rpc::ListRepertoireRequest {
+    rpc::ListRepertoireRequest
 }
 
 fn parse_path_scope_kind(value: Option<String>) -> Result<rpc::RpcPathScopeKind, String> {
@@ -1084,6 +1434,34 @@ fn serialize_list_repositories_response(
     })
 }
 
+fn serialize_repertoire_entry(entry: &rpc::RepertoireEntry) -> serde_json::Value {
+    serde_json::json!({
+        "tool_id": entry.tool_id,
+        "name": entry.name,
+        "description": entry.description,
+        "provider_kind": entry.provider_kind,
+        "provider_id": entry.provider_id,
+        "risk_tier": entry.risk_tier,
+        "default_result_format": entry.default_result_format,
+        "supported_result_formats": entry.supported_result_formats,
+        "idempotency": entry.idempotency,
+        "cancellable": entry.cancellable,
+        "streaming": entry.streaming,
+        "timeout_ms": entry.timeout_ms,
+    })
+}
+
+fn serialize_list_repertoire_response(response: rpc::ListRepertoireResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "entries": response
+            .entries
+            .iter()
+            .map(serialize_repertoire_entry)
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn serialize_submit_job_response(response: rpc::SubmitJobResponse) -> serde_json::Value {
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
@@ -1362,6 +1740,22 @@ fn make_error_response(
         .into_response()
 }
 
+/// Build a standard bearer-auth failure response.
+fn unauthorized_response(reason: impl Into<String>) -> Response {
+    let mut response = make_error_response(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        reason,
+        false,
+        "authentication_required",
+    );
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        header::HeaderValue::from_static(r#"Bearer realm="Atelia Secretary""#),
+    );
+    response
+}
+
 fn transport_error_response(next_state: String, reason: impl std::fmt::Display) -> Response {
     make_error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1400,6 +1794,51 @@ where
     match tokio::time::timeout(request_timeout, future).await {
         Ok(response) => response,
         Err(_) => request_timeout_response(state, &path, request_timeout).await,
+    }
+}
+
+/// Enforce the configured local-auth mode for every HTTP route.
+async fn local_auth_middleware(
+    State(auth): State<LocalAuthConfig>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    match auth {
+        LocalAuthConfig::Disabled => next.run(request).await,
+        LocalAuthConfig::BearerToken { token } => {
+            let provided = request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_bearer_token);
+
+            match provided {
+                Some(provided) if bearer_token_matches(&token, provided) => next.run(request).await,
+                _ => unauthorized_response("missing or invalid Authorization header"),
+            }
+        }
+    }
+}
+
+/// Compare bearer tokens without data-dependent early exit.
+fn bearer_token_matches(expected: &str, provided: &str) -> bool {
+    expected.as_bytes().ct_eq(provided.as_bytes()).into()
+}
+
+/// Parse a single `Authorization: Bearer <token>` header value.
+fn parse_bearer_token(value: &str) -> Option<&str> {
+    let mut parts = value.split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() {
+        Some(token)
+    } else {
+        None
     }
 }
 
@@ -1647,6 +2086,35 @@ async fn dispatch_list_repositories(state: RpcServerState, request: Request<Body
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_list_repositories_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_list_repertoire(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<ListRepertoireRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let parsed = parse_list_repertoire_payload(payload);
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.list_repertoire(parsed) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_list_repertoire_response(
                 response,
             ))),
         )
@@ -2375,6 +2843,26 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                     dispatch_list_repositories(state, request).await
                 }
             }
+            Route::ListRepertoire => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_list_repertoire(state, request).await
+                }
+            }
             Route::ListEvents => {
                 if method != Method::POST {
                     let mut response = make_error_response(
@@ -2786,13 +3274,17 @@ async fn fallback_route(State(state): State<RpcServerState>, request: Request<Bo
     .await
 }
 
-pub fn build_router(rpc_server: RpcServerState) -> Router {
+/// Build the daemon router with the selected local auth boundary.
+pub fn build_router(rpc_server: RpcServerState, auth: LocalAuthConfig) -> Router {
+    let auth_layer = middleware::from_fn_with_state(auth, local_auth_middleware);
+
     Router::new()
         .route("/v1/health", any(dispatch_route))
         .route("/v1/jobs/submit", any(dispatch_route))
         .route("/v1/jobs/list", any(dispatch_route))
         .route("/v1/jobs/*path", any(dispatch_route))
         .route("/v1/repositories:list", any(dispatch_route))
+        .route("/v1/repertoire:list", any(dispatch_route))
         .route("/v1/events/list", any(dispatch_route))
         .route("/v1/events/replay", any(dispatch_route))
         .route("/v1/tool-output/settings/get", any(dispatch_route))
@@ -2807,21 +3299,26 @@ pub fn build_router(rpc_server: RpcServerState) -> Router {
         .route("/v1/tool-results:render", any(dispatch_route))
         .route("/v1/project-status:get", any(dispatch_route))
         .fallback(fallback_route)
+        .layer(auth_layer)
         .with_state(rpc_server)
 }
 
+/// Bind the daemon TCP listener to the already validated address.
 pub async fn bind_listener(listen_addr: SocketAddr) -> Result<TcpListener> {
     TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("failed to bind {listen_addr}"))
 }
 
+/// Run the daemon listener with the selected local auth boundary.
 pub async fn run_listener(
     rpc_server: RpcServerState,
+    auth: LocalAuthConfig,
     listener: TcpListener,
     shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
-    axum::serve(listener, build_router(rpc_server))
+    validate_local_auth_binding(&auth, &listener.local_addr()?)?;
+    axum::serve(listener, build_router(rpc_server, auth))
         .with_graceful_shutdown(async move {
             let _ = shutdown.await;
         })
@@ -2840,7 +3337,7 @@ mod tests {
         ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionServices, ProvenanceSource,
         RetryPolicy, EXTENSION_MANIFEST_SCHEMA, EXTENSION_RPC_PROTOCOL,
     };
-    use axum::http::StatusCode;
+    use axum::{http::StatusCode, Router};
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -2911,6 +3408,38 @@ mod tests {
         }
     }
 
+    struct LocalAuthEnvGuard {
+        previous_auth_disabled: Option<OsString>,
+        previous_auth_token: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl LocalAuthEnvGuard {
+        fn lock() -> Self {
+            let lock = LISTEN_ADDR_ENV_MUTEX.lock().unwrap();
+            let previous_auth_disabled = std::env::var_os(AUTH_DISABLED_ENV);
+            let previous_auth_token = std::env::var_os(AUTH_TOKEN_ENV);
+            Self {
+                previous_auth_disabled,
+                previous_auth_token,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for LocalAuthEnvGuard {
+        fn drop(&mut self) {
+            match self.previous_auth_disabled.as_ref() {
+                Some(value) => std::env::set_var(AUTH_DISABLED_ENV, value),
+                None => std::env::remove_var(AUTH_DISABLED_ENV),
+            }
+            match self.previous_auth_token.as_ref() {
+                Some(value) => std::env::set_var(AUTH_TOKEN_ENV, value),
+                None => std::env::remove_var(AUTH_TOKEN_ENV),
+            }
+        }
+    }
+
     fn test_repo_dir(name: &str) -> std::path::PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
@@ -2930,8 +3459,42 @@ mod tests {
         Arc::new(RwLock::new(rpc::SecretaryRpcServer::new(service)))
     }
 
+    fn disabled_auth() -> LocalAuthConfig {
+        LocalAuthConfig::Disabled
+    }
+
+    fn bearer_auth(token: &str) -> LocalAuthConfig {
+        LocalAuthConfig::BearerToken {
+            token: token.to_string(),
+        }
+    }
+
+    #[test]
+    fn local_auth_config_debug_redacts_token() {
+        let debug = format!("{:?}", bearer_auth("super-secret-token"));
+        assert!(!debug.contains("super-secret-token"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn bearer_token_matches_rejects_different_tokens() {
+        assert!(bearer_token_matches(
+            "super-secret-token",
+            "super-secret-token"
+        ));
+        assert!(!bearer_token_matches(
+            "super-secret-token",
+            "super-secret-t0ken"
+        ));
+        assert!(!bearer_token_matches("super-secret-token", "super-secret"));
+    }
+
+    fn test_router(state: &RpcServerState) -> Router {
+        build_router(state.clone(), disabled_auth())
+    }
+
     async fn send_request(state: &RpcServerState, method: Method, path: &str) -> Response {
-        let app = build_router(state.clone());
+        let app = test_router(state);
         app.oneshot(
             Request::builder()
                 .method(method)
@@ -2949,13 +3512,32 @@ mod tests {
         path: &str,
         body: serde_json::Value,
     ) -> Response {
-        let app = build_router(state.clone());
+        let app = test_router(state);
         app.oneshot(
             Request::builder()
                 .method(method)
                 .uri(path)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(serde_json::to_vec(&body).expect("json body")))
+                .expect("valid request"),
+        )
+        .await
+        .expect("request should succeed")
+    }
+
+    async fn send_authenticated_request(
+        state: &RpcServerState,
+        method: Method,
+        path: &str,
+        token: &str,
+    ) -> Response {
+        let app = build_router(state.clone(), bearer_auth(token));
+        app.oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
                 .expect("valid request"),
         )
         .await
@@ -3054,6 +3636,7 @@ mod tests {
             route_for_path("/v1/repositories:list"),
             Route::ListRepositories
         );
+        assert_eq!(route_for_path("/v1/repertoire:list"), Route::ListRepertoire);
         assert_eq!(route_for_path("/v1/events/list"), Route::ListEvents);
         assert_eq!(route_for_path("/v1/events/replay"), Route::ReplayEvents);
         assert_eq!(
@@ -3192,6 +3775,413 @@ mod tests {
             json["error"]["reason"],
             "request to /v1/health exceeded 25ms"
         );
+    }
+
+    #[tokio::test]
+    async fn local_auth_rejects_missing_authorization_header() {
+        let rpc_server = ready_rpc_server();
+        let app = build_router(rpc_server, bearer_auth("test-token"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/health")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::WWW_AUTHENTICATE),
+            Some(&header::HeaderValue::from_static(
+                r#"Bearer realm="Atelia Secretary""#
+            ))
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json: Value = serde_json::from_slice(&body).expect("response json");
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn local_auth_rejects_invalid_authorization_header() {
+        let rpc_server = ready_rpc_server();
+        let app = build_router(rpc_server, bearer_auth("test-token"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/health")
+                    .header(header::AUTHORIZATION, "Bearer wrong-token")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json: Value = serde_json::from_slice(&body).expect("response json");
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn local_auth_allows_valid_authorization_header() {
+        let rpc_server = ready_rpc_server();
+        let response =
+            send_authenticated_request(&rpc_server, Method::GET, "/v1/health", "test-token").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json: Value = serde_json::from_slice(&body).expect("response json");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["data"]["daemon_status"], "ready");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_auth_creates_and_reuses_session_token() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::remove_var(AUTH_TOKEN_ENV);
+
+        let storage_dir = test_repo_dir("local-auth");
+        let resolved = resolve_local_auth(&storage_dir).expect("resolve local auth");
+        let token_path = local_auth_token_path(&storage_dir);
+        let token = fs::read_to_string(&token_path).expect("session token file");
+
+        match resolved {
+            LocalAuthConfig::BearerToken {
+                token: resolved_token,
+            } => {
+                assert_eq!(resolved_token, token);
+                assert_eq!(resolved_token.len(), 64);
+            }
+            LocalAuthConfig::Disabled => panic!("expected bearer token"),
+        }
+
+        let resolved_again = resolve_local_auth(&storage_dir).expect("resolve local auth again");
+        assert_eq!(resolved_again, LocalAuthConfig::BearerToken { token });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_auth_write_or_reuse_session_token_recovers_from_already_exists() {
+        let storage_dir = test_repo_dir("local-auth-already-exists");
+        let token_path = local_auth_token_path(&storage_dir);
+        let existing_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        fs::write(&token_path, existing_token).expect("seed session token");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&token_path)
+                .expect("seed token metadata")
+                .permissions();
+            permissions.set_mode(0o644);
+            fs::set_permissions(&token_path, permissions).expect("seed token permissions");
+        }
+
+        let recovered = write_or_reuse_session_token(&token_path, "f".repeat(64))
+            .expect("recover existing session token");
+
+        assert_eq!(recovered, existing_token);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(&token_path)
+                .expect("session token metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_auth_write_or_reuse_session_token_retries_after_transient_invalid_read() {
+        let storage_dir = test_repo_dir("local-auth-already-exists-transient");
+        let token_path = local_auth_token_path(&storage_dir);
+        fs::write(&token_path, "broken-token").expect("seed invalid session token");
+
+        let repaired_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let writer_token_path = token_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            fs::write(&writer_token_path, repaired_token).expect("repair session token");
+        });
+
+        let recovered = write_or_reuse_session_token(&token_path, "f".repeat(64))
+            .expect("recover repaired session token");
+
+        writer.join().expect("repair thread");
+        assert_eq!(recovered, repaired_token);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_auth_retries_when_existing_token_is_repaired_during_read() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::remove_var(AUTH_TOKEN_ENV);
+
+        let storage_dir = test_repo_dir("local-auth-read-retry");
+        let token_path = local_auth_token_path(&storage_dir);
+        fs::write(&token_path, "broken-token").expect("seed invalid session token");
+
+        let repaired_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let writer_token_path = token_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            fs::write(&writer_token_path, repaired_token).expect("repair session token");
+        });
+
+        let resolved = resolve_local_auth(&storage_dir).expect("resolve repaired local auth");
+
+        writer.join().expect("repair thread");
+        assert_eq!(
+            resolved,
+            LocalAuthConfig::BearerToken {
+                token: repaired_token.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_local_auth_rejects_bearer_token_with_internal_whitespace() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::set_var(AUTH_TOKEN_ENV, "abc def");
+
+        let err = resolve_local_auth(&test_repo_dir("local-auth-env-token"))
+            .expect_err("internal whitespace should be rejected");
+
+        assert!(err
+            .to_string()
+            .contains("ATELIA_DAEMON_AUTH_TOKEN must not contain internal whitespace"));
+    }
+
+    #[test]
+    fn resolve_local_auth_rejects_bearer_token_with_boundary_whitespace() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+
+        for token in [" abcdef", "abcdef "] {
+            std::env::set_var(AUTH_TOKEN_ENV, token);
+
+            let err = resolve_local_auth(&test_repo_dir("local-auth-env-token-boundary"))
+                .expect_err("boundary whitespace should be rejected");
+
+            assert!(err
+                .to_string()
+                .contains("ATELIA_DAEMON_AUTH_TOKEN must not have leading or trailing whitespace"));
+        }
+    }
+
+    #[test]
+    fn resolve_local_auth_rejects_bearer_token_with_non_visible_ascii() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+
+        for (label, token) in [("control", "abc\u{0007}def"), ("non_ascii", "abcédef")] {
+            std::env::set_var(AUTH_TOKEN_ENV, token);
+
+            let err = resolve_local_auth(&test_repo_dir(&format!("local-auth-env-token-{label}")))
+                .expect_err("non-visible ASCII should be rejected");
+
+            assert!(err
+                .to_string()
+                .contains("ATELIA_DAEMON_AUTH_TOKEN must contain only visible ASCII characters"));
+        }
+    }
+
+    #[test]
+    fn resolve_local_auth_rejects_weak_pinned_token() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::set_var(AUTH_TOKEN_ENV, "abcdefghijklmnopqrstuvwxyz0123456789-_abcd");
+
+        let err = resolve_local_auth(&test_repo_dir("local-auth-env-weak-token"))
+            .expect_err("weak pinned token should be rejected");
+
+        assert!(err.to_string().contains(
+            "ATELIA_DAEMON_AUTH_TOKEN must be either exactly 64 hexadecimal characters or at least 43 base64url characters using only ASCII alphanumeric, '-' or '_'"
+        ));
+    }
+
+    #[test]
+    fn resolve_local_auth_accepts_valid_pinned_token() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::set_var(
+            AUTH_TOKEN_ENV,
+            "abcdefghijklmnopqrstuvwxyz0123456789-_abcde",
+        );
+
+        let resolved = resolve_local_auth(&test_repo_dir("local-auth-env-valid-token"))
+            .expect("valid pinned token should be accepted");
+
+        assert_eq!(
+            resolved,
+            LocalAuthConfig::BearerToken {
+                token: "abcdefghijklmnopqrstuvwxyz0123456789-_abcde".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_local_auth_rejects_conflicting_disabled_and_token_env() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::set_var(AUTH_DISABLED_ENV, "1");
+        std::env::set_var(AUTH_TOKEN_ENV, "abcdef");
+
+        let err = resolve_local_auth(&test_repo_dir("local-auth-env-conflict"))
+            .expect_err("conflicting envs should be rejected");
+
+        assert!(err.to_string().contains(
+            "ATELIA_DAEMON_AUTH_DISABLED and ATELIA_DAEMON_AUTH_TOKEN are mutually exclusive"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_auth_rejects_invalid_persisted_session_token_file() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::remove_var(AUTH_TOKEN_ENV);
+
+        for (name, contents) in [
+            ("empty", String::new()),
+            ("truncated", String::from("abc123")),
+            ("corrupt", "z".repeat(64)),
+        ] {
+            let storage_dir = test_repo_dir(&format!("local-auth-invalid-{name}"));
+            let token_path = local_auth_token_path(&storage_dir);
+            fs::write(&token_path, contents).expect("seed invalid session token");
+
+            let err = resolve_local_auth(&storage_dir)
+                .expect_err("invalid session token file should fail closed");
+
+            let message = err.to_string();
+            assert!(message.contains("session token file"));
+            assert!(message.contains("must contain exactly 64 hexadecimal characters"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_auth_rejects_symlinked_session_token_file() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::remove_var(AUTH_TOKEN_ENV);
+
+        let storage_dir = test_repo_dir("local-auth-symlink");
+        let token_path = local_auth_token_path(&storage_dir);
+        let real_token_path = storage_dir.join("real-daemon-auth.token");
+        fs::write(
+            &real_token_path,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("seed real token");
+        symlink(&real_token_path, &token_path).expect("seed symlinked token");
+
+        let err = resolve_local_auth(&storage_dir)
+            .expect_err("symlinked session token file should fail closed");
+
+        assert!(err.to_string().contains("session token file"));
+        assert!(err.to_string().contains("must be a regular file"));
+    }
+
+    #[test]
+    fn encode_session_token_formats_lowercase_hex() {
+        let token = encode_session_token(&[0x00, 0x01, 0xab, 0xcd, 0xef, 0xff]);
+
+        assert_eq!(token, "0001abcdefff");
+        assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(token.chars().all(|ch| !ch.is_ascii_uppercase()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_auth_enforces_restrictive_permissions_on_existing_token_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::remove_var(AUTH_TOKEN_ENV);
+
+        let storage_dir = test_repo_dir("local-auth-permissions");
+        let token_path = local_auth_token_path(&storage_dir);
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        fs::write(&token_path, token).expect("seed session token");
+        let mut permissions = fs::metadata(&token_path)
+            .expect("seed token metadata")
+            .permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&token_path, permissions).expect("seed token permissions");
+
+        let resolved = resolve_local_auth(&storage_dir).expect("resolve local auth");
+        assert_eq!(
+            resolved,
+            LocalAuthConfig::BearerToken {
+                token: token.to_string(),
+            }
+        );
+
+        let token_path = local_auth_token_path(&storage_dir);
+        let mode = fs::metadata(&token_path)
+            .expect("session token metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn validate_local_auth_binding_rejects_auth_disabled_on_unsafe_non_loopback_listener() {
+        let _guard = UnsafeAllowNonLoopbackListenEnvGuard::lock();
+        std::env::set_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV, "1");
+        let listen_addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+
+        let err = validate_local_auth_binding(&LocalAuthConfig::Disabled, &listen_addr)
+            .expect_err("auth-disabled non-loopback listener should fail closed");
+
+        assert!(err
+            .to_string()
+            .contains("refusing to combine ATELIA_DAEMON_AUTH_DISABLED=1"));
+    }
+
+    #[test]
+    fn validate_local_auth_binding_rejects_auth_disabled_on_non_loopback_without_escape_hatch() {
+        let _guard = UnsafeAllowNonLoopbackListenEnvGuard::lock();
+        std::env::remove_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV);
+        let listen_addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+
+        let err = validate_local_auth_binding(&LocalAuthConfig::Disabled, &listen_addr)
+            .expect_err("auth-disabled non-loopback listener should fail closed");
+
+        assert!(err
+            .to_string()
+            .contains("refusing to combine ATELIA_DAEMON_AUTH_DISABLED=1"));
     }
 
     #[test]
@@ -4222,7 +5212,7 @@ mod tests {
             })
         };
 
-        let app = build_router(rpc_server.clone());
+        let app = build_router(rpc_server.clone(), disabled_auth());
         let response = app
             .oneshot(
                 Request::builder()
@@ -4307,7 +5297,7 @@ mod tests {
     async fn oversized_list_repositories_request_returns_too_large() {
         let rpc_server = ready_rpc_server();
         let payload = vec![b'a'; MAX_REQUEST_BODY_BYTES + 1];
-        let app = build_router(rpc_server);
+        let app = build_router(rpc_server, disabled_auth());
         let response = app
             .oneshot(
                 Request::builder()
@@ -4329,6 +5319,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_repertoire_route_returns_builtin_projection() {
+        let rpc_server = ready_rpc_server();
+        let response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/repertoire:list",
+            serde_json::json!({}),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], "ok");
+        let entries = payload["data"]["entries"]
+            .as_array()
+            .expect("repertoire entries array");
+        let tool_ids: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry["tool_id"].as_str().expect("tool id"))
+            .collect();
+        assert_eq!(tool_ids, vec!["fs.read", "secretary.echo"]);
+        assert_eq!(entries[0]["timeout_ms"].as_u64(), Some(0));
+        assert_eq!(entries[1]["timeout_ms"].as_u64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn list_repertoire_route_rejects_unknown_fields() {
+        let rpc_server = ready_rpc_server();
+        let response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/repertoire:list",
+            serde_json::json!({
+                "unexpected": true,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["error"]["code"], "invalid_json");
+        assert!(payload["error"]["reason"]
+            .as_str()
+            .expect("error reason")
+            .contains("unknown field"));
+    }
+
+    #[tokio::test]
     async fn local_tcp_health_endpoint_is_reachable_if_socket_allowed() {
         use tokio::net::TcpListener;
 
@@ -4341,7 +5386,12 @@ mod tests {
         let addr = listener.local_addr().expect("listener local addr");
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let server_task = tokio::spawn(run_listener(rpc_server.clone(), listener, shutdown_rx));
+        let server_task = tokio::spawn(run_listener(
+            rpc_server.clone(),
+            disabled_auth(),
+            listener,
+            shutdown_rx,
+        ));
 
         let response = reqwest::get(format!("http://{addr}/v1/health"))
             .await
@@ -4364,6 +5414,39 @@ mod tests {
         let _ = server_task
             .await
             .expect("server task should complete after shutdown");
+    }
+
+    #[tokio::test]
+    async fn run_listener_rejects_disabled_auth_on_unsafe_non_loopback_listener() {
+        use tokio::net::TcpListener;
+
+        let _guard = UnsafeAllowNonLoopbackListenEnvGuard::lock();
+        std::env::set_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV, "1");
+
+        let rpc_server = ready_rpc_server();
+        let listener = match TcpListener::bind("0.0.0.0:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to bind test listener: {error}"),
+        };
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(run_listener(
+            rpc_server,
+            disabled_auth(),
+            listener,
+            shutdown_rx,
+        ));
+
+        let err = tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("run_listener should fail before serving")
+            .expect("server task should not panic")
+            .expect_err("run_listener should reject unsafe listener");
+
+        assert!(err
+            .to_string()
+            .contains("refusing to combine ATELIA_DAEMON_AUTH_DISABLED=1"));
     }
 
     #[tokio::test]

@@ -13,6 +13,11 @@ delegation substrate, and a service broker. Git, GitHub, Linear, memory
 providers, memory strategies, notification systems, review agents, and approval
 agents are extension-provided surfaces.
 
+The current beta repertoire surface projects only the built-in Secretary tools
+that are dispatchable in this beta slice: `fs.read` and `secretary.echo`.
+Broader built-ins may exist in future or runtime-backed slices, but they are
+not claimed by `ListRepertoire` until dispatch exists.
+
 ## Risk Scale
 
 - `R0`: status / capability discovery
@@ -28,7 +33,7 @@ agents are extension-provided surfaces.
 | Area | Capabilities | Risk / Policy | Output | Audit | Customization |
 | --- | --- | --- | --- | --- | --- |
 | local filesystem | `fs.read`, `fs.list`, `fs.search`, `fs.stat`, `fs.diff`, `fs.write`, `fs.patch`, `fs.delete`, `fs.move` | read R1; write R2; `fs.delete`/`fs.move` are Unix-validated and unsupported on non-Unix | TOON tree/list/diff; path scope; truncation; hashes; platform safety flag | actor, path, before/after hash, diff summary | path globs, max bytes, binary handling, diff verbosity |
-| shell/process | `proc.exec` (Unix-only; returns unsupported on non-Unix), `proc.run`, `proc.spawn`, `proc.kill`, `proc.status`, `proc.stream` | explicit argv process exec R2; arbitrary shell R3; privileged patterns R4 | argv, cwd, exit code, duration, inline bounded stdout/stderr | env redaction, timeout, process tree, approval id | allowlist, timeout, cwd, env allowlist, sandbox profile |
+| shell/process | `proc.exec` (Unix-only; returns unsupported on non-Unix), `proc.run` (same explicit-argv runtime path; unsupported on non-Unix), `proc.spawn`, `proc.kill`, `proc.status`, `proc.stream` | explicit argv process exec R2; arbitrary shell R3; privileged patterns R4 | argv, cwd, exit code, duration, inline bounded stdout/stderr | env redaction, timeout, process tree, approval id | allowlist, timeout, cwd, env allowlist, sandbox profile |
 | search/index | `search.files`, `search.text`, `search.symbols`, `search.recent` | read R1 | ranked hits, snippets, scope, truncation | query summary, scope, hit count | max hits, snippet size, path filters |
 | job/task | `job.create`, `job.status`, `job.cancel`, `job.events`, `task.attach_artifact` | status R1; create/cancel R2/R3 by scope | job id, state, owner, blockers, artifact refs | actor, task scope, state transitions | timeout, concurrency, ownership, retention |
 | event stream | `event.subscribe`, `event.publish_internal`, `event.ack` | subscribe R1/R2; publish R2/R3 by topic | event id, topic, source, payload refs | topic, source, delivery state | filters, backpressure, delivery class |
