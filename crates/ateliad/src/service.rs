@@ -536,6 +536,24 @@ impl SecretaryService {
         ))
     }
 
+    /// Find a blocked repository ancestor that covers the repository root being registered.
+    fn blocked_repository_ancestor_for_root(
+        &self,
+        root_path: &str,
+    ) -> ServiceResult<Option<RepositoryRecord>> {
+        let candidate_root = Path::new(root_path);
+        Ok(self
+            .lifecycle
+            .runtime()
+            .store()
+            .list_repositories()?
+            .into_iter()
+            .find(|repository| {
+                repository.trust_state == RepositoryTrustState::Blocked
+                    && candidate_root.starts_with(Path::new(&repository.root_path))
+            }))
+    }
+
     /// Register a new repository and persist it in the store.
     #[allow(dead_code)]
     pub fn register_repository(
@@ -570,6 +588,17 @@ impl SecretaryService {
             record.allowed_path_scope = requested_scope;
         }
         let _requester = request.requester;
+
+        if let Some(blocked_repository) =
+            self.blocked_repository_ancestor_for_root(&record.root_path)?
+        {
+            return Err(ServiceError::Conflict {
+                reason: format!(
+                    "root_path is blocked by repository {}",
+                    blocked_repository.id.as_str()
+                ),
+            });
+        }
 
         if let Some(blocked_policy_decision) =
             self.blocking_policy_decision_for_root(&record.root_path)?
@@ -1276,14 +1305,12 @@ fn validate_repository_allowed_scope(
 }
 
 const REPOSITORY_REGISTRATION_BLOCK_REASON_CODE: &str = "repository_blocked";
-const REPOSITORY_REGISTRATION_BLOCK_CAPABILITY: &str = "filesystem.read";
 const REPOSITORY_REGISTRATION_BLOCK_SCOPE_KIND: &str = "repository";
 const REPOSITORY_REGISTRATION_BLOCK_SCOPE_VALUE: &str = ".";
 
 fn is_repository_registration_block(policy_decision: &atelia_core::PolicyDecision) -> bool {
     policy_decision.outcome == PolicyOutcome::Blocked
         && policy_decision.reason_code.trim() == REPOSITORY_REGISTRATION_BLOCK_REASON_CODE
-        && policy_decision.requested_capability.trim() == REPOSITORY_REGISTRATION_BLOCK_CAPABILITY
         && policy_decision.resource_scope.kind.trim() == REPOSITORY_REGISTRATION_BLOCK_SCOPE_KIND
         && policy_decision.resource_scope.value.trim() == REPOSITORY_REGISTRATION_BLOCK_SCOPE_VALUE
 }
@@ -2216,7 +2243,8 @@ mod tests {
     }
 
     #[test]
-    fn register_rejects_root_covered_by_blocked_policy_decision() {
+    fn register_rejects_root_covered_by_blocked_policy_decision_for_alias_and_non_read_capabilities(
+    ) {
         let svc = ready_service();
         let root = test_repo_dir("blocked-policy-root");
         let child_root = root.join("nested");
@@ -2233,11 +2261,51 @@ mod tests {
             })
             .expect("parent register should succeed");
 
-        svc.lifecycle
-            .runtime()
-            .store()
-            .create_policy_decision(blocked_policy_decision(parent_repository.id.clone(), "."))
-            .expect("policy decision should persist");
+        for requested_capability in ["filesystem-read", "repo.broad.mutation"] {
+            svc.lifecycle
+                .runtime()
+                .store()
+                .create_policy_decision(blocked_policy_decision(
+                    parent_repository.id.clone(),
+                    requested_capability,
+                    ".",
+                ))
+                .expect("policy decision should persist");
+
+            let err = svc
+                .register_repository(RegisterRepositoryRequest {
+                    display_name: format!("child-repo-{requested_capability}"),
+                    root_path: child_root.to_string_lossy().to_string(),
+                    trust_state: RepositoryTrustState::Trusted,
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .unwrap_err();
+
+            assert!(matches!(err, ServiceError::Conflict { .. }));
+        }
+
+        assert_eq!(svc.health().repository_count, 1);
+        let _ = fs::remove_dir_all(child_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_rejects_root_under_blocked_ancestor_repository() {
+        let svc = ready_service();
+        let root = test_repo_dir("blocked-ancestor-root");
+        let child_root = root.join("nested");
+        fs::create_dir_all(&child_root).unwrap();
+        fs::create_dir_all(child_root.join(".git")).unwrap();
+
+        svc.register_repository(RegisterRepositoryRequest {
+            display_name: "blocked-parent".to_string(),
+            root_path: root.to_string_lossy().to_string(),
+            trust_state: RepositoryTrustState::Blocked,
+            allowed_scope: None,
+            requester: None,
+        })
+        .expect("blocked parent register should succeed");
 
         let err = svc
             .register_repository(RegisterRepositoryRequest {
@@ -3440,6 +3508,7 @@ mod tests {
     /// Build a blocked policy decision fixture for repository registration tests.
     fn blocked_policy_decision(
         repository_id: RepositoryId,
+        requested_capability: &str,
         resource_scope_value: &str,
     ) -> PolicyDecision {
         PolicyDecision {
@@ -3450,7 +3519,7 @@ mod tests {
                 id: "service-test".to_string(),
             },
             repository_id,
-            requested_capability: "filesystem.read".to_string(),
+            requested_capability: requested_capability.to_string(),
             resource_scope: ResourceScope {
                 kind: "repository".to_string(),
                 value: resource_scope_value.to_string(),
