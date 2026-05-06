@@ -1308,6 +1308,8 @@ const REPOSITORY_REGISTRATION_BLOCK_REASON_CODE: &str = "repository_blocked";
 const REPOSITORY_REGISTRATION_BLOCK_SCOPE_KIND: &str = "repository";
 const REPOSITORY_REGISTRATION_BLOCK_SCOPE_VALUE: &str = ".";
 
+/// Return `true` when a policy decision blocks repository registration at the
+/// repository root scope.
 fn is_repository_registration_block(policy_decision: &atelia_core::PolicyDecision) -> bool {
     policy_decision.outcome == PolicyOutcome::Blocked
         && policy_decision.reason_code.trim() == REPOSITORY_REGISTRATION_BLOCK_REASON_CODE
@@ -1315,6 +1317,8 @@ fn is_repository_registration_block(policy_decision: &atelia_core::PolicyDecisio
         && policy_decision.resource_scope.value.trim() == REPOSITORY_REGISTRATION_BLOCK_SCOPE_VALUE
 }
 
+/// Return `true` when two repository roots are distinct and one is a strict
+/// ancestor of the other.
 fn roots_strictly_overlap(candidate_root: &Path, blocked_root: &Path) -> bool {
     candidate_root != blocked_root
         && (candidate_root.starts_with(blocked_root) || blocked_root.starts_with(candidate_root))

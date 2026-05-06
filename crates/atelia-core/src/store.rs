@@ -1671,6 +1671,8 @@ fn validate_repository_record(record: &RepositoryRecord) -> StoreResult<()> {
     Ok(())
 }
 
+/// Return `true` when two repository roots are distinct and one is a strict
+/// ancestor of the other.
 fn repository_roots_strictly_overlap(candidate_root: &str, blocked_root: &str) -> bool {
     let candidate_root = Path::new(candidate_root);
     let blocked_root = Path::new(blocked_root);
@@ -1679,6 +1681,8 @@ fn repository_roots_strictly_overlap(candidate_root: &str, blocked_root: &str) -
         && (candidate_root.starts_with(blocked_root) || blocked_root.starts_with(candidate_root))
 }
 
+/// Return `true` when a blocked policy decision targets repository scope at the
+/// root path.
 fn is_root_scoped_repository_block(policy_decision: &PolicyDecision) -> bool {
     policy_decision.outcome == crate::domain::PolicyOutcome::Blocked
         && policy_decision.reason_code.trim() == "repository_blocked"
@@ -1686,6 +1690,8 @@ fn is_root_scoped_repository_block(policy_decision: &PolicyDecision) -> bool {
         && policy_decision.resource_scope.value.trim() == "."
 }
 
+/// Find the first root-scoped blocked policy decision whose repository root
+/// strictly overlaps `root_path`.
 fn root_scoped_blocked_policy_overlapping_repository<'a>(
     inner: &'a InMemoryInner,
     root_path: &str,
