@@ -4,6 +4,7 @@
 //! exposes a synchronous service API for health checks, repository
 //! registration/listing, and the first supported job lifecycle calls.
 
+use atelia_core::policy::{REASON_REPOSITORY_BLOCKED, SCOPE_KIND_REPOSITORY, SCOPE_VALUE_ROOT};
 use atelia_core::{
     canonicalize_job_requested_capability, canonicalize_within_scope,
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
@@ -14,13 +15,13 @@ use atelia_core::{
     InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService, JobPage, JobQuery,
     JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest, ListBlocklistResponse,
     ListExtensionsRequest, ListExtensionsResponse, OutputFormat, PathScope, PolicyDecision,
-    PolicyEngine, PolicyInput, RegistryError, RemoveExtensionRequest, RemoveExtensionResponse,
-    RenderedToolOutput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
-    RollbackExtensionRequest, RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt,
-    RuntimeJobRequest, SecretaryStore, StoreError, ToolInvocationId, ToolOutputDefaults,
-    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
-    ToolOutputSettingsScope, ToolResultId, TruncationMetadata, UpdateExtensionRequest,
-    UpdateExtensionResponse,
+    PolicyEngine, PolicyInput, PolicyOutcome, RegistryError, RemoveExtensionRequest,
+    RemoveExtensionResponse, RenderedToolOutput, RepositoryId, RepositoryRecord,
+    RepositoryTrustState, ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse,
+    RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
+    ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange,
+    ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId, TruncationMetadata,
+    UpdateExtensionRequest, UpdateExtensionResponse,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -514,6 +515,46 @@ impl SecretaryService {
         }
     }
 
+    /// Find a blocked policy decision whose scope overlaps the repository root being registered.
+    fn blocking_policy_decision_for_root(
+        &self,
+        root_path: &str,
+    ) -> ServiceResult<Option<atelia_core::PolicyDecision>> {
+        let candidate_root = Path::new(root_path);
+        let repository_roots = self
+            .lifecycle
+            .runtime()
+            .store()
+            .list_repositories()?
+            .into_iter()
+            .map(|repository| (repository.id, PathBuf::from(repository.root_path)))
+            .collect::<HashMap<_, _>>();
+
+        Ok(blocking_policy_decision_for_candidate_root(
+            candidate_root,
+            repository_roots,
+            self.lifecycle.runtime().store().list_policy_decisions()?,
+        ))
+    }
+
+    /// Find a blocked repository whose root overlaps the repository root being registered.
+    fn blocked_repository_ancestor_for_root(
+        &self,
+        root_path: &str,
+    ) -> ServiceResult<Option<RepositoryRecord>> {
+        let candidate_root = Path::new(root_path);
+        Ok(self
+            .lifecycle
+            .runtime()
+            .store()
+            .list_repositories()?
+            .into_iter()
+            .find(|repository| {
+                repository.trust_state == RepositoryTrustState::Blocked
+                    && roots_strictly_overlap(candidate_root, Path::new(&repository.root_path))
+            }))
+    }
+
     /// Register a new repository and persist it in the store.
     #[allow(dead_code)]
     pub fn register_repository(
@@ -548,6 +589,28 @@ impl SecretaryService {
             record.allowed_path_scope = requested_scope;
         }
         let _requester = request.requester;
+
+        if let Some(blocked_repository) =
+            self.blocked_repository_ancestor_for_root(&record.root_path)?
+        {
+            return Err(ServiceError::Conflict {
+                reason: format!(
+                    "root_path is blocked by repository {}",
+                    blocked_repository.id.as_str()
+                ),
+            });
+        }
+
+        if let Some(blocked_policy_decision) =
+            self.blocking_policy_decision_for_root(&record.root_path)?
+        {
+            return Err(ServiceError::Conflict {
+                reason: format!(
+                    "root_path is blocked by policy decision {}",
+                    blocked_policy_decision.id.as_str()
+                ),
+            });
+        }
 
         self.lifecycle
             .runtime()
@@ -1242,6 +1305,53 @@ fn validate_repository_allowed_scope(
     Ok(())
 }
 
+/// Return `true` when a policy decision blocks repository registration at the
+/// repository root scope.
+fn is_repository_registration_block(policy_decision: &atelia_core::PolicyDecision) -> bool {
+    policy_decision.outcome == PolicyOutcome::Blocked
+        && policy_decision.reason_code.trim() == REASON_REPOSITORY_BLOCKED
+        && policy_decision.resource_scope.kind.trim() == SCOPE_KIND_REPOSITORY
+        && policy_decision.resource_scope.value.trim() == SCOPE_VALUE_ROOT
+}
+
+/// Return `true` when two repository roots are distinct and one is a strict
+/// ancestor of the other.
+fn roots_strictly_overlap(candidate_root: &Path, blocked_root: &Path) -> bool {
+    candidate_root != blocked_root
+        && (candidate_root.starts_with(blocked_root) || blocked_root.starts_with(candidate_root))
+}
+
+/// Find the first blocked policy decision whose canonical scope contains the candidate root.
+fn blocking_policy_decision_for_candidate_root(
+    candidate_root: &Path,
+    repository_roots: HashMap<RepositoryId, PathBuf>,
+    policy_decisions: Vec<atelia_core::PolicyDecision>,
+) -> Option<atelia_core::PolicyDecision> {
+    for policy_decision in policy_decisions {
+        if !is_repository_registration_block(&policy_decision) {
+            continue;
+        }
+
+        let Some(blocked_repository_root) = repository_roots.get(&policy_decision.repository_id)
+        else {
+            continue;
+        };
+        let blocked_scope = match canonicalize_within_scope(
+            blocked_repository_root,
+            Path::new(policy_decision.resource_scope.value.trim()),
+        ) {
+            Ok(scope) => scope,
+            Err(_) => continue,
+        };
+
+        if roots_strictly_overlap(candidate_root, blocked_scope.canonical.as_path()) {
+            return Some(policy_decision);
+        }
+    }
+
+    None
+}
+
 fn actor_signature(actor: &Actor) -> String {
     match actor {
         Actor::User { id, display_name } => {
@@ -1432,8 +1542,9 @@ mod tests {
         ApplyBlocklistRequest, BlockKey, BlockReason, ExtensionCompatibility, ExtensionEntrypoints,
         ExtensionFailure, ExtensionKind, ExtensionManifest, ExtensionPermission,
         ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionServices,
-        InstallExtensionRequest, ListBlocklistRequest, ListExtensionsRequest, ProvenanceSource,
-        RepositoryTrustState, RetryPolicy, RollbackExtensionRequest, EXTENSION_MANIFEST_SCHEMA,
+        InstallExtensionRequest, LedgerTimestamp, ListBlocklistRequest, ListExtensionsRequest,
+        PolicyDecision, PolicyDecisionId, PolicyOutcome, ProvenanceSource, RepositoryTrustState,
+        ResourceScope, RetryPolicy, RiskTier, RollbackExtensionRequest, EXTENSION_MANIFEST_SCHEMA,
         EXTENSION_RPC_PROTOCOL,
     };
     use std::collections::BTreeMap;
@@ -2135,6 +2246,412 @@ mod tests {
         assert!(matches!(err, ServiceError::Conflict { .. }));
         assert_eq!(svc.health().repository_count, 1);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_prefers_duplicate_root_conflict_over_exact_root_blocked_policy_decision() {
+        let svc = ready_service();
+        let root = test_repo_dir("duplicate-blocked-policy");
+
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "repo-a".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("first register should succeed");
+
+        svc.lifecycle
+            .runtime()
+            .store()
+            .create_policy_decision(blocked_policy_decision(
+                repository.id.clone(),
+                "filesystem-read",
+                ".",
+            ))
+            .expect("policy decision should persist");
+
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "repo-b".to_string(),
+                root_path: root.join(".").to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::ReadOnly,
+                allowed_scope: None,
+                requester: None,
+            })
+            .unwrap_err();
+
+        match err {
+            ServiceError::Conflict { reason } => {
+                assert_eq!(reason, "root_path is already registered");
+            }
+            other => panic!("expected duplicate-root conflict, got {other:?}"),
+        }
+        assert_eq!(svc.health().repository_count, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_rejects_root_covered_by_blocked_policy_decision_for_alias_and_non_read_capabilities(
+    ) {
+        for requested_capability in ["filesystem-read", "repo.broad.mutation"] {
+            let svc = ready_service();
+            let root = test_repo_dir(&format!("blocked-policy-root-{requested_capability}"));
+            let child_root = root.join("nested");
+            fs::create_dir_all(&child_root).unwrap();
+            fs::create_dir_all(child_root.join(".git")).unwrap();
+
+            let parent_repository = svc
+                .register_repository(RegisterRepositoryRequest {
+                    display_name: "parent-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    trust_state: RepositoryTrustState::Trusted,
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("parent register should succeed");
+
+            svc.lifecycle
+                .runtime()
+                .store()
+                .create_policy_decision(blocked_policy_decision(
+                    parent_repository.id.clone(),
+                    requested_capability,
+                    ".",
+                ))
+                .expect("policy decision should persist");
+
+            let err = svc
+                .register_repository(RegisterRepositoryRequest {
+                    display_name: format!("child-repo-{requested_capability}"),
+                    root_path: child_root.to_string_lossy().to_string(),
+                    trust_state: RepositoryTrustState::Trusted,
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .unwrap_err();
+
+            assert!(matches!(err, ServiceError::Conflict { .. }));
+            assert_eq!(svc.health().repository_count, 1);
+
+            let _ = fs::remove_dir_all(child_root);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn register_rejects_root_under_blocked_ancestor_repository() {
+        let svc = ready_service();
+        let root = test_repo_dir("blocked-ancestor-root");
+        let child_root = root.join("nested");
+        fs::create_dir_all(&child_root).unwrap();
+        fs::create_dir_all(child_root.join(".git")).unwrap();
+
+        svc.register_repository(RegisterRepositoryRequest {
+            display_name: "blocked-parent".to_string(),
+            root_path: root.to_string_lossy().to_string(),
+            trust_state: RepositoryTrustState::Blocked,
+            allowed_scope: None,
+            requester: None,
+        })
+        .expect("blocked parent register should succeed");
+
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "child-repo".to_string(),
+                root_path: child_root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::Conflict { .. }));
+        assert_eq!(svc.health().repository_count, 1);
+        let _ = fs::remove_dir_all(child_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_rejects_root_over_blocked_child_repository() {
+        let svc = ready_service();
+        let root = test_repo_dir("blocked-child-root");
+        let child_root = root.join("nested");
+        fs::create_dir_all(&child_root).unwrap();
+        fs::create_dir_all(child_root.join(".git")).unwrap();
+
+        svc.register_repository(RegisterRepositoryRequest {
+            display_name: "blocked-child".to_string(),
+            root_path: child_root.to_string_lossy().to_string(),
+            trust_state: RepositoryTrustState::Blocked,
+            allowed_scope: None,
+            requester: None,
+        })
+        .expect("blocked child register should succeed");
+
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::Conflict { .. }));
+        assert_eq!(svc.health().repository_count, 1);
+        let _ = fs::remove_dir_all(child_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_rejects_root_over_root_scoped_blocked_policy_decision_child() {
+        let svc = ready_service();
+        let root = test_repo_dir("blocked-policy-child-root");
+        let child_root = root.join("nested");
+        fs::create_dir_all(&child_root).unwrap();
+        fs::create_dir_all(child_root.join(".git")).unwrap();
+
+        let child_repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "child-repo".to_string(),
+                root_path: child_root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("child register should succeed");
+
+        svc.lifecycle
+            .runtime()
+            .store()
+            .create_policy_decision(blocked_policy_decision(
+                child_repository.id.clone(),
+                "filesystem-read",
+                ".",
+            ))
+            .expect("policy decision should persist");
+
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::Conflict { .. }));
+        assert_eq!(svc.health().repository_count, 1);
+        let _ = fs::remove_dir_all(child_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_accepts_root_covered_by_non_root_blocked_path_like_policy_decision() {
+        let svc = ready_service();
+        let root = test_repo_dir("non-root-blocked-policy-root");
+        let child_root = root.join("nested");
+        fs::create_dir_all(&child_root).unwrap();
+        fs::create_dir_all(child_root.join(".git")).unwrap();
+
+        let parent_repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("parent register should succeed");
+
+        svc.lifecycle
+            .runtime()
+            .store()
+            .create_policy_decision(PolicyDecision {
+                id: PolicyDecisionId::new(),
+                schema_version: 1,
+                created_at: LedgerTimestamp::now(),
+                requester: Actor::System {
+                    id: "service-test".to_string(),
+                },
+                repository_id: parent_repository.id.clone(),
+                requested_capability: "repo.broad.mutation".to_string(),
+                resource_scope: ResourceScope {
+                    kind: "path".to_string(),
+                    value: ".".to_string(),
+                },
+                tool_id: None,
+                provider_id: None,
+                declared_effect: "block repository mutation".to_string(),
+                current_trust_state: RepositoryTrustState::Trusted,
+                approval_available: false,
+                policy_version: atelia_core::DEFAULT_POLICY_VERSION.to_string(),
+                outcome: PolicyOutcome::Blocked,
+                risk_tier: RiskTier::R4,
+                reason_code: "destructive_repository_action_blocked".to_string(),
+                user_reason: "path-scoped blocked action".to_string(),
+                approval_request_ref: None,
+                audit_ref: None,
+                redactions: Vec::new(),
+            })
+            .expect("policy decision should persist");
+
+        let child_repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "child-repo".to_string(),
+                root_path: child_root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("child register should succeed");
+
+        assert_eq!(svc.health().repository_count, 2);
+        assert_eq!(
+            child_repository.root_path,
+            child_root.canonicalize().unwrap().to_string_lossy()
+        );
+        let _ = fs::remove_dir_all(child_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blocking_policy_decision_skips_stale_repository_references() {
+        let candidate_root = Path::new("/tmp/atelia-register-candidate");
+        let stale_decision = PolicyDecision {
+            id: PolicyDecisionId::new(),
+            schema_version: 1,
+            created_at: LedgerTimestamp::now(),
+            requester: Actor::System {
+                id: "service-test".to_string(),
+            },
+            repository_id: RepositoryId::new(),
+            requested_capability: "filesystem.read".to_string(),
+            resource_scope: ResourceScope {
+                kind: "repository".to_string(),
+                value: ".".to_string(),
+            },
+            tool_id: None,
+            provider_id: None,
+            declared_effect: "stale blocked repository reference".to_string(),
+            current_trust_state: RepositoryTrustState::Trusted,
+            approval_available: false,
+            policy_version: atelia_core::DEFAULT_POLICY_VERSION.to_string(),
+            outcome: PolicyOutcome::Blocked,
+            risk_tier: RiskTier::R4,
+            reason_code: "repository_blocked".to_string(),
+            user_reason: "stale repository reference".to_string(),
+            approval_request_ref: None,
+            audit_ref: None,
+            redactions: Vec::new(),
+        };
+
+        let matched = blocking_policy_decision_for_candidate_root(
+            candidate_root,
+            HashMap::new(),
+            vec![stale_decision],
+        );
+
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn blocking_policy_decision_ignores_non_path_scopes() {
+        let source_root = plain_test_dir("register-source-non-path-scope");
+        let candidate_root = source_root.join("candidate");
+        fs::create_dir_all(&candidate_root).unwrap();
+        let repository_id = RepositoryId::new();
+        let mut repository_roots = HashMap::new();
+        repository_roots.insert(repository_id.clone(), source_root.clone());
+
+        let non_path_decision = PolicyDecision {
+            id: PolicyDecisionId::new(),
+            schema_version: 1,
+            created_at: LedgerTimestamp::now(),
+            requester: Actor::System {
+                id: "service-test".to_string(),
+            },
+            repository_id,
+            requested_capability: "filesystem.read".to_string(),
+            resource_scope: ResourceScope {
+                kind: "artifact_ref".to_string(),
+                value: ".".to_string(),
+            },
+            tool_id: None,
+            provider_id: None,
+            declared_effect: "non-path blocked reference".to_string(),
+            current_trust_state: RepositoryTrustState::Trusted,
+            approval_available: false,
+            policy_version: atelia_core::DEFAULT_POLICY_VERSION.to_string(),
+            outcome: PolicyOutcome::Blocked,
+            risk_tier: RiskTier::R4,
+            reason_code: "repository_blocked".to_string(),
+            user_reason: "non-path blocked scope".to_string(),
+            approval_request_ref: None,
+            audit_ref: None,
+            redactions: Vec::new(),
+        };
+
+        let matched = blocking_policy_decision_for_candidate_root(
+            candidate_root.as_path(),
+            repository_roots,
+            vec![non_path_decision],
+        );
+
+        assert!(matched.is_none());
+        let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn blocking_policy_decision_ignores_non_root_blocked_path_like_scope() {
+        let source_root = plain_test_dir("register-source-non-root-path-like");
+        let candidate_root = source_root.join("nested");
+        fs::create_dir_all(&candidate_root).unwrap();
+        let repository_id = RepositoryId::new();
+        let mut repository_roots = HashMap::new();
+        repository_roots.insert(repository_id.clone(), source_root.clone());
+
+        let non_root_blocked_decision = PolicyDecision {
+            id: PolicyDecisionId::new(),
+            schema_version: 1,
+            created_at: LedgerTimestamp::now(),
+            requester: Actor::System {
+                id: "service-test".to_string(),
+            },
+            repository_id,
+            requested_capability: "repo.broad.mutation".to_string(),
+            resource_scope: ResourceScope {
+                kind: "path".to_string(),
+                value: ".".to_string(),
+            },
+            tool_id: None,
+            provider_id: None,
+            declared_effect: "block repository mutation".to_string(),
+            current_trust_state: RepositoryTrustState::Trusted,
+            approval_available: false,
+            policy_version: atelia_core::DEFAULT_POLICY_VERSION.to_string(),
+            outcome: PolicyOutcome::Blocked,
+            risk_tier: RiskTier::R4,
+            reason_code: "destructive_repository_action_blocked".to_string(),
+            user_reason: "path-scoped blocked action".to_string(),
+            approval_request_ref: None,
+            audit_ref: None,
+            redactions: Vec::new(),
+        };
+
+        let matched = blocking_policy_decision_for_candidate_root(
+            candidate_root.as_path(),
+            repository_roots,
+            vec![non_root_blocked_decision],
+        );
+
+        assert!(matched.is_none());
+        let _ = fs::remove_dir_all(source_root);
     }
 
     #[test]
@@ -3113,6 +3630,41 @@ mod tests {
         Actor::User {
             id: "user:test-two".to_string(),
             display_name: Some("Second Actor".to_string()),
+        }
+    }
+
+    /// Build a blocked policy decision fixture for repository registration tests.
+    fn blocked_policy_decision(
+        repository_id: RepositoryId,
+        requested_capability: &str,
+        resource_scope_value: &str,
+    ) -> PolicyDecision {
+        PolicyDecision {
+            id: PolicyDecisionId::new(),
+            schema_version: 1,
+            created_at: LedgerTimestamp::now(),
+            requester: Actor::System {
+                id: "service-test".to_string(),
+            },
+            repository_id,
+            requested_capability: requested_capability.to_string(),
+            resource_scope: ResourceScope {
+                kind: "repository".to_string(),
+                value: resource_scope_value.to_string(),
+            },
+            tool_id: None,
+            provider_id: None,
+            declared_effect: "block repository registration".to_string(),
+            current_trust_state: RepositoryTrustState::Trusted,
+            approval_available: false,
+            policy_version: atelia_core::DEFAULT_POLICY_VERSION.to_string(),
+            outcome: PolicyOutcome::Blocked,
+            risk_tier: RiskTier::R4,
+            reason_code: "repository_blocked".to_string(),
+            user_reason: "repository root is blocked by policy".to_string(),
+            approval_request_ref: None,
+            audit_ref: None,
+            redactions: Vec::new(),
         }
     }
 
