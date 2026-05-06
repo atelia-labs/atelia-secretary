@@ -2316,7 +2316,10 @@ mod tests {
             .expect("child register should succeed");
 
         assert_eq!(svc.health().repository_count, 2);
-        assert_eq!(child_repository.root_path, child_root.to_string_lossy());
+        assert_eq!(
+            child_repository.root_path,
+            child_root.canonicalize().unwrap().to_string_lossy()
+        );
         let _ = fs::remove_dir_all(child_root);
         let _ = fs::remove_dir_all(root);
     }
