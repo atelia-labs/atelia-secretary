@@ -78,7 +78,7 @@ Beta RPC groups:
 
 - `ListRepertoire`: beta repertoire projection を inspect する
 
-Agent が現在の context にある live tool surface の computed projection については [Agent Repertoire](../../atelia/docs/agent-repertoire.ja.md) を参照します。`ListRepertoire` はその projection の最初の beta protocol slice です。
+Agent が現在の context にある live tool surface の computed projection については [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.ja.md) を参照します。`ListRepertoire` はその projection の最初の beta protocol slice です。
 初期 transport は gRPC または別の typed RPC transport で構いません。ただし domain contract は versioned かつ stable にします。
 
 ## Domain Records

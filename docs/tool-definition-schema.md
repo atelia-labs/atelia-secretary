@@ -35,7 +35,7 @@ effects:
 idempotency: idempotent
 streaming: false
 cancellable: true
-timeout_ms: 0
+timeout_ms: 0 # no explicit per-tool timeout; runtime-service defaults apply
 artifact_policy:
   max_primary_tokens: 1200
   large_payload: artifact_ref
@@ -113,6 +113,10 @@ Current shipped beta built-ins:
 
 Other built-ins may exist in future or non-shipped slices, but the current
 beta repertoire projection only exposes the tools above until dispatch exists.
+
+Note: this example uses `fs.search` as an illustrative schema for a future or
+non-shipped built-in. The current shipped beta built-ins are `secretary.echo`
+and `fs.read`.
 
 Future or non-shipped built-ins:
 

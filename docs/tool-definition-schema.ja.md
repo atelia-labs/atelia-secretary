@@ -110,6 +110,8 @@ Secretary built-in は意図的に小さくします。すべての built-in too
 その他の built-in は future または non-shipped slice に存在しうるが、現行の beta repertoire projection が
 公開するのは上記の tool のみで、dispatch が揃うまでは含めません。
 
+注: この例では `fs.search` を future または non-shipped built-in の illustrative schema として使っています。現行の shipped beta built-ins は `secretary.echo` と `fs.read` です。
+
 future または non-shipped built-ins:
 
 - `job.events`
