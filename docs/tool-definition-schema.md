@@ -35,7 +35,7 @@ effects:
 idempotency: idempotent
 streaming: false
 cancellable: true
-timeout_ms: 10000
+timeout_ms: 0 # no explicit per-tool timeout budget yet; 0 means not enforced
 artifact_policy:
   max_primary_tokens: 1200
   large_payload: artifact_ref
@@ -106,26 +106,20 @@ See [Tool Catalog](tool-catalog.md) for the built-in surface boundary.
 Secretary built-ins are intentionally small. Each built-in tool must have a
 definition using this schema before implementation.
 
-Initial built-ins:
+Current shipped beta built-ins:
 
+- `secretary.echo`
 - `fs.read`
-- `fs.list`
-- `fs.search`
-- `fs.stat`
-- `fs.diff`
-- `fs.write`
-- `fs.patch`
-- `proc.run`
-- `proc.spawn`
-- `proc.kill`
-- `proc.status`
-- `proc.stream`
-- `search.files`
-- `search.text`
-- `search.symbols`
-- `job.create`
-- `job.status`
-- `job.cancel`
+
+Other built-ins may exist in future or non-shipped slices, but the current
+beta repertoire projection only exposes the tools above until dispatch exists.
+
+Note: this example uses `fs.search` as an illustrative schema for a future or
+non-shipped built-in. The current shipped beta built-ins are `secretary.echo`
+and `fs.read`.
+
+Future or non-shipped built-ins:
+
 - `job.events`
 - `event.subscribe`
 - `event.publish_internal`

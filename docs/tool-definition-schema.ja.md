@@ -32,7 +32,7 @@ effects:
 idempotency: idempotent
 streaming: false
 cancellable: true
-timeout_ms: 10000
+timeout_ms: 0 # ここで明示的な per-tool timeout は宣言しない。runtime-service defaults が適用される。
 artifact_policy:
   max_primary_tokens: 1200
   large_payload: artifact_ref
@@ -102,26 +102,18 @@ fields:
 
 Secretary built-in は意図的に小さくします。すべての built-in tool は、実装前にこの schema に従う definition を持ちます。
 
-初期 built-ins:
+現行 beta で shipped されている built-ins:
 
+- `secretary.echo`
 - `fs.read`
-- `fs.list`
-- `fs.search`
-- `fs.stat`
-- `fs.diff`
-- `fs.write`
-- `fs.patch`
-- `proc.run`
-- `proc.spawn`
-- `proc.kill`
-- `proc.status`
-- `proc.stream`
-- `search.files`
-- `search.text`
-- `search.symbols`
-- `job.create`
-- `job.status`
-- `job.cancel`
+
+その他の built-in は future または non-shipped slice に存在しうるが、現行の beta repertoire projection が
+公開するのは上記の tool のみで、dispatch が揃うまでは含めません。
+
+注: この例では `fs.search` を future または non-shipped built-in の illustrative schema として使っています。現行の shipped beta built-ins は `secretary.echo` と `fs.read` です。
+
+future または non-shipped built-ins:
+
 - `job.events`
 - `event.subscribe`
 - `event.publish_internal`
