@@ -406,9 +406,13 @@ where
                 audit_record: None,
                 events: final_events,
             };
-            let finalizer = submit_job_idempotency
-                .take()
-                .and_then(|finalizer| finalizer(&final_receipt));
+            let finalizer = if final_receipt.job.status == JobStatus::Succeeded {
+                submit_job_idempotency
+                    .take()
+                    .and_then(|finalizer| finalizer(&final_receipt))
+            } else {
+                None
+            };
             let persisted_event = if let Some((idempotency_key, idempotency_record)) = finalizer {
                 self.store
                     .append_job_event_and_update_job_with_submit_job_idempotency(
@@ -704,9 +708,13 @@ where
             audit_record: Some(audit_record.clone()),
             events: final_events,
         };
-        let finalizer = submit_job_idempotency
-            .take()
-            .and_then(|finalizer| finalizer(&final_receipt));
+        let finalizer = if final_receipt.job.status == JobStatus::Succeeded {
+            submit_job_idempotency
+                .take()
+                .and_then(|finalizer| finalizer(&final_receipt))
+        } else {
+            None
+        };
         let (persisted_result_event, persisted_audit_event, persisted_terminal_event) = self
             .store
             .record_tool_result_audit_terminal_with_submit_job_idempotency(

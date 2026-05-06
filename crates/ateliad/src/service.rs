@@ -24,7 +24,7 @@ use atelia_core::{
     TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse,
 };
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -417,6 +417,7 @@ pub struct SecretaryService {
     extension_registry: Mutex<ExtensionRegistryService>,
     tool_output_settings: Mutex<InMemoryToolOutputSettingsService>,
     idempotent_submissions: Mutex<VecDeque<(String, IdempotentSubmitJob)>>,
+    idempotent_submissions_in_flight: Mutex<HashSet<String>>,
     cancellation_requesters: Mutex<HashMap<JobId, Actor>>,
 }
 
@@ -444,6 +445,7 @@ impl SecretaryService {
                 LedgerTimestamp::now(),
             )),
             idempotent_submissions: VecDeque::new().into(),
+            idempotent_submissions_in_flight: HashSet::new().into(),
             cancellation_requesters: HashMap::new().into(),
         }
     }
@@ -828,9 +830,8 @@ impl SecretaryService {
             .map(str::to_string);
         let request_signature =
             submit_job_request_signature(&request, &normalized_goal, &requested_capabilities);
-        let mut idempotent_cache_lock = if let Some(idempotency_key) =
-            normalized_idempotency_key.as_deref()
-        {
+        let mut idempotent_cache_key = None;
+        if let Some(idempotency_key) = normalized_idempotency_key.as_deref() {
             let mut cache =
                 self.idempotent_submissions
                     .lock()
@@ -878,10 +879,20 @@ impl SecretaryService {
                 });
             }
 
-            Some((idempotency_key.to_string(), cache))
-        } else {
-            None
-        };
+            drop(cache);
+            let mut in_flight = self
+                .idempotent_submissions_in_flight
+                .lock()
+                .map_err(|err| ServiceError::Internal {
+                    reason: format!("idempotency inflight lock poisoned: {err}"),
+                })?;
+            if !in_flight.insert(idempotency_key.to_string()) {
+                return Err(ServiceError::Conflict {
+                    reason: "idempotency_key is already being processed".to_string(),
+                });
+            }
+            idempotent_cache_key = Some(idempotency_key.to_string());
+        }
 
         let tool_output_defaults = self.get_tool_output_defaults(
             ToolOutputSettingsScope::repository(repository.id.clone())
@@ -908,24 +919,23 @@ impl SecretaryService {
 
         let receipt = match tool_kind {
             SubmitJobToolKind::Echo => {
-                let submit_job_finalizer =
-                    idempotent_cache_lock.as_ref().map(|(idempotency_key, _)| {
-                        let idempotency_key = idempotency_key.clone();
-                        let request_signature = request_signature.clone();
-                        move |receipt: &RuntimeJobReceipt| {
-                            if receipt.job.status == JobStatus::Succeeded {
-                                Some((
-                                    idempotency_key.clone(),
-                                    SubmitJobIdempotencyRecord {
-                                        signature: request_signature.clone(),
-                                        receipt: receipt.clone(),
-                                    },
-                                ))
-                            } else {
-                                None
-                            }
+                let submit_job_finalizer = idempotent_cache_key.as_ref().map(|idempotency_key| {
+                    let idempotency_key = idempotency_key.clone();
+                    let request_signature = request_signature.clone();
+                    move |receipt: &RuntimeJobReceipt| {
+                        if receipt.job.status == JobStatus::Succeeded {
+                            Some((
+                                idempotency_key.clone(),
+                                SubmitJobIdempotencyRecord {
+                                    signature: request_signature.clone(),
+                                    receipt: receipt.clone(),
+                                },
+                            ))
+                        } else {
+                            None
                         }
-                    });
+                    }
+                });
                 self.lifecycle.runtime().run_tool_job_with_finalizer(
                     runtime_request,
                     &EchoTool,
@@ -934,24 +944,23 @@ impl SecretaryService {
             }
             SubmitJobToolKind::FsRead => {
                 let tool = FsReadTool::new(&repository.root_path);
-                let submit_job_finalizer =
-                    idempotent_cache_lock.as_ref().map(|(idempotency_key, _)| {
-                        let idempotency_key = idempotency_key.clone();
-                        let request_signature = request_signature.clone();
-                        move |receipt: &RuntimeJobReceipt| {
-                            if receipt.job.status == JobStatus::Succeeded {
-                                Some((
-                                    idempotency_key.clone(),
-                                    SubmitJobIdempotencyRecord {
-                                        signature: request_signature.clone(),
-                                        receipt: receipt.clone(),
-                                    },
-                                ))
-                            } else {
-                                None
-                            }
+                let submit_job_finalizer = idempotent_cache_key.as_ref().map(|idempotency_key| {
+                    let idempotency_key = idempotency_key.clone();
+                    let request_signature = request_signature.clone();
+                    move |receipt: &RuntimeJobReceipt| {
+                        if receipt.job.status == JobStatus::Succeeded {
+                            Some((
+                                idempotency_key.clone(),
+                                SubmitJobIdempotencyRecord {
+                                    signature: request_signature.clone(),
+                                    receipt: receipt.clone(),
+                                },
+                            ))
+                        } else {
+                            None
                         }
-                    });
+                    }
+                });
                 self.lifecycle.runtime().run_tool_job_with_finalizer(
                     runtime_request,
                     &tool,
@@ -959,8 +968,22 @@ impl SecretaryService {
                 )?
             }
         };
-        if let Some((idempotency_key, mut cache)) = idempotent_cache_lock.take() {
+        if let Some(idempotency_key) = idempotent_cache_key {
+            let mut in_flight = self
+                .idempotent_submissions_in_flight
+                .lock()
+                .map_err(|err| ServiceError::Internal {
+                    reason: format!("idempotency inflight lock poisoned: {err}"),
+                })?;
+            in_flight.remove(&idempotency_key);
+
             if receipt.job.status == JobStatus::Succeeded {
+                let mut cache =
+                    self.idempotent_submissions
+                        .lock()
+                        .map_err(|err| ServiceError::Internal {
+                            reason: format!("idempotency cache lock poisoned: {err}"),
+                        })?;
                 cache_idempotent_submission(
                     &mut cache,
                     idempotency_key,

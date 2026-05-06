@@ -1751,6 +1751,15 @@ fn validate_submit_job_idempotency_record(
             ),
         });
     }
+    if record.receipt.job.status != JobStatus::Succeeded {
+        return Err(StoreError::InvalidRecord {
+            collection: "submit_job_idempotency",
+            reason: format!(
+                "idempotency key {} must reference a succeeded submit_job receipt",
+                id_debug(idempotency_key)
+            ),
+        });
+    }
 
     validate_loaded_submit_job_receipt(inner, &record.receipt)
 }
@@ -1788,7 +1797,7 @@ fn validate_loaded_submit_job_receipt(
         });
     }
 
-    validate_loaded_submit_job_receipt_lineage(receipt)?;
+    validate_loaded_submit_job_receipt_lineage(inner, receipt)?;
 
     match (
         &receipt.tool_invocation,
@@ -2018,7 +2027,10 @@ fn validate_loaded_submit_job_receipt_job(
     Ok(())
 }
 
-fn validate_loaded_submit_job_receipt_lineage(receipt: &RuntimeJobReceipt) -> StoreResult<()> {
+fn validate_loaded_submit_job_receipt_lineage(
+    inner: &InMemoryInner,
+    receipt: &RuntimeJobReceipt,
+) -> StoreResult<()> {
     ensure_same_repository(
         "submit_job_idempotency",
         "receipt.policy_decision.repository_id",
@@ -2104,7 +2116,7 @@ fn validate_loaded_submit_job_receipt_lineage(receipt: &RuntimeJobReceipt) -> St
     }
 
     for event in &receipt.events {
-        validate_submit_job_receipt_event_lineage(&receipt.job.id, event)?;
+        validate_submit_job_receipt_event_lineage(inner, &receipt.job.id, event)?;
     }
 
     Ok(())
@@ -2172,7 +2184,7 @@ fn expected_submit_job_receipt_events<'a>(
                     id_debug(event_id)
                 ),
             })?;
-        if submit_job_receipt_event_belongs_to_job(&receipt.job.id, event) {
+        if submit_job_receipt_event_belongs_to_job(inner, &receipt.job.id, event)? {
             if found_latest_event {
                 return Err(StoreError::InvalidRecord {
                     collection: "submit_job_idempotency",
@@ -2204,8 +2216,12 @@ fn expected_submit_job_receipt_events<'a>(
     Ok(expected_events)
 }
 
-fn validate_submit_job_receipt_event_lineage(job_id: &JobId, event: &JobEvent) -> StoreResult<()> {
-    if submit_job_receipt_event_belongs_to_job(job_id, event) {
+fn validate_submit_job_receipt_event_lineage(
+    inner: &InMemoryInner,
+    job_id: &JobId,
+    event: &JobEvent,
+) -> StoreResult<()> {
+    if submit_job_receipt_event_belongs_to_job(inner, job_id, event)? {
         return Ok(());
     }
 
@@ -2219,15 +2235,97 @@ fn validate_submit_job_receipt_event_lineage(job_id: &JobId, event: &JobEvent) -
     })
 }
 
-fn submit_job_receipt_event_belongs_to_job(job_id: &JobId, event: &JobEvent) -> bool {
+fn submit_job_receipt_event_belongs_to_job(
+    inner: &InMemoryInner,
+    job_id: &JobId,
+    event: &JobEvent,
+) -> StoreResult<bool> {
     if let Some(event_job_id) = &event.refs.job_id {
         if event_job_id == job_id {
-            return true;
+            return Ok(true);
         }
     }
 
-    event.subject.subject_type == EventSubjectType::Job
+    if event.subject.subject_type == EventSubjectType::Job
         && event.subject.subject_id == job_id.as_str()
+    {
+        return Ok(true);
+    }
+
+    if let Some(tool_invocation_id) = &event.refs.tool_invocation_id {
+        let tool_invocation = inner
+            .tool_invocations
+            .get(tool_invocation_id)
+            .ok_or_else(|| StoreError::NotFound {
+                collection: "tool_invocations",
+                id: format!(
+                    "{} (submit_job_idempotency.event.refs.tool_invocation_id)",
+                    id_debug(tool_invocation_id)
+                ),
+            })?;
+        if &tool_invocation.job_id == job_id {
+            return Ok(true);
+        }
+    }
+
+    if let Some(tool_result_id) = &event.refs.tool_result_id {
+        let tool_result =
+            inner
+                .tool_results
+                .get(tool_result_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "tool_results",
+                    id: format!(
+                        "{} (submit_job_idempotency.event.refs.tool_result_id)",
+                        id_debug(tool_result_id)
+                    ),
+                })?;
+        let tool_invocation = inner
+            .tool_invocations
+            .get(&tool_result.invocation_id)
+            .ok_or_else(|| StoreError::NotFound {
+                collection: "tool_invocations",
+                id: format!(
+                    "{} (submit_job_idempotency.event.refs.tool_result_id.invocation_id)",
+                    id_debug(&tool_result.invocation_id)
+                ),
+            })?;
+        if &tool_invocation.job_id == job_id {
+            return Ok(true);
+        }
+    }
+
+    if let Some(audit_record_id) = &event.refs.audit_record_id {
+        let audit_record =
+            inner
+                .audit_records
+                .get(audit_record_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    collection: "audit_records",
+                    id: format!(
+                        "{} (submit_job_idempotency.event.refs.audit_record_id)",
+                        id_debug(audit_record_id)
+                    ),
+                })?;
+        if let Some(tool_invocation_id) = &audit_record.tool_invocation_id {
+            let tool_invocation =
+                inner
+                    .tool_invocations
+                    .get(tool_invocation_id)
+                    .ok_or_else(|| StoreError::NotFound {
+                        collection: "tool_invocations",
+                        id: format!(
+                        "{} (submit_job_idempotency.event.refs.audit_record_id.tool_invocation_id)",
+                        id_debug(tool_invocation_id)
+                    ),
+                    })?;
+            if &tool_invocation.job_id == job_id {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 fn insert_submit_job_idempotency_locked(
@@ -7234,31 +7332,51 @@ mod tests {
 
         let job = persist_job(&store, job_record(repository.id.clone()));
         let stale_job = job.clone();
+        let initial_event = store
+            .get_job_event(job.latest_event_id.as_ref().unwrap())
+            .unwrap();
 
-        let mut committed_job = job;
-        committed_job
+        let mut running_job = job.clone();
+        running_job
             .transition_status(JobStatus::Running, timestamp(5))
             .unwrap();
-        let initial_event = store
-            .get_job_event(committed_job.latest_event_id.as_ref().unwrap())
-            .unwrap();
-
-        let mut event = job_event(repository.id.clone());
-        event.subject = EventSubject::job(&committed_job.id);
-        event.kind = JobEventKind::JobStatusChanged {
+        let mut running_event = job_event(repository.id.clone());
+        running_event.subject = EventSubject::job(&job.id);
+        running_event.kind = JobEventKind::JobStatusChanged {
             from: JobStatus::Queued,
             to: JobStatus::Running,
         };
-        event.refs.job_id = Some(committed_job.id.clone());
+        running_event.refs.job_id = Some(job.id.clone());
+        let persisted_running_event = store
+            .append_job_event_and_update_job(running_job.clone(), running_event)
+            .unwrap();
+        running_job.latest_event_id = Some(persisted_running_event.id.clone());
+
+        let mut final_job = running_job.clone();
+        final_job
+            .transition_status(JobStatus::Succeeded, timestamp(6))
+            .unwrap();
+
+        let mut event = job_event(repository.id.clone());
+        event.subject = EventSubject::job(&running_job.id);
+        event.kind = JobEventKind::JobStatusChanged {
+            from: JobStatus::Running,
+            to: JobStatus::Succeeded,
+        };
+        event.refs.job_id = Some(running_job.id.clone());
 
         let receipt = RuntimeJobReceipt {
-            job: stale_job.clone(),
+            job: final_job.clone(),
             policy_decision: policy,
             tool_invocation: None,
             tool_result: None,
             rendered_output: None,
             audit_record: None,
-            events: vec![initial_event, event.clone()],
+            events: vec![
+                initial_event,
+                persisted_running_event.clone(),
+                event.clone(),
+            ],
         };
 
         let submission = SubmitJobIdempotencyRecord {
@@ -7268,21 +7386,21 @@ mod tests {
 
         let persisted_event = store
             .append_job_event_and_update_job_with_submit_job_idempotency(
-                committed_job.clone(),
+                final_job.clone(),
                 event.clone(),
                 "ledger-key".to_string(),
                 submission,
             )
             .unwrap();
 
-        let stored_job = store.get_job(&committed_job.id).unwrap();
+        let stored_job = store.get_job(&job.id).unwrap();
         let stored_submission = store
             .get_submit_job_idempotency("ledger-key")
             .unwrap()
             .expect("idempotency record should exist");
 
-        committed_job.latest_event_id = Some(persisted_event.id.clone());
-        assert_eq!(stored_job, committed_job);
+        final_job.latest_event_id = Some(persisted_event.id.clone());
+        assert_eq!(stored_job, final_job);
         assert_eq!(stored_submission.receipt.job, stored_job);
         assert_ne!(stored_submission.receipt.job, stale_job);
     }
@@ -7403,6 +7521,8 @@ mod tests {
         let mut policy = policy_decision(repository.id.clone());
 
         job.latest_event_id = Some(event.id.clone());
+        job.status = JobStatus::Succeeded;
+        job.completed_at = Some(timestamp(2));
         let mut event = event;
         event.sequence_number = 1;
         policy.repository_id = other_repository.id.clone();
@@ -7470,6 +7590,8 @@ mod tests {
         let event = initial_job_event(repository.id.clone(), &job.id);
         let policy = policy_decision(repository.id.clone());
         job.latest_event_id = Some(event.id.clone());
+        job.status = JobStatus::Succeeded;
+        job.completed_at = Some(timestamp(2));
         let mut event = event;
         event.sequence_number = 1;
 
@@ -7565,6 +7687,8 @@ mod tests {
         let mut job = job_record(repository.id.clone());
         let mut event = initial_job_event(repository.id.clone(), &job.id);
         job.latest_event_id = Some(event.id.clone());
+        job.status = JobStatus::Succeeded;
+        job.completed_at = Some(timestamp(2));
 
         let mut other_job = job_record(repository.id.clone());
         let mut other_event = initial_job_event(repository.id.clone(), &other_job.id);
