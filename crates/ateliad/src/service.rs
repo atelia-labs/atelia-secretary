@@ -10,23 +10,22 @@ use atelia_core::{
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
     CancelJobReceipt, DefaultPolicyEngine, DisableExtensionRequest, DisableExtensionResponse,
     EchoTool, EnableExtensionRequest, EnableExtensionResponse, EventCursor, EventPage, EventQuery,
-    EventRefs, EventSeverity, EventSubject, ExtensionRegistryService, ExtensionStatusRequest,
-    ExtensionStatusResponse, FsReadTool, InMemoryStore, InMemoryToolOutputSettingsService,
-    InstallExtensionRequest, InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService,
-    JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
-    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
-    OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput, PolicyOutcome,
-    RegistryError, RemoveExtensionRequest, RemoveExtensionResponse, RenderedToolOutput,
-    RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RollbackExtensionRequest,
-    RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore,
-    StoreError, SubmitJobIdempotencyRecord, ToolInvocationId, ToolOutputDefaults,
-    ToolOutputOverrides,
+    ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, FsReadTool,
+    InMemoryStore, InMemoryToolOutputSettingsService, InstallExtensionRequest,
+    InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService, JobPage, JobQuery,
+    JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest, ListBlocklistResponse,
+    ListExtensionsRequest, ListExtensionsResponse, OutputFormat, PathScope, PolicyDecision,
+    PolicyEngine, PolicyInput, PolicyOutcome, RegistryError, RemoveExtensionRequest,
+    RemoveExtensionResponse, RenderedToolOutput, RepositoryId, RepositoryRecord,
+    RepositoryTrustState, ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse,
+    RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
+    SubmitJobIdempotencyRecord, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
     TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse,
 };
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -1159,6 +1158,11 @@ impl SecretaryService {
     /// Atomically snapshot retained events and subscribe to future events.
     #[allow(dead_code)]
     pub fn watch_events_live(&self, query: EventQuery) -> ServiceResult<LiveEventSubscription> {
+        if query.page_size == Some(0) {
+            return Err(ServiceError::InvalidArgument {
+                reason: "page_size must be greater than 0".to_string(),
+            });
+        }
         let (events, receiver, resolved_cursor_sequence) = self
             .lifecycle
             .runtime()
@@ -1722,10 +1726,10 @@ impl Default for SecretaryService {
 mod tests {
     use super::*;
     use atelia_core::{
-        ApplyBlocklistRequest, BlockKey, BlockReason, ExtensionCompatibility, ExtensionEntrypoints,
-        ExtensionFailure, ExtensionKind, ExtensionManifest, ExtensionPermission,
-        ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionServices, EventRefs,
-        EventSeverity, EventSubject, InstallExtensionRequest, JobEventId, JobEventKind,
+        ApplyBlocklistRequest, BlockKey, BlockReason, EventRefs, EventSeverity, EventSubject,
+        ExtensionCompatibility, ExtensionEntrypoints, ExtensionFailure, ExtensionKind,
+        ExtensionManifest, ExtensionPermission, ExtensionPublisher, ExtensionRealm,
+        ExtensionRuntime, ExtensionServices, InstallExtensionRequest, JobEventId, JobEventKind,
         LedgerTimestamp, ListBlocklistRequest, ListExtensionsRequest, PolicyDecision,
         PolicyDecisionId, PolicyOutcome, ProvenanceSource, RepositoryTrustState, ResourceScope,
         RetryPolicy, RiskTier, RollbackExtensionRequest, EXTENSION_MANIFEST_SCHEMA,
@@ -3123,7 +3127,19 @@ mod tests {
     }
 
     #[test]
-    fn watch_events_live_drains_retained_pages_before_streaming() {
+    fn watch_events_live_rejects_zero_page_size() {
+        let svc = ready_service();
+        match svc.watch_events_live(EventQuery {
+            page_size: Some(0),
+            ..EventQuery::default()
+        }) {
+            Err(ServiceError::InvalidArgument { .. }) => {}
+            _ => panic!("expected invalid page_size to be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_events_live_drains_retained_pages_before_streaming() {
         let svc = ready_service();
         let root = test_repo_dir("watch-events-live-retained-pages");
 
@@ -3150,7 +3166,7 @@ mod tests {
             .append_job_event(test_job_event(&repository.id, 2))
             .expect("second retained event should append");
 
-        let live = svc
+        let mut live = svc
             .watch_events_live(EventQuery {
                 repository_id: Some(repository.id.clone()),
                 cursor: EventCursor::Beginning,
@@ -3188,6 +3204,23 @@ mod tests {
         );
         assert_eq!(live.replay_max_sequence, Some(second_event.sequence_number));
         assert_eq!(live.resolved_cursor_sequence, None);
+
+        let live_event = svc
+            .lifecycle
+            .runtime()
+            .store()
+            .append_job_event(test_job_event(&repository.id, 3))
+            .expect("post-snapshot event should append");
+        let received = live
+            .receiver
+            .recv()
+            .await
+            .expect("live receiver should get post-snapshot event");
+        assert_eq!(received.sequence_number, live_event.sequence_number);
+        assert!(
+            received.sequence_number > live.replay_max_sequence.expect("replay boundary"),
+            "live delivery should advance beyond replay boundary"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

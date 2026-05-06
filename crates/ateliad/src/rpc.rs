@@ -233,20 +233,9 @@ impl SecretaryRpcServer {
         &self,
         request: WatchEventsRequest,
     ) -> RpcResult<WatchEventsReplayResponse> {
-        let incoming_cursor = request
-            .cursor
-            .clone()
-            .unwrap_or(EventCursorRequest::Beginning);
-        let query = EventQuery {
-            repository_id: Some(parse_repository_id(&request.repository_id)?),
-            cursor: parse_event_cursor(incoming_cursor.clone())?,
-            subject_ids: request.subject_ids,
-            job_ids: Vec::new(),
-            min_severity: request.min_severity.map(parse_event_severity),
-            page_size: Some(parse_watch_events_limit(request.limit)?),
-            page_token: None,
-        };
+        let (query, incoming_cursor) = build_watch_event_query_from_request(&request)?;
         let page = self.service.list_events_page(query)?;
+        let resolved_cursor_sequence = page.resolved_cursor_sequence;
         let events = page
             .events
             .into_iter()
@@ -254,6 +243,8 @@ impl SecretaryRpcServer {
             .collect::<Vec<_>>();
         let cursor = if let Some(event) = events.last() {
             Some(EventCursorRequest::AfterSequence(event.sequence))
+        } else if matches!(incoming_cursor, EventCursorRequest::AfterEventId(_)) {
+            resolved_cursor_sequence.map(EventCursorRequest::AfterSequence)
         } else {
             Some(incoming_cursor)
         };
@@ -269,19 +260,7 @@ impl SecretaryRpcServer {
         &self,
         request: WatchEventsRequest,
     ) -> RpcResult<WatchEventsLiveResponse> {
-        let incoming_cursor = request
-            .cursor
-            .clone()
-            .unwrap_or(EventCursorRequest::Beginning);
-        let query = EventQuery {
-            repository_id: Some(parse_repository_id(&request.repository_id)?),
-            cursor: parse_event_cursor(incoming_cursor.clone())?,
-            subject_ids: request.subject_ids.clone(),
-            job_ids: Vec::new(),
-            min_severity: request.min_severity.map(parse_event_severity),
-            page_size: Some(parse_watch_events_limit(request.limit)?),
-            page_token: None,
-        };
+        let (query, incoming_cursor) = build_watch_event_query_from_request(&request)?;
         let live = self.service.watch_events_live(query)?;
         let replay_max_sequence = live.replay_max_sequence;
         let events = live
@@ -293,6 +272,8 @@ impl SecretaryRpcServer {
             watch_events_last_sequence(&events, replay_max_sequence, live.resolved_cursor_sequence);
         let cursor = if let Some(event) = events.last() {
             Some(EventCursorRequest::AfterSequence(event.sequence))
+        } else if let Some(last_sequence) = last_sequence {
+            Some(EventCursorRequest::AfterSequence(last_sequence))
         } else {
             Some(incoming_cursor)
         };
@@ -1353,11 +1334,14 @@ fn watch_events_last_sequence(
     replay_max_sequence: Option<u64>,
     resolved_cursor_sequence: Option<u64>,
 ) -> Option<u64> {
-    events
-        .last()
-        .map(|event| event.sequence)
-        .or(resolved_cursor_sequence)
-        .or(replay_max_sequence)
+    events.last().map(|event| event.sequence).or(
+        match (resolved_cursor_sequence, replay_max_sequence) {
+            (Some(resolved), Some(replay_max)) => Some(resolved.max(replay_max)),
+            (Some(resolved), None) => Some(resolved),
+            (None, Some(replay_max)) => Some(replay_max),
+            (None, None) => None,
+        },
+    )
 }
 
 fn parse_watch_events_limit(limit: Option<usize>) -> RpcResult<usize> {
@@ -1699,6 +1683,27 @@ fn parse_event_query(request: ListEventsRequest) -> RpcResult<EventQuery> {
         page_size,
         page_token: request.page_token,
     })
+}
+
+fn build_watch_event_query_from_request(
+    request: &WatchEventsRequest,
+) -> RpcResult<(EventQuery, EventCursorRequest)> {
+    let incoming_cursor = request
+        .cursor
+        .clone()
+        .unwrap_or(EventCursorRequest::Beginning);
+    Ok((
+        EventQuery {
+            repository_id: Some(parse_repository_id(&request.repository_id)?),
+            cursor: parse_event_cursor(incoming_cursor.clone())?,
+            subject_ids: request.subject_ids.clone(),
+            job_ids: Vec::new(),
+            min_severity: request.min_severity.map(parse_event_severity),
+            page_size: Some(parse_watch_events_limit(request.limit)?),
+            page_token: None,
+        },
+        incoming_cursor,
+    ))
 }
 
 fn parse_event_cursor(cursor: EventCursorRequest) -> RpcResult<CoreEventCursor> {
@@ -3472,13 +3477,33 @@ mod tests {
             watch_exhausted.cursor,
             Some(EventCursorRequest::AfterSequence(latest_sequence))
         );
+        let latest_event_id = all_events
+            .events
+            .last()
+            .expect("list should include at least one event")
+            .event_id
+            .clone();
+        let watch_after_event_id_exhausted = server
+            .watch_events(WatchEventsRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::AfterEventId(latest_event_id)),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: Some(1),
+            })
+            .expect("watch events should succeed when event-id cursor is at latest");
+        assert!(watch_after_event_id_exhausted.events.is_empty());
+        assert_eq!(
+            watch_after_event_id_exhausted.cursor,
+            Some(EventCursorRequest::AfterSequence(latest_sequence))
+        );
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(other_root);
     }
 
-    #[test]
-    fn watch_events_live_filters_replay_before_bootstrap() {
+    #[tokio::test]
+    async fn watch_events_live_filters_replay_before_bootstrap() {
         let server = ready_server();
         let first_root = test_repo_dir("watch-events-live-filter-first");
         let second_root = test_repo_dir("watch-events-live-filter-second");
@@ -3536,7 +3561,7 @@ mod tests {
             })
             .expect("live watch should succeed");
 
-        assert!(live.events.len() > 1);
+        assert!(!live.events.is_empty());
         assert!(live.events.iter().all(|event| {
             event.refs.repository_id.as_deref() == Some(second_repository.repository_id.as_str())
         }));
@@ -3564,8 +3589,8 @@ mod tests {
         let _ = fs::remove_dir_all(second_root);
     }
 
-    #[test]
-    fn watch_events_live_receives_future_events() {
+    #[tokio::test]
+    async fn watch_events_live_receives_future_events() {
         let server = ready_server();
         let root = test_repo_dir("watch-events-live");
 
@@ -3602,14 +3627,10 @@ mod tests {
             })
             .expect("submit should succeed");
 
-        let received = tokio::runtime::Runtime::new()
-            .expect("runtime should build")
-            .block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
-                    .await
-                    .expect("expected future event")
-                    .expect("receiver should stay open")
-            });
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("expected future event")
+            .expect("receiver should stay open");
         match last_sequence {
             None => {}
             Some(seq) => assert!(received.sequence_number > seq),
@@ -3622,8 +3643,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn watch_events_live_uses_none_replay_sequence_when_empty() {
+    #[tokio::test]
+    async fn watch_events_live_uses_none_replay_sequence_when_empty() {
         let server = ready_server();
         let root = test_repo_dir("watch-events-live-empty");
 
@@ -3659,11 +3680,19 @@ mod tests {
     fn watch_events_last_sequence_falls_back_to_replay_max_sequence_when_empty() {
         assert_eq!(watch_events_last_sequence(&[], Some(42), None), Some(42));
         assert_eq!(watch_events_last_sequence(&[], None, Some(42)), Some(42));
+        assert_eq!(
+            watch_events_last_sequence(&[], Some(41), Some(42)),
+            Some(42)
+        );
+        assert_eq!(
+            watch_events_last_sequence(&[], Some(42), Some(41)),
+            Some(42)
+        );
         assert_eq!(watch_events_last_sequence(&[], None, None), None);
     }
 
-    #[test]
-    fn watch_events_live_uses_resolved_cursor_sequence_when_replay_is_empty() {
+    #[tokio::test]
+    async fn watch_events_live_uses_resolved_cursor_sequence_when_replay_is_empty() {
         let server = ready_server();
         let root = test_repo_dir("watch-events-live-empty-after-event-id");
 

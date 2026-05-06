@@ -80,6 +80,7 @@ impl Default for EventQuery {
 pub struct EventPage {
     pub events: Vec<JobEvent>,
     pub next_page_token: Option<String>,
+    pub resolved_cursor_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -380,34 +381,93 @@ impl InMemoryStore {
     fn subscribe_repository_job_events(
         &self,
         repository_id: &RepositoryId,
-    ) -> broadcast::Receiver<JobEvent> {
-        self.repository_event_broadcaster(repository_id).subscribe()
+    ) -> StoreResult<broadcast::Receiver<JobEvent>> {
+        Ok(self
+            .repository_event_broadcaster(repository_id)?
+            .subscribe())
     }
 
     fn repository_event_broadcaster(
         &self,
         repository_id: &RepositoryId,
-    ) -> broadcast::Sender<JobEvent> {
-        let mut broadcasters = self
-            .repository_event_broadcasters
-            .lock()
-            .expect("repository event broadcaster lock poisoned");
-        broadcasters
+    ) -> StoreResult<broadcast::Sender<JobEvent>> {
+        let mut broadcasters =
+            self.repository_event_broadcasters
+                .lock()
+                .map_err(|_| StoreError::Conflict {
+                    collection: "repository_event_broadcasters",
+                    reason: "in-memory repository event broadcaster lock was poisoned".to_string(),
+                })?;
+        Ok(broadcasters
             .entry(repository_id.clone())
             .or_insert_with(Self::new_event_broadcaster)
-            .clone()
+            .clone())
     }
 
-    fn publish_job_events(&self, inner: &InMemoryInner, events: &[JobEvent]) {
+    fn prepare_job_event_publish(
+        &self,
+        inner: &InMemoryInner,
+        events: &[JobEvent],
+    ) -> StoreResult<Vec<(JobEvent, Option<broadcast::Sender<JobEvent>>)>> {
+        let mut targets = Vec::with_capacity(events.len());
         for event in events {
-            let event = event.clone();
+            let repository_broadcaster = match event_repository_id(inner, event)? {
+                Some(repository_id) => Some(self.repository_event_broadcaster(&repository_id)?),
+                None => None,
+            };
+            targets.push((event.clone(), repository_broadcaster));
+        }
+
+        Ok(targets)
+    }
+
+    fn publish_job_events(&self, targets: Vec<(JobEvent, Option<broadcast::Sender<JobEvent>>)>) {
+        for (event, repository_broadcaster) in targets {
             let _ = self.event_broadcaster.send(event.clone());
-            if let Ok(Some(repository_id)) = event_repository_id(inner, &event) {
-                let _ = self
-                    .repository_event_broadcaster(&repository_id)
-                    .send(event);
+            if let Some(repository_broadcaster) = repository_broadcaster {
+                let _ = repository_broadcaster.send(event);
             }
         }
+    }
+
+    fn filtered_job_event_receiver(
+        &self,
+        receiver: broadcast::Receiver<JobEvent>,
+        query: EventQuery,
+        resolved_cursor_sequence: Option<u64>,
+    ) -> broadcast::Receiver<JobEvent> {
+        let sender = Self::new_event_broadcaster();
+        let filtered_receiver = sender.subscribe();
+        let store = self.clone();
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(forward_filtered_job_events(
+                    receiver,
+                    sender,
+                    store,
+                    query,
+                    resolved_cursor_sequence,
+                ));
+            }
+            Err(_) => {
+                let _ = std::thread::Builder::new()
+                    .name("atelia-watch-event-filter".to_string())
+                    .spawn(move || {
+                        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread().build() {
+                            runtime.block_on(forward_filtered_job_events(
+                                receiver,
+                                sender,
+                                store,
+                                query,
+                                resolved_cursor_sequence,
+                            ));
+                        }
+                    });
+            }
+        }
+
+        filtered_receiver
     }
 
     fn mutate<R>(
@@ -431,11 +491,12 @@ impl InMemoryStore {
         let mut guard = self.lock()?;
         let mut draft = guard.clone();
         let (result, events) = mutator(&mut draft)?;
+        let publish_targets = self.prepare_job_event_publish(&draft, &events)?;
         if let Some(snapshot_path) = &self.durable_snapshot_path {
             persist_durable_snapshot(snapshot_path, &draft)?;
         }
         *guard = draft;
-        self.publish_job_events(&guard, &events);
+        self.publish_job_events(publish_targets);
         Ok(result)
     }
 
@@ -455,6 +516,35 @@ impl Default for InMemoryStore {
             durable_snapshot_path: None,
             event_broadcaster: InMemoryStore::new_event_broadcaster(),
             repository_event_broadcasters: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+async fn forward_filtered_job_events(
+    mut receiver: broadcast::Receiver<JobEvent>,
+    sender: broadcast::Sender<JobEvent>,
+    store: InMemoryStore,
+    query: EventQuery,
+    resolved_cursor_sequence: Option<u64>,
+) {
+    if sender.receiver_count() == 0 {
+        return;
+    }
+    loop {
+        let event = match receiver.recv().await {
+            Ok(event) => event,
+            Err(broadcast::error::RecvError::Lagged(_)) => break,
+            Err(broadcast::error::RecvError::Closed) => break,
+        };
+        if resolved_cursor_sequence.is_some_and(|sequence| event.sequence_number <= sequence) {
+            continue;
+        }
+        let should_forward = store
+            .lock()
+            .and_then(|inner| event_matches_query(&inner, &event, &query))
+            .unwrap_or(false);
+        if should_forward {
+            let _ = sender.send(event);
         }
     }
 }
@@ -677,7 +767,7 @@ impl SecretaryStore for InMemoryStore {
         idempotency_key: String,
         mut idempotency_record: SubmitJobIdempotencyRecord,
     ) -> StoreResult<JobEvent> {
-        self.mutate(|inner| {
+        self.mutate_with_published_events(|inner| {
             validate_job_update(inner, &record, &event)?;
             validate_new_job_event(inner, &event, None)?;
 
@@ -691,7 +781,7 @@ impl SecretaryStore for InMemoryStore {
             idempotency_record.receipt.job = committed_job;
             insert_submit_job_idempotency_locked(inner, idempotency_key, idempotency_record)?;
 
-            Ok(event)
+            Ok((event.clone(), vec![event]))
         })
     }
 
@@ -778,8 +868,8 @@ impl SecretaryStore for InMemoryStore {
         query: EventQuery,
     ) -> StoreResult<(Vec<JobEvent>, broadcast::Receiver<JobEvent>, Option<u64>)> {
         let inner = self.lock()?;
-        let receiver = match query.repository_id.as_ref() {
-            Some(repository_id) => self.subscribe_repository_job_events(repository_id),
+        let raw_receiver = match query.repository_id.as_ref() {
+            Some(repository_id) => self.subscribe_repository_job_events(repository_id)?,
             None => self.event_broadcaster.subscribe(),
         };
         let resolved_cursor_sequence = match query.cursor.clone() {
@@ -791,21 +881,9 @@ impl SecretaryStore for InMemoryStore {
             )?),
         };
         let filtered = collect_filtered_job_events(&inner, &query)?;
-        let page_size = query.page_size.unwrap_or(usize::MAX);
-        let page_token = query.page_token.clone();
-        let start = page_start(page_token.as_deref(), "job_events")?;
-        let filtered_len = filtered.len();
-        let events = filtered
-            .into_iter()
-            .skip(start)
-            .cloned()
-            .collect::<Vec<_>>();
-        let next_start = start.saturating_add(page_size);
-        let _next_page_token = if page_size != 0 && filtered_len > next_start {
-            Some(next_start.to_string())
-        } else {
-            None
-        };
+        let events = filtered.into_iter().cloned().collect::<Vec<_>>();
+        let receiver =
+            self.filtered_job_event_receiver(raw_receiver, query, resolved_cursor_sequence);
 
         Ok((events, receiver, resolved_cursor_sequence))
     }
@@ -814,6 +892,14 @@ impl SecretaryStore for InMemoryStore {
         let inner = self.lock()?;
         let start = page_start(query.page_token.as_deref(), "job_events")?;
         let page_size = query.page_size.unwrap_or(usize::MAX);
+        let resolved_cursor_sequence = match query.cursor.clone() {
+            EventCursor::Beginning => None,
+            EventCursor::AfterSequence(sequence) => Some(sequence),
+            EventCursor::AfterEventId(id) => Some(event_cursor_sequence(
+                &inner,
+                EventCursor::AfterEventId(id),
+            )?),
+        };
         let filtered = collect_filtered_job_events(&inner, &query)?;
 
         let (event_refs, next_page_token) = page_records(filtered.into_iter(), start, page_size);
@@ -822,6 +908,7 @@ impl SecretaryStore for InMemoryStore {
         Ok(EventPage {
             events,
             next_page_token,
+            resolved_cursor_sequence,
         })
     }
 
@@ -1277,7 +1364,7 @@ impl SecretaryStore for InMemoryStore {
             idempotency,
         } = request;
 
-        self.mutate(|inner| {
+        self.mutate_with_published_events(|inner| {
             validate_sibling_event_ids_are_unique(&tool_result_event, &audit_event)?;
             validate_sibling_event_ids_are_unique(&tool_result_event, &terminal_event)?;
             validate_sibling_event_ids_are_unique(&audit_event, &terminal_event)?;
@@ -1388,7 +1475,14 @@ impl SecretaryStore for InMemoryStore {
                 insert_submit_job_idempotency_locked(inner, idempotency_key, idempotency_record)?;
             }
 
-            Ok((tool_result_event, audit_event, terminal_event))
+            Ok((
+                (
+                    tool_result_event.clone(),
+                    audit_event.clone(),
+                    terminal_event.clone(),
+                ),
+                vec![tool_result_event, audit_event, terminal_event],
+            ))
         })
     }
 
@@ -5120,16 +5214,33 @@ mod tests {
 
     #[test]
     fn append_events_publish_in_commit_order() {
-        let store = InMemoryStore::new();
+        let store = Arc::new(InMemoryStore::new());
         let repository = repository_record();
 
         store.create_repository(repository.clone()).unwrap();
         let mut receiver = store.subscribe_job_events();
 
-        let first = store
-            .append_job_event(job_event(repository.id.clone()))
-            .unwrap();
-        let second = store.append_job_event(job_event(repository.id)).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let first_store = Arc::clone(&store);
+        let first_barrier = Arc::clone(&barrier);
+        let first_repository_id = repository.id.clone();
+        let first_handle = thread::spawn(move || {
+            first_barrier.wait();
+            first_store.append_job_event(job_event(first_repository_id))
+        });
+
+        let second_store = Arc::clone(&store);
+        let second_barrier = Arc::clone(&barrier);
+        let second_repository_id = repository.id.clone();
+        let second_handle = thread::spawn(move || {
+            second_barrier.wait();
+            second_store.append_job_event(job_event(second_repository_id))
+        });
+
+        let first = first_handle.join().unwrap().unwrap();
+        let second = second_handle.join().unwrap().unwrap();
+        let mut expected_sequences = vec![first.sequence_number, second.sequence_number];
+        expected_sequences.sort_unstable();
 
         let received = [
             receiver.blocking_recv().expect("first event should arrive"),
@@ -5143,99 +5254,150 @@ mod tests {
                 .iter()
                 .map(|event| event.sequence_number)
                 .collect::<Vec<_>>(),
-            vec![first.sequence_number, second.sequence_number]
+            expected_sequences
         );
     }
 
     #[test]
     fn watch_job_events_live_returns_retained_events_and_future_append_once() {
-        let store = InMemoryStore::new();
-        let repository = repository_record();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let store = InMemoryStore::new();
+                let repository = repository_record();
 
-        store.create_repository(repository.clone()).unwrap();
-        let first = store
-            .append_job_event(job_event(repository.id.clone()))
-            .unwrap();
-        let second = store
-            .append_job_event(job_event(repository.id.clone()))
-            .unwrap();
+                store.create_repository(repository.clone()).unwrap();
+                let first = store
+                    .append_job_event(job_event(repository.id.clone()))
+                    .unwrap();
+                let second = store
+                    .append_job_event(job_event(repository.id.clone()))
+                    .unwrap();
 
-        let (events, mut receiver, resolved_cursor_sequence) = store
-            .watch_job_events_live(EventQuery {
-                repository_id: Some(repository.id.clone()),
-                cursor: EventCursor::Beginning,
-                subject_ids: Vec::new(),
-                job_ids: Vec::new(),
-                min_severity: None,
-                page_size: Some(1),
-                page_token: None,
-            })
-            .unwrap();
+                let (events, mut receiver, resolved_cursor_sequence) = store
+                    .watch_job_events_live(EventQuery {
+                        repository_id: Some(repository.id.clone()),
+                        cursor: EventCursor::Beginning,
+                        subject_ids: Vec::new(),
+                        job_ids: Vec::new(),
+                        min_severity: None,
+                        page_size: Some(1),
+                        page_token: None,
+                    })
+                    .unwrap();
 
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event.sequence_number)
-                .collect::<Vec<_>>(),
-            vec![first.sequence_number, second.sequence_number]
-        );
-        assert_eq!(resolved_cursor_sequence, None);
+                assert_eq!(
+                    events
+                        .iter()
+                        .map(|event| event.sequence_number)
+                        .collect::<Vec<_>>(),
+                    vec![first.sequence_number, second.sequence_number]
+                );
+                assert_eq!(resolved_cursor_sequence, None);
 
-        let third = store.append_job_event(job_event(repository.id)).unwrap();
-        let received = receiver
-            .blocking_recv()
-            .expect("future event should arrive");
+                let third = store.append_job_event(job_event(repository.id)).unwrap();
+                let received = receiver.recv().await.expect("future event should arrive");
 
-        assert_eq!(received.sequence_number, third.sequence_number);
-        assert!(receiver.try_recv().is_err());
-        assert!(events
-            .iter()
-            .all(|event| event.sequence_number != third.sequence_number));
+                assert_eq!(received.sequence_number, third.sequence_number);
+                assert!(receiver.try_recv().is_err());
+                assert!(events
+                    .iter()
+                    .all(|event| event.sequence_number != third.sequence_number));
+            });
     }
 
     #[test]
     fn watch_job_events_live_ignores_unrelated_repository_volume() {
-        let store = InMemoryStore::new();
-        let watched_repository = repository_record();
-        let noisy_repository = repository_record();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let store = InMemoryStore::new();
+                let watched_repository = repository_record();
+                let noisy_repository = repository_record();
 
-        store.create_repository(watched_repository.clone()).unwrap();
-        store.create_repository(noisy_repository.clone()).unwrap();
+                store.create_repository(watched_repository.clone()).unwrap();
+                store.create_repository(noisy_repository.clone()).unwrap();
 
-        let (events, mut receiver, resolved_cursor_sequence) = store
-            .watch_job_events_live(EventQuery {
-                repository_id: Some(watched_repository.id.clone()),
-                cursor: EventCursor::Beginning,
-                subject_ids: Vec::new(),
-                job_ids: Vec::new(),
-                min_severity: None,
-                page_size: Some(1),
-                page_token: None,
-            })
-            .unwrap();
+                let (events, mut receiver, resolved_cursor_sequence) = store
+                    .watch_job_events_live(EventQuery {
+                        repository_id: Some(watched_repository.id.clone()),
+                        cursor: EventCursor::Beginning,
+                        subject_ids: Vec::new(),
+                        job_ids: Vec::new(),
+                        min_severity: None,
+                        page_size: Some(1),
+                        page_token: None,
+                    })
+                    .unwrap();
 
-        assert!(events.is_empty());
-        assert_eq!(resolved_cursor_sequence, None);
+                assert!(events.is_empty());
+                assert_eq!(resolved_cursor_sequence, None);
 
-        for _ in 0..1100 {
-            store
-                .append_job_event(job_event(noisy_repository.id.clone()))
-                .unwrap();
-        }
+                for _ in 0..1100 {
+                    store
+                        .append_job_event(job_event(noisy_repository.id.clone()))
+                        .unwrap();
+                }
 
-        let expected = store
-            .append_job_event(job_event(watched_repository.id.clone()))
-            .unwrap();
-        let received = receiver
-            .blocking_recv()
-            .expect("filtered watch should stay open for matching event");
+                let expected = store
+                    .append_job_event(job_event(watched_repository.id.clone()))
+                    .unwrap();
+                let received = receiver
+                    .recv()
+                    .await
+                    .expect("filtered watch should stay open for matching event");
 
-        assert_eq!(received.id, expected.id);
-        assert_eq!(
-            received.refs.repository_id.as_ref(),
-            Some(&watched_repository.id)
-        );
-        assert!(receiver.try_recv().is_err());
+                assert_eq!(received.id, expected.id);
+                assert_eq!(
+                    received.refs.repository_id.as_ref(),
+                    Some(&watched_repository.id)
+                );
+                assert!(receiver.try_recv().is_err());
+            });
+    }
+
+    #[test]
+    fn watch_job_events_live_filters_future_events_by_query() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let store = InMemoryStore::new();
+                let repository = repository_record();
+
+                store.create_repository(repository.clone()).unwrap();
+                let (events, mut receiver, resolved_cursor_sequence) = store
+                    .watch_job_events_live(EventQuery {
+                        repository_id: Some(repository.id.clone()),
+                        cursor: EventCursor::Beginning,
+                        subject_ids: Vec::new(),
+                        job_ids: Vec::new(),
+                        min_severity: Some(EventSeverity::Warning),
+                        page_size: None,
+                        page_token: None,
+                    })
+                    .unwrap();
+
+                assert!(events.is_empty());
+                assert_eq!(resolved_cursor_sequence, None);
+
+                store
+                    .append_job_event(job_event(repository.id.clone()))
+                    .unwrap();
+                let mut matching_event = job_event(repository.id);
+                matching_event.severity = EventSeverity::Warning;
+                let matching_event = store.append_job_event(matching_event).unwrap();
+                let received = receiver
+                    .recv()
+                    .await
+                    .expect("matching future event should arrive");
+
+                assert_eq!(received.id, matching_event.id);
+                assert_eq!(received.severity, EventSeverity::Warning);
+                assert!(receiver.try_recv().is_err());
+            });
     }
 
     #[test]
@@ -7641,6 +7803,7 @@ mod tests {
             receipt: receipt.clone(),
         };
 
+        let mut receiver = store.subscribe_job_events();
         let persisted_event = store
             .append_job_event_and_update_job_with_submit_job_idempotency(
                 final_job.clone(),
@@ -7649,6 +7812,9 @@ mod tests {
                 submission,
             )
             .unwrap();
+        let published_event = receiver
+            .blocking_recv()
+            .expect("idempotent event should be published");
 
         let stored_job = store.get_job(&job.id).unwrap();
         let stored_submission = store
@@ -7657,6 +7823,7 @@ mod tests {
             .expect("idempotency record should exist");
 
         final_job.latest_event_id = Some(persisted_event.id.clone());
+        assert_eq!(published_event.id, persisted_event.id);
         assert_eq!(stored_job, final_job);
         assert_eq!(stored_submission.receipt.job, stored_job);
         assert_ne!(stored_submission.receipt.job, stale_job);

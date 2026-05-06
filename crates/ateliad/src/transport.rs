@@ -2297,7 +2297,12 @@ async fn dispatch_replay_events(state: RpcServerState, request: Request<Body>) -
             .into_response(),
         Err(error) => {
             let (status, recoverable) = rpc_error_status(error.code);
-            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+            let code = if error.code == rpc::RpcErrorCode::CursorExpired {
+                "cursor_expired"
+            } else {
+                "rpc_error"
+            };
+            make_error_response(status, code, error.reason, recoverable, next_state)
         }
     }
 }
@@ -2371,7 +2376,7 @@ fn watch_events_stream_body(
                 break;
             }
         }
-        }
+    }
     };
 
     Body::from_stream(stream)
