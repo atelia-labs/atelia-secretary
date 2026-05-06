@@ -42,6 +42,36 @@ jobs:
       - name: Docker build
         run: docker build --file Dockerfile --tag atelia-secretary-beta-gate .
 
+      - name: Docker smoke rejects non-loopback listen without escape hatch
+        run: |
+          output_file="$(mktemp)"
+          cleanup() {
+            rm -f "$output_file"
+          }
+          trap cleanup EXIT
+
+          if timeout --kill-after=5s 15s docker run --rm \
+            --name atelia-secretary-beta-gate-negative \
+            --env ATELIA_DAEMON_LISTEN_ADDR=0.0.0.0:8080 \
+            atelia-secretary-beta-gate >"$output_file" 2>&1; then
+            cat "$output_file"
+            echo "expected non-loopback listener to be rejected"
+            exit 1
+          else
+            status=$?
+            output="$(cat "$output_file")"
+          fi
+
+          printf '%s\n' "$output"
+
+          if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+            echo "docker run timed out; the daemon may have accepted the non-loopback listener and kept running"
+            exit 1
+          fi
+
+          printf '%s\n' "$output" | grep -F \
+            "refusing explicit non-loopback listener address 0.0.0.0:8080; set ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN=1 to allow this during beta"
+
       - name: Docker smoke
         run: |
           cleanup() {
