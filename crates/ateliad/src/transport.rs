@@ -509,8 +509,8 @@ fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String>
         .with_context(|| format!("failed to create auth storage dir {storage_dir:?}"))?;
 
     let token_path = local_auth_token_path(storage_dir);
-    match std::fs::read_to_string(&token_path) {
-        Ok(token) => validate_and_restrict_session_token(&token_path, token),
+    match std::fs::symlink_metadata(&token_path) {
+        Ok(_) => read_and_validate_session_token(&token_path, storage_dir),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let token = generate_session_token()?;
             write_or_reuse_session_token(&token_path, token)
@@ -521,10 +521,44 @@ fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String>
     }
 }
 
-fn read_and_validate_session_token(token_path: &std::path::Path) -> Result<String> {
+fn read_and_validate_session_token(
+    token_path: &std::path::Path,
+    storage_dir: &std::path::Path,
+) -> Result<String> {
+    validate_existing_session_token_file(token_path, storage_dir)?;
     let token = std::fs::read_to_string(token_path)
         .with_context(|| format!("failed to read session token file {token_path:?}"))?;
     validate_and_restrict_session_token(token_path, token)
+}
+
+fn validate_existing_session_token_file(
+    token_path: &std::path::Path,
+    storage_dir: &std::path::Path,
+) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(token_path)
+        .with_context(|| format!("failed to inspect session token file {token_path:?}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(anyhow!(
+            "session token file {token_path:?} must be a regular file"
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let storage_owner = std::fs::metadata(storage_dir)
+            .with_context(|| format!("failed to inspect auth storage dir {storage_dir:?}"))?
+            .uid();
+
+        if metadata.uid() != storage_owner {
+            return Err(anyhow!(
+                "session token file {token_path:?} must be owned by the auth storage dir owner"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_and_restrict_session_token(
@@ -562,11 +596,14 @@ fn write_or_reuse_session_token(token_path: &std::path::Path, token: String) -> 
 }
 
 fn read_and_validate_session_token_with_retry(token_path: &std::path::Path) -> Result<String> {
+    let storage_dir = token_path
+        .parent()
+        .ok_or_else(|| anyhow!("session token file path {token_path:?} has no parent directory"))?;
     const SESSION_TOKEN_READ_ATTEMPTS: usize = 10;
     let retry_delay = Duration::from_millis(25);
 
     for attempt in 0..SESSION_TOKEN_READ_ATTEMPTS {
-        match read_and_validate_session_token(token_path) {
+        match read_and_validate_session_token(token_path, storage_dir) {
             Ok(token) => return Ok(token),
             Err(_error) if attempt + 1 < SESSION_TOKEN_READ_ATTEMPTS => {
                 std::thread::sleep(retry_delay);
@@ -3798,6 +3835,32 @@ mod tests {
             assert!(message.contains("session token file"));
             assert!(message.contains("must contain exactly 64 hexadecimal characters"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_auth_rejects_symlinked_session_token_file() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::remove_var(AUTH_TOKEN_ENV);
+
+        let storage_dir = test_repo_dir("local-auth-symlink");
+        let token_path = local_auth_token_path(&storage_dir);
+        let real_token_path = storage_dir.join("real-daemon-auth.token");
+        fs::write(
+            &real_token_path,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("seed real token");
+        symlink(&real_token_path, &token_path).expect("seed symlinked token");
+
+        let err = resolve_local_auth(&storage_dir)
+            .expect_err("symlinked session token file should fail closed");
+
+        assert!(err.to_string().contains("session token file"));
+        assert!(err.to_string().contains("must be a regular file"));
     }
 
     #[test]
