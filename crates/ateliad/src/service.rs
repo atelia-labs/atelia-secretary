@@ -514,7 +514,7 @@ impl SecretaryService {
         }
     }
 
-    /// Find a blocked policy decision that covers the repository root being registered.
+    /// Find a blocked policy decision whose scope overlaps the repository root being registered.
     fn blocking_policy_decision_for_root(
         &self,
         root_path: &str,
@@ -536,7 +536,7 @@ impl SecretaryService {
         ))
     }
 
-    /// Find a blocked repository ancestor that covers the repository root being registered.
+    /// Find a blocked repository whose root overlaps the repository root being registered.
     fn blocked_repository_ancestor_for_root(
         &self,
         root_path: &str,
@@ -550,8 +550,7 @@ impl SecretaryService {
             .into_iter()
             .find(|repository| {
                 repository.trust_state == RepositoryTrustState::Blocked
-                    && candidate_root != Path::new(&repository.root_path)
-                    && candidate_root.starts_with(Path::new(&repository.root_path))
+                    && roots_strictly_overlap(candidate_root, Path::new(&repository.root_path))
             }))
     }
 
@@ -1316,6 +1315,11 @@ fn is_repository_registration_block(policy_decision: &atelia_core::PolicyDecisio
         && policy_decision.resource_scope.value.trim() == REPOSITORY_REGISTRATION_BLOCK_SCOPE_VALUE
 }
 
+fn roots_strictly_overlap(candidate_root: &Path, blocked_root: &Path) -> bool {
+    candidate_root != blocked_root
+        && (candidate_root.starts_with(blocked_root) || blocked_root.starts_with(candidate_root))
+}
+
 /// Find the first blocked policy decision whose canonical scope contains the candidate root.
 fn blocking_policy_decision_for_candidate_root(
     candidate_root: &Path,
@@ -1339,9 +1343,7 @@ fn blocking_policy_decision_for_candidate_root(
             Err(_) => continue,
         };
 
-        if candidate_root != blocked_scope.canonical.as_path()
-            && candidate_root.starts_with(&blocked_scope.canonical)
-        {
+        if roots_strictly_overlap(candidate_root, blocked_scope.canonical.as_path()) {
             return Some(policy_decision);
         }
     }
@@ -2359,6 +2361,83 @@ mod tests {
             .register_repository(RegisterRepositoryRequest {
                 display_name: "child-repo".to_string(),
                 root_path: child_root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::Conflict { .. }));
+        assert_eq!(svc.health().repository_count, 1);
+        let _ = fs::remove_dir_all(child_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_rejects_root_over_blocked_child_repository() {
+        let svc = ready_service();
+        let root = test_repo_dir("blocked-child-root");
+        let child_root = root.join("nested");
+        fs::create_dir_all(&child_root).unwrap();
+        fs::create_dir_all(child_root.join(".git")).unwrap();
+
+        svc.register_repository(RegisterRepositoryRequest {
+            display_name: "blocked-child".to_string(),
+            root_path: child_root.to_string_lossy().to_string(),
+            trust_state: RepositoryTrustState::Blocked,
+            allowed_scope: None,
+            requester: None,
+        })
+        .expect("blocked child register should succeed");
+
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::Conflict { .. }));
+        assert_eq!(svc.health().repository_count, 1);
+        let _ = fs::remove_dir_all(child_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_rejects_root_over_root_scoped_blocked_policy_decision_child() {
+        let svc = ready_service();
+        let root = test_repo_dir("blocked-policy-child-root");
+        let child_root = root.join("nested");
+        fs::create_dir_all(&child_root).unwrap();
+        fs::create_dir_all(child_root.join(".git")).unwrap();
+
+        let child_repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "child-repo".to_string(),
+                root_path: child_root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("child register should succeed");
+
+        svc.lifecycle
+            .runtime()
+            .store()
+            .create_policy_decision(blocked_policy_decision(
+                child_repository.id.clone(),
+                "filesystem-read",
+                ".",
+            ))
+            .expect("policy decision should persist");
+
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
                 trust_state: RepositoryTrustState::Trusted,
                 allowed_scope: None,
                 requester: None,
