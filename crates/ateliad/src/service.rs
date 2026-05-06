@@ -250,6 +250,7 @@ pub struct RegisterRepositoryRequest {
     pub requester: Option<Actor>,
 }
 
+/// Request DTO for `submit_job`, including an optional idempotency key for replay-safe retries.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct SubmitJobRequest {
@@ -259,6 +260,7 @@ pub struct SubmitJobRequest {
     pub goal: String,
     pub resource_scope: Option<ResourceScope>,
     pub requested_capabilities: Vec<String>,
+    /// Optional caller-provided key used to deduplicate successful retries.
     pub idempotency_key: Option<String>,
 }
 
@@ -388,9 +390,12 @@ pub struct ExtensionExecutionResponse {
     pub metadata: ProtocolMetadata,
 }
 
+/// In-memory cache entry for a previously committed successful submit-job call.
 #[derive(Debug, Clone)]
 struct IdempotentSubmitJob {
+    /// Canonical request signature used to validate replay compatibility.
     signature: String,
+    /// The receipt returned for the original successful submission.
     receipt: RuntimeJobReceipt,
 }
 
@@ -1570,6 +1575,7 @@ fn validate_filesystem_read_scope(
     }
 }
 
+/// Build the canonical request signature used to compare idempotent submit-job retries.
 fn submit_job_request_signature(
     request: &SubmitJobRequest,
     normalized_goal: &str,
@@ -2090,7 +2096,8 @@ mod tests {
             .store()
             .get_submit_job_idempotency("restart-key")
             .expect("idempotency record should persist")
-            .is_some());
+            .map(|record| record.receipt == receipt)
+            .unwrap_or(false));
         drop(first_service);
 
         let second_service =
@@ -2125,7 +2132,8 @@ mod tests {
             .store()
             .get_submit_job_idempotency("restart-key")
             .expect("idempotency record should reload")
-            .is_some());
+            .map(|record| record.receipt == receipt)
+            .unwrap_or(false));
 
         let status = second_service
             .get_project_status(GetProjectStatusRequest {

@@ -125,6 +125,7 @@ impl RuntimeArtifactSpillover {
     }
 }
 
+/// Complete runtime outcome for a submitted job, including the ordered ledger events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeJobReceipt {
     pub job: JobRecord,
@@ -296,6 +297,8 @@ where
         )
     }
 
+    /// Run a tool job and optionally derive a submit-job idempotency receipt before the
+    /// terminal event is persisted.
     pub fn run_tool_job_with_finalizer<T, F>(
         &self,
         request: RuntimeJobRequest,
@@ -643,16 +646,10 @@ where
             refs_for_audit(&job, &policy_decision, &invocation, &result, &audit_record),
         );
 
-        let (result_event, audit_event) = self.store.record_tool_result_and_audit_with_events(
-            job.clone(),
-            result.clone(),
-            result_event,
-            audit_record.clone(),
-            audit_event,
-        )?;
+        let job_before_tool_commit = job.clone();
         job.latest_event_id = Some(audit_event.id.clone());
-        events.push(result_event);
-        events.push(audit_event);
+        events.push(result_event.clone());
+        events.push(audit_event.clone());
 
         let terminal_status = match result.status {
             ToolResultStatus::Succeeded => JobStatus::Succeeded,
@@ -660,7 +657,6 @@ where
             ToolResultStatus::Canceled => JobStatus::Canceled,
         };
         let previous = job.status;
-        job.transition_status(terminal_status, LedgerTimestamp::now())?;
         let terminal_event = job_event(
             EventSubject::job(&job.id),
             JobEventKind::JobStatusChanged {
@@ -671,6 +667,7 @@ where
             "job completed",
             refs_for_audit(&job, &policy_decision, &invocation, &result, &audit_record),
         );
+        job.transition_status(terminal_status, terminal_event.created_at)?;
         let rendered_output = if should_rerender_output {
             match render_tool_result_with_policy(&result, &render_policy) {
                 Ok(rendered_output) => rendered_output,
@@ -708,21 +705,23 @@ where
         let finalizer = submit_job_idempotency
             .take()
             .and_then(|finalizer| finalizer(&final_receipt));
-        let persisted_event = if let Some((idempotency_key, idempotency_record)) = finalizer {
-            self.store
-                .append_job_event_and_update_job_with_submit_job_idempotency(
-                    job.clone(),
-                    terminal_event,
-                    idempotency_key,
-                    idempotency_record,
-                )?
-        } else {
-            self.store
-                .append_job_event_and_update_job(job.clone(), terminal_event)?
-        };
+        let (persisted_result_event, persisted_audit_event, persisted_terminal_event) = self
+            .store
+            .record_tool_result_audit_terminal_with_submit_job_idempotency(
+                job_before_tool_commit,
+                result.clone(),
+                result_event,
+                audit_record.clone(),
+                audit_event,
+                terminal_event,
+                finalizer,
+            )?;
         let mut final_receipt = final_receipt;
-        if let Some(last_event) = final_receipt.events.last_mut() {
-            *last_event = persisted_event;
+        if final_receipt.events.len() >= 3 {
+            let len = final_receipt.events.len();
+            final_receipt.events[len - 3] = persisted_result_event;
+            final_receipt.events[len - 2] = persisted_audit_event;
+            final_receipt.events[len - 1] = persisted_terminal_event;
         }
 
         Ok(final_receipt)
