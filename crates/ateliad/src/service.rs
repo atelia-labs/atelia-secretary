@@ -2245,23 +2245,23 @@ mod tests {
     #[test]
     fn register_rejects_root_covered_by_blocked_policy_decision_for_alias_and_non_read_capabilities(
     ) {
-        let svc = ready_service();
-        let root = test_repo_dir("blocked-policy-root");
-        let child_root = root.join("nested");
-        fs::create_dir_all(&child_root).unwrap();
-        fs::create_dir_all(child_root.join(".git")).unwrap();
-
-        let parent_repository = svc
-            .register_repository(RegisterRepositoryRequest {
-                display_name: "parent-repo".to_string(),
-                root_path: root.to_string_lossy().to_string(),
-                trust_state: RepositoryTrustState::Trusted,
-                allowed_scope: None,
-                requester: None,
-            })
-            .expect("parent register should succeed");
-
         for requested_capability in ["filesystem-read", "repo.broad.mutation"] {
+            let svc = ready_service();
+            let root = test_repo_dir(&format!("blocked-policy-root-{requested_capability}"));
+            let child_root = root.join("nested");
+            fs::create_dir_all(&child_root).unwrap();
+            fs::create_dir_all(child_root.join(".git")).unwrap();
+
+            let parent_repository = svc
+                .register_repository(RegisterRepositoryRequest {
+                    display_name: "parent-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    trust_state: RepositoryTrustState::Trusted,
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("parent register should succeed");
+
             svc.lifecycle
                 .runtime()
                 .store()
@@ -2283,11 +2283,11 @@ mod tests {
                 .unwrap_err();
 
             assert!(matches!(err, ServiceError::Conflict { .. }));
-        }
+            assert_eq!(svc.health().repository_count, 1);
 
-        assert_eq!(svc.health().repository_count, 1);
-        let _ = fs::remove_dir_all(child_root);
-        let _ = fs::remove_dir_all(root);
+            let _ = fs::remove_dir_all(child_root);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
