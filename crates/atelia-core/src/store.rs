@@ -559,10 +559,16 @@ async fn forward_filtered_job_events(
         if resolved_cursor_sequence.is_some_and(|sequence| event.sequence_number <= sequence) {
             continue;
         }
-        let should_forward = store
+        let should_forward = match store
             .lock()
             .and_then(|inner| event_matches_query(&inner, &event, &query))
-            .unwrap_or(false);
+        {
+            Ok(should_forward) => should_forward,
+            Err(error) => {
+                let _ = sender.send(Err(error));
+                break;
+            }
+        };
         if should_forward {
             let _ = sender.send(Ok(event));
         }
@@ -5428,6 +5434,106 @@ mod tests {
                 assert_eq!(received.severity, EventSeverity::Warning);
                 assert!(receiver.try_recv().is_err());
             });
+    }
+
+    #[test]
+    fn watch_job_events_live_forwards_without_tokio_runtime() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+
+        store.create_repository(repository.clone()).unwrap();
+        let (events, mut receiver, resolved_cursor_sequence) = store
+            .watch_job_events_live(EventQuery {
+                repository_id: Some(repository.id.clone()),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: Vec::new(),
+                min_severity: None,
+                page_size: Some(1),
+                page_token: None,
+            })
+            .unwrap();
+
+        assert!(events.is_empty());
+        assert_eq!(resolved_cursor_sequence, None);
+
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let received = receiver
+                .blocking_recv()
+                .expect("fallback receiver should stay open")
+                .expect("fallback receiver should forward an event");
+            done_sender
+                .send(received)
+                .expect("test thread should report forwarded event");
+        });
+
+        let expected = store.append_job_event(job_event(repository.id)).unwrap();
+        let received = done_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("fallback thread should forward the matching event");
+
+        assert_eq!(received.id, expected.id);
+    }
+
+    #[test]
+    fn forward_filtered_job_events_reports_match_errors() {
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let store = InMemoryStore::new();
+        let poisoned_store = store.clone();
+
+        let _ = thread::spawn(move || {
+            let _guard = poisoned_store
+                .lock()
+                .expect("store lock should be acquired");
+            panic!("poison store lock for watcher error propagation test");
+        })
+        .join();
+
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime should build");
+            runtime.block_on(async move {
+                let repository = repository_record();
+                let (raw_sender, raw_receiver) = broadcast::channel(16);
+                let (filtered_sender, mut filtered_receiver) = broadcast::channel(16);
+
+                let forwarder = tokio::spawn(forward_filtered_job_events(
+                    raw_receiver,
+                    filtered_sender,
+                    store,
+                    EventQuery::default(),
+                    None,
+                ));
+
+                raw_sender
+                    .send(job_event(repository.id))
+                    .expect("raw event should broadcast");
+                let received = filtered_receiver
+                    .recv()
+                    .await
+                    .expect("filtered receiver should stay open");
+                forwarder
+                    .await
+                    .expect("forwarder task should complete cleanly");
+                done_sender
+                    .send(received)
+                    .expect("test thread should report terminal error");
+            });
+        });
+
+        let received = done_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("forwarder should report the matching error");
+
+        assert!(matches!(
+            received,
+            Err(StoreError::Conflict {
+                collection: "store",
+                ..
+            })
+        ));
     }
 
     #[test]
