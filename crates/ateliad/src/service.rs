@@ -933,52 +933,24 @@ impl SecretaryService {
 
                 let receipt = match tool_kind {
                     SubmitJobToolKind::Echo => {
-                        let submit_job_finalizer =
-                            Some(idempotency_key.to_string()).map(|idempotency_key| {
-                                let request_signature = request_signature.clone();
-                                move |receipt: &RuntimeJobReceipt| {
-                                    if receipt.job.status == JobStatus::Succeeded {
-                                        Some((
-                                            idempotency_key.clone(),
-                                            SubmitJobIdempotencyRecord {
-                                                signature: request_signature.clone(),
-                                                receipt: receipt.clone(),
-                                            },
-                                        ))
-                                    } else {
-                                        None
-                                    }
-                                }
-                            });
                         self.lifecycle.runtime().run_tool_job_with_finalizer(
                             runtime_request.clone(),
                             &EchoTool,
-                            submit_job_finalizer,
+                            Some(make_submit_job_finalizer(
+                                idempotency_key.to_string(),
+                                request_signature.clone(),
+                            )),
                         )?
                     }
                     SubmitJobToolKind::FsRead => {
                         let tool = FsReadTool::new(&repository.root_path);
-                        let submit_job_finalizer =
-                            Some(idempotency_key.to_string()).map(|idempotency_key| {
-                                let request_signature = request_signature.clone();
-                                move |receipt: &RuntimeJobReceipt| {
-                                    if receipt.job.status == JobStatus::Succeeded {
-                                        Some((
-                                            idempotency_key.clone(),
-                                            SubmitJobIdempotencyRecord {
-                                                signature: request_signature.clone(),
-                                                receipt: receipt.clone(),
-                                            },
-                                        ))
-                                    } else {
-                                        None
-                                    }
-                                }
-                            });
                         self.lifecycle.runtime().run_tool_job_with_finalizer(
                             runtime_request.clone(),
                             &tool,
-                            submit_job_finalizer,
+                            Some(make_submit_job_finalizer(
+                                idempotency_key.to_string(),
+                                request_signature.clone(),
+                            )),
                         )?
                     }
                 };
@@ -1688,6 +1660,25 @@ fn cache_idempotent_submission(
         cache.pop_front();
     }
     cache.push_back((idempotency_key, submission));
+}
+
+fn make_submit_job_finalizer(
+    idempotency_key: String,
+    request_signature: String,
+) -> impl FnOnce(&RuntimeJobReceipt) -> Option<(String, SubmitJobIdempotencyRecord)> {
+    move |receipt: &RuntimeJobReceipt| {
+        if receipt.job.status == JobStatus::Succeeded {
+            Some((
+                idempotency_key.clone(),
+                SubmitJobIdempotencyRecord {
+                    signature: request_signature.clone(),
+                    receipt: receipt.clone(),
+                },
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for SecretaryService {
