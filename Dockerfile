@@ -6,5 +6,6 @@ RUN cargo build --locked --release -p ateliad
 FROM debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252
 RUN useradd --system --uid 10001 --create-home atelia
 COPY --from=builder /workspace/target/release/ateliad /usr/local/bin/ateliad
+ENV ATELIA_DAEMON_STORAGE_DIR=/home/atelia/.atelia-secretary
 USER atelia
 ENTRYPOINT ["ateliad"]

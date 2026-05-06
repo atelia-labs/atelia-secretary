@@ -28,6 +28,91 @@ explicit unsafe escape hatch `ATELIA_DAEMON_UNSAFE_ALLOW_NON_LOOPBACK_LISTEN=1`
 is configured. That override is for controlled local testing only and should
 not be treated as a normal deployment mode.
 
+Secretary also requires a local bearer token by default. On startup it creates
+or reuses `<storage_dir>/daemon-auth.token` and expects every request to carry
+`Authorization: Bearer <token>`. A deliberate opt-out,
+`ATELIA_DAEMON_AUTH_DISABLED=1`, exists for controlled local testing only and
+should not be used as a normal deployment mode. `ATELIA_DAEMON_AUTH_TOKEN`
+may be set to pin a specific token for automation, but it should still be
+treated as a local secret. When present, `ATELIA_DAEMON_AUTH_TOKEN` must be a
+strong token: either 64 hexadecimal characters or an unpadded base64url token
+with length at least 43. Existing token files are normalized to restrictive
+permissions before reuse, and the auth-disabled opt-out is rejected if it is
+paired with an unsafe non-loopback listener override.
+
+Token-file auto creation and reuse are Unix-only. On non-Unix platforms,
+`ATELIA_DAEMON_AUTH_TOKEN` is the supported way to keep auth enabled; if you
+intentionally disable auth there, treat it as local testing only.
+
+Token generation follows these requirements:
+
+- use the system CSPRNG;
+- generate at least 32 bytes of raw entropy;
+- encode the token as hex or base64url without padding;
+- harden `<storage_dir>/daemon-auth.token` to owner-only access before reuse.
+
+## Local Token Lifecycle
+
+- The local bearer token does not expire on its own. The generated
+  `<storage_dir>/daemon-auth.token` is reused until it is deleted or replaced,
+  and `ATELIA_DAEMON_AUTH_TOKEN` stays active for as long as the process reads
+  that value.
+- There is no automatic rotation. To rotate a generated token safely, stop or
+  quiesce dependent clients, delete `<storage_dir>/daemon-auth.token`, restart
+  Secretary, and then update clients with the newly generated token.
+- To rotate a pinned token, set a new `ATELIA_DAEMON_AUTH_TOKEN` value, update
+  every client to the same value, and restart Secretary and the clients in a
+  controlled cutover. Do not reuse the old value after cutover.
+- If a token is exposed or suspected compromised, treat it as revoked: replace
+  the daemon token, invalidate the stored file or pinned environment value,
+  restart the daemon, update every dependent automation, and review the access
+  path that leaked it.
+- For automation, prefer a pinned token only when the secret can be stored in a
+  proper secret manager or other access-controlled runtime secret store.
+  Never commit the token to version control, shared config, or CI variables.
+  Backups and shared machine images must not capture the token in plaintext, and
+  any automation that reads it should run with the minimum required access.
+- On Unix, the token file is created and normalized with restrictive
+  permissions so the owning user can read it. If the file is copied, restored,
+  or mounted from elsewhere, verify that the running user still owns it and can
+  read it before relying on reuse. If the environment can only provide
+  `0400`, that is still acceptable as long as the file remains owner-only
+  readable.
+- On non-Unix platforms, Secretary does not auto create or reuse the token
+  file. Keep auth enabled by setting `ATELIA_DAEMON_AUTH_TOKEN`, or use
+  `ATELIA_DAEMON_AUTH_DISABLED=1` only for controlled local testing.
+
+## Replay Protection
+
+Accepted beta limitation: Secretary does not yet provide built-in replay
+protection or token expiry for local auth. A captured authorized request can be
+replayed until the token changes or the local boundary is removed.
+
+Secretary currently relies on two local-boundary mitigations:
+
+- the daemon binds to loopback only by default, so traffic is limited to the
+  local host unless the unsafe non-loopback override is enabled;
+- the daemon requires a bearer token on each request unless the local auth
+  opt-out is enabled.
+
+Recommended mitigations:
+
+- keep the daemon loopback-only and leave local auth enabled;
+- use a unique token per host or per daemon instance;
+- rotate the token on a regular cadence, around every 30 days, and
+  immediately after exposure or suspected interception;
+- monitor token usage and keep an audit trail for access and rotation;
+- avoid putting the daemon behind a shared listener, reverse proxy, or other
+  boundary that would make captured requests easier to reuse.
+
+Roadmap for stronger replay protection:
+
+- short-lived tokens;
+- refresh flow for token renewal;
+- request signing with HMAC plus nonce and timestamp;
+- server-side nonce tracking;
+- token rotation support as a first-class operation.
+
 ## Threat Model Seeds
 
 Initial threat model work should cover:
