@@ -15,7 +15,7 @@ use std::error::Error;
 use std::fmt;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, MutexGuard};
 use tokio::sync::{broadcast, mpsc};
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -447,7 +447,7 @@ impl InMemoryStore {
         receiver: broadcast::Receiver<JobEvent>,
         query: EventQuery,
         resolved_cursor_sequence: Option<u64>,
-    ) -> mpsc::Receiver<WatchJobEvent> {
+    ) -> StoreResult<mpsc::Receiver<WatchJobEvent>> {
         let (sender, filtered_receiver) = mpsc::channel(FILTERED_WATCH_EVENT_BUFFER);
         let store = self.clone();
 
@@ -462,23 +462,50 @@ impl InMemoryStore {
                 ));
             }
             Err(_) => {
-                let _ = std::thread::Builder::new()
+                let (startup_sender, startup_receiver) = std_mpsc::sync_channel(1);
+                std::thread::Builder::new()
                     .name("atelia-watch-event-filter".to_string())
                     .spawn(move || {
-                        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread().build() {
-                            runtime.block_on(forward_filtered_job_events(
-                                receiver,
-                                sender,
-                                store,
-                                query,
-                                resolved_cursor_sequence,
-                            ));
-                        }
-                    });
+                        let runtime = match tokio::runtime::Builder::new_current_thread().build() {
+                            Ok(runtime) => runtime,
+                            Err(error) => {
+                                let reason =
+                                    format!("failed to build watch event filter runtime: {error}");
+                                let _ = startup_sender.send(Err(reason.clone()));
+                                let _ = sender.blocking_send(Err(StoreError::Conflict {
+                                    collection: "store",
+                                    reason,
+                                }));
+                                return;
+                            }
+                        };
+                        let _ = startup_sender.send(Ok(()));
+                        runtime.block_on(forward_filtered_job_events(
+                            receiver,
+                            sender,
+                            store,
+                            query,
+                            resolved_cursor_sequence,
+                        ));
+                    })
+                    .map_err(|error| StoreError::Conflict {
+                        collection: "store",
+                        reason: format!("failed to spawn watch event filter thread: {error}"),
+                    })?;
+                startup_receiver
+                    .recv()
+                    .map_err(|error| StoreError::Conflict {
+                        collection: "store",
+                        reason: format!("watch event filter thread exited during startup: {error}"),
+                    })?
+                    .map_err(|reason| StoreError::Conflict {
+                        collection: "store",
+                        reason,
+                    })?;
             }
         }
 
-        filtered_receiver
+        Ok(filtered_receiver)
     }
 
     fn mutate<R>(
@@ -964,7 +991,8 @@ impl SecretaryStore for InMemoryStore {
             .filter(|candidate| event_candidate_matches_query(candidate, &query))
             .map(|candidate| candidate.event)
             .collect::<Vec<_>>();
-        let receiver = self.filtered_job_event_receiver(raw_receiver, query, live_cutoff_sequence);
+        let receiver =
+            self.filtered_job_event_receiver(raw_receiver, query, live_cutoff_sequence)?;
 
         Ok((events, receiver, resolved_cursor_sequence))
     }
@@ -2965,42 +2993,35 @@ fn event_matches_query(
     event: &JobEvent,
     query: &EventQuery,
 ) -> StoreResult<bool> {
-    let repository_matches = query
+    let repository_id = query
         .repository_id
         .as_ref()
         .map(|repository_id| {
             event_repository_id(inner, event)
-                .map(|event_repository_id| event_repository_id.as_ref() == Some(repository_id))
+                .map(|event_repository_id| (repository_id, event_repository_id))
         })
-        .transpose()?
-        .unwrap_or(true);
-    let subject_matches =
-        query.subject_ids.is_empty() || query.subject_ids.contains(&event.subject.subject_id);
-    let job_matches = query.job_ids.is_empty()
-        || event.refs.job_id.as_ref().map_or_else(
-            || {
-                event.subject.subject_type == EventSubjectType::Job
-                    && query
-                        .job_ids
-                        .iter()
-                        .any(|job_id| job_id.as_str() == event.subject.subject_id)
-            },
-            |job_id| query.job_ids.contains(job_id),
-        );
-    let severity_matches = query
-        .min_severity
-        .map(|min_severity| severity_rank(event.severity) >= severity_rank(min_severity))
-        .unwrap_or(true);
+        .transpose()?;
 
-    Ok(repository_matches && subject_matches && job_matches && severity_matches)
+    Ok(matches_event_query(
+        event,
+        query,
+        repository_id
+            .as_ref()
+            .map(|(requested_repository_id, event_repository_id)| {
+                (*requested_repository_id, event_repository_id.as_ref())
+            }),
+    ))
 }
 
-fn event_candidate_matches_query(candidate: &EventQueryCandidate, query: &EventQuery) -> bool {
-    let event = &candidate.event;
-    let repository_matches = query
-        .repository_id
-        .as_ref()
-        .map(|repository_id| candidate.repository_id.as_ref() == Some(repository_id))
+fn matches_event_query(
+    event: &JobEvent,
+    query: &EventQuery,
+    repository_ids: Option<(&RepositoryId, Option<&RepositoryId>)>,
+) -> bool {
+    let repository_matches = repository_ids
+        .map(|(requested_repository_id, event_repository_id)| {
+            event_repository_id == Some(requested_repository_id)
+        })
         .unwrap_or(true);
     let subject_matches =
         query.subject_ids.is_empty() || query.subject_ids.contains(&event.subject.subject_id);
@@ -3021,6 +3042,17 @@ fn event_candidate_matches_query(candidate: &EventQueryCandidate, query: &EventQ
         .unwrap_or(true);
 
     repository_matches && subject_matches && job_matches && severity_matches
+}
+
+fn event_candidate_matches_query(candidate: &EventQueryCandidate, query: &EventQuery) -> bool {
+    matches_event_query(
+        &candidate.event,
+        query,
+        query
+            .repository_id
+            .as_ref()
+            .map(|repository_id| (repository_id, candidate.repository_id.as_ref())),
+    )
 }
 
 #[cfg(test)]
