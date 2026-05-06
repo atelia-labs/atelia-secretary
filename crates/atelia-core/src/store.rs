@@ -573,11 +573,9 @@ async fn forward_filtered_job_events(
             received = receiver.recv() => match received {
                 Ok(event) => event,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    let _ = sender.send(Err(StoreError::CursorExpired {
-                        reason: format!(
-                            "watch_events live filter fell behind and missed {skipped} events"
-                        ),
-                    })).await;
+                    let _ = sender
+                        .send(Err(cursor_expired_lagged_live_filter(skipped, &query)))
+                        .await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -895,19 +893,17 @@ impl SecretaryStore for InMemoryStore {
         limit: Option<usize>,
     ) -> StoreResult<Vec<JobEvent>> {
         let inner = self.lock()?;
-        let after_sequence =
-            match cursor {
-                EventCursor::Beginning => 0,
-                EventCursor::AfterSequence(sequence) => sequence,
-                EventCursor::AfterEventId(id) => {
-                    let event = inner.job_events_by_id.get(&id).ok_or_else(|| {
-                        StoreError::CursorExpired {
-                            reason: format!("event id is not retained: {}", id_debug(&id)),
-                        }
-                    })?;
-                    event.sequence_number
-                }
-            };
+        let after_sequence = match cursor {
+            EventCursor::Beginning => 0,
+            EventCursor::AfterSequence(sequence) => sequence,
+            EventCursor::AfterEventId(id) => {
+                let event = inner
+                    .job_events_by_id
+                    .get(&id)
+                    .ok_or_else(|| cursor_expired_event_id("replay_job_events", &id))?;
+                event.sequence_number
+            }
+        };
 
         let mut events = Vec::new();
         if let Some(start_sequence) = after_sequence.checked_add(1) {
@@ -999,11 +995,7 @@ impl SecretaryStore for InMemoryStore {
                     if event_candidate_matches_query(&candidate, &query) {
                         events.push(candidate.event);
                         if events.len() > MAX_LIVE_WATCH_SNAPSHOT {
-                            return Err(StoreError::CursorExpired {
-                                reason: format!(
-                                    "live watch snapshot exceeds {MAX_LIVE_WATCH_SNAPSHOT} retained events; use replay before opening a live watch"
-                                ),
-                            });
+                            return Err(cursor_expired_live_snapshot(events.len()));
                         }
                     }
                 }
@@ -3006,16 +2998,53 @@ fn event_cursor_sequence(inner: &InMemoryInner, cursor: EventCursor) -> StoreRes
         EventCursor::Beginning => Ok(0),
         EventCursor::AfterSequence(sequence) => Ok(sequence),
         EventCursor::AfterEventId(id) => {
-            let event =
-                inner
-                    .job_events_by_id
-                    .get(&id)
-                    .ok_or_else(|| StoreError::CursorExpired {
-                        reason: format!("event id is not retained: {}", id_debug(&id)),
-                    })?;
+            let event = inner
+                .job_events_by_id
+                .get(&id)
+                .ok_or_else(|| cursor_expired_event_id("event_cursor_sequence", &id))?;
             Ok(event.sequence_number)
         }
     }
+}
+
+fn cursor_expired_lagged_live_filter(skipped: u64, query: &EventQuery) -> StoreError {
+    let reason = format!("watch_events live filter fell behind and missed {skipped} events");
+    tracing::warn!(
+        error.kind = "cursor_expired",
+        context = "watch_events_live_filter",
+        skipped,
+        repository_id = query.repository_id.as_ref().map(id_debug).as_deref(),
+        reason = %reason,
+        "watch events cursor expired"
+    );
+    StoreError::CursorExpired { reason }
+}
+
+fn cursor_expired_live_snapshot(retained_events: usize) -> StoreError {
+    let reason = format!(
+        "live watch snapshot exceeds {MAX_LIVE_WATCH_SNAPSHOT} retained events; use replay before opening a live watch"
+    );
+    tracing::warn!(
+        error.kind = "cursor_expired",
+        context = "watch_events_live_snapshot",
+        retained_events,
+        max_live_watch_snapshot = MAX_LIVE_WATCH_SNAPSHOT,
+        reason = %reason,
+        "watch events cursor expired"
+    );
+    StoreError::CursorExpired { reason }
+}
+
+fn cursor_expired_event_id(context: &'static str, id: &JobEventId) -> StoreError {
+    let reason = format!("event id is not retained: {}", id_debug(id));
+    tracing::warn!(
+        error.kind = "cursor_expired",
+        context,
+        event_id = %id_debug(id),
+        reason = %reason,
+        "watch events cursor expired"
+    );
+    StoreError::CursorExpired { reason }
 }
 
 fn event_matches_query(
