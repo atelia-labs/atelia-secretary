@@ -30,9 +30,12 @@ Secretary は beta では local bearer token も要求します。startup 時に
 向けの明示的な opt-out として `ATELIA_DAEMON_AUTH_DISABLED=1` があり、
 通常の deployment mode として扱うべきではありません。
 `ATELIA_DAEMON_AUTH_TOKEN` を設定すると token を固定できますが、
-それでも local secret として扱う必要があります。既存の token file は
-再利用前に restrictive permissions に正規化され、auth-disabled の opt-out
-は unsafe な non-loopback listener override と組み合わせると拒否されます。
+それでも local secret として扱う必要があります。設定された
+`ATELIA_DAEMON_AUTH_TOKEN` は強い token でなければならず、64 文字の
+hexadecimal 文字列または padding なしで長さ 43 文字以上の base64url token
+だけが受け入れられます。既存の token file は再利用前に restrictive
+permissions に正規化され、auth-disabled の opt-out は unsafe な
+non-loopback listener override と組み合わせると拒否されます。
 
 token file の自動作成と再利用は Unix のみです。non-Unix では
 `ATELIA_DAEMON_AUTH_TOKEN` を使って auth を有効に保ち、auth を無効化する

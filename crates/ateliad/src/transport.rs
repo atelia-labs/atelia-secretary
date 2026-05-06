@@ -562,13 +562,14 @@ fn validate_existing_session_token_file(
     {
         use std::os::unix::fs::MetadataExt;
 
+        let current_euid = unsafe { libc::geteuid() };
         let storage_owner = std::fs::metadata(storage_dir)
             .with_context(|| format!("failed to inspect auth storage dir {storage_dir:?}"))?
             .uid();
 
-        if metadata.uid() != storage_owner {
+        if storage_owner != current_euid || metadata.uid() != current_euid {
             return Err(anyhow!(
-                "session token file {token_path:?} must be owned by the auth storage dir owner"
+                "session token file {token_path:?} must be owned by the current user and the auth storage dir owner"
             ));
         }
     }

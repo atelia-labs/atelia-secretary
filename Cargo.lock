@@ -47,6 +47,7 @@ dependencies = [
  "atelia-core",
  "axum",
  "getrandom 0.4.2",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
