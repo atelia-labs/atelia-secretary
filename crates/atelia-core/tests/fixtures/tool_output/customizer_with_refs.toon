@@ -1,0 +1,15 @@
+status succeeded
+schema_version tool_result.v1
+format toon
+tool_id customizer
+result_id res_00000000-0000-4000-8000-000000000007
+invocation_id tool_00000000-0000-4000-8000-000000000008
+schema_ref "schema:tool.customizer.v1"
+fields[3]{key,value}
+  summary,"customizer keeps refs"
+  policy.state,allowed_with_audit
+  diagnostics.parser_failure,none
+evidence_refs[1]{id,uri,media_type,label,digest}
+  art_00000000-0000-4000-8000-000000000009,/tmp/customizer-evidence.txt,text/plain,"customizer evidence","sha256:feedbeef"
+output_refs[1]{id,uri,media_type,label,digest}
+  out_00000000-0000-4000-8000-000000000010,/tmp/customizer-stdout.txt,text/plain,"customizer stdout","sha256:c0ffee00"
