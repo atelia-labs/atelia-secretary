@@ -69,7 +69,9 @@ Token generation follows these requirements:
 - On Unix, the token file is created and normalized with restrictive
   permissions so the owning user can read it. If the file is copied, restored,
   or mounted from elsewhere, verify that the running user still owns it and can
-  read it before relying on reuse.
+  read it before relying on reuse. If the environment can only provide
+  `0400`, that is still acceptable as long as the file remains owner-only
+  readable.
 
 ## Replay Protection
 

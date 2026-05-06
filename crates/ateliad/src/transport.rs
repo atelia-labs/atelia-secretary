@@ -19,6 +19,7 @@ use axum::{
     Json, Router,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, RwLock};
 
@@ -1721,11 +1722,15 @@ async fn local_auth_middleware(
                 .and_then(parse_bearer_token);
 
             match provided {
-                Some(provided) if provided == token => next.run(request).await,
+                Some(provided) if bearer_token_matches(&token, provided) => next.run(request).await,
                 _ => unauthorized_response("missing or invalid Authorization header"),
             }
         }
     }
+}
+
+fn bearer_token_matches(expected: &str, provided: &str) -> bool {
+    expected.as_bytes().ct_eq(provided.as_bytes()).into()
 }
 
 fn parse_bearer_token(value: &str) -> Option<&str> {
@@ -3322,6 +3327,19 @@ mod tests {
         let debug = format!("{:?}", bearer_auth("super-secret-token"));
         assert!(!debug.contains("super-secret-token"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn bearer_token_matches_rejects_different_tokens() {
+        assert!(bearer_token_matches(
+            "super-secret-token",
+            "super-secret-token"
+        ));
+        assert!(!bearer_token_matches(
+            "super-secret-token",
+            "super-secret-t0ken"
+        ));
+        assert!(!bearer_token_matches("super-secret-token", "super-secret"));
     }
 
     fn test_router(state: &RpcServerState) -> Router {
