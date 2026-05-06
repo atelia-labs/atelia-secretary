@@ -3788,6 +3788,10 @@ mod tests {
 
         assert!(live.events.is_empty());
         assert_eq!(
+            live.cursor,
+            Some(EventCursorRequest::AfterSequence(anchor_event.sequence))
+        );
+        assert_eq!(
             live.subscription.resolved_cursor_sequence,
             Some(anchor_event.sequence)
         );
@@ -4885,6 +4889,15 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, RpcErrorCode::NotFound);
+    }
+
+    #[test]
+    fn cursor_expired_store_error_maps_to_cursor_expired_rpc_code() {
+        let error = store_error_to_rpc(StoreError::CursorExpired {
+            reason: "event id is not retained".to_string(),
+        });
+
+        assert_eq!(error.code, RpcErrorCode::CursorExpired);
     }
 
     #[test]
