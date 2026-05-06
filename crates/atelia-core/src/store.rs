@@ -954,46 +954,50 @@ impl SecretaryStore for InMemoryStore {
             (after_sequence.checked_add(1), live_cutoff_sequence)
         {
             while start_sequence <= live_cutoff_sequence {
-                let batch = {
+                let (candidates, last_sequence) = {
                     let inner = self.lock()?;
-                    inner
+                    let batch: Vec<_> = inner
                         .job_events_by_sequence
                         .range(start_sequence..=live_cutoff_sequence)
                         .take(LIVE_WATCH_SNAPSHOT_SCAN_BATCH)
                         .map(|(sequence, id)| (*sequence, id.clone()))
-                        .collect::<Vec<_>>()
+                        .collect();
+                    if batch.is_empty() {
+                        (Vec::new(), None)
+                    } else {
+                        let last = batch.last().map(|(sequence, _)| *sequence);
+                        let candidates: Vec<EventQueryCandidate> = batch
+                            .into_iter()
+                            .map(|(_, id)| {
+                                let event = inner
+                                    .job_events_by_id
+                                    .get(&id)
+                                    .ok_or_else(|| StoreError::Conflict {
+                                        collection: "job_events",
+                                        reason: format!(
+                                            "sequence index references missing id {}",
+                                            id_debug(&id)
+                                        ),
+                                    })?
+                                    .clone();
+                                let repository_id = if needs_repository_resolution {
+                                    event_repository_id(&inner, &event)?
+                                } else {
+                                    None
+                                };
+                                Ok(EventQueryCandidate {
+                                    event,
+                                    repository_id,
+                                })
+                            })
+                            .collect::<StoreResult<Vec<_>>>()?;
+                        (candidates, last)
+                    }
                 };
-                if batch.is_empty() {
-                    break;
-                }
-                let last_sequence = batch.last().map(|(sequence, _)| *sequence);
 
-                for (_, id) in batch {
-                    let candidate = {
-                        let inner = self.lock()?;
-                        let event = inner
-                            .job_events_by_id
-                            .get(&id)
-                            .ok_or_else(|| StoreError::Conflict {
-                                collection: "job_events",
-                                reason: format!(
-                                    "sequence index references missing id {}",
-                                    id_debug(&id)
-                                ),
-                            })?
-                            .clone();
-                        let repository_id = if needs_repository_resolution {
-                            event_repository_id(&inner, &event)?
-                        } else {
-                            None
-                        };
-                        EventQueryCandidate {
-                            event,
-                            repository_id,
-                        }
-                    };
-                    if event_candidate_matches_query(&candidate, &query) {
-                        events.push(candidate.event);
+                for candidate in &candidates {
+                    if event_candidate_matches_query(candidate, &query) {
+                        events.push(candidate.event.clone());
                         if events.len() > MAX_LIVE_WATCH_SNAPSHOT {
                             return Err(cursor_expired_live_snapshot(events.len()));
                         }
