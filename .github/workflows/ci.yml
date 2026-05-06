@@ -57,10 +57,11 @@ jobs:
             cat "$output_file"
             echo "expected non-loopback listener to be rejected"
             exit 1
+          else
+            status=$?
+            output="$(cat "$output_file")"
           fi
 
-          status=$?
-          output="$(cat "$output_file")"
           printf '%s\n' "$output"
 
           if [ "$status" -eq 124 ]; then
