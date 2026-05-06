@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
-const DURABLE_STORE_SCHEMA_VERSION: u32 = 1;
+const DURABLE_STORE_SCHEMA_VERSION: u32 = 2;
+const DURABLE_STORE_LEGACY_SCHEMA_VERSION: u32 = 1;
 const DURABLE_STORE_FILE_NAME: &str = "ledger.json";
 
 /// Cursor used by clients to replay the ordered job-event ledger.
@@ -1193,7 +1194,9 @@ fn load_durable_snapshot(path: &Path) -> StoreResult<InMemoryInner> {
             ),
         })?;
 
-    if snapshot.schema_version != DURABLE_STORE_SCHEMA_VERSION {
+    if !(DURABLE_STORE_LEGACY_SCHEMA_VERSION..=DURABLE_STORE_SCHEMA_VERSION)
+        .contains(&snapshot.schema_version)
+    {
         return Err(StoreError::InvalidRecord {
             collection: "store",
             reason: format!(
@@ -1603,15 +1606,7 @@ fn validate_loaded_submit_job_receipt(
             collection: "jobs",
             id: format!("{} (submit_job_idempotency.job)", id_debug(&receipt.job.id)),
         })?;
-    if stored_job != &receipt.job {
-        return Err(StoreError::InvalidReference {
-            collection: "submit_job_idempotency",
-            reason: format!(
-                "receipt.job {} does not match stored job record",
-                id_debug(&receipt.job.id)
-            ),
-        });
-    }
+    validate_loaded_submit_job_receipt_job(stored_job, &receipt.job)?;
 
     let stored_policy_decision = inner
         .policy_decisions
@@ -1789,6 +1784,40 @@ fn validate_loaded_submit_job_receipt(
             ),
         });
     }
+
+    Ok(())
+}
+
+fn validate_loaded_submit_job_receipt_job(
+    stored_job: &JobRecord,
+    receipt_job: &JobRecord,
+) -> StoreResult<()> {
+    ensure_same_repository(
+        "submit_job_idempotency",
+        "receipt.job.repository_id",
+        &stored_job.repository_id,
+        &receipt_job.repository_id,
+    )?;
+    ensure_immutable_job_field(
+        &receipt_job.id,
+        "schema_version",
+        stored_job.schema_version,
+        receipt_job.schema_version,
+    )?;
+    ensure_immutable_job_field(
+        &receipt_job.id,
+        "created_at",
+        stored_job.created_at,
+        receipt_job.created_at,
+    )?;
+    ensure_immutable_job_field(
+        &receipt_job.id,
+        "requester",
+        &stored_job.requester,
+        &receipt_job.requester,
+    )?;
+    ensure_immutable_job_field(&receipt_job.id, "kind", &stored_job.kind, &receipt_job.kind)?;
+    ensure_immutable_job_field(&receipt_job.id, "goal", &stored_job.goal, &receipt_job.goal)?;
 
     Ok(())
 }
@@ -6746,7 +6775,7 @@ mod tests {
         let storage_dir = durable_storage_dir("legacy-idempotency");
         let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
         let snapshot = DurableStoreSnapshot {
-            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            schema_version: DURABLE_STORE_LEGACY_SCHEMA_VERSION,
             inner: InMemoryInner::default(),
         };
         let mut serialized = serde_json::to_value(&snapshot).unwrap();
@@ -6766,6 +6795,51 @@ mod tests {
             .get_submit_job_idempotency("ledger-key")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn durable_store_loads_submit_job_idempotency_when_job_updated_at_diverges() {
+        let storage_dir = durable_storage_dir("idempotency-mutated-job-snapshot");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let store = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        let repository = repository_record();
+        store.create_repository(repository.clone()).unwrap();
+
+        let runtime = SecretaryRuntime::new(store.clone(), DefaultPolicyEngine::new());
+        let request =
+            RuntimeJobRequest::new(actor(), repository.id.clone(), JobKind::Read, "persist me")
+                .with_requested_capabilities(vec!["capability.discovery".to_string()]);
+        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+        let submission = SubmitJobIdempotencyRecord {
+            signature: "request-signature".to_string(),
+            receipt: receipt.clone(),
+        };
+
+        store
+            .record_submit_job_idempotency("ledger-key".to_string(), submission.clone())
+            .unwrap();
+
+        let mut mutated_inner = store.lock().unwrap().clone();
+        mutated_inner
+            .jobs
+            .get_mut(&receipt.job.id)
+            .expect("job should exist")
+            .updated_at = timestamp(receipt.job.updated_at.unix_millis + 1);
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&DurableStoreSnapshot {
+                schema_version: DURABLE_STORE_SCHEMA_VERSION,
+                inner: mutated_inner,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let reopened = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        assert_eq!(
+            reopened.get_submit_job_idempotency("ledger-key").unwrap(),
+            Some(submission)
+        );
     }
 
     #[test]
@@ -6865,8 +6939,8 @@ mod tests {
         let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
         assert!(matches!(
             err,
-            StoreError::InvalidReference {
-                collection: "submit_job_idempotency",
+            StoreError::Conflict {
+                collection: "jobs",
                 ..
             }
         ));
