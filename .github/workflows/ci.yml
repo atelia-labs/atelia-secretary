@@ -64,7 +64,7 @@ jobs:
 
           printf '%s\n' "$output"
 
-          if [ "$status" -eq 124 ]; then
+          if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
             echo "docker run timed out; the daemon may have accepted the non-loopback listener and kept running"
             exit 1
           fi
