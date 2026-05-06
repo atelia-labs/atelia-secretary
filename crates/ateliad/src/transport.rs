@@ -32,6 +32,7 @@ const AUTH_TOKEN_FILE_NAME: &str = "daemon-auth.token";
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Shared RPC server state used by the HTTP router.
 pub type RpcServerState = Arc<RwLock<rpc::SecretaryRpcServer>>;
 
 /// Local authentication mode for the daemon boundary.
@@ -513,6 +514,7 @@ fn local_auth_token_path(storage_dir: &std::path::Path) -> std::path::PathBuf {
     storage_dir.join(AUTH_TOKEN_FILE_NAME)
 }
 
+/// Return whether an operator-provided token meets the beta strength floor.
 fn local_auth_token_is_strong(token: &str) -> bool {
     let bytes = token.as_bytes();
     (bytes.len() == 64 && bytes.iter().all(|byte| byte.is_ascii_hexdigit()))
@@ -522,6 +524,7 @@ fn local_auth_token_is_strong(token: &str) -> bool {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
 }
 
+/// Load an existing generated session token or create one in the storage dir.
 fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String> {
     std::fs::create_dir_all(storage_dir)
         .with_context(|| format!("failed to create auth storage dir {storage_dir:?}"))?;
@@ -539,6 +542,7 @@ fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String>
     }
 }
 
+/// Read a persisted session token after validating file safety properties.
 fn read_and_validate_session_token(
     token_path: &std::path::Path,
     storage_dir: &std::path::Path,
@@ -549,6 +553,7 @@ fn read_and_validate_session_token(
     validate_and_restrict_session_token(token_path, token)
 }
 
+/// Validate that an existing token path is a safe regular file owned by this user.
 fn validate_existing_session_token_file(
     token_path: &std::path::Path,
     storage_dir: &std::path::Path,
@@ -580,6 +585,7 @@ fn validate_existing_session_token_file(
     Ok(())
 }
 
+/// Normalize permissions and validate the generated-token file contents.
 fn validate_and_restrict_session_token(
     token_path: &std::path::Path,
     token: String,
@@ -594,6 +600,7 @@ fn validate_and_restrict_session_token(
     }
 }
 
+/// Atomically create a new session-token file.
 fn write_session_token(token_path: &std::path::Path, token: &[u8]) -> Result<()> {
     let mut file = open_session_token_file(token_path)?;
     use std::io::Write;
@@ -601,6 +608,7 @@ fn write_session_token(token_path: &std::path::Path, token: &[u8]) -> Result<()>
         .with_context(|| format!("failed to write session token file {token_path:?}"))
 }
 
+/// Write a generated token, or reuse a concurrently created valid token file.
 fn write_or_reuse_session_token(token_path: &std::path::Path, token: String) -> Result<String> {
     match write_session_token(token_path, token.as_bytes()) {
         Ok(()) => {
@@ -614,6 +622,7 @@ fn write_or_reuse_session_token(token_path: &std::path::Path, token: String) -> 
     }
 }
 
+/// Retry token reads briefly while another process may be repairing permissions.
 fn read_and_validate_session_token_with_retry(token_path: &std::path::Path) -> Result<String> {
     let storage_dir = token_path
         .parent()
@@ -634,6 +643,7 @@ fn read_and_validate_session_token_with_retry(token_path: &std::path::Path) -> R
     unreachable!("retry loop must return on success or failure")
 }
 
+/// Return whether an error chain contains an already-exists filesystem error.
 fn is_already_exists_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -643,6 +653,7 @@ fn is_already_exists_error(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(unix)]
+/// Open a new token file with owner-only permissions on Unix.
 fn open_session_token_file(token_path: &std::path::Path) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -655,12 +666,14 @@ fn open_session_token_file(token_path: &std::path::Path) -> Result<std::fs::File
 }
 
 #[cfg(not(unix))]
+/// Refuse file-backed token creation where owner-only permissions are unavailable.
 fn open_session_token_file(_token_path: &std::path::Path) -> Result<std::fs::File> {
     Err(anyhow!(
         "refusing to create session token file on non-Unix platforms because restrictive permissions are not implemented"
     ))
 }
 
+/// Generate a fresh 32-byte local auth token encoded as lowercase hexadecimal.
 fn generate_session_token() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes)
@@ -668,6 +681,7 @@ fn generate_session_token() -> Result<String> {
     Ok(encode_session_token(&bytes))
 }
 
+/// Encode raw token bytes as lowercase hexadecimal.
 fn encode_session_token(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut token = String::with_capacity(bytes.len() * 2);
@@ -679,6 +693,7 @@ fn encode_session_token(bytes: &[u8]) -> String {
 }
 
 #[cfg(unix)]
+/// Set owner-read/write-only permissions on a token file.
 fn set_restrictive_permissions(path: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1655,6 +1670,7 @@ fn make_error_response(
         .into_response()
 }
 
+/// Build a standard bearer-auth failure response.
 fn unauthorized_response(reason: impl Into<String>) -> Response {
     let mut response = make_error_response(
         StatusCode::UNAUTHORIZED,
@@ -1711,6 +1727,7 @@ where
     }
 }
 
+/// Enforce the configured local-auth mode for every HTTP route.
 async fn local_auth_middleware(
     State(auth): State<LocalAuthConfig>,
     request: Request<Body>,
@@ -1733,10 +1750,12 @@ async fn local_auth_middleware(
     }
 }
 
+/// Compare bearer tokens without data-dependent early exit.
 fn bearer_token_matches(expected: &str, provided: &str) -> bool {
     expected.as_bytes().ct_eq(provided.as_bytes()).into()
 }
 
+/// Parse a single `Authorization: Bearer <token>` header value.
 fn parse_bearer_token(value: &str) -> Option<&str> {
     let mut parts = value.split_whitespace();
     let scheme = parts.next()?;
@@ -3164,6 +3183,7 @@ pub fn build_router(rpc_server: RpcServerState, auth: LocalAuthConfig) -> Router
         .with_state(rpc_server)
 }
 
+/// Bind the daemon TCP listener to the already validated address.
 pub async fn bind_listener(listen_addr: SocketAddr) -> Result<TcpListener> {
     TcpListener::bind(listen_addr)
         .await
