@@ -6,6 +6,8 @@
 
 Secretary core は general harness を提供します。filesystem、shell、search、job、event、policy、extension hosting、service broker、hook intake、output rendering、agent delegation substrate が中心です。Git、GitHub、Linear、memory provider、memory strategy、notification、review agent、approval agent は extension-provided surface として扱います。
 
+現在の beta repertoire surface は、この beta slice で dispatch 可能な built-in Secretary tool だけ、すなわち `fs.read` と `secretary.echo` を projection します。より広い built-in は将来の slice または runtime-backed slice に存在し得ますが、dispatch が存在するまでは `ListRepertoire` では claim しません。この table は capability area 単位でまとめているため、`secretary.echo` は個別 row を置かず、beta repertoire note で shipped surface として明示しています。
+
 ## Risk Scale
 
 - `R0`: status / capability discovery
@@ -19,7 +21,7 @@ Secretary core は general harness を提供します。filesystem、shell、sea
 | Area | Capabilities | Risk / Policy | Output | Audit | Customization |
 | --- | --- | --- | --- | --- | --- |
 | local filesystem | `fs.read`, `fs.list`, `fs.search`, `fs.stat`, `fs.diff`, `fs.write`, `fs.patch`, `fs.delete`, `fs.move` | read R1; write R2; `fs.delete`/`fs.move` は Unix-validated で、non-Unix では unsupported | TOON tree/list/diff; path scope; truncation; hashes; platform safety flag | actor, path, before/after hash, diff summary | path globs, max bytes, binary handling, diff verbosity |
-| shell/process | `proc.run`, `proc.spawn`, `proc.kill`, `proc.status`, `proc.stream` | known safe command R2; arbitrary shell R3; privileged patterns R4 | argv, cwd, exit code, duration, stdout/stderr refs | env redaction, timeout, process tree, approval id | allowlist, timeout, cwd, env allowlist, sandbox profile |
+| shell/process | `proc.exec`（Unix-only。non-Unix では unsupported。低レベルの explicit-argv 実行 entry point）、`proc.run`（`proc.exec` と同じ explicit-argv runtime path。non-Unix では unsupported）、`proc.spawn`, `proc.kill`, `proc.status`, `proc.stream` | explicit argv process exec R2; arbitrary shell R3; privileged patterns R4 | argv, cwd, exit code, duration, stdout/stderr refs | env redaction, timeout, process tree, approval id | allowlist, timeout, cwd, env allowlist, sandbox profile |
 | search/index | `search.files`, `search.text`, `search.symbols`, `search.recent` | read R1 | ranked hits, snippets, scope, truncation | query summary, scope, hit count | max hits, snippet size, path filters |
 | job/task | `job.create`, `job.status`, `job.cancel`, `job.events`, `task.attach_artifact` | status R1; create/cancel R2/R3 by scope | job id, state, owner, blockers, artifact refs | actor, task scope, state transitions | timeout, concurrency, ownership, retention |
 | event stream | `event.subscribe`, `event.publish_internal`, `event.ack` | subscribe R1/R2; publish R2/R3 by topic | event id, topic, source, payload refs | topic, source, delivery state | filters, backpressure, delivery class |

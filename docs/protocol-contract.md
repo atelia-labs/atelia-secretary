@@ -80,10 +80,24 @@ Required RPC groups:
 | `ApplyBlocklist` | Add a blocklist entry |
 | `ListBlocklist` | Inspect the current blocklist |
 
-`ListRepertoire` is planned as the first beta protocol slice for
+`ListRepertoire` is the first beta protocol slice for
 [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md).
-It returns the computed projection of the live tool surface in the current
-context, not a persisted store.
+It returns the computed beta `RepertoireEntry` projection of the live tool
+surface in the current context, along with its metadata, not a persisted
+store.
+
+Beta RPC groups:
+
+| RPC | Purpose |
+| --- | --- |
+| `ListRepertoire` | Inspect the beta repertoire projection |
+
+The first beta server surface is intentionally small and currently projects
+only the built-in Secretary tools that are dispatchable in this beta slice:
+`fs.read` and `secretary.echo` as beta repertoire entries. Broader built-ins
+may exist in future or runtime-backed slices, but they are not claimed by
+`ListRepertoire` until dispatch exists. Extension-backed repertoire entries
+remain a future slice.
 
 For the beta slice, extension management APIs are operator-facing.
 Extension execution RPCs are not supported in beta. Endpoints may exist, but

@@ -10,6 +10,7 @@
 use crate::service::{
     BetaStateHint as ServiceBetaStateHint, CheckPolicyRequest as ServiceCheckPolicyRequest,
     DaemonHealth, DaemonStatus, GetProjectStatusRequest as ServiceGetProjectStatusRequest,
+    ListRepertoireRequest as ServiceListRepertoireRequest,
     ListRepositoriesRequest as ServiceListRepositoriesRequest,
     ListToolOutputSettingsHistoryRequest as ServiceListToolOutputSettingsHistoryRequest,
     ProtocolMetadata as ServiceProtocolMetadata,
@@ -106,6 +107,23 @@ impl SecretaryRpcServer {
             metadata: self.metadata(),
             repositories,
             next_page_token: page.next_page_token,
+        })
+    }
+
+    /// Return the beta repertoire projection over the daemon's built-in tools.
+    pub fn list_repertoire(
+        &self,
+        _request: ListRepertoireRequest,
+    ) -> RpcResult<ListRepertoireResponse> {
+        let response = self.service.list_repertoire(ServiceListRepertoireRequest)?;
+
+        Ok(ListRepertoireResponse {
+            metadata: self.metadata(),
+            entries: response
+                .entries
+                .into_iter()
+                .map(RepertoireEntry::from)
+                .collect(),
         })
     }
 
@@ -739,6 +757,48 @@ pub struct ListRepositoriesResponse {
     pub next_page_token: Option<String>,
 }
 
+/// Request for the repertoire projection RPC.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ListRepertoireRequest;
+
+/// Repertoire projection response including protocol metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListRepertoireResponse {
+    /// Protocol metadata for the current daemon instance.
+    pub metadata: ProtocolMetadata,
+    /// Projected repertoire entries in stable display order.
+    pub entries: Vec<RepertoireEntry>,
+}
+
+/// Public repertoire view for a single built-in tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepertoireEntry {
+    /// Stable tool identifier.
+    pub tool_id: String,
+    /// Human-readable tool name.
+    pub name: String,
+    /// Concise description shown to clients.
+    pub description: String,
+    /// Provider category for the tool implementation.
+    pub provider_kind: String,
+    /// Stable provider identifier.
+    pub provider_id: String,
+    /// Risk tier used for client-side policy and presentation.
+    pub risk_tier: String,
+    /// Default result format returned by the tool.
+    pub default_result_format: String,
+    /// Result formats the tool can emit.
+    pub supported_result_formats: Vec<String>,
+    /// Idempotency classification for repeated calls.
+    pub idempotency: String,
+    /// Whether the tool can be cancelled after dispatch.
+    pub cancellable: bool,
+    /// Whether the tool streams partial results.
+    pub streaming: bool,
+    /// Advertised timeout budget in milliseconds; `0` means not enforced yet.
+    pub timeout_ms: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetToolOutputDefaultsRequest {
     pub scope: RpcToolOutputScope,
@@ -1114,6 +1174,25 @@ impl From<RepositoryRecord> for Repository {
             trust_state: record.trust_state.into(),
             created_at_unix_ms: record.created_at.unix_millis,
             updated_at_unix_ms: record.updated_at.unix_millis,
+        }
+    }
+}
+
+impl From<crate::service::RepertoireEntry> for RepertoireEntry {
+    fn from(entry: crate::service::RepertoireEntry) -> Self {
+        Self {
+            tool_id: entry.tool_id,
+            name: entry.name,
+            description: entry.description,
+            provider_kind: entry.provider_kind,
+            provider_id: entry.provider_id,
+            risk_tier: entry.risk_tier,
+            default_result_format: entry.default_result_format,
+            supported_result_formats: entry.supported_result_formats,
+            idempotency: entry.idempotency,
+            cancellable: entry.cancellable,
+            streaming: entry.streaming,
+            timeout_ms: entry.timeout_ms,
         }
     }
 }
@@ -2495,6 +2574,43 @@ mod tests {
         assert!(response
             .capabilities
             .contains(&"project_status.v1".to_string()));
+    }
+
+    #[test]
+    fn list_repertoire_projects_static_builtin_tools() {
+        let server = ready_server();
+
+        let response = server
+            .list_repertoire(ListRepertoireRequest)
+            .expect("repertoire projection should succeed");
+
+        let tool_ids: Vec<&str> = response
+            .entries
+            .iter()
+            .map(|entry| entry.tool_id.as_str())
+            .collect();
+        assert_eq!(tool_ids, vec!["fs.read", "secretary.echo"]);
+        let read = response
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "fs.read")
+            .expect("fs.read repertoire entry");
+        assert_eq!(read.name, "Filesystem Read");
+        assert_eq!(read.risk_tier, "R1");
+        assert_eq!(read.provider_id, "atelia-secretary");
+        assert!(!read.cancellable);
+        let echo = response
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "secretary.echo")
+            .expect("secretary.echo repertoire entry");
+        assert_eq!(echo.risk_tier, "R0");
+        assert!(!echo.cancellable);
+        assert_eq!(echo.timeout_ms, 0);
+        assert!(response
+            .entries
+            .iter()
+            .all(|entry| { matches!(entry.tool_id.as_str(), "fs.read" | "secretary.echo") }));
     }
 
     #[test]

@@ -5,7 +5,7 @@
     "unix_millis": 1700000123000
   },
   "invocation_id": "tool_00000000-0000-4000-8000-000000000006",
-  "tool_id": "git_status",
+  "tool_id": "customizer",
   "status": "succeeded",
   "schema_ref": "schema:tool.customizer.v1",
   "fields": [
