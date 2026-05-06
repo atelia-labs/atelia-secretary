@@ -557,10 +557,8 @@ async fn forward_filtered_job_events(
                 break;
             }
         };
-        if should_forward {
-            if sender.send(Ok(event)).await.is_err() {
-                break;
-            }
+        if should_forward && sender.send(Ok(event)).await.is_err() {
+            break;
         }
     }
 }
