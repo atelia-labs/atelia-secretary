@@ -34,9 +34,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type RpcServerState = Arc<RwLock<rpc::SecretaryRpcServer>>;
 
+/// Local authentication mode for the daemon boundary.
 #[derive(Clone, PartialEq, Eq)]
 pub enum LocalAuthConfig {
+    /// Require a bearer token on the `Authorization` header.
     BearerToken { token: String },
+    /// Disable local authentication entirely.
     Disabled,
 }
 
@@ -3133,6 +3136,7 @@ async fn fallback_route(State(state): State<RpcServerState>, request: Request<Bo
     .await
 }
 
+/// Build the daemon router with the selected local auth boundary.
 pub fn build_router(rpc_server: RpcServerState, auth: LocalAuthConfig) -> Router {
     let auth_layer = middleware::from_fn_with_state(auth, local_auth_middleware);
 
@@ -3166,6 +3170,7 @@ pub async fn bind_listener(listen_addr: SocketAddr) -> Result<TcpListener> {
         .with_context(|| format!("failed to bind {listen_addr}"))
 }
 
+/// Run the daemon listener with the selected local auth boundary.
 pub async fn run_listener(
     rpc_server: RpcServerState,
     auth: LocalAuthConfig,
