@@ -829,10 +829,12 @@ impl SecretaryService {
         let mut idempotent_cache_lock = if let Some(idempotency_key) =
             normalized_idempotency_key.as_deref()
         {
-            let mut cache = self
-                .idempotent_submissions
-                .lock()
-                .expect("idempotency cache lock poisoned");
+            let mut cache =
+                self.idempotent_submissions
+                    .lock()
+                    .map_err(|err| ServiceError::Internal {
+                        reason: format!("idempotency cache lock poisoned: {err}"),
+                    })?;
 
             if let Some(cached) = cache.get(idempotency_key) {
                 if cached.signature == request_signature {
@@ -4074,6 +4076,48 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn submit_job_idempotency_cache_lock_poisoning_returns_service_error() {
+        let svc = Arc::new(ready_service());
+        let poisoned = Arc::clone(&svc);
+
+        thread::spawn(move || {
+            let _guard = poisoned.idempotent_submissions.lock().unwrap();
+            panic!("poison idempotency cache lock");
+        })
+        .join()
+        .expect_err("poisoning thread should panic");
+
+        let root = test_repo_dir("idempotency-cache-poison");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("request-123".to_string()),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ServiceError::Internal { reason } if reason.contains("idempotency cache lock poisoned")
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
