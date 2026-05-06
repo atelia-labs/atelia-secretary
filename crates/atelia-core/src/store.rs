@@ -939,15 +939,9 @@ impl SecretaryStore for InMemoryStore {
         };
         let (after_sequence, resolved_cursor_sequence, live_cutoff_sequence) = {
             let inner = self.lock()?;
-            let resolved_cursor_sequence = match query.cursor.clone() {
-                EventCursor::Beginning => None,
-                EventCursor::AfterSequence(sequence) => Some(sequence),
-                EventCursor::AfterEventId(id) => Some(event_cursor_sequence(
-                    &inner,
-                    EventCursor::AfterEventId(id),
-                )?),
-            };
-            let after_sequence = event_cursor_sequence(&inner, query.cursor.clone())?;
+            let resolved_cursor_sequence =
+                resolve_event_cursor_sequence(&inner, query.cursor.clone())?;
+            let after_sequence = resolved_cursor_sequence.unwrap_or(0);
             let live_cutoff_sequence = match resolved_cursor_sequence {
                 Some(resolved) => Some(resolved.max(inner.next_event_sequence)),
                 None => Some(inner.next_event_sequence),
@@ -1031,14 +1025,7 @@ impl SecretaryStore for InMemoryStore {
         let inner = self.lock()?;
         let start = page_start(query.page_token.as_deref(), "job_events")?;
         let page_size = query.page_size.unwrap_or(usize::MAX);
-        let resolved_cursor_sequence = match query.cursor.clone() {
-            EventCursor::Beginning => None,
-            EventCursor::AfterSequence(sequence) => Some(sequence),
-            EventCursor::AfterEventId(id) => Some(event_cursor_sequence(
-                &inner,
-                EventCursor::AfterEventId(id),
-            )?),
-        };
+        let resolved_cursor_sequence = resolve_event_cursor_sequence(&inner, query.cursor.clone())?;
         let filtered = collect_filtered_job_events(&inner, &query)?;
 
         let (event_refs, next_page_token) = page_records(filtered.into_iter(), start, page_size);
@@ -2999,6 +2986,19 @@ fn collect_filtered_job_events<'a>(
     }
 
     Ok(filtered)
+}
+
+fn resolve_event_cursor_sequence(
+    inner: &InMemoryInner,
+    cursor: EventCursor,
+) -> StoreResult<Option<u64>> {
+    match cursor {
+        EventCursor::Beginning => Ok(None),
+        EventCursor::AfterSequence(sequence) => Ok(Some(sequence)),
+        EventCursor::AfterEventId(id) => {
+            event_cursor_sequence(inner, EventCursor::AfterEventId(id)).map(Some)
+        }
+    }
 }
 
 fn event_cursor_sequence(inner: &InMemoryInner, cursor: EventCursor) -> StoreResult<u64> {
