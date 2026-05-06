@@ -26,6 +26,7 @@ const DURABLE_STORE_LEGACY_SCHEMA_VERSION: u32 = 1;
 const DURABLE_STORE_FILE_NAME: &str = "ledger.json";
 const FILTERED_WATCH_EVENT_BUFFER: usize = 1024;
 const MAX_LIVE_WATCH_SNAPSHOT: usize = 1000;
+const LIVE_WATCH_SNAPSHOT_SCAN_BATCH: usize = 256;
 
 /// Cursor used by clients to replay the ordered job-event ledger.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -936,7 +937,7 @@ impl SecretaryStore for InMemoryStore {
             Some(repository_id) => self.subscribe_repository_job_events(repository_id)?,
             None => self.event_broadcaster.subscribe(),
         };
-        let (candidate_ids, resolved_cursor_sequence, live_cutoff_sequence) = {
+        let (after_sequence, resolved_cursor_sequence, live_cutoff_sequence) = {
             let inner = self.lock()?;
             let resolved_cursor_sequence = match query.cursor.clone() {
                 EventCursor::Beginning => None,
@@ -947,62 +948,76 @@ impl SecretaryStore for InMemoryStore {
                 )?),
             };
             let after_sequence = event_cursor_sequence(&inner, query.cursor.clone())?;
-            let mut candidate_ids = Vec::new();
-            if let Some(start_sequence) = after_sequence.checked_add(1) {
-                for (_, id) in inner
-                    .job_events_by_sequence
-                    .range(start_sequence..)
-                    .take(MAX_LIVE_WATCH_SNAPSHOT + 1)
-                {
-                    candidate_ids.push(id.clone());
-                }
-            }
             let live_cutoff_sequence = match resolved_cursor_sequence {
                 Some(resolved) => Some(resolved.max(inner.next_event_sequence)),
                 None => Some(inner.next_event_sequence),
             };
             (
-                candidate_ids,
+                after_sequence,
                 resolved_cursor_sequence,
                 live_cutoff_sequence,
             )
         };
-        if candidate_ids.len() > MAX_LIVE_WATCH_SNAPSHOT {
-            return Err(StoreError::CursorExpired {
-                reason: format!(
-                    "live watch snapshot exceeds {MAX_LIVE_WATCH_SNAPSHOT} retained events; use replay before opening a live watch"
-                ),
-            });
-        }
         let needs_repository_resolution = query.repository_id.is_some();
-        let candidates = candidate_ids
-            .into_iter()
-            .map(|id| {
-                let inner = self.lock()?;
-                let event = inner
-                    .job_events_by_id
-                    .get(&id)
-                    .ok_or_else(|| StoreError::Conflict {
-                        collection: "job_events",
-                        reason: format!("sequence index references missing id {}", id_debug(&id)),
-                    })?
-                    .clone();
-                let repository_id = if needs_repository_resolution {
-                    event_repository_id(&inner, &event)?
-                } else {
-                    None
+        let mut events = Vec::new();
+        if let Some(mut start_sequence) = after_sequence.checked_add(1) {
+            loop {
+                let batch = {
+                    let inner = self.lock()?;
+                    inner
+                        .job_events_by_sequence
+                        .range(start_sequence..)
+                        .take(LIVE_WATCH_SNAPSHOT_SCAN_BATCH)
+                        .map(|(sequence, id)| (*sequence, id.clone()))
+                        .collect::<Vec<_>>()
                 };
-                Ok(EventQueryCandidate {
-                    event,
-                    repository_id,
-                })
-            })
-            .collect::<StoreResult<Vec<_>>>()?;
-        let events = candidates
-            .into_iter()
-            .filter(|candidate| event_candidate_matches_query(candidate, &query))
-            .map(|candidate| candidate.event)
-            .collect::<Vec<_>>();
+                if batch.is_empty() {
+                    break;
+                }
+                let last_sequence = batch.last().map(|(sequence, _)| *sequence);
+
+                for (_, id) in batch {
+                    let candidate = {
+                        let inner = self.lock()?;
+                        let event = inner
+                            .job_events_by_id
+                            .get(&id)
+                            .ok_or_else(|| StoreError::Conflict {
+                                collection: "job_events",
+                                reason: format!(
+                                    "sequence index references missing id {}",
+                                    id_debug(&id)
+                                ),
+                            })?
+                            .clone();
+                        let repository_id = if needs_repository_resolution {
+                            event_repository_id(&inner, &event)?
+                        } else {
+                            None
+                        };
+                        EventQueryCandidate {
+                            event,
+                            repository_id,
+                        }
+                    };
+                    if event_candidate_matches_query(&candidate, &query) {
+                        events.push(candidate.event);
+                        if events.len() > MAX_LIVE_WATCH_SNAPSHOT {
+                            return Err(StoreError::CursorExpired {
+                                reason: format!(
+                                    "live watch snapshot exceeds {MAX_LIVE_WATCH_SNAPSHOT} retained events; use replay before opening a live watch"
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                start_sequence = match last_sequence.and_then(|sequence| sequence.checked_add(1)) {
+                    Some(sequence) => sequence,
+                    None => break,
+                };
+            }
+        }
         let receiver =
             self.filtered_job_event_receiver(raw_receiver, query, live_cutoff_sequence)?;
 
@@ -5525,6 +5540,39 @@ mod tests {
                 if reason.contains("live watch snapshot exceeds")
                     && reason.contains("use replay")
         ));
+    }
+
+    #[test]
+    fn watch_job_events_live_caps_filtered_snapshot_after_matching() {
+        let store = InMemoryStore::new();
+        let watched_repository = repository_record();
+        let noisy_repository = repository_record();
+
+        store.create_repository(watched_repository.clone()).unwrap();
+        store.create_repository(noisy_repository.clone()).unwrap();
+        for _ in 0..=MAX_LIVE_WATCH_SNAPSHOT {
+            store
+                .append_job_event(job_event(noisy_repository.id.clone()))
+                .unwrap();
+        }
+        let expected = store
+            .append_job_event(job_event(watched_repository.id.clone()))
+            .unwrap();
+
+        let (events, _receiver, resolved_cursor_sequence) = store
+            .watch_job_events_live(EventQuery {
+                repository_id: Some(watched_repository.id),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: Vec::new(),
+                min_severity: None,
+                page_size: None,
+                page_token: None,
+            })
+            .expect("unrelated retained events should not trip the live snapshot cap");
+
+        assert_eq!(resolved_cursor_sequence, None);
+        assert_eq!(events, vec![expected]);
     }
 
     #[test]
