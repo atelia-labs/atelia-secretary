@@ -81,6 +81,24 @@ pub struct EventPage {
     pub next_page_token: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ToolResultAuditTerminalRequest {
+    /// Job snapshot before the tool-result, audit, and terminal events are applied.
+    pub record: JobRecord,
+    /// Tool result to persist atomically with its audit and terminal events.
+    pub tool_result: ToolResult,
+    /// Ledger event describing the persisted tool result.
+    pub tool_result_event: JobEvent,
+    /// Audit record to persist after the tool result is accepted.
+    pub audit_record: AuditRecord,
+    /// Ledger event describing the audit record.
+    pub audit_event: JobEvent,
+    /// Terminal job event that completes the submit-job lifecycle.
+    pub terminal_event: JobEvent,
+    /// Optional durable idempotency receipt to persist with the terminal event.
+    pub idempotency: Option<(String, SubmitJobIdempotencyRecord)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
     NotFound {
@@ -261,13 +279,7 @@ pub trait SecretaryStore: Send + Sync + 'static {
     /// audit record, and durable idempotency receipt in one transaction.
     fn record_tool_result_audit_terminal_with_submit_job_idempotency(
         &self,
-        record: JobRecord,
-        tool_result: ToolResult,
-        tool_result_event: JobEvent,
-        audit_record: AuditRecord,
-        audit_event: JobEvent,
-        terminal_event: JobEvent,
-        idempotency: Option<(String, SubmitJobIdempotencyRecord)>,
+        request: ToolResultAuditTerminalRequest,
     ) -> StoreResult<(JobEvent, JobEvent, JobEvent)>;
     fn list_audit_records(&self) -> StoreResult<Vec<AuditRecord>>;
     fn get_audit_record(&self, id: &AuditRecordId) -> StoreResult<AuditRecord>;
@@ -1142,14 +1154,18 @@ impl SecretaryStore for InMemoryStore {
 
     fn record_tool_result_audit_terminal_with_submit_job_idempotency(
         &self,
-        mut record: JobRecord,
-        tool_result: ToolResult,
-        mut tool_result_event: JobEvent,
-        audit_record: AuditRecord,
-        mut audit_event: JobEvent,
-        mut terminal_event: JobEvent,
-        idempotency: Option<(String, SubmitJobIdempotencyRecord)>,
+        request: ToolResultAuditTerminalRequest,
     ) -> StoreResult<(JobEvent, JobEvent, JobEvent)> {
+        let ToolResultAuditTerminalRequest {
+            mut record,
+            tool_result,
+            mut tool_result_event,
+            audit_record,
+            mut audit_event,
+            mut terminal_event,
+            idempotency,
+        } = request;
+
         self.mutate(|inner| {
             validate_sibling_event_ids_are_unique(&tool_result_event, &audit_event)?;
             validate_sibling_event_ids_are_unique(&tool_result_event, &terminal_event)?;

@@ -16,8 +16,10 @@ use crate::policy::{
     DEFAULT_POLICY_VERSION,
 };
 use crate::settings::{OversizeOutputPolicy, ToolOutputDefaults};
-use crate::store::SubmitJobIdempotencyRecord;
-use crate::store::{EventCursor, InMemoryStore, JobPage, JobQuery, SecretaryStore, StoreError};
+use crate::store::{
+    EventCursor, InMemoryStore, JobPage, JobQuery, SecretaryStore, StoreError,
+    SubmitJobIdempotencyRecord, ToolResultAuditTerminalRequest,
+};
 use crate::tool_output::{
     render_tool_result_with_policy, RenderOptions, RenderedToolOutput, ToolOutputRenderError,
 };
@@ -708,13 +710,15 @@ where
         let (persisted_result_event, persisted_audit_event, persisted_terminal_event) = self
             .store
             .record_tool_result_audit_terminal_with_submit_job_idempotency(
-                job_before_tool_commit,
-                result.clone(),
-                result_event,
-                audit_record.clone(),
-                audit_event,
-                terminal_event,
-                finalizer,
+                ToolResultAuditTerminalRequest {
+                    record: job_before_tool_commit,
+                    tool_result: result.clone(),
+                    tool_result_event: result_event,
+                    audit_record: audit_record.clone(),
+                    audit_event,
+                    terminal_event,
+                    idempotency: finalizer,
+                },
             )?;
         let mut final_receipt = final_receipt;
         if final_receipt.events.len() >= 3 {
