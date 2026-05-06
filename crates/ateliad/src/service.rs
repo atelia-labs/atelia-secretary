@@ -1155,25 +1155,14 @@ impl SecretaryService {
             .replay_job_events(cursor, limit)?)
     }
 
-    /// Subscribe to future events while returning the initial replay slice.
+    /// Atomically snapshot retained events and subscribe to future events.
     #[allow(dead_code)]
     pub fn watch_events_live(&self, query: EventQuery) -> ServiceResult<LiveEventSubscription> {
-        let receiver = self.lifecycle.runtime().store().subscribe_job_events();
-        let mut events = Vec::new();
-        let mut page_token = query.page_token.clone();
-
-        loop {
-            let page = self.list_events_page(EventQuery {
-                page_token: page_token.clone(),
-                ..query.clone()
-            })?;
-            page_token = page.next_page_token.clone();
-            events.extend(page.events);
-
-            if page_token.is_none() {
-                break;
-            }
-        }
+        let (events, receiver) = self
+            .lifecycle
+            .runtime()
+            .store()
+            .watch_job_events_live(query)?;
 
         let replay_max_sequence = events.last().map(|event| event.sequence_number);
         Ok(LiveEventSubscription {

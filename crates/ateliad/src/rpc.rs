@@ -3475,7 +3475,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_events_live_filters_replay_before_limit() {
+    fn watch_events_live_filters_replay_before_bootstrap() {
         let server = ready_server();
         let first_root = test_repo_dir("watch-events-live-filter-first");
         let second_root = test_repo_dir("watch-events-live-filter-second");
@@ -3529,7 +3529,7 @@ mod tests {
                 cursor: Some(EventCursorRequest::Beginning),
                 subject_ids: Vec::new(),
                 min_severity: None,
-                limit: Some(1),
+                limit: None,
             })
             .expect("live watch should succeed");
 

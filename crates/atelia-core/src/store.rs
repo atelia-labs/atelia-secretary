@@ -214,6 +214,10 @@ pub trait SecretaryStore: Send + Sync + 'static {
         cursor: EventCursor,
         limit: Option<usize>,
     ) -> StoreResult<Vec<JobEvent>>;
+    fn watch_job_events_live(
+        &self,
+        query: EventQuery,
+    ) -> StoreResult<(Vec<JobEvent>, broadcast::Receiver<JobEvent>)>;
     fn query_job_events(&self, query: EventQuery) -> StoreResult<EventPage>;
     fn get_job_event(&self, id: &JobEventId) -> StoreResult<JobEvent>;
 
@@ -735,28 +739,37 @@ impl SecretaryStore for InMemoryStore {
         Ok(events)
     }
 
+    fn watch_job_events_live(
+        &self,
+        query: EventQuery,
+    ) -> StoreResult<(Vec<JobEvent>, broadcast::Receiver<JobEvent>)> {
+        let inner = self.lock()?;
+        let receiver = self.event_broadcaster.subscribe();
+        let filtered = collect_filtered_job_events(&inner, &query)?;
+        let page_size = query.page_size.unwrap_or(usize::MAX);
+        let mut page_token = query.page_token.clone();
+        let mut events = Vec::new();
+
+        loop {
+            let start = page_start(page_token.as_deref(), "job_events")?;
+            let (event_refs, next_page_token) =
+                page_records(filtered.iter().copied(), start, page_size);
+            events.extend(event_refs.into_iter().cloned());
+
+            match next_page_token {
+                Some(next_page_token) => page_token = Some(next_page_token),
+                None => break,
+            }
+        }
+
+        Ok((events, receiver))
+    }
+
     fn query_job_events(&self, query: EventQuery) -> StoreResult<EventPage> {
         let inner = self.lock()?;
         let start = page_start(query.page_token.as_deref(), "job_events")?;
         let page_size = query.page_size.unwrap_or(usize::MAX);
-        let after_sequence = event_cursor_sequence(&inner, query.cursor.clone())?;
-
-        let mut filtered = Vec::new();
-        if let Some(start_sequence) = after_sequence.checked_add(1) {
-            for (_, id) in inner.job_events_by_sequence.range(start_sequence..) {
-                let event = inner
-                    .job_events_by_id
-                    .get(id)
-                    .ok_or_else(|| StoreError::Conflict {
-                        collection: "job_events",
-                        reason: format!("sequence index references missing id {}", id_debug(id)),
-                    })?;
-
-                if event_matches_query(&inner, event, &query)? {
-                    filtered.push(event);
-                }
-            }
-        }
+        let filtered = collect_filtered_job_events(&inner, &query)?;
 
         let (event_refs, next_page_token) = page_records(filtered.into_iter(), start, page_size);
         let events = event_refs.into_iter().cloned().collect();
@@ -2682,6 +2695,32 @@ fn page_records<Record>(
     };
 
     (retained, next_page_token)
+}
+
+fn collect_filtered_job_events<'a>(
+    inner: &'a InMemoryInner,
+    query: &EventQuery,
+) -> StoreResult<Vec<&'a JobEvent>> {
+    let after_sequence = event_cursor_sequence(inner, query.cursor.clone())?;
+
+    let mut filtered = Vec::new();
+    if let Some(start_sequence) = after_sequence.checked_add(1) {
+        for (_, id) in inner.job_events_by_sequence.range(start_sequence..) {
+            let event = inner
+                .job_events_by_id
+                .get(id)
+                .ok_or_else(|| StoreError::Conflict {
+                    collection: "job_events",
+                    reason: format!("sequence index references missing id {}", id_debug(id)),
+                })?;
+
+            if event_matches_query(inner, event, query)? {
+                filtered.push(event);
+            }
+        }
+    }
+
+    Ok(filtered)
 }
 
 fn event_cursor_sequence(inner: &InMemoryInner, cursor: EventCursor) -> StoreResult<u64> {
@@ -5061,6 +5100,51 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![first.sequence_number, second.sequence_number]
         );
+    }
+
+    #[test]
+    fn watch_job_events_live_returns_retained_events_and_future_append_once() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+
+        store.create_repository(repository.clone()).unwrap();
+        let first = store
+            .append_job_event(job_event(repository.id.clone()))
+            .unwrap();
+        let second = store
+            .append_job_event(job_event(repository.id.clone()))
+            .unwrap();
+
+        let (events, mut receiver) = store
+            .watch_job_events_live(EventQuery {
+                repository_id: Some(repository.id.clone()),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: Vec::new(),
+                min_severity: None,
+                page_size: Some(1),
+                page_token: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence_number)
+                .collect::<Vec<_>>(),
+            vec![first.sequence_number, second.sequence_number]
+        );
+
+        let third = store.append_job_event(job_event(repository.id)).unwrap();
+        let received = receiver
+            .blocking_recv()
+            .expect("future event should arrive");
+
+        assert_eq!(received.sequence_number, third.sequence_number);
+        assert!(receiver.try_recv().is_err());
+        assert!(events
+            .iter()
+            .all(|event| event.sequence_number != third.sequence_number));
     }
 
     #[test]
