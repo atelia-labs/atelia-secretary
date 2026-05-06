@@ -121,6 +121,9 @@ pub enum StoreError {
     InvalidCursor {
         reason: String,
     },
+    CursorExpired {
+        reason: String,
+    },
     SequenceOverflow,
     InvalidRecord {
         collection: &'static str,
@@ -144,6 +147,7 @@ impl fmt::Display for StoreError {
                 write!(f, "{collection} invalid reference: {reason}")
             }
             StoreError::InvalidCursor { reason } => write!(f, "invalid event cursor: {reason}"),
+            StoreError::CursorExpired { reason } => write!(f, "cursor expired: {reason}"),
             StoreError::SequenceOverflow => write!(f, "job event sequence overflowed"),
             StoreError::InvalidRecord { collection, reason } => {
                 write!(f, "{collection} invalid record: {reason}")
@@ -295,6 +299,7 @@ pub struct InMemoryStore {
     inner: Arc<Mutex<InMemoryInner>>,
     durable_snapshot_path: Option<PathBuf>,
     event_broadcaster: broadcast::Sender<JobEvent>,
+    repository_event_broadcasters: Arc<Mutex<HashMap<RepositoryId, broadcast::Sender<JobEvent>>>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -353,6 +358,7 @@ impl InMemoryStore {
             inner: Arc::new(Mutex::new(inner)),
             durable_snapshot_path: Some(snapshot_path),
             event_broadcaster: Self::new_event_broadcaster(),
+            repository_event_broadcasters: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -371,9 +377,36 @@ impl InMemoryStore {
         self.event_broadcaster.subscribe()
     }
 
-    fn publish_job_events(&self, events: &[JobEvent]) {
+    fn subscribe_repository_job_events(
+        &self,
+        repository_id: &RepositoryId,
+    ) -> broadcast::Receiver<JobEvent> {
+        self.repository_event_broadcaster(repository_id).subscribe()
+    }
+
+    fn repository_event_broadcaster(
+        &self,
+        repository_id: &RepositoryId,
+    ) -> broadcast::Sender<JobEvent> {
+        let mut broadcasters = self
+            .repository_event_broadcasters
+            .lock()
+            .expect("repository event broadcaster lock poisoned");
+        broadcasters
+            .entry(repository_id.clone())
+            .or_insert_with(Self::new_event_broadcaster)
+            .clone()
+    }
+
+    fn publish_job_events(&self, inner: &InMemoryInner, events: &[JobEvent]) {
         for event in events {
+            let event = event.clone();
             let _ = self.event_broadcaster.send(event.clone());
+            if let Ok(Some(repository_id)) = event_repository_id(inner, &event) {
+                let _ = self
+                    .repository_event_broadcaster(&repository_id)
+                    .send(event);
+            }
         }
     }
 
@@ -402,7 +435,7 @@ impl InMemoryStore {
             persist_durable_snapshot(snapshot_path, &draft)?;
         }
         *guard = draft;
-        self.publish_job_events(&events);
+        self.publish_job_events(&guard, &events);
         Ok(result)
     }
 
@@ -421,6 +454,7 @@ impl Default for InMemoryStore {
             inner: Arc::new(Mutex::new(InMemoryInner::default())),
             durable_snapshot_path: None,
             event_broadcaster: InMemoryStore::new_event_broadcaster(),
+            repository_event_broadcasters: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -711,7 +745,7 @@ impl SecretaryStore for InMemoryStore {
                 EventCursor::AfterSequence(sequence) => sequence,
                 EventCursor::AfterEventId(id) => {
                     let event = inner.job_events_by_id.get(&id).ok_or_else(|| {
-                        StoreError::InvalidCursor {
+                        StoreError::CursorExpired {
                             reason: format!("event id is not retained: {}", id_debug(&id)),
                         }
                     })?;
@@ -744,7 +778,10 @@ impl SecretaryStore for InMemoryStore {
         query: EventQuery,
     ) -> StoreResult<(Vec<JobEvent>, broadcast::Receiver<JobEvent>)> {
         let inner = self.lock()?;
-        let receiver = self.event_broadcaster.subscribe();
+        let receiver = match query.repository_id.as_ref() {
+            Some(repository_id) => self.subscribe_repository_job_events(repository_id),
+            None => self.event_broadcaster.subscribe(),
+        };
         let filtered = collect_filtered_job_events(&inner, &query)?;
         let page_size = query.page_size.unwrap_or(usize::MAX);
         let mut page_token = query.page_token.clone();
@@ -2732,7 +2769,7 @@ fn event_cursor_sequence(inner: &InMemoryInner, cursor: EventCursor) -> StoreRes
                 inner
                     .job_events_by_id
                     .get(&id)
-                    .ok_or_else(|| StoreError::InvalidCursor {
+                    .ok_or_else(|| StoreError::CursorExpired {
                         reason: format!("event id is not retained: {}", id_debug(&id)),
                     })?;
             Ok(event.sequence_number)
@@ -5145,6 +5182,50 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| event.sequence_number != third.sequence_number));
+    }
+
+    #[test]
+    fn watch_job_events_live_ignores_unrelated_repository_volume() {
+        let store = InMemoryStore::new();
+        let watched_repository = repository_record();
+        let noisy_repository = repository_record();
+
+        store.create_repository(watched_repository.clone()).unwrap();
+        store.create_repository(noisy_repository.clone()).unwrap();
+
+        let (events, mut receiver) = store
+            .watch_job_events_live(EventQuery {
+                repository_id: Some(watched_repository.id.clone()),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: Vec::new(),
+                min_severity: None,
+                page_size: Some(1),
+                page_token: None,
+            })
+            .unwrap();
+
+        assert!(events.is_empty());
+
+        for _ in 0..1100 {
+            store
+                .append_job_event(job_event(noisy_repository.id.clone()))
+                .unwrap();
+        }
+
+        let expected = store
+            .append_job_event(job_event(watched_repository.id.clone()))
+            .unwrap();
+        let received = receiver
+            .blocking_recv()
+            .expect("filtered watch should stay open for matching event");
+
+        assert_eq!(received.id, expected.id);
+        assert_eq!(
+            received.refs.repository_id.as_ref(),
+            Some(&watched_repository.id)
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

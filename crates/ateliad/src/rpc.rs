@@ -671,6 +671,7 @@ pub enum RpcErrorCode {
     NotFound,
     Conflict,
     UnsupportedCapability,
+    CursorExpired,
     Internal,
 }
 
@@ -2271,9 +2272,11 @@ fn store_error_to_rpc(error: StoreError) -> RpcError {
     let code = match error {
         StoreError::NotFound { .. } => RpcErrorCode::NotFound,
         StoreError::DuplicateId { .. } | StoreError::Conflict { .. } => RpcErrorCode::Conflict,
-        StoreError::InvalidReference { .. }
-        | StoreError::InvalidCursor { .. }
-        | StoreError::InvalidRecord { .. } => RpcErrorCode::InvalidArgument,
+        StoreError::InvalidReference { .. } | StoreError::InvalidRecord { .. } => {
+            RpcErrorCode::InvalidArgument
+        }
+        StoreError::InvalidCursor { .. } => RpcErrorCode::InvalidArgument,
+        StoreError::CursorExpired { .. } => RpcErrorCode::CursorExpired,
         StoreError::SequenceOverflow => RpcErrorCode::Internal,
     };
 

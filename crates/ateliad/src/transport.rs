@@ -1686,6 +1686,23 @@ fn serialize_watch_events_recovery_error(reason: impl Into<String>) -> serde_jso
     })
 }
 
+fn ndjson_body_from_frame(frame: serde_json::Value) -> Body {
+    let stream = stream! {
+        match serde_json::to_vec(&frame) {
+            Ok(bytes) => {
+                yield Ok::<Vec<u8>, std::io::Error>(bytes);
+            }
+            Err(error) => {
+                yield Err::<Vec<u8>, std::io::Error>(std::io::Error::other(error));
+                return;
+            }
+        }
+        yield Ok::<Vec<u8>, std::io::Error>(b"\n".to_vec());
+    };
+
+    Body::from_stream(stream)
+}
+
 fn serialize_event(event: &rpc::RpcEvent) -> serde_json::Value {
     serde_json::json!({
         "event_id": event.event_id,
@@ -1886,6 +1903,7 @@ fn rpc_error_status(code: rpc::RpcErrorCode) -> (StatusCode, bool) {
         rpc::RpcErrorCode::NotFound => (StatusCode::NOT_FOUND, false),
         rpc::RpcErrorCode::Conflict => (StatusCode::CONFLICT, true),
         rpc::RpcErrorCode::UnsupportedCapability => (StatusCode::NOT_IMPLEMENTED, true),
+        rpc::RpcErrorCode::CursorExpired => (StatusCode::BAD_REQUEST, true),
         rpc::RpcErrorCode::Internal => (StatusCode::INTERNAL_SERVER_ERROR, false),
     }
 }
@@ -2357,6 +2375,16 @@ fn watch_events_stream_body(
     Body::from_stream(stream)
 }
 
+fn watch_events_cursor_expired_response(reason: impl Into<String>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(ndjson_body_from_frame(
+            serialize_watch_events_recovery_error(reason),
+        ))
+        .expect("cursor expired response")
+}
+
 async fn dispatch_watch_events(state: RpcServerState, request: Request<Body>) -> Response {
     let payload = match body_or_empty_json::<ReplayEventsRequestPayload>(request).await {
         Ok(payload) => payload,
@@ -2390,6 +2418,9 @@ async fn dispatch_watch_events(state: RpcServerState, request: Request<Body>) ->
             .header(header::CONTENT_TYPE, "application/x-ndjson")
             .body(watch_events_stream_body(response, parsed))
             .expect("stream response"),
+        Err(error) if error.code == rpc::RpcErrorCode::CursorExpired => {
+            watch_events_cursor_expired_response(error.reason)
+        }
         Err(error) => {
             let (status, recoverable) = rpc_error_status(error.code);
             make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
@@ -4491,6 +4522,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watch_events_stream_reports_cursor_expired_recovery() {
+        let response = watch_events_cursor_expired_response("event id is not retained");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("content type")
+                .to_str()
+                .expect("valid content type"),
+            "application/x-ndjson"
+        );
+
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("watch events cursor expired response should serialize");
+        let lines = std::str::from_utf8(&payload)
+            .expect("stream should be utf8")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+
+        let error_frame: Value = serde_json::from_str(lines[0]).expect("error frame should parse");
+        assert_eq!(error_frame["kind"], "error");
+        assert_eq!(error_frame["error"]["code"], "cursor_expired");
+        assert_eq!(error_frame["error"]["recoverable"], true);
+        assert_eq!(error_frame["error"]["next_state"], "refresh_status");
+    }
+
+    #[tokio::test]
     async fn watch_events_stream_allows_first_live_event_when_replay_is_empty() {
         let repository_id = RepositoryId::new();
         let live_event = test_job_event(&repository_id, 1);
@@ -4763,6 +4825,10 @@ mod tests {
         assert_eq!(
             rpc_error_status(rpc::RpcErrorCode::NotFound),
             (StatusCode::NOT_FOUND, false)
+        );
+        assert_eq!(
+            rpc_error_status(rpc::RpcErrorCode::CursorExpired),
+            (StatusCode::BAD_REQUEST, true)
         );
     }
 
