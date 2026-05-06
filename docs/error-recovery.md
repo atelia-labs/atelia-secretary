@@ -32,7 +32,7 @@ clients unless needed.
 | `TIMEOUT` | execution exceeded timeout | `retry_with_narrower_scope` |
 | `CANCELED` | job or tool was canceled | `inspect_audit_record` |
 | `STORE_UNAVAILABLE` | local store unavailable | `wait_for_daemon` |
-| `CURSOR_EXPIRED` | event cursor is stale or no longer retained | `refresh_status` |
+| `CURSOR_EXPIRED` | live watch stream lost continuity and needs a fresh snapshot | `refresh_status` |
 | `OUTPUT_TRUNCATED` | output is partial | `inspect_tool_result` |
 | `INTERNAL` | unexpected daemon error | `inspect_audit_record` |
 
@@ -61,9 +61,10 @@ Clients should be able to display:
 
 Do not expose stack traces as product copy.
 
-Malformed page tokens and cursor syntax remain `INVALID_REQUEST`. Use
-`CURSOR_EXPIRED` only when a previously valid retained event cursor can no
-longer resume.
+Malformed page tokens and replay/query cursor syntax remain `INVALID_REQUEST`.
+Unknown event ids in replay/query also remain `INVALID_REQUEST`. Use
+`CURSOR_EXPIRED` only when the live watch stream can no longer continue from
+its last sequence.
 
 ## Agent Behavior
 

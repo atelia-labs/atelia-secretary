@@ -1163,11 +1163,15 @@ impl SecretaryService {
                 reason: "page_size must be greater than 0".to_string(),
             });
         }
-        let (events, receiver, resolved_cursor_sequence) = self
+        let retained_limit = query.page_size;
+        let (mut events, receiver, resolved_cursor_sequence) = self
             .lifecycle
             .runtime()
             .store()
             .watch_job_events_live(query)?;
+        if let Some(limit) = retained_limit {
+            events.truncate(limit);
+        }
 
         let replay_max_sequence = events.last().map(|event| event.sequence_number);
         Ok(LiveEventSubscription {
@@ -3139,7 +3143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_events_live_drains_retained_pages_before_streaming() {
+    async fn watch_events_live_honors_retained_page_size_before_streaming() {
         let svc = ready_service();
         let root = test_repo_dir("watch-events-live-retained-pages");
 
@@ -3159,7 +3163,7 @@ mod tests {
             .store()
             .append_job_event(test_job_event(&repository.id, 1))
             .expect("first retained event should append");
-        let second_event = svc
+        let _second_event = svc
             .lifecycle
             .runtime()
             .store()
@@ -3178,13 +3182,13 @@ mod tests {
             })
             .expect("live watch should succeed");
 
-        assert_eq!(live.events.len(), 2);
+        assert_eq!(live.events.len(), 1);
         assert_eq!(
             live.events
                 .iter()
                 .map(|event| event.sequence_number)
                 .collect::<Vec<_>>(),
-            vec![first_event.sequence_number, second_event.sequence_number]
+            vec![first_event.sequence_number]
         );
         assert_eq!(
             live.events[0]
@@ -3194,15 +3198,7 @@ mod tests {
                 .map(|id| id.as_str()),
             Some(repository.id.as_str())
         );
-        assert_eq!(
-            live.events[1]
-                .refs
-                .repository_id
-                .as_ref()
-                .map(|id| id.as_str()),
-            Some(repository.id.as_str())
-        );
-        assert_eq!(live.replay_max_sequence, Some(second_event.sequence_number));
+        assert_eq!(live.replay_max_sequence, Some(first_event.sequence_number));
         assert_eq!(live.resolved_cursor_sequence, None);
 
         let live_event = svc

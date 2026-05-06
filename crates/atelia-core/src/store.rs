@@ -126,7 +126,7 @@ pub enum StoreError {
     InvalidCursor {
         reason: String,
     },
-    /// The cursor refers to an event that used to exist but is no longer retained.
+    /// The live event stream lost continuity and must be refreshed.
     CursorExpired {
         reason: String,
     },
@@ -3039,18 +3039,6 @@ fn cursor_expired_live_snapshot(retained_events: usize) -> StoreError {
         context = "watch_events_live_snapshot",
         retained_events,
         max_live_watch_snapshot = MAX_LIVE_WATCH_SNAPSHOT,
-        reason = %reason,
-        "watch events cursor expired"
-    );
-    StoreError::CursorExpired { reason }
-}
-
-fn cursor_expired_event_id(context: &'static str, id: &JobEventId) -> StoreError {
-    let reason = format!("event id is not retained: {}", id_debug(id));
-    tracing::warn!(
-        error.kind = "cursor_expired",
-        context,
-        event_id = %id_debug(id),
         reason = %reason,
         "watch events cursor expired"
     );

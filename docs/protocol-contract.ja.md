@@ -168,7 +168,7 @@ event ordering は daemon store 単位です。
 - client は last seen sequence number または event id で resume する
 
 daemon が current process 内で continuity を保証できない場合、`WatchEvents` は `CURSOR_EXPIRED` recovery error を返し、client に `GetProjectStatus` を呼ぶよう伝えます。restart 後は、durable snapshot が必要なら `GetProjectStatus`、bounded replay-only semantics が必要なら `ReplayEvents` を使います。
-以前は有効だった retained event id がもう使えない場合も `WatchEvents` は `CURSOR_EXPIRED` を返します。page token や cursor syntax の不正は `INVALID_REQUEST` のままです。
+replay/query で unknown event id を指定した request は `INVALID_REQUEST` のままです。live watch stream が continuity を失った場合のみ `WatchEvents` は `CURSOR_EXPIRED` を返します。page token や replay/query cursor syntax の不正は `INVALID_REQUEST` のままです。
 
 ## Error Shape
 

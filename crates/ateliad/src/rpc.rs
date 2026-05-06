@@ -656,7 +656,7 @@ fn registry_error_to_rpc(error: atelia_core::RegistryError) -> RpcError {
 pub enum RpcErrorCode {
     InvalidArgument,
     NotFound,
-    /// The requested cursor has expired because the underlying event is no longer retained.
+    /// The live watch stream cursor has expired and must be refreshed.
     CursorExpired,
     Conflict,
     UnsupportedCapability,
@@ -4314,14 +4314,14 @@ mod tests {
     }
 
     #[test]
-    /// Map expired store cursors to the dedicated RPC error code.
-    fn store_cursor_expired_maps_to_cursor_expired_rpc_error() {
-        let error = store_error_to_rpc(StoreError::CursorExpired {
-            reason: "event id is no longer retained: event-123".to_string(),
+    /// Map stale replay cursors to the ordinary invalid-argument RPC error.
+    fn store_invalid_cursor_maps_to_invalid_argument_rpc_error() {
+        let error = store_error_to_rpc(StoreError::InvalidCursor {
+            reason: "unknown event id: event-123".to_string(),
         });
 
-        assert_eq!(error.code, RpcErrorCode::CursorExpired);
-        assert!(error.reason.contains("no longer retained"));
+        assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+        assert!(error.reason.contains("unknown event id"));
     }
 
     #[test]
