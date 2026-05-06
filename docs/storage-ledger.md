@@ -27,6 +27,7 @@ append log. The architecture requires these logical collections:
 | `tool_results` | canonical structured outputs |
 | `audit_records` | durable policy and execution evidence |
 | `lock_decisions` | durable repository/path mutual-exclusion decisions |
+| `submit_job_idempotency` | successful SubmitJob request signatures and replayable receipts, validated fail-closed on snapshot startup |
 | `schema_migrations` | applied storage migrations |
 
 ## Beta Durable Snapshot

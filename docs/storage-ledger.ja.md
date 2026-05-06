@@ -24,6 +24,7 @@ Atelia Secretary には、複雑な database より先に local ledger が必要
 | `tool_results` | canonical structured outputs |
 | `audit_records` | durable policy and execution evidence |
 | `lock_decisions` | durable repository/path mutual-exclusion decisions |
+| `submit_job_idempotency` | successful SubmitJob request signatures and replayable receipts, snapshot startup 時に fail-closed で validate される |
 | `schema_migrations` | applied storage migrations |
 
 ## Beta Durable Snapshot

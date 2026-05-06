@@ -822,12 +822,18 @@ impl SecretaryService {
         let tool_kind = resolve_submit_job_tool_kind(&request, &requested_capabilities)?;
         let repository = self.get_repository(&request.repository_id)?;
 
-        let normalized_idempotency_key = request
-            .idempotency_key
-            .as_ref()
-            .map(|key| key.trim())
-            .filter(|key| !key.is_empty())
-            .map(str::to_string);
+        let normalized_idempotency_key = match request.idempotency_key.as_ref() {
+            Some(idempotency_key) => {
+                let trimmed = idempotency_key.trim();
+                if trimmed.is_empty() {
+                    return Err(ServiceError::InvalidArgument {
+                        reason: "idempotency_key must not be blank".to_string(),
+                    });
+                }
+                Some(trimmed.to_string())
+            }
+            None => None,
+        };
         let request_signature =
             submit_job_request_signature(&request, &normalized_goal, &requested_capabilities);
         let tool_output_defaults = self.get_tool_output_defaults(
@@ -4880,6 +4886,40 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ServiceError::Conflict { reason: _ }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_blank_idempotency_key() {
+        let svc = ready_service();
+        let root = test_repo_dir("blank-idempotency-key");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("   ".to_string()),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ServiceError::InvalidArgument { reason }
+                if reason == "idempotency_key must not be blank"
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
