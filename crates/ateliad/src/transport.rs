@@ -2322,7 +2322,9 @@ fn watch_events_stream_body(
         yield Ok::<Vec<u8>, std::io::Error>(b"\n".to_vec());
 
         let mut receiver = subscription.receiver;
-        let mut replay_max_sequence = subscription.replay_max_sequence;
+        let mut replay_max_sequence = subscription
+            .replay_max_sequence
+            .or(subscription.resolved_cursor_sequence);
         loop {
             match receiver.recv().await {
                 Ok(event) => {
@@ -4430,6 +4432,7 @@ mod tests {
             subscription: rpc::WatchEventsLiveSubscription {
                 receiver,
                 replay_max_sequence: Some(replay_event.sequence_number),
+                resolved_cursor_sequence: Some(replay_event.sequence_number),
                 last_sequence: Some(replay_event.sequence_number),
             },
         };
@@ -4492,6 +4495,7 @@ mod tests {
             subscription: rpc::WatchEventsLiveSubscription {
                 receiver,
                 replay_max_sequence: Some(replay_event.sequence_number),
+                resolved_cursor_sequence: Some(replay_event.sequence_number),
                 last_sequence: Some(replay_event.sequence_number),
             },
         };
@@ -4571,6 +4575,7 @@ mod tests {
             subscription: rpc::WatchEventsLiveSubscription {
                 receiver,
                 replay_max_sequence: None,
+                resolved_cursor_sequence: None,
                 last_sequence: None,
             },
         };
@@ -4596,6 +4601,57 @@ mod tests {
         let event_frame: Value = serde_json::from_str(lines[1]).expect("event frame should parse");
         assert_eq!(event_frame["kind"], "event");
         assert_eq!(event_frame["event"]["sequence"], 1);
+    }
+
+    #[tokio::test]
+    async fn watch_events_stream_skips_events_before_resolved_cursor_sequence() {
+        let repository_id = RepositoryId::new();
+        let anchor_event = test_job_event(&repository_id, 1);
+        let live_event = test_job_event(&repository_id, 2);
+        let metadata =
+            rpc::ProtocolMetadata::from(service::SecretaryService::new().protocol_metadata());
+        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        sender
+            .send(anchor_event.clone())
+            .expect("anchor event should broadcast");
+        sender
+            .send(live_event.clone())
+            .expect("live event should broadcast");
+        drop(sender);
+
+        let response = rpc::WatchEventsLiveResponse {
+            metadata,
+            events: Vec::new(),
+            cursor: Some(rpc::EventCursorRequest::Beginning),
+            subscription: rpc::WatchEventsLiveSubscription {
+                receiver,
+                replay_max_sequence: None,
+                resolved_cursor_sequence: Some(anchor_event.sequence_number),
+                last_sequence: Some(anchor_event.sequence_number),
+            },
+        };
+        let request = rpc::WatchEventsRequest {
+            repository_id: repository_id.as_str().to_string(),
+            cursor: Some(rpc::EventCursorRequest::Beginning),
+            subject_ids: Vec::new(),
+            min_severity: None,
+            limit: Some(1),
+        };
+
+        let body = watch_events_stream_body(response, request);
+        let payload = to_bytes(body, usize::MAX)
+            .await
+            .expect("watch events stream should serialize");
+        let lines = std::str::from_utf8(&payload)
+            .expect("stream should be utf8")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+
+        let event_frame: Value = serde_json::from_str(lines[1]).expect("event frame should parse");
+        assert_eq!(event_frame["kind"], "event");
+        assert_eq!(event_frame["event"]["sequence"], 2);
     }
 
     #[test]

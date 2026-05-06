@@ -221,7 +221,7 @@ pub trait SecretaryStore: Send + Sync + 'static {
     fn watch_job_events_live(
         &self,
         query: EventQuery,
-    ) -> StoreResult<(Vec<JobEvent>, broadcast::Receiver<JobEvent>)>;
+    ) -> StoreResult<(Vec<JobEvent>, broadcast::Receiver<JobEvent>, Option<u64>)>;
     fn query_job_events(&self, query: EventQuery) -> StoreResult<EventPage>;
     fn get_job_event(&self, id: &JobEventId) -> StoreResult<JobEvent>;
 
@@ -776,11 +776,19 @@ impl SecretaryStore for InMemoryStore {
     fn watch_job_events_live(
         &self,
         query: EventQuery,
-    ) -> StoreResult<(Vec<JobEvent>, broadcast::Receiver<JobEvent>)> {
+    ) -> StoreResult<(Vec<JobEvent>, broadcast::Receiver<JobEvent>, Option<u64>)> {
         let inner = self.lock()?;
         let receiver = match query.repository_id.as_ref() {
             Some(repository_id) => self.subscribe_repository_job_events(repository_id),
             None => self.event_broadcaster.subscribe(),
+        };
+        let resolved_cursor_sequence = match query.cursor.clone() {
+            EventCursor::Beginning => None,
+            EventCursor::AfterSequence(sequence) => Some(sequence),
+            EventCursor::AfterEventId(id) => Some(event_cursor_sequence(
+                &inner,
+                EventCursor::AfterEventId(id),
+            )?),
         };
         let filtered = collect_filtered_job_events(&inner, &query)?;
         let page_size = query.page_size.unwrap_or(usize::MAX);
@@ -799,7 +807,7 @@ impl SecretaryStore for InMemoryStore {
             }
         }
 
-        Ok((events, receiver))
+        Ok((events, receiver, resolved_cursor_sequence))
     }
 
     fn query_job_events(&self, query: EventQuery) -> StoreResult<EventPage> {
@@ -5152,7 +5160,7 @@ mod tests {
             .append_job_event(job_event(repository.id.clone()))
             .unwrap();
 
-        let (events, mut receiver) = store
+        let (events, mut receiver, resolved_cursor_sequence) = store
             .watch_job_events_live(EventQuery {
                 repository_id: Some(repository.id.clone()),
                 cursor: EventCursor::Beginning,
@@ -5171,6 +5179,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![first.sequence_number, second.sequence_number]
         );
+        assert_eq!(resolved_cursor_sequence, None);
 
         let third = store.append_job_event(job_event(repository.id)).unwrap();
         let received = receiver
@@ -5193,7 +5202,7 @@ mod tests {
         store.create_repository(watched_repository.clone()).unwrap();
         store.create_repository(noisy_repository.clone()).unwrap();
 
-        let (events, mut receiver) = store
+        let (events, mut receiver, resolved_cursor_sequence) = store
             .watch_job_events_live(EventQuery {
                 repository_id: Some(watched_repository.id.clone()),
                 cursor: EventCursor::Beginning,
@@ -5206,6 +5215,7 @@ mod tests {
             .unwrap();
 
         assert!(events.is_empty());
+        assert_eq!(resolved_cursor_sequence, None);
 
         for _ in 0..1100 {
             store

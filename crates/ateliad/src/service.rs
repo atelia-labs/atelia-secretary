@@ -427,6 +427,7 @@ pub struct LiveEventSubscription {
     pub events: Vec<JobEvent>,
     pub receiver: broadcast::Receiver<JobEvent>,
     pub replay_max_sequence: Option<u64>,
+    pub resolved_cursor_sequence: Option<u64>,
 }
 
 impl SecretaryService {
@@ -1158,7 +1159,7 @@ impl SecretaryService {
     /// Atomically snapshot retained events and subscribe to future events.
     #[allow(dead_code)]
     pub fn watch_events_live(&self, query: EventQuery) -> ServiceResult<LiveEventSubscription> {
-        let (events, receiver) = self
+        let (events, receiver, resolved_cursor_sequence) = self
             .lifecycle
             .runtime()
             .store()
@@ -1169,6 +1170,7 @@ impl SecretaryService {
             events,
             receiver,
             replay_max_sequence,
+            resolved_cursor_sequence,
         })
     }
 
@@ -3185,6 +3187,7 @@ mod tests {
             Some(repository.id.as_str())
         );
         assert_eq!(live.replay_max_sequence, Some(second_event.sequence_number));
+        assert_eq!(live.resolved_cursor_sequence, None);
 
         let _ = fs::remove_dir_all(root);
     }
