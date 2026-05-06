@@ -431,15 +431,12 @@ pub fn validate_listen_addr(listen_addr: &SocketAddr, explicit_addr: bool) -> Re
     }
 }
 
-/// Refuse to combine auth-disabled mode with an unsafe non-loopback listener.
+/// Refuse to combine auth-disabled mode with any non-loopback listener.
 pub fn validate_local_auth_binding(
     local_auth: &LocalAuthConfig,
     listen_addr: &SocketAddr,
 ) -> Result<()> {
-    if matches!(local_auth, LocalAuthConfig::Disabled)
-        && !is_loopback(listen_addr)
-        && unsafe_allow_non_loopback_listen()
-    {
+    if matches!(local_auth, LocalAuthConfig::Disabled) && !is_loopback(listen_addr) {
         Err(anyhow!(
             "refusing to combine {AUTH_DISABLED_ENV}=1 with non-loopback listener address {listen_addr}; keep auth enabled or bind to loopback only"
         ))
@@ -4163,6 +4160,20 @@ mod tests {
     fn validate_local_auth_binding_rejects_auth_disabled_on_unsafe_non_loopback_listener() {
         let _guard = UnsafeAllowNonLoopbackListenEnvGuard::lock();
         std::env::set_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV, "1");
+        let listen_addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+
+        let err = validate_local_auth_binding(&LocalAuthConfig::Disabled, &listen_addr)
+            .expect_err("auth-disabled non-loopback listener should fail closed");
+
+        assert!(err
+            .to_string()
+            .contains("refusing to combine ATELIA_DAEMON_AUTH_DISABLED=1"));
+    }
+
+    #[test]
+    fn validate_local_auth_binding_rejects_auth_disabled_on_non_loopback_without_escape_hatch() {
+        let _guard = UnsafeAllowNonLoopbackListenEnvGuard::lock();
+        std::env::remove_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV);
         let listen_addr = SocketAddr::from(([0, 0, 0, 0], 8080));
 
         let err = validate_local_auth_binding(&LocalAuthConfig::Disabled, &listen_addr)
