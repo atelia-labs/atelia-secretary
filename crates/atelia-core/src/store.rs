@@ -557,9 +557,22 @@ async fn forward_filtered_job_events(
         if resolved_cursor_sequence.is_some_and(|sequence| event.sequence_number <= sequence) {
             continue;
         }
-        let should_forward = match store
-            .lock()
-            .and_then(|inner| event_matches_query(&inner, &event, &query))
+        let should_forward = match tokio::task::spawn_blocking({
+            let store = store.clone();
+            let event = event.clone();
+            let query = query.clone();
+            move || {
+                store
+                    .lock()
+                    .and_then(|inner| event_matches_query(&inner, &event, &query))
+            }
+        })
+        .await
+        .map_err(|error| StoreError::Conflict {
+            collection: "store",
+            reason: format!("watch event filter task failed: {error}"),
+        })
+        .and_then(|result| result)
         {
             Ok(should_forward) => should_forward,
             Err(error) => {
@@ -895,7 +908,7 @@ impl SecretaryStore for InMemoryStore {
             Some(repository_id) => self.subscribe_repository_job_events(repository_id)?,
             None => self.event_broadcaster.subscribe(),
         };
-        let (candidates, resolved_cursor_sequence, live_cutoff_sequence) = {
+        let (candidate_ids, resolved_cursor_sequence, live_cutoff_sequence) = {
             let inner = self.lock()?;
             let resolved_cursor_sequence = match query.cursor.clone() {
                 EventCursor::Beginning => None,
@@ -906,37 +919,46 @@ impl SecretaryStore for InMemoryStore {
                 )?),
             };
             let after_sequence = event_cursor_sequence(&inner, query.cursor.clone())?;
-            let mut candidates = Vec::new();
-            let needs_repository_resolution = query.repository_id.is_some();
+            let mut candidate_ids = Vec::new();
             if let Some(start_sequence) = after_sequence.checked_add(1) {
                 for (_, id) in inner.job_events_by_sequence.range(start_sequence..) {
-                    let event =
-                        inner
-                            .job_events_by_id
-                            .get(id)
-                            .ok_or_else(|| StoreError::Conflict {
-                                collection: "job_events",
-                                reason: format!(
-                                    "sequence index references missing id {}",
-                                    id_debug(id)
-                                ),
-                            })?;
-                    candidates.push(EventQueryCandidate {
-                        event: event.clone(),
-                        repository_id: if needs_repository_resolution {
-                            event_repository_id(&inner, event)?
-                        } else {
-                            None
-                        },
-                    });
+                    candidate_ids.push(id.clone());
                 }
             }
             let live_cutoff_sequence = match resolved_cursor_sequence {
                 Some(resolved) => Some(resolved.max(inner.next_event_sequence)),
                 None => Some(inner.next_event_sequence),
             };
-            (candidates, resolved_cursor_sequence, live_cutoff_sequence)
+            (
+                candidate_ids,
+                resolved_cursor_sequence,
+                live_cutoff_sequence,
+            )
         };
+        let needs_repository_resolution = query.repository_id.is_some();
+        let candidates = candidate_ids
+            .into_iter()
+            .map(|id| {
+                let inner = self.lock()?;
+                let event = inner
+                    .job_events_by_id
+                    .get(&id)
+                    .ok_or_else(|| StoreError::Conflict {
+                        collection: "job_events",
+                        reason: format!("sequence index references missing id {}", id_debug(&id)),
+                    })?
+                    .clone();
+                let repository_id = if needs_repository_resolution {
+                    event_repository_id(&inner, &event)?
+                } else {
+                    None
+                };
+                Ok(EventQueryCandidate {
+                    event,
+                    repository_id,
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
         let events = candidates
             .into_iter()
             .filter(|candidate| event_candidate_matches_query(candidate, &query))
