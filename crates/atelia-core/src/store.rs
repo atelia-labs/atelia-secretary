@@ -4,8 +4,8 @@ use crate::domain::{
     Actor, AuditRecord, AuditRecordId, CancellationState, EventSeverity, EventSubjectType,
     JobEvent, JobEventId, JobEventKind, JobId, JobRecord, JobStatus, LedgerTimestamp, LockDecision,
     LockDecisionId, LockOwner, MigrationLockStatus, PolicyDecision, PolicyDecisionId, RepositoryId,
-    RepositoryRecord, SchemaMigrationId, SchemaMigrationRecord, ToolInvocation, ToolInvocationId,
-    ToolResult, ToolResultId, MIGRATION_LOCK_RECORD_NAME,
+    RepositoryRecord, RepositoryTrustState, SchemaMigrationId, SchemaMigrationRecord,
+    ToolInvocation, ToolInvocationId, ToolResult, ToolResultId, MIGRATION_LOCK_RECORD_NAME,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -334,6 +334,35 @@ impl SecretaryStore for InMemoryStore {
                     id: format!("root_path {}", record.root_path),
                 });
             }
+
+            if let Some(conflicting_repository) = inner.repositories.values().find(|existing| {
+                repository_roots_strictly_overlap(&record.root_path, &existing.root_path)
+                    && (record.trust_state == RepositoryTrustState::Blocked
+                        || existing.trust_state == RepositoryTrustState::Blocked)
+            }) {
+                return Err(StoreError::Conflict {
+                    collection: "repositories",
+                    reason: format!(
+                        "root_path {} conflicts with blocked repository root {}",
+                        record.root_path, conflicting_repository.root_path
+                    ),
+                });
+            }
+
+            if let Some((policy_decision, blocked_root)) =
+                root_scoped_blocked_policy_overlapping_repository(inner, &record.root_path)?
+            {
+                return Err(StoreError::Conflict {
+                    collection: "repositories",
+                    reason: format!(
+                        "root_path {} conflicts with blocked policy root {} from policy decision {}",
+                        record.root_path,
+                        blocked_root,
+                        id_debug(&policy_decision.id)
+                    ),
+                });
+            }
+
             insert_record(
                 &mut inner.repositories,
                 record.id.clone(),
@@ -1164,14 +1193,69 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
 }
 
 fn validate_loaded_store(inner: &InMemoryInner) -> StoreResult<()> {
+    let repositories = inner.repositories.values().collect::<Vec<_>>();
     let mut seen_repository_roots = HashSet::new();
-    for repository in inner.repositories.values() {
+    for repository in &repositories {
         validate_repository_record(repository)?;
         if !seen_repository_roots.insert(repository.root_path.clone()) {
             return Err(StoreError::InvalidRecord {
                 collection: "repositories",
                 reason: format!("duplicate root_path {}", repository.root_path),
             });
+        }
+    }
+
+    for (index, repository) in repositories.iter().enumerate() {
+        for conflicting_repository in repositories.iter().skip(index + 1) {
+            if repository_roots_strictly_overlap(
+                &repository.root_path,
+                &conflicting_repository.root_path,
+            ) && (repository.trust_state == RepositoryTrustState::Blocked
+                || conflicting_repository.trust_state == RepositoryTrustState::Blocked)
+            {
+                return Err(StoreError::InvalidRecord {
+                    collection: "repositories",
+                    reason: format!(
+                        "blocked root_path {} conflicts with repository root_path {}",
+                        repository.root_path, conflicting_repository.root_path
+                    ),
+                });
+            }
+        }
+    }
+
+    for policy_decision in inner.policy_decisions.values() {
+        if !is_root_scoped_repository_block(policy_decision) {
+            continue;
+        }
+
+        let repository = inner
+            .repositories
+            .get(&policy_decision.repository_id)
+            .ok_or_else(|| StoreError::InvalidReference {
+                collection: "policy_decisions",
+                reason: format!(
+                    "policy decision {} references missing repository {}",
+                    id_debug(&policy_decision.id),
+                    id_debug(&policy_decision.repository_id)
+                ),
+            })?;
+
+        for conflicting_repository in inner.repositories.values() {
+            if conflicting_repository.id != repository.id
+                && repository_roots_strictly_overlap(
+                    &repository.root_path,
+                    &conflicting_repository.root_path,
+                )
+            {
+                return Err(StoreError::InvalidRecord {
+                    collection: "repositories",
+                    reason: format!(
+                        "blocked policy root_path {} conflicts with repository root_path {}",
+                        repository.root_path, conflicting_repository.root_path
+                    ),
+                });
+            }
         }
     }
 
@@ -1560,6 +1644,50 @@ fn validate_repository_record(record: &RepositoryRecord) -> StoreResult<()> {
     }
 
     Ok(())
+}
+
+fn repository_roots_strictly_overlap(candidate_root: &str, blocked_root: &str) -> bool {
+    let candidate_root = Path::new(candidate_root);
+    let blocked_root = Path::new(blocked_root);
+
+    candidate_root != blocked_root
+        && (candidate_root.starts_with(blocked_root) || blocked_root.starts_with(candidate_root))
+}
+
+fn is_root_scoped_repository_block(policy_decision: &PolicyDecision) -> bool {
+    policy_decision.outcome == crate::domain::PolicyOutcome::Blocked
+        && policy_decision.reason_code.trim() == "repository_blocked"
+        && policy_decision.resource_scope.kind.trim() == "repository"
+        && policy_decision.resource_scope.value.trim() == "."
+}
+
+fn root_scoped_blocked_policy_overlapping_repository<'a>(
+    inner: &'a InMemoryInner,
+    root_path: &str,
+) -> StoreResult<Option<(&'a PolicyDecision, &'a str)>> {
+    for policy_decision in inner.policy_decisions.values() {
+        if !is_root_scoped_repository_block(policy_decision) {
+            continue;
+        }
+
+        let repository = inner
+            .repositories
+            .get(&policy_decision.repository_id)
+            .ok_or_else(|| StoreError::InvalidReference {
+                collection: "policy_decisions",
+                reason: format!(
+                    "policy decision {} references missing repository {}",
+                    id_debug(&policy_decision.id),
+                    id_debug(&policy_decision.repository_id)
+                ),
+            })?;
+
+        if repository_roots_strictly_overlap(root_path, &repository.root_path) {
+            return Ok(Some((policy_decision, repository.root_path.as_str())));
+        }
+    }
+
+    Ok(None)
 }
 
 fn page_start(page_token: Option<&str>, collection: &'static str) -> StoreResult<usize> {
@@ -3179,6 +3307,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     static REPOSITORY_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
     static DURABLE_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -5386,6 +5516,97 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn blocked_repository_root_registration_is_atomic_against_overlapping_trusted_roots() {
+        let store = Arc::new(InMemoryStore::new());
+        let root = format!("/tmp/atelia-store-test-atomic-{}", std::process::id());
+        let blocked_child_root = format!("{root}/nested");
+        let trusted_parent = RepositoryRecord::new(
+            "store test trusted parent",
+            &root,
+            RepositoryTrustState::Trusted,
+            timestamp(1),
+        );
+        let blocked_child = RepositoryRecord::new(
+            "store test blocked child",
+            &blocked_child_root,
+            RepositoryTrustState::Blocked,
+            timestamp(2),
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let parent_store = Arc::clone(&store);
+        let parent_barrier = Arc::clone(&barrier);
+        let parent_handle = thread::spawn(move || {
+            parent_barrier.wait();
+            parent_store.create_repository(trusted_parent)
+        });
+
+        let child_store = Arc::clone(&store);
+        let child_barrier = Arc::clone(&barrier);
+        let child_handle = thread::spawn(move || {
+            child_barrier.wait();
+            child_store.create_repository(blocked_child)
+        });
+
+        let parent_result = parent_handle.join().unwrap();
+        let child_result = child_handle.join().unwrap();
+
+        let results = [parent_result, child_result];
+        assert!(results.iter().any(|result| result.is_ok()));
+        assert!(results.iter().any(|result| {
+            matches!(
+                result,
+                Err(StoreError::Conflict {
+                    collection: "repositories",
+                    ..
+                })
+            )
+        }));
+        assert_eq!(store.list_repositories().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn repository_registration_rejects_overlap_with_root_scoped_blocked_policy() {
+        let store = InMemoryStore::new();
+        let root = format!(
+            "/tmp/atelia-store-test-policy-overlap-{}",
+            std::process::id()
+        );
+        let blocked_child_root = format!("{root}/nested");
+        let blocked_child = RepositoryRecord::new(
+            "store test blocked policy child",
+            &blocked_child_root,
+            RepositoryTrustState::Trusted,
+            timestamp(1),
+        );
+        let trusted_parent = RepositoryRecord::new(
+            "store test trusted parent",
+            &root,
+            RepositoryTrustState::Trusted,
+            timestamp(2),
+        );
+
+        store.create_repository(blocked_child.clone()).unwrap();
+        let mut policy = policy_decision(blocked_child.id.clone());
+        policy.outcome = PolicyOutcome::Blocked;
+        policy.reason_code = "repository_blocked".to_string();
+        policy.resource_scope = ResourceScope {
+            kind: "repository".to_string(),
+            value: ".".to_string(),
+        };
+        store.create_policy_decision(policy).unwrap();
+
+        assert!(matches!(
+            store.create_repository(trusted_parent),
+            Err(StoreError::Conflict {
+                collection: "repositories",
+                ..
+            })
+        ));
+        assert_eq!(store.list_repositories().unwrap().len(), 1);
     }
 
     #[test]
