@@ -88,7 +88,9 @@ Recommended mitigations:
 
 - keep the daemon loopback-only and leave local auth enabled;
 - use a unique token per host or per daemon instance;
-- rotate the token immediately after exposure or suspected interception;
+- rotate the token on a regular cadence, around every 30 days, and
+  immediately after exposure or suspected interception;
+- monitor token usage and keep an audit trail for access and rotation;
 - avoid putting the daemon behind a shared listener, reverse proxy, or other
   boundary that would make captured requests easier to reuse.
 

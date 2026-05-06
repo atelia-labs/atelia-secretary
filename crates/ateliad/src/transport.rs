@@ -492,6 +492,11 @@ pub fn resolve_local_auth(storage_dir: &std::path::Path) -> Result<LocalAuthConf
                 "{AUTH_TOKEN_ENV} must contain only visible ASCII characters"
             ));
         }
+        if !local_auth_token_is_strong(&token) {
+            return Err(anyhow!(
+                "{AUTH_TOKEN_ENV} must be either exactly 64 hexadecimal characters or at least 43 base64url characters using only ASCII alphanumeric, '-' or '_'"
+            ));
+        }
 
         return Ok(LocalAuthConfig::BearerToken { token });
     }
@@ -502,6 +507,15 @@ pub fn resolve_local_auth(storage_dir: &std::path::Path) -> Result<LocalAuthConf
 
 fn local_auth_token_path(storage_dir: &std::path::Path) -> std::path::PathBuf {
     storage_dir.join(AUTH_TOKEN_FILE_NAME)
+}
+
+fn local_auth_token_is_strong(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    (bytes.len() == 64 && bytes.iter().all(|byte| byte.is_ascii_hexdigit()))
+        || (bytes.len() >= 43
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
 }
 
 fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String> {
@@ -3797,6 +3811,40 @@ mod tests {
                 .to_string()
                 .contains("ATELIA_DAEMON_AUTH_TOKEN must contain only visible ASCII characters"));
         }
+    }
+
+    #[test]
+    fn resolve_local_auth_rejects_weak_pinned_token() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::set_var(AUTH_TOKEN_ENV, "abcdefghijklmnopqrstuvwxyz0123456789-_abcd");
+
+        let err = resolve_local_auth(&test_repo_dir("local-auth-env-weak-token"))
+            .expect_err("weak pinned token should be rejected");
+
+        assert!(err.to_string().contains(
+            "ATELIA_DAEMON_AUTH_TOKEN must be either exactly 64 hexadecimal characters or at least 43 base64url characters using only ASCII alphanumeric, '-' or '_'"
+        ));
+    }
+
+    #[test]
+    fn resolve_local_auth_accepts_valid_pinned_token() {
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::set_var(
+            AUTH_TOKEN_ENV,
+            "abcdefghijklmnopqrstuvwxyz0123456789-_abcde",
+        );
+
+        let resolved = resolve_local_auth(&test_repo_dir("local-auth-env-valid-token"))
+            .expect("valid pinned token should be accepted");
+
+        assert_eq!(
+            resolved,
+            LocalAuthConfig::BearerToken {
+                token: "abcdefghijklmnopqrstuvwxyz0123456789-_abcde".to_string(),
+            }
+        );
     }
 
     #[test]
