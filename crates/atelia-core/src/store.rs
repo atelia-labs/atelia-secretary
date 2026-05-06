@@ -572,11 +572,12 @@ impl SecretaryStore for InMemoryStore {
 
             append_event_locked(inner, &mut event)?;
             record.latest_event_id = Some(event.id.clone());
+            let committed_job = record.clone();
             inner.jobs.insert(record.id.clone(), record);
             if let Some(last_event) = idempotency_record.receipt.events.last_mut() {
                 *last_event = event.clone();
             }
-            idempotency_record.receipt.job.latest_event_id = Some(event.id.clone());
+            idempotency_record.receipt.job = committed_job;
             insert_submit_job_idempotency_locked(inner, idempotency_key, idempotency_record)?;
 
             Ok(event)
@@ -6840,6 +6841,69 @@ mod tests {
             reopened.get_submit_job_idempotency("ledger-key").unwrap(),
             Some(submission)
         );
+    }
+
+    #[test]
+    fn append_job_event_and_update_job_with_submit_job_idempotency_normalizes_committed_job() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+        let policy = policy_decision(repository.id.clone());
+        store.create_repository(repository.clone()).unwrap();
+        store.create_policy_decision(policy.clone()).unwrap();
+
+        let job = persist_job(&store, job_record(repository.id.clone()));
+        let stale_job = job.clone();
+
+        let mut committed_job = job;
+        committed_job
+            .transition_status(JobStatus::Running, timestamp(5))
+            .unwrap();
+        let initial_event = store
+            .get_job_event(committed_job.latest_event_id.as_ref().unwrap())
+            .unwrap();
+
+        let mut event = job_event(repository.id.clone());
+        event.subject = EventSubject::job(&committed_job.id);
+        event.kind = JobEventKind::JobStatusChanged {
+            from: JobStatus::Queued,
+            to: JobStatus::Running,
+        };
+        event.refs.job_id = Some(committed_job.id.clone());
+
+        let receipt = RuntimeJobReceipt {
+            job: stale_job.clone(),
+            policy_decision: policy,
+            tool_invocation: None,
+            tool_result: None,
+            rendered_output: None,
+            audit_record: None,
+            events: vec![initial_event, event.clone()],
+        };
+
+        let submission = SubmitJobIdempotencyRecord {
+            signature: "request-signature".to_string(),
+            receipt: receipt.clone(),
+        };
+
+        let persisted_event = store
+            .append_job_event_and_update_job_with_submit_job_idempotency(
+                committed_job.clone(),
+                event.clone(),
+                "ledger-key".to_string(),
+                submission,
+            )
+            .unwrap();
+
+        let stored_job = store.get_job(&committed_job.id).unwrap();
+        let stored_submission = store
+            .get_submit_job_idempotency("ledger-key")
+            .unwrap()
+            .expect("idempotency record should exist");
+
+        committed_job.latest_event_id = Some(persisted_event.id.clone());
+        assert_eq!(stored_job, committed_job);
+        assert_eq!(stored_submission.receipt.job, stored_job);
+        assert_ne!(stored_submission.receipt.job, stale_job);
     }
 
     #[test]
