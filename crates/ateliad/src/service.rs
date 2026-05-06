@@ -550,6 +550,7 @@ impl SecretaryService {
             .into_iter()
             .find(|repository| {
                 repository.trust_state == RepositoryTrustState::Blocked
+                    && candidate_root != Path::new(&repository.root_path)
                     && candidate_root.starts_with(Path::new(&repository.root_path))
             }))
     }
@@ -1338,7 +1339,9 @@ fn blocking_policy_decision_for_candidate_root(
             Err(_) => continue,
         };
 
-        if candidate_root.starts_with(&blocked_scope.canonical) {
+        if candidate_root != blocked_scope.canonical.as_path()
+            && candidate_root.starts_with(&blocked_scope.canonical)
+        {
             return Some(policy_decision);
         }
     }
@@ -2238,6 +2241,51 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ServiceError::Conflict { .. }));
+        assert_eq!(svc.health().repository_count, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_prefers_duplicate_root_conflict_over_exact_root_blocked_policy_decision() {
+        let svc = ready_service();
+        let root = test_repo_dir("duplicate-blocked-policy");
+
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "repo-a".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("first register should succeed");
+
+        svc.lifecycle
+            .runtime()
+            .store()
+            .create_policy_decision(blocked_policy_decision(
+                repository.id.clone(),
+                "filesystem-read",
+                ".",
+            ))
+            .expect("policy decision should persist");
+
+        let err = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "repo-b".to_string(),
+                root_path: root.join(".").to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::ReadOnly,
+                allowed_scope: None,
+                requester: None,
+            })
+            .unwrap_err();
+
+        match err {
+            ServiceError::Conflict { reason } => {
+                assert_eq!(reason, "root_path is already registered");
+            }
+            other => panic!("expected duplicate-root conflict, got {other:?}"),
+        }
         assert_eq!(svc.health().repository_count, 1);
         let _ = fs::remove_dir_all(root);
     }
