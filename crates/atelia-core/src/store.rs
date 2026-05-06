@@ -1954,6 +1954,49 @@ fn validate_loaded_submit_job_receipt_job(
     stored_job: &JobRecord,
     receipt_job: &JobRecord,
 ) -> StoreResult<()> {
+    if receipt_job.updated_at < receipt_job.created_at {
+        return Err(StoreError::InvalidRecord {
+            collection: "submit_job_idempotency",
+            reason: "receipt.job.updated_at must not be earlier than created_at".to_string(),
+        });
+    }
+    if let Some(started_at) = receipt_job.started_at {
+        if started_at < receipt_job.created_at {
+            return Err(StoreError::InvalidRecord {
+                collection: "submit_job_idempotency",
+                reason: "receipt.job.started_at must not be earlier than created_at".to_string(),
+            });
+        }
+        if started_at > receipt_job.updated_at {
+            return Err(StoreError::InvalidRecord {
+                collection: "submit_job_idempotency",
+                reason: "receipt.job.started_at must not be later than updated_at".to_string(),
+            });
+        }
+    }
+    if let Some(completed_at) = receipt_job.completed_at {
+        if completed_at < receipt_job.created_at {
+            return Err(StoreError::InvalidRecord {
+                collection: "submit_job_idempotency",
+                reason: "receipt.job.completed_at must not be earlier than created_at".to_string(),
+            });
+        }
+        if completed_at > receipt_job.updated_at {
+            return Err(StoreError::InvalidRecord {
+                collection: "submit_job_idempotency",
+                reason: "receipt.job.completed_at must not be later than updated_at".to_string(),
+            });
+        }
+        if let Some(started_at) = receipt_job.started_at {
+            if completed_at < started_at {
+                return Err(StoreError::InvalidRecord {
+                    collection: "submit_job_idempotency",
+                    reason: "receipt.job.completed_at must not be earlier than started_at"
+                        .to_string(),
+                });
+            }
+        }
+    }
     ensure_same_repository(
         "submit_job_idempotency",
         "receipt.job.repository_id",
@@ -7081,6 +7124,49 @@ mod tests {
             reopened.get_submit_job_idempotency("ledger-key").unwrap(),
             Some(submission)
         );
+    }
+
+    #[test]
+    fn durable_store_rejects_submit_job_idempotency_with_invalid_receipt_job_timestamps() {
+        let storage_dir = durable_storage_dir("idempotency-invalid-receipt-job-timestamps");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let store = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        let repository = repository_record();
+        store.create_repository(repository.clone()).unwrap();
+
+        let runtime = SecretaryRuntime::new(store.clone(), DefaultPolicyEngine::new());
+        let request =
+            RuntimeJobRequest::new(actor(), repository.id.clone(), JobKind::Read, "persist me")
+                .with_requested_capabilities(vec!["capability.discovery".to_string()]);
+        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+        let mut invalid_inner = store.lock().unwrap().clone();
+        let mut invalid_receipt = receipt.clone();
+        invalid_receipt.job.started_at = Some(timestamp(receipt.job.updated_at.unix_millis + 1));
+        invalid_inner.idempotent_submit_jobs.insert(
+            "ledger-key".to_string(),
+            SubmitJobIdempotencyRecord {
+                signature: "request-signature".to_string(),
+                receipt: invalid_receipt,
+            },
+        );
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner: invalid_inner,
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidRecord {
+                collection: "submit_job_idempotency",
+                ..
+            }
+        ));
     }
 
     #[test]

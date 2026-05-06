@@ -24,7 +24,7 @@ use atelia_core::{
     TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse,
 };
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -399,6 +399,8 @@ struct IdempotentSubmitJob {
     receipt: RuntimeJobReceipt,
 }
 
+const IDEMPOTENT_SUBMISSION_CACHE_LIMIT: usize = 256;
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
@@ -414,7 +416,7 @@ pub struct SecretaryService {
     daemon_status: DaemonStatus,
     extension_registry: Mutex<ExtensionRegistryService>,
     tool_output_settings: Mutex<InMemoryToolOutputSettingsService>,
-    idempotent_submissions: Mutex<HashMap<String, IdempotentSubmitJob>>,
+    idempotent_submissions: Mutex<VecDeque<(String, IdempotentSubmitJob)>>,
     cancellation_requesters: Mutex<HashMap<JobId, Actor>>,
 }
 
@@ -441,7 +443,7 @@ impl SecretaryService {
             tool_output_settings: Mutex::new(InMemoryToolOutputSettingsService::new(
                 LedgerTimestamp::now(),
             )),
-            idempotent_submissions: HashMap::new().into(),
+            idempotent_submissions: VecDeque::new().into(),
             cancellation_requesters: HashMap::new().into(),
         }
     }
@@ -836,7 +838,12 @@ impl SecretaryService {
                         reason: format!("idempotency cache lock poisoned: {err}"),
                     })?;
 
-            if let Some(cached) = cache.get(idempotency_key) {
+            if let Some(cached) = cache
+                .iter()
+                .rev()
+                .find(|(cached_key, _)| cached_key.as_str() == idempotency_key)
+                .map(|(_, cached)| cached)
+            {
                 if cached.signature == request_signature {
                     return Ok(cached.receipt.clone());
                 }
@@ -854,7 +861,8 @@ impl SecretaryService {
             {
                 if stored.signature == request_signature {
                     let receipt = stored.receipt.clone();
-                    cache.insert(
+                    cache_idempotent_submission(
+                        &mut cache,
                         idempotency_key.to_string(),
                         IdempotentSubmitJob {
                             signature: stored.signature,
@@ -953,7 +961,8 @@ impl SecretaryService {
         };
         if let Some((idempotency_key, mut cache)) = idempotent_cache_lock.take() {
             if receipt.job.status == JobStatus::Succeeded {
-                cache.insert(
+                cache_idempotent_submission(
+                    &mut cache,
                     idempotency_key,
                     IdempotentSubmitJob {
                         signature: request_signature,
@@ -1610,6 +1619,23 @@ fn submit_job_request_signature(
         requested_capabilities,
     })
     .expect("serialize canonical submit_job request signature")
+}
+
+fn cache_idempotent_submission(
+    cache: &mut VecDeque<(String, IdempotentSubmitJob)>,
+    idempotency_key: String,
+    submission: IdempotentSubmitJob,
+) {
+    if let Some(position) = cache
+        .iter()
+        .position(|(cached_key, _)| cached_key == &idempotency_key)
+    {
+        cache.remove(position);
+    }
+    if cache.len() >= IDEMPOTENT_SUBMISSION_CACHE_LIMIT {
+        cache.pop_front();
+    }
+    cache.push_back((idempotency_key, submission));
 }
 
 impl Default for SecretaryService {
@@ -4642,6 +4668,67 @@ mod tests {
             .expect("replayed submit should return same job");
 
         assert_eq!(second.job.id, first.job.id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_idempotency_cache_is_bounded() {
+        let svc = ready_service();
+        let root = test_repo_dir("bounded-idempotency-cache");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let first = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("request-0".to_string()),
+            })
+            .expect("first submit should succeed");
+
+        for index in 1..=IDEMPOTENT_SUBMISSION_CACHE_LIMIT {
+            let receipt = svc
+                .submit_job(SubmitJobRequest {
+                    requester: actor(),
+                    repository_id: repository.id.clone(),
+                    kind: JobKind::Read,
+                    goal: "summarize".to_string(),
+                    resource_scope: None,
+                    requested_capabilities: Vec::new(),
+                    idempotency_key: Some(format!("request-{index}")),
+                })
+                .expect("unique submit should succeed");
+            assert_eq!(receipt.job.goal, "summarize");
+        }
+
+        assert_eq!(
+            svc.idempotent_submissions.lock().unwrap().len(),
+            IDEMPOTENT_SUBMISSION_CACHE_LIMIT
+        );
+
+        let replayed = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: "summarize".to_string(),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: Some("request-0".to_string()),
+            })
+            .expect("replayed submit should still succeed after cache eviction");
+        assert_eq!(replayed.job.id, first.job.id);
         let _ = fs::remove_dir_all(root);
     }
 
