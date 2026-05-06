@@ -243,12 +243,7 @@ impl SecretaryRpcServer {
             subject_ids: request.subject_ids,
             job_ids: Vec::new(),
             min_severity: request.min_severity.map(parse_event_severity),
-            page_size: Some(
-                request
-                    .limit
-                    .unwrap_or(MAX_WATCH_EVENTS_PAGE)
-                    .min(MAX_WATCH_EVENTS_PAGE),
-            ),
+            page_size: Some(parse_watch_events_limit(request.limit)?),
             page_token: None,
         };
         let page = self.service.list_events_page(query)?;
@@ -284,12 +279,7 @@ impl SecretaryRpcServer {
             subject_ids: request.subject_ids.clone(),
             job_ids: Vec::new(),
             min_severity: request.min_severity.map(parse_event_severity),
-            page_size: Some(
-                request
-                    .limit
-                    .unwrap_or(MAX_WATCH_EVENTS_PAGE)
-                    .min(MAX_WATCH_EVENTS_PAGE),
-            ),
+            page_size: Some(parse_watch_events_limit(request.limit)?),
             page_token: None,
         };
         let live = self.service.watch_events_live(query)?;
@@ -299,12 +289,13 @@ impl SecretaryRpcServer {
             .into_iter()
             .map(RpcEvent::from)
             .collect::<Vec<_>>();
+        let last_sequence =
+            watch_events_last_sequence(&events, replay_max_sequence, incoming_cursor.clone());
         let cursor = if let Some(event) = events.last() {
             Some(EventCursorRequest::AfterSequence(event.sequence))
         } else {
             Some(incoming_cursor)
         };
-        let last_sequence = watch_events_last_sequence(&events, replay_max_sequence);
 
         Ok(WatchEventsLiveResponse {
             metadata: self.metadata(),
@@ -1358,11 +1349,23 @@ pub struct WatchEventsReplayResponse {
 fn watch_events_last_sequence(
     events: &[RpcEvent],
     replay_max_sequence: Option<u64>,
+    incoming_cursor: EventCursorRequest,
 ) -> Option<u64> {
     events
         .last()
         .map(|event| event.sequence)
-        .or(replay_max_sequence)
+        .or(match incoming_cursor {
+            EventCursorRequest::AfterSequence(sequence) => Some(sequence),
+            _ => replay_max_sequence,
+        })
+}
+
+fn parse_watch_events_limit(limit: Option<usize>) -> RpcResult<usize> {
+    match limit {
+        Some(0) => Err(RpcError::invalid_argument("limit must be greater than 0")),
+        Some(limit) => Ok(limit.min(MAX_WATCH_EVENTS_PAGE)),
+        None => Ok(MAX_WATCH_EVENTS_PAGE),
+    }
 }
 
 #[allow(dead_code)]
@@ -3640,8 +3643,65 @@ mod tests {
 
     #[test]
     fn watch_events_last_sequence_falls_back_to_replay_max_sequence_when_empty() {
-        assert_eq!(watch_events_last_sequence(&[], Some(42)), Some(42));
-        assert_eq!(watch_events_last_sequence(&[], None), None);
+        assert_eq!(
+            watch_events_last_sequence(&[], Some(42), EventCursorRequest::Beginning),
+            Some(42)
+        );
+        assert_eq!(
+            watch_events_last_sequence(&[], None, EventCursorRequest::AfterSequence(42)),
+            Some(42)
+        );
+        assert_eq!(
+            watch_events_last_sequence(&[], None, EventCursorRequest::Beginning),
+            None
+        );
+    }
+
+    #[test]
+    fn watch_events_live_rejects_zero_limit() {
+        let server = ready_server();
+        let root = test_repo_dir("watch-events-live-zero-limit");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-zero-limit-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let watch_err = server.watch_events(WatchEventsRequest {
+            repository_id: registered.repository.repository_id.clone(),
+            cursor: Some(EventCursorRequest::Beginning),
+            subject_ids: Vec::new(),
+            min_severity: None,
+            limit: Some(0),
+        });
+        assert!(matches!(
+            watch_err,
+            Err(RpcError {
+                code: RpcErrorCode::InvalidArgument,
+                ..
+            })
+        ));
+
+        let live_err = server.watch_events_live(WatchEventsRequest {
+            repository_id: registered.repository.repository_id,
+            cursor: Some(EventCursorRequest::Beginning),
+            subject_ids: Vec::new(),
+            min_severity: None,
+            limit: Some(0),
+        });
+        assert!(matches!(
+            live_err,
+            Err(RpcError {
+                code: RpcErrorCode::InvalidArgument,
+                ..
+            })
+        ));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
