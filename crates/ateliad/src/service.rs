@@ -869,117 +869,135 @@ impl SecretaryService {
                 reason: format!("idempotency key lock poisoned: {err}"),
             })?;
 
-            let mut cache =
-                self.idempotent_submissions
-                    .lock()
-                    .map_err(|err| ServiceError::Internal {
-                        reason: format!("idempotency cache lock poisoned: {err}"),
+            let receipt_result = (|| -> ServiceResult<RuntimeJobReceipt> {
+                {
+                    let cache = self.idempotent_submissions.lock().map_err(|err| {
+                        ServiceError::Internal {
+                            reason: format!("idempotency cache lock poisoned: {err}"),
+                        }
                     })?;
 
-            if let Some(cached) = cache
-                .iter()
-                .rev()
-                .find(|(cached_key, _)| cached_key.as_str() == idempotency_key)
-                .map(|(_, cached)| cached)
-            {
-                if cached.signature == request_signature {
-                    return Ok(cached.receipt.clone());
+                    if let Some(cached) = cache
+                        .iter()
+                        .rev()
+                        .find(|(cached_key, _)| cached_key.as_str() == idempotency_key)
+                        .map(|(_, cached)| cached)
+                    {
+                        if cached.signature == request_signature {
+                            return Ok(cached.receipt.clone());
+                        }
+                        return Err(ServiceError::Conflict {
+                            reason:
+                                "idempotency_key was previously used for a different submit request"
+                                    .to_string(),
+                        });
+                    }
                 }
-                return Err(ServiceError::Conflict {
-                    reason: "idempotency_key was previously used for a different submit request"
-                        .to_string(),
-                });
-            }
 
-            if let Some(stored) = self
-                .lifecycle
-                .runtime()
-                .store()
-                .get_submit_job_idempotency(idempotency_key)?
-            {
-                if stored.signature == request_signature {
-                    let receipt = stored.receipt.clone();
+                if let Some(stored) = self
+                    .lifecycle
+                    .runtime()
+                    .store()
+                    .get_submit_job_idempotency(idempotency_key)?
+                {
+                    if stored.signature == request_signature {
+                        let receipt = stored.receipt.clone();
+                        let mut cache = self.idempotent_submissions.lock().map_err(|err| {
+                            ServiceError::Internal {
+                                reason: format!("idempotency cache lock poisoned: {err}"),
+                            }
+                        })?;
+                        cache_idempotent_submission(
+                            &mut cache,
+                            idempotency_key.to_string(),
+                            IdempotentSubmitJob {
+                                signature: stored.signature,
+                                receipt: receipt.clone(),
+                            },
+                        );
+                        return Ok(receipt);
+                    }
+
+                    return Err(ServiceError::Conflict {
+                        reason:
+                            "idempotency_key was previously used for a different submit request"
+                                .to_string(),
+                    });
+                }
+
+                let receipt = match tool_kind {
+                    SubmitJobToolKind::Echo => {
+                        let submit_job_finalizer =
+                            Some(idempotency_key.to_string()).map(|idempotency_key| {
+                                let request_signature = request_signature.clone();
+                                move |receipt: &RuntimeJobReceipt| {
+                                    if receipt.job.status == JobStatus::Succeeded {
+                                        Some((
+                                            idempotency_key.clone(),
+                                            SubmitJobIdempotencyRecord {
+                                                signature: request_signature.clone(),
+                                                receipt: receipt.clone(),
+                                            },
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                }
+                            });
+                        self.lifecycle.runtime().run_tool_job_with_finalizer(
+                            runtime_request.clone(),
+                            &EchoTool,
+                            submit_job_finalizer,
+                        )?
+                    }
+                    SubmitJobToolKind::FsRead => {
+                        let tool = FsReadTool::new(&repository.root_path);
+                        let submit_job_finalizer =
+                            Some(idempotency_key.to_string()).map(|idempotency_key| {
+                                let request_signature = request_signature.clone();
+                                move |receipt: &RuntimeJobReceipt| {
+                                    if receipt.job.status == JobStatus::Succeeded {
+                                        Some((
+                                            idempotency_key.clone(),
+                                            SubmitJobIdempotencyRecord {
+                                                signature: request_signature.clone(),
+                                                receipt: receipt.clone(),
+                                            },
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                }
+                            });
+                        self.lifecycle.runtime().run_tool_job_with_finalizer(
+                            runtime_request.clone(),
+                            &tool,
+                            submit_job_finalizer,
+                        )?
+                    }
+                };
+                if receipt.job.status == JobStatus::Succeeded {
+                    let mut cache = self.idempotent_submissions.lock().map_err(|err| {
+                        ServiceError::Internal {
+                            reason: format!("idempotency cache lock poisoned: {err}"),
+                        }
+                    })?;
                     cache_idempotent_submission(
                         &mut cache,
                         idempotency_key.to_string(),
                         IdempotentSubmitJob {
-                            signature: stored.signature,
+                            signature: request_signature.clone(),
                             receipt: receipt.clone(),
                         },
                     );
-                    return Ok(receipt);
                 }
 
-                return Err(ServiceError::Conflict {
-                    reason: "idempotency_key was previously used for a different submit request"
-                        .to_string(),
-                });
-            }
+                Ok(receipt)
+            })();
 
-            let receipt = match tool_kind {
-                SubmitJobToolKind::Echo => {
-                    let submit_job_finalizer =
-                        Some(idempotency_key.to_string()).map(|idempotency_key| {
-                            let request_signature = request_signature.clone();
-                            move |receipt: &RuntimeJobReceipt| {
-                                if receipt.job.status == JobStatus::Succeeded {
-                                    Some((
-                                        idempotency_key.clone(),
-                                        SubmitJobIdempotencyRecord {
-                                            signature: request_signature.clone(),
-                                            receipt: receipt.clone(),
-                                        },
-                                    ))
-                                } else {
-                                    None
-                                }
-                            }
-                        });
-                    self.lifecycle.runtime().run_tool_job_with_finalizer(
-                        runtime_request.clone(),
-                        &EchoTool,
-                        submit_job_finalizer,
-                    )?
-                }
-                SubmitJobToolKind::FsRead => {
-                    let tool = FsReadTool::new(&repository.root_path);
-                    let submit_job_finalizer =
-                        Some(idempotency_key.to_string()).map(|idempotency_key| {
-                            let request_signature = request_signature.clone();
-                            move |receipt: &RuntimeJobReceipt| {
-                                if receipt.job.status == JobStatus::Succeeded {
-                                    Some((
-                                        idempotency_key.clone(),
-                                        SubmitJobIdempotencyRecord {
-                                            signature: request_signature.clone(),
-                                            receipt: receipt.clone(),
-                                        },
-                                    ))
-                                } else {
-                                    None
-                                }
-                            }
-                        });
-                    self.lifecycle.runtime().run_tool_job_with_finalizer(
-                        runtime_request.clone(),
-                        &tool,
-                        submit_job_finalizer,
-                    )?
-                }
-            };
-            if receipt.job.status == JobStatus::Succeeded {
-                cache_idempotent_submission(
-                    &mut cache,
-                    idempotency_key.to_string(),
-                    IdempotentSubmitJob {
-                        signature: request_signature.clone(),
-                        receipt: receipt.clone(),
-                    },
-                );
-            }
-
-            drop(cache);
-            if Arc::strong_count(&key_lock) == 1 {
+            drop(_key_guard);
+            drop(key_lock);
+            {
                 let mut locks = self.idempotent_submission_locks.lock().map_err(|err| {
                     ServiceError::Internal {
                         reason: format!("idempotency lock map poisoned: {err}"),
@@ -992,7 +1010,7 @@ impl SecretaryService {
                 }
             }
 
-            receipt
+            receipt_result?
         } else {
             match tool_kind {
                 SubmitJobToolKind::Echo => self.lifecycle.runtime().run_tool_job_with_finalizer(
@@ -1479,19 +1497,6 @@ fn blocking_policy_decision_for_candidate_root(
     }
 
     None
-}
-
-fn actor_signature(actor: &Actor) -> String {
-    match actor {
-        Actor::User { id, display_name } => {
-            format!("user:{id}:{:?}", display_name)
-        }
-        Actor::Agent { id, display_name } => {
-            format!("agent:{id}:{:?}", display_name)
-        }
-        Actor::Extension { id } => format!("extension:{id}"),
-        Actor::System { id } => format!("system:{id}"),
-    }
 }
 
 fn normalize_requested_capabilities(
@@ -4709,6 +4714,7 @@ mod tests {
             .expect("replayed submit should return same job");
 
         assert_eq!(second.job.id, first.job.id);
+        assert!(svc.idempotent_submission_locks.lock().unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4830,6 +4836,7 @@ mod tests {
             )
             .expect("list jobs should succeed");
         assert_eq!(page.jobs.len(), 1);
+        assert!(svc.idempotent_submission_locks.lock().unwrap().is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

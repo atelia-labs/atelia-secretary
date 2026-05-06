@@ -673,7 +673,6 @@ where
             "job completed",
             refs_for_audit(&job, &policy_decision, &invocation, &result, &audit_record),
         );
-        job.transition_status(terminal_status, terminal_event.created_at)?;
         let rendered_output = if should_rerender_output {
             match render_tool_result_with_policy(&result, &render_policy) {
                 Ok(rendered_output) => rendered_output,
@@ -692,6 +691,7 @@ where
         } else {
             rendered_output
         };
+        job.transition_status(terminal_status, terminal_event.created_at)?;
 
         let mut final_events = events.clone();
         final_events.push(terminal_event.clone());
