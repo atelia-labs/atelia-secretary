@@ -547,18 +547,26 @@ fn read_and_validate_session_token(
     token_path: &std::path::Path,
     storage_dir: &std::path::Path,
 ) -> Result<String> {
-    validate_existing_session_token_file(token_path, storage_dir)?;
-    let token = std::fs::read_to_string(token_path)
+    let mut token_file = open_existing_session_token_file(token_path)?;
+    validate_existing_session_token_file(&token_file, storage_dir, token_path)?;
+
+    use std::io::Read;
+
+    let mut token = String::new();
+    token_file
+        .read_to_string(&mut token)
         .with_context(|| format!("failed to read session token file {token_path:?}"))?;
-    validate_and_restrict_session_token(token_path, token)
+    validate_and_restrict_session_token(&token_file, token_path, token)
 }
 
 /// Validate that an existing token path is a safe regular file owned by this user.
 fn validate_existing_session_token_file(
-    token_path: &std::path::Path,
+    token_file: &std::fs::File,
     storage_dir: &std::path::Path,
+    token_path: &std::path::Path,
 ) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(token_path)
+    let metadata = token_file
+        .metadata()
         .with_context(|| format!("failed to inspect session token file {token_path:?}"))?;
     if !metadata.file_type().is_file() {
         return Err(anyhow!(
@@ -587,10 +595,11 @@ fn validate_existing_session_token_file(
 
 /// Normalize permissions and validate the generated-token file contents.
 fn validate_and_restrict_session_token(
+    token_file: &std::fs::File,
     token_path: &std::path::Path,
     token: String,
 ) -> Result<String> {
-    set_restrictive_permissions(token_path)?;
+    set_restrictive_permissions(token_file, token_path)?;
     if token.len() != 64 || !token.chars().all(|ch| ch.is_ascii_hexdigit()) {
         Err(anyhow!(
             "session token file {token_path:?} must contain exactly 64 hexadecimal characters; delete it and restart to regenerate"
@@ -606,15 +615,13 @@ fn write_session_token(token_path: &std::path::Path, token: &[u8]) -> Result<()>
     use std::io::Write;
     file.write_all(token)
         .with_context(|| format!("failed to write session token file {token_path:?}"))
+        .and_then(|()| set_restrictive_permissions(&file, token_path))
 }
 
 /// Write a generated token, or reuse a concurrently created valid token file.
 fn write_or_reuse_session_token(token_path: &std::path::Path, token: String) -> Result<String> {
     match write_session_token(token_path, token.as_bytes()) {
-        Ok(()) => {
-            set_restrictive_permissions(token_path)?;
-            Ok(token)
-        }
+        Ok(()) => Ok(token),
         Err(error) if is_already_exists_error(&error) => {
             read_and_validate_session_token_with_retry(token_path)
         }
@@ -673,6 +680,31 @@ fn open_session_token_file(_token_path: &std::path::Path) -> Result<std::fs::Fil
     ))
 }
 
+#[cfg(unix)]
+fn open_existing_session_token_file(token_path: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(token_path)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => Err(anyhow!(
+            "session token file {token_path:?} must be a regular file"
+        )),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to open session token file {token_path:?}"))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn open_existing_session_token_file(token_path: &std::path::Path) -> Result<std::fs::File> {
+    std::fs::File::open(token_path)
+        .with_context(|| format!("failed to open session token file {token_path:?}"))
+}
+
 /// Generate a fresh 32-byte local auth token encoded as lowercase hexadecimal.
 fn generate_session_token() -> Result<String> {
     let mut bytes = [0u8; 32];
@@ -694,19 +726,20 @@ fn encode_session_token(bytes: &[u8]) -> String {
 
 #[cfg(unix)]
 /// Set owner-read/write-only permissions on a token file.
-fn set_restrictive_permissions(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+fn set_restrictive_permissions(file: &std::fs::File, path: &std::path::Path) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
 
-    let mut permissions = std::fs::metadata(path)
-        .with_context(|| format!("failed to read metadata for {path:?}"))?
-        .permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(path, permissions)
-        .with_context(|| format!("failed to set restrictive permissions on {path:?}"))
+    let result = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to set restrictive permissions on {path:?}"));
+    }
+
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_restrictive_permissions(_path: &std::path::Path) -> Result<()> {
+fn set_restrictive_permissions(_file: &std::fs::File, _path: &std::path::Path) -> Result<()> {
     Err(anyhow!(
         "session token files require Unix restrictive permissions and cannot be safely used on non-Unix platforms"
     ))
@@ -3197,6 +3230,7 @@ pub async fn run_listener(
     listener: TcpListener,
     shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
+    validate_local_auth_binding(&auth, &listener.local_addr()?)?;
     axum::serve(listener, build_router(rpc_server, auth))
         .with_graceful_shutdown(async move {
             let _ = shutdown.await;
@@ -5223,6 +5257,39 @@ mod tests {
         let _ = server_task
             .await
             .expect("server task should complete after shutdown");
+    }
+
+    #[tokio::test]
+    async fn run_listener_rejects_disabled_auth_on_unsafe_non_loopback_listener() {
+        use tokio::net::TcpListener;
+
+        let _guard = UnsafeAllowNonLoopbackListenEnvGuard::lock();
+        std::env::set_var(UNSAFE_ALLOW_NON_LOOPBACK_LISTEN_ENV, "1");
+
+        let rpc_server = ready_rpc_server();
+        let listener = match TcpListener::bind("0.0.0.0:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to bind test listener: {error}"),
+        };
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(run_listener(
+            rpc_server,
+            disabled_auth(),
+            listener,
+            shutdown_rx,
+        ));
+
+        let err = tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("run_listener should fail before serving")
+            .expect("server task should not panic")
+            .expect_err("run_listener should reject unsafe listener");
+
+        assert!(err
+            .to_string()
+            .contains("refusing to combine ATELIA_DAEMON_AUTH_DISABLED=1"));
     }
 
     #[tokio::test]
