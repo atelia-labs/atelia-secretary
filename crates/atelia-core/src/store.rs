@@ -531,10 +531,13 @@ async fn forward_filtered_job_events(
         return;
     }
     loop {
-        let event = match receiver.recv().await {
-            Ok(event) => event,
-            Err(broadcast::error::RecvError::Lagged(_)) => break,
-            Err(broadcast::error::RecvError::Closed) => break,
+        let event = tokio::select! {
+            _ = sender.closed() => break,
+            received = receiver.recv() => match received {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(_)) => break,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
         };
         if resolved_cursor_sequence.is_some_and(|sequence| event.sequence_number <= sequence) {
             continue;
@@ -6372,6 +6375,42 @@ mod tests {
                 .unwrap(),
             Vec::<JobEvent>::new()
         );
+    }
+
+    #[test]
+    fn forward_filtered_job_events_stops_when_filtered_receiver_drops() {
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime should build");
+            runtime.block_on(async move {
+                let store = InMemoryStore::new();
+                let (_raw_sender, raw_receiver) = broadcast::channel(16);
+                let (filtered_sender, filtered_receiver) = broadcast::channel(16);
+
+                let forwarder = tokio::spawn(forward_filtered_job_events(
+                    raw_receiver,
+                    filtered_sender,
+                    store,
+                    EventQuery::default(),
+                    None,
+                ));
+
+                drop(filtered_receiver);
+                forwarder
+                    .await
+                    .expect("forwarder task should complete cleanly");
+            });
+            done_sender
+                .send(())
+                .expect("test thread should report completion");
+        });
+
+        done_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("forwarder should stop when the last filtered receiver drops");
     }
 
     #[test]

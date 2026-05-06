@@ -268,8 +268,13 @@ impl SecretaryRpcServer {
             .into_iter()
             .map(RpcEvent::from)
             .collect::<Vec<_>>();
-        let last_sequence =
+        let mut last_sequence =
             watch_events_last_sequence(&events, replay_max_sequence, live.resolved_cursor_sequence);
+        if events.is_empty() {
+            if let EventCursorRequest::AfterSequence(sequence) = &incoming_cursor {
+                last_sequence = Some(last_sequence.map_or(*sequence, |last| last.max(*sequence)));
+            }
+        }
         let cursor = if let Some(event) = events.last() {
             Some(EventCursorRequest::AfterSequence(event.sequence))
         } else if let Some(last_sequence) = last_sequence {
@@ -3672,6 +3677,37 @@ mod tests {
         assert_eq!(live.subscription.replay_max_sequence, None);
         assert_eq!(live.subscription.resolved_cursor_sequence, None);
         assert_eq!(live.subscription.last_sequence, None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn watch_events_live_preserves_after_sequence_anchor_when_empty() {
+        let server = ready_server();
+        let root = test_repo_dir("watch-events-live-empty-after-sequence");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-empty-after-sequence-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let live = server
+            .watch_events_live(WatchEventsRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::AfterSequence(42)),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: Some(1),
+            })
+            .expect("live watch should succeed");
+
+        assert!(live.events.is_empty());
+        assert_eq!(live.cursor, Some(EventCursorRequest::AfterSequence(42)));
+        assert_eq!(live.subscription.last_sequence, Some(42));
 
         let _ = fs::remove_dir_all(root);
     }
