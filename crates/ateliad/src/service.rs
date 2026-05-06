@@ -425,7 +425,7 @@ pub struct SecretaryService {
 pub struct LiveEventSubscription {
     pub events: Vec<JobEvent>,
     pub receiver: broadcast::Receiver<JobEvent>,
-    pub replay_max_sequence: u64,
+    pub replay_max_sequence: Option<u64>,
 }
 
 impl SecretaryService {
@@ -1159,10 +1159,7 @@ impl SecretaryService {
     pub fn watch_events_live(&self, query: EventQuery) -> ServiceResult<LiveEventSubscription> {
         let receiver = self.lifecycle.runtime().store().subscribe_job_events();
         let events = self.list_events_page(query)?.events;
-        let replay_max_sequence = events
-            .last()
-            .map(|event| event.sequence_number)
-            .unwrap_or(0);
+        let replay_max_sequence = events.last().map(|event| event.sequence_number);
         Ok(LiveEventSubscription {
             events,
             receiver,

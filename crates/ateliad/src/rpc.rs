@@ -1355,11 +1355,14 @@ pub struct WatchEventsReplayResponse {
     pub cursor: Option<EventCursorRequest>,
 }
 
-fn watch_events_last_sequence(events: &[RpcEvent], replay_max_sequence: u64) -> u64 {
+fn watch_events_last_sequence(
+    events: &[RpcEvent],
+    replay_max_sequence: Option<u64>,
+) -> Option<u64> {
     events
         .last()
         .map(|event| event.sequence)
-        .unwrap_or(replay_max_sequence)
+        .or(replay_max_sequence)
 }
 
 #[allow(dead_code)]
@@ -1373,8 +1376,8 @@ pub struct WatchEventsLiveResponse {
 #[allow(dead_code)]
 pub struct WatchEventsLiveSubscription {
     pub receiver: broadcast::Receiver<JobEvent>,
-    pub replay_max_sequence: u64,
-    pub last_sequence: u64,
+    pub replay_max_sequence: Option<u64>,
+    pub last_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3538,7 +3541,7 @@ mod tests {
         );
         assert_eq!(
             live.subscription.replay_max_sequence,
-            live.events[0].sequence
+            Some(live.events[0].sequence)
         );
 
         let _ = fs::remove_dir_all(first_root);
@@ -3591,7 +3594,10 @@ mod tests {
                     .expect("expected future event")
                     .expect("receiver should stay open")
             });
-        assert!(received.sequence_number > last_sequence || last_sequence == 0);
+        match last_sequence {
+            None => {}
+            Some(seq) => assert!(received.sequence_number > seq),
+        }
         assert_eq!(
             received.refs.job_id.as_ref().map(|id| id.as_str()),
             Some(submitted.job.job_id.as_str())
@@ -3601,8 +3607,41 @@ mod tests {
     }
 
     #[test]
+    fn watch_events_live_uses_none_replay_sequence_when_empty() {
+        let server = ready_server();
+        let root = test_repo_dir("watch-events-live-empty");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "watch-live-empty-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let live = server
+            .watch_events_live(WatchEventsRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                cursor: Some(EventCursorRequest::Beginning),
+                subject_ids: Vec::new(),
+                min_severity: None,
+                limit: Some(1),
+            })
+            .expect("live watch should succeed");
+
+        assert!(live.events.is_empty());
+        assert_eq!(live.cursor, Some(EventCursorRequest::Beginning));
+        assert_eq!(live.subscription.replay_max_sequence, None);
+        assert_eq!(live.subscription.last_sequence, None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn watch_events_last_sequence_falls_back_to_replay_max_sequence_when_empty() {
-        assert_eq!(watch_events_last_sequence(&[], 42), 42);
+        assert_eq!(watch_events_last_sequence(&[], Some(42)), Some(42));
+        assert_eq!(watch_events_last_sequence(&[], None), None);
     }
 
     #[test]
