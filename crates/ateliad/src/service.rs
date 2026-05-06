@@ -12,8 +12,8 @@ use atelia_core::{
     EchoTool, EnableExtensionRequest, EnableExtensionResponse, EventCursor, EventPage, EventQuery,
     EventRefs, EventSeverity, EventSubject, ExtensionRegistryService, ExtensionStatusRequest,
     ExtensionStatusResponse, FsReadTool, InMemoryStore, InMemoryToolOutputSettingsService,
-    InstallExtensionRequest, InstallExtensionResponse, JobEvent, JobEventId, JobEventKind, JobId,
-    JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
+    InstallExtensionRequest, InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService,
+    JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
     ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
     OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput, PolicyOutcome,
     RegistryError, RemoveExtensionRequest, RemoveExtensionResponse, RenderedToolOutput,
@@ -1733,10 +1733,11 @@ mod tests {
     use atelia_core::{
         ApplyBlocklistRequest, BlockKey, BlockReason, ExtensionCompatibility, ExtensionEntrypoints,
         ExtensionFailure, ExtensionKind, ExtensionManifest, ExtensionPermission,
-        ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionServices,
-        InstallExtensionRequest, LedgerTimestamp, ListBlocklistRequest, ListExtensionsRequest,
-        PolicyDecision, PolicyDecisionId, PolicyOutcome, ProvenanceSource, RepositoryTrustState,
-        ResourceScope, RetryPolicy, RiskTier, RollbackExtensionRequest, EXTENSION_MANIFEST_SCHEMA,
+        ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionServices, EventRefs,
+        EventSeverity, EventSubject, InstallExtensionRequest, JobEventId, JobEventKind,
+        LedgerTimestamp, ListBlocklistRequest, ListExtensionsRequest, PolicyDecision,
+        PolicyDecisionId, PolicyOutcome, ProvenanceSource, RepositoryTrustState, ResourceScope,
+        RetryPolicy, RiskTier, RollbackExtensionRequest, EXTENSION_MANIFEST_SCHEMA,
         EXTENSION_RPC_PROTOCOL,
     };
     use std::collections::BTreeMap;

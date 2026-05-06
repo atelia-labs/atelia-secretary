@@ -3535,8 +3535,7 @@ mod tests {
 
         assert!(live.events.len() > 1);
         assert!(live.events.iter().all(|event| {
-            event.refs.repository_id.as_ref().map(|id| id.as_str())
-                == Some(second_repository.repository_id.as_str())
+            event.refs.repository_id.as_deref() == Some(second_repository.repository_id.as_str())
         }));
         assert_eq!(
             live.cursor,
