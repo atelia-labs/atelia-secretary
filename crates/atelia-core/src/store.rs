@@ -792,20 +792,20 @@ impl SecretaryStore for InMemoryStore {
         };
         let filtered = collect_filtered_job_events(&inner, &query)?;
         let page_size = query.page_size.unwrap_or(usize::MAX);
-        let mut page_token = query.page_token.clone();
-        let mut events = Vec::new();
-
-        loop {
-            let start = page_start(page_token.as_deref(), "job_events")?;
-            let (event_refs, next_page_token) =
-                page_records(filtered.iter().copied(), start, page_size);
-            events.extend(event_refs.into_iter().cloned());
-
-            match next_page_token {
-                Some(next_page_token) => page_token = Some(next_page_token),
-                None => break,
-            }
-        }
+        let page_token = query.page_token.clone();
+        let start = page_start(page_token.as_deref(), "job_events")?;
+        let filtered_len = filtered.len();
+        let events = filtered
+            .into_iter()
+            .skip(start)
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_start = start.saturating_add(page_size);
+        let _next_page_token = if page_size != 0 && filtered_len > next_start {
+            Some(next_start.to_string())
+        } else {
+            None
+        };
 
         Ok((events, receiver, resolved_cursor_sequence))
     }
