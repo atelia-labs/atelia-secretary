@@ -6702,6 +6702,58 @@ mod tests {
     }
 
     #[test]
+    fn forward_filtered_job_events_reports_lagged_raw_receiver() {
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime should build");
+            runtime.block_on(async move {
+                let repository = repository_record();
+                let (raw_sender, raw_receiver) = broadcast::channel(1);
+                let (filtered_sender, mut filtered_receiver) = mpsc::channel(16);
+
+                raw_sender
+                    .send(job_event(repository.id.clone()))
+                    .expect("first raw event should broadcast");
+                raw_sender
+                    .send(job_event(repository.id.clone()))
+                    .expect("second raw event should broadcast");
+
+                let forwarder = tokio::spawn(forward_filtered_job_events(
+                    raw_receiver,
+                    filtered_sender,
+                    InMemoryStore::new(),
+                    EventQuery::default(),
+                    None,
+                ));
+
+                let received = filtered_receiver
+                    .recv()
+                    .await
+                    .expect("filtered receiver should receive terminal lag error");
+                forwarder
+                    .await
+                    .expect("forwarder task should complete cleanly");
+                done_sender
+                    .send(received)
+                    .expect("test thread should report terminal lag error");
+            });
+        });
+
+        let received = done_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("forwarder should report lagged raw receiver");
+
+        assert!(matches!(
+            received,
+            Err(StoreError::CursorExpired { reason })
+                if reason.contains("missed 1 events")
+        ));
+    }
+
+    #[test]
     fn replay_from_cursor_returns_events_after_cursor() {
         let store = InMemoryStore::new();
         let repository = repository_record();
