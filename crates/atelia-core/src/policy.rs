@@ -7,6 +7,9 @@ use crate::domain::{
 
 const POLICY_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_POLICY_VERSION: &str = "policy-stub-v1";
+pub const REASON_REPOSITORY_BLOCKED: &str = "repository_blocked";
+pub const SCOPE_KIND_REPOSITORY: &str = "repository";
+pub const SCOPE_VALUE_ROOT: &str = ".";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyInput {
@@ -115,7 +118,7 @@ impl DefaultPolicyEngine {
         if input.current_trust_state == RepositoryTrustState::Blocked {
             return RuleDecision::blocked(
                 RiskTier::R4,
-                "repository_blocked",
+                REASON_REPOSITORY_BLOCKED,
                 "The repository is blocked by policy, so the requested action cannot run.",
             );
         }

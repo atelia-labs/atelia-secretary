@@ -7,6 +7,7 @@ use crate::domain::{
     RepositoryRecord, RepositoryTrustState, SchemaMigrationId, SchemaMigrationRecord,
     ToolInvocation, ToolInvocationId, ToolResult, ToolResultId, MIGRATION_LOCK_RECORD_NAME,
 };
+use crate::policy::{REASON_REPOSITORY_BLOCKED, SCOPE_KIND_REPOSITORY, SCOPE_VALUE_ROOT};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -1274,9 +1275,9 @@ fn validate_loaded_store(inner: &InMemoryInner) -> StoreResult<()> {
                 )
             {
                 return Err(StoreError::InvalidRecord {
-                    collection: "repositories",
+                    collection: "policy_decisions",
                     reason: format!(
-                        "blocked policy root_path {} conflicts with repository root_path {}",
+                        "policy_decision root_path {} conflicts with repository root_path {}",
                         repository.root_path, conflicting_repository.root_path
                     ),
                 });
@@ -1685,9 +1686,9 @@ fn repository_roots_strictly_overlap(candidate_root: &str, blocked_root: &str) -
 /// root path.
 fn is_root_scoped_repository_block(policy_decision: &PolicyDecision) -> bool {
     policy_decision.outcome == crate::domain::PolicyOutcome::Blocked
-        && policy_decision.reason_code.trim() == "repository_blocked"
-        && policy_decision.resource_scope.kind.trim() == "repository"
-        && policy_decision.resource_scope.value.trim() == "."
+        && policy_decision.reason_code.trim() == REASON_REPOSITORY_BLOCKED
+        && policy_decision.resource_scope.kind.trim() == SCOPE_KIND_REPOSITORY
+        && policy_decision.resource_scope.value.trim() == SCOPE_VALUE_ROOT
 }
 
 /// Find the first root-scoped blocked policy decision whose repository root

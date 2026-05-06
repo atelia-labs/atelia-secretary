@@ -4,6 +4,7 @@
 //! exposes a synchronous service API for health checks, repository
 //! registration/listing, and the first supported job lifecycle calls.
 
+use atelia_core::policy::{REASON_REPOSITORY_BLOCKED, SCOPE_KIND_REPOSITORY, SCOPE_VALUE_ROOT};
 use atelia_core::{
     canonicalize_job_requested_capability, canonicalize_within_scope,
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
@@ -1304,17 +1305,13 @@ fn validate_repository_allowed_scope(
     Ok(())
 }
 
-const REPOSITORY_REGISTRATION_BLOCK_REASON_CODE: &str = "repository_blocked";
-const REPOSITORY_REGISTRATION_BLOCK_SCOPE_KIND: &str = "repository";
-const REPOSITORY_REGISTRATION_BLOCK_SCOPE_VALUE: &str = ".";
-
 /// Return `true` when a policy decision blocks repository registration at the
 /// repository root scope.
 fn is_repository_registration_block(policy_decision: &atelia_core::PolicyDecision) -> bool {
     policy_decision.outcome == PolicyOutcome::Blocked
-        && policy_decision.reason_code.trim() == REPOSITORY_REGISTRATION_BLOCK_REASON_CODE
-        && policy_decision.resource_scope.kind.trim() == REPOSITORY_REGISTRATION_BLOCK_SCOPE_KIND
-        && policy_decision.resource_scope.value.trim() == REPOSITORY_REGISTRATION_BLOCK_SCOPE_VALUE
+        && policy_decision.reason_code.trim() == REASON_REPOSITORY_BLOCKED
+        && policy_decision.resource_scope.kind.trim() == SCOPE_KIND_REPOSITORY
+        && policy_decision.resource_scope.value.trim() == SCOPE_VALUE_ROOT
 }
 
 /// Return `true` when two repository roots are distinct and one is a strict
