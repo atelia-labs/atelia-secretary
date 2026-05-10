@@ -1,10 +1,10 @@
 # Secretary Runtime Architecture
 
-この文書は、Atelia Secretary の runtime architecture を定義します。daemon の protocol surface、domain record、policy boundary、audit model、tool execution、extension seam の実装上の基準点です。
+この文書は、Atelia Secretary の runtime architecture を定義します。daemon の protocol surface、domain record、policy boundary、audit model、tool execution、service brokering、AEP package boundary の実装上の基準点です。
 
 この architecture は Atelia の MDP quality bar に従います。MDP は Minimum Desirable / Delightful Product です。Desirable は「その product がその人の生活や仕事に存在する理由があるか」を問い、Delightful は「使うときに丁寧さ、読みやすさ、生きた手触りがあるか」を問います。runtime は規律を持って作れるほど小さく、それでも product の土台として信頼できるほど完全であるべきです。
 
-これは捨てる前提の first-loop sketch ではありません。後続の implementation slice で capability、storage engine、transport、extension host、hosted sync が追加されても、ここで定義する domain boundary は保ちます。
+これは捨てる前提の first-loop sketch ではありません。後続の implementation slice で capability、storage engine、transport、AEP backend host、hosted sync が追加されても、ここで定義する domain boundary は保ちます。
 
 ## Design Commitments
 
@@ -15,7 +15,7 @@ runtime architecture は次を約束します。
 - execution effect より前の policy decision
 - rendered output より前の canonical tool result
 - client-specific view state より前の typed protocol contract
-- built-in service integration より前の provider boundary
+- built-in service integration より前の brokered provider boundary
 - generic error より recoverable failure state
 
 ## Product Contract
@@ -29,7 +29,7 @@ runtime は generic automation platform ではありません。Atelia を成立
 - work はあとから inspect できる structured record を作る
 - tool output は TOON / JSON rendering から独立した canonical result を持つ
 - status、error、approval state が、単に技術的に正しいだけでなく理解できる
-- full extension host に踏み込まず、extension point を予約する
+- 公開 storefront や arbitrary client plug-in runtime に踏み込まず、AEP package point を予約する
 
 ## Runtime の形
 
@@ -52,9 +52,9 @@ daemon が所有しないもの:
 - 長期 personal memory
 - 任意の GitHub / Linear / 外部サービス integration
 - delegated cloud agent orchestration
-- third-party extension installation
+- generic third-party plug-in storefront behavior
 
-これらの surface は client または extension に寄せます。
+これらの surface は client、AEP package、または将来の product slice に寄せます。ただし client は client であり、Secretary host ではありません。
 
 ## Protocol Surface
 
@@ -92,7 +92,7 @@ daemon は明示的な domain record を永続化します。storage は simple 
 | job | user または agent が要求した仕事 | kind、goal、repository id、status、requester、created/started/completed timestamps を含む |
 | job_event | observable job lifecycle event | append-only。streaming と replay を支える |
 | policy_decision | allow / audit / approval / block の結果 | risk tier、reason、policy version、requested capability を含む |
-| tool_invocation | built-in または extension tool call | tool id、input digest、permission、status、output ref を含む |
+| tool_invocation | built-in または package-provided tool call | tool id、input digest、permission、status、output ref を含む |
 | tool_result | canonical structured result | rendered format から独立する |
 | audit_record | durable execution / policy record | append-only。必要に応じて redaction する |
 
@@ -174,9 +174,11 @@ renderer は次を支えます。
 
 output format を「raw log vs structured record」のように雑に比較しません。各 tool contract は field、order、omission、reference、redundancy を意図的に定義します。
 
-## Extension Boundary
+## AEP Package Boundary
 
-runtime architecture は、full extension installation の前から extension concept を予約します。
+runtime architecture は、full package runtime execution の前から AEP package concept を予約します。
+
+この boundary は AEP の backend-host slice です。Secretary は AEP と Atelia Protocol を分けて扱います。Atelia Protocol は daemon / client / agent RPC、AEP は package manifest、permission、service、hook、composition、presentation declaration、audit、lifecycle behavior を扱います。
 
 ただし domain と protocol naming では次の概念を予約します。
 
@@ -193,14 +195,16 @@ runtime architecture は、full extension installation の前から extension co
 
 最初の実装は built-in provider だけを expose して構いません。GitHub、Linear、long-term memory、observational memory、external agent を Secretary core に焼き込まないことを優先します。
 
+service call は Secretary runtime、Service Broker、Policy Engine、Audit Log の境界を通します。caller 側の `services.consumes` grant と provider 側の `provides.required_permissions` が一致して初めて有効です。package-owned permission と provider-owned service grant は別の authority です。consumer は provider permission を参照するだけで、再定義したり risk tier を下げたりできません。
+
 ## Deferred Product Surface
 
 runtime architecture は次を後回しにします。
 
-- full Rust / WASM extension runtime
-- third-party extension registry
-- extension bundles
-- service-to-service extension calls
+- full Rust / WASM package runtime
+- third-party registry search as a product surface
+- AEP bundles
+- brokered beta slice を超える package-to-package service calls
 - `needs_approval` state を返す以上の human approval UI
 - long-term memory / preference storage
 - autonomous delegated agent scheduling
@@ -223,7 +227,7 @@ runtime architecture は次を後回しにします。
 7. policy-gated filesystem write/patch
 8. cwd、timeout、env allowlist を持つ explicit argv process execution
 9. TOON / JSON rendering を持つ canonical tool result
-10. 将来の extension boundary のための provider identifier 予約
+10. 将来の AEP package boundary のための provider identifier 予約
 
 ## Acceptance Criteria
 

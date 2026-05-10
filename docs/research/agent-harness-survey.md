@@ -4,12 +4,13 @@ This note organizes directions from public AI coding agent and harness
 landscape research as input to Atelia Secretary's daemon and orchestration
 design.
 
-Normative Client UX, Hooks, and Custom AX extension specifications live in the
-Atelia project repository.
+Normative Client UX, Hooks, AEP package, and Surface Protocol specifications
+live in the Atelia project repository.
 
 - [Client UX](https://github.com/atelia-labs/atelia/blob/main/docs/client-ux.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md)
-- [Custom AX Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
+- [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.md)
+- [Surface Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.md)
 
 ## Directions Worth Adopting For Secretary
 
@@ -46,7 +47,8 @@ Atelia project repository.
   requirements.
 - Claude Code exposes layers such as project memory files, Skills, MCP,
   subagents, hooks, plugins, and agent teams. Atelia can connect this direction
-  to Custom AX extensions and explicit Secretary / specialist agent roles.
+  to AEP packages, host-rendered surfaces, and explicit Secretary / specialist
+  agent roles.
 - GitHub Copilot coding agent accepts tasks from issues, GitHub surfaces, CLI,
   and MCP, then produces pull requests and review requests. Atelia can use GitHub
   issues as the public outlet for Secretary-level AX Feedback and implementation

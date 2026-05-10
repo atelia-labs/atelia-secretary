@@ -1,17 +1,19 @@
 # Tool Catalog
 
 This document organizes the small built-in tool surface Atelia Secretary can
-expose. Convenience integrations belong to extensions.
+expose. Convenience integrations belong to AEP packages.
 
 See also [Tool Definition Schema](tool-definition-schema.md), [Tool Output
 Schema](tool-output-schema.md), [Extensions Runtime](extensions-runtime.md),
-Atelia [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md), and [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md) as the computed projection of the live tool surface in the current context.
+Atelia [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.md),
+[Surface Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.md),
+and [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md) as the computed projection of the live tool surface in the current context.
 
 Secretary core should provide a general harness: filesystem, shell, search,
-jobs, events, policy, extension hosting, hooks, output rendering, agent
+jobs, events, policy, AEP backend hosting, hooks, output rendering, agent
 delegation substrate, and a service broker. Git, GitHub, Linear, memory
 providers, memory strategies, notification systems, review agents, and approval
-agents are extension-provided surfaces.
+agents are package-provided surfaces.
 
 The current beta repertoire surface projects only the built-in Secretary tools
 that are dispatchable in this beta slice: `fs.read` and `secretary.echo`.
@@ -38,16 +40,16 @@ not claimed by `ListRepertoire` until dispatch exists.
 | job/task | `job.create`, `job.status`, `job.cancel`, `job.events`, `task.attach_artifact` | status R1; create/cancel R2/R3 by scope | job id, state, owner, blockers, artifact refs | actor, task scope, state transitions | timeout, concurrency, ownership, retention |
 | event stream | `event.subscribe`, `event.publish_internal`, `event.ack` | subscribe R1/R2; publish R2/R3 by topic | event id, topic, source, payload refs | topic, source, delivery state | filters, backpressure, delivery class |
 | policy/approval boundary | `policy.check`, `approval.request`, `approval.submit`, `approval.status` | check R1; submit R2/R3/R4 by scope | decision, reason, approver, expiry, conditions | request, decision, capability, approval ref | approval agent routing, escalation, expiry |
-| extension host | `extension.install/update/remove/rollback`, `extension.enable/disable`, `extension.status`, `extension.permission.review`, `extension.blocklist.apply`, `bundle.install/update/remove/rollback`, `bundle.status` | inspect R1; install/update R3; dangerous R4 | manifest diff, permission diff, service dependency diff, trigger/action/status | provenance, signature, manifest digest, rollback point | scopes, trigger filters, blocklist, approvals |
+| AEP package host | `extension.install/update/remove/rollback`, `extension.enable/disable`, `extension.status`, `extension.permission.review`, `extension.blocklist.apply`, `bundle.install/update/remove/rollback`, `bundle.status` | inspect R1; install/update R3; dangerous R4 | manifest diff, permission diff, service dependency diff, trigger/action/status | provenance, signature, manifest digest, rollback point, registry/quarantine/revocation state | scopes, trigger filters, blocklist, approvals |
 | service broker | `service.call`, `service.status`, `service.schema` | schema/status R1; call follows callee permission and capability | caller, callee, service, method, schema, result refs | caller/callee versions, input/output digest, permission, capability, failures | timeout, schema version, result format |
 | hook intake | `hook.create/update/enable/disable/run`, `webhook.receive`, `schedule.create` | inspect R1; user hook R2/R3; external event R3 | trigger, verification, action, status, failures | source, signature status, delivery id, state changes | source allowlist, rate limits, dedupe |
 | output rendering | `output.render`, `output.negotiate`, `output.preview`, `output.schema` | render R0/R1; customizer involvement R2 | TOON/JSON, schema version, fallback reason | renderer, schema version, customizer identity | format, field order, token budget, language |
 | agent delegation substrate | `agent.register`, `agent.delegate`, `agent.status`, `agent.cancel`, `agent.takeover`, `agent.assign_role` | status R1; bounded delegation R2/R3; authority escalation R4 | goal, scope, tools, worktree, policy, branch, blockers | agent identity, grants, workspace, outputs, review status | roles, tool bundles, autonomy, budget, review gates |
 
-## Extension-Provided Areas
+## Package-Provided Areas
 
 The following areas should normally be implemented as official or community
-extensions:
+packages:
 
 - Git command helpers and repository workflows
 - GitHub integration
@@ -58,14 +60,14 @@ extensions:
 - memory strategies, including observational memory
 - preference managers
 - notification and digest systems
-- client extension views / actions / settings
+- client semantic surfaces / actions / settings
 - approval agents
 - review agents
 - Codex / Claude / Devin / Jules / CodeRabbit agent providers
 - PR resolve agents
 - browser / computer use providers
 
-Approval agents are extensions. The built-in `approval.*` tools are only the
+Approval agents are packages. The built-in `approval.*` tools are only the
 core approval boundary: request creation, decision submission, status, and
 verification.
 

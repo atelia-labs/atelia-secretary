@@ -4,9 +4,9 @@
 
 Atelia Secretary は、Atelia に常駐するプロジェクト秘書を動かす Rust backend daemon です。
 
-Atelia 全体の思想、AX 原則、AEP / extension 仕様、Hooks、client UX、ガバナンスは [`atelia`](https://github.com/atelia-labs/atelia/blob/main/README.ja.md) リポジトリで扱います。このリポジトリは、その仕様を実行する daemon 実装に集中します。
+Atelia 全体の思想、AX 原則、AEP package 仕様、Surface Protocol、Hooks、client UX、ガバナンスは [`atelia`](https://github.com/atelia-labs/atelia/blob/main/README.ja.md) リポジトリで扱います。このリポジトリは、その仕様を実行する daemon 実装に集中します。
 
-Atelia Secretary は [AEP](https://github.com/atelia-labs/atelia/pull/4) の reference backend host です。Rust / WASM backend runtime boundary、manifest validation slice、permission / capability enforcement、brokered services、Hook 実行境界、audit、blocklist、install record、rollback behavior を担当します。
+Atelia Secretary は [AEP](https://github.com/atelia-labs/atelia/blob/main/docs/aep.ja.md) の reference backend host です。Secretary-side runtime boundary、manifest validation slice、permission / capability enforcement、brokered services、Hook 実行境界、audit、registry / blocklist enforcement、install record、quarantine、revocation、rollback behavior を担当します。
 
 ## スコープ
 
@@ -17,16 +17,16 @@ Atelia Secretary は [AEP](https://github.com/atelia-labs/atelia/pull/4) の ref
 - agent delegation substrate
 - policy enforcement
 - AX Feedback の保存と Atelia レベルのワークフローへの接続
-- extension host と capability boundary
+- AEP backend host と capability boundary
 - execution ledger と daemon logs
-- extension / Hook 実行境界の実装
+- package / Hook 実行境界の実装
 
 ## 対象外
 
 - Atelia 全体の思想と仕様
 - Mac / iOS client UI
 - Atelia Kit の共有 Swift ロジック
-- AEP / extension の規範的仕様
+- AEP package の規範的仕様
 - Hooks の規範的仕様
 
 ## ドキュメント
@@ -52,7 +52,7 @@ Implementation contracts:
 - [Tool Catalog](docs/tool-catalog.ja.md)
 - [Tool Definition Schema](docs/tool-definition-schema.ja.md)
 - [Tool Output Schema](docs/tool-output-schema.ja.md)
-- [Extensions Runtime](docs/extensions-runtime.ja.md)
+- [AEP Package Runtime](docs/extensions-runtime.ja.md)
 - [Operational AX Analytics](docs/operational-ax-analytics.ja.md)
 
 Release and research:
@@ -64,16 +64,19 @@ Release and research:
 プロジェクト全体のドキュメント:
 
 - [Atelia](https://github.com/atelia-labs/atelia/blob/main/README.ja.md)
-- [Atelia Extension Protocol / AEP Manifest / AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
-  は、個別 docs が `atelia` main に入るまで同じ `atelia` PR `#4` を指す一時リンクです。
+- [Package Authoring, Remix, and Discovery](https://github.com/atelia-labs/atelia/blob/main/docs/package-authoring-discovery.ja.md)
+- [Package Sharing and Source Policy](https://github.com/atelia-labs/atelia/blob/main/docs/package-sharing-source-policy.ja.md)
+- [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.ja.md)
+- [AEP Services](https://github.com/atelia-labs/atelia/blob/main/docs/aep-services.ja.md)
+- [Surface Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.ja.md)
+- [AEP Registry](https://github.com/atelia-labs/atelia/blob/main/docs/aep-registry.ja.md)
+- [Broker Boundary](https://github.com/atelia-labs/atelia/blob/main/docs/broker-boundary.ja.md)
 - [AX Feedback](https://github.com/atelia-labs/atelia/blob/main/docs/ax-feedback.ja.md)
-- [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.ja.md)
-- [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.ja.md)
 - [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.ja.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.ja.md)
 - [Client UX](https://github.com/atelia-labs/atelia/blob/main/docs/client-ux.ja.md)
 
 ## 現在の状態
 
-Atelia Secretary は初期設計と first product 実装の段階です。現在は Rust daemon architecture を、実装できる粒度まで具体化しています。対象は typed protocol、domain record、policy、job orchestration、execution ledger、tool execution、extension boundary です。
+Atelia Secretary は初期設計と first product 実装の段階です。現在は Rust daemon architecture を、実装できる粒度まで具体化しています。対象は typed protocol、domain record、policy、job orchestration、execution ledger、tool execution、service brokering、AEP package boundary です。
 beta protocol contract は `docs/protocol-contract.ja.md` で lock しており、shipping transport は HTTP/JSON です。generated proto/gRPC client / server path は future work です。

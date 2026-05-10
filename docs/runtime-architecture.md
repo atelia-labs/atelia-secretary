@@ -2,7 +2,8 @@
 
 This document defines the runtime architecture for Atelia Secretary. It is the
 implementation anchor for the daemon: protocol surface, domain records, policy
-boundary, audit model, tool execution, and extension seams.
+boundary, audit model, tool execution, service brokering, and AEP package
+boundaries.
 
 The architecture is shaped by Atelia's MDP quality bar: Minimum Desirable /
 Delightful Product. Desirable asks whether the product should exist in
@@ -11,7 +12,7 @@ legible, and alive. The runtime should be small enough to build with discipline,
 but complete enough to be trustworthy as the foundation of the product.
 
 This is not a throwaway first-loop sketch. Later implementation slices may add
-capabilities, storage engines, transports, extension hosts, and hosted sync, but
+capabilities, storage engines, transports, AEP backend hosts, and hosted sync, but
 they should preserve the domain boundaries defined here.
 
 ## Design Commitments
@@ -23,7 +24,7 @@ The runtime architecture commits to:
 - policy decisions before execution effects;
 - canonical tool results before rendered output;
 - typed protocol contracts before client-specific view state;
-- provider boundaries before built-in service integrations;
+- brokered provider boundaries before built-in service integrations;
 - recoverable failure states before generic errors.
 
 ## Product Contract
@@ -41,7 +42,8 @@ that makes Atelia possible:
 - tool output has a canonical result independent of TOON / JSON rendering;
 - status, errors, and approval states are understandable instead of merely
   technically correct;
-- extension points are reserved without committing to the full extension host.
+- AEP package points are reserved without committing to a public storefront or
+  arbitrary client plug-in runtime.
 
 ## Runtime Shape
 
@@ -64,9 +66,10 @@ It does not own:
 - long-term personal memory;
 - arbitrary GitHub / Linear / external service integrations;
 - delegated cloud agent orchestration;
-- third-party extension installation.
+- public third-party storefront behavior.
 
-Those surfaces are left to clients or extensions.
+Those surfaces are left to clients, AEP packages, or future product slices, but
+clients remain clients, not Secretary hosts.
 
 ## Protocol Surface
 
@@ -112,7 +115,7 @@ part of the architecture.
 | job | user or agent requested work | includes kind, goal, repository id, status, requester, created/started/completed timestamps |
 | job_event | observable job lifecycle event | append-only; supports streaming and replay |
 | policy_decision | allow / audit / approval / block result | includes risk tier, reason, policy version, requested capability |
-| tool_invocation | one built-in or extension tool call | includes tool id, input digest, permission, status, output ref |
+| tool_invocation | one built-in or package-provided tool call | includes tool id, input digest, permission, status, output ref |
 | tool_result | canonical structured result | independent of rendered format |
 | audit_record | durable execution and policy record | append-only; redacted where needed |
 
@@ -202,10 +205,10 @@ The daemon should not compare output formats as "raw log vs structured record."
 Each tool contract should define fields, ordering, omissions, references, and
 redundancy intentionally.
 
-## Extension Boundary
+## AEP Package Boundary
 
-The runtime architecture reserves extension concepts even before full extension
-installation exists.
+The runtime architecture reserves AEP package concepts even before full package
+runtime execution exists.
 
 This boundary is the backend-host slice of AEP. Secretary should treat AEP as
 separate from Atelia Protocol: Atelia Protocol is daemon / client / agent RPC,
@@ -229,14 +232,21 @@ The first implementation may expose only built-in providers. It should not bake
 GitHub, Linear, long-term memory, observational memory, or external agents into
 Secretary core.
 
+Service calls must cross the Secretary runtime, Service Broker, Policy Engine,
+and Audit Log boundary. A call is valid only when the caller declares the
+matching `services.consumes` grant and the provider declares the matching
+`provides.required_permissions`. Package-owned permissions and
+provider-owned service grants are separate authorities; consumers reference
+provider permissions, they do not redefine or downgrade them.
+
 ## Deferred Product Surface
 
 The runtime architecture explicitly defers:
 
-- full Rust / WASM extension runtime;
-- third-party extension registry;
-- extension bundles;
-- service-to-service extension calls;
+- full Rust / WASM package runtime;
+- third-party registry search as a product surface;
+- AEP bundles;
+- package-to-package service calls beyond the brokered beta slice;
 - human approval UI beyond returning `needs_approval` state;
 - long-term memory or preference storage;
 - autonomous delegated agent scheduling;
@@ -260,7 +270,7 @@ The implementation should land in slices that preserve the architecture:
 7. Policy-gated filesystem write/patch.
 8. Explicit argv process execution with cwd, timeout, and env allowlist.
 9. Canonical tool results with TOON and JSON rendering.
-10. Reserved provider identifiers for future extension boundaries.
+10. Reserved provider identifiers for future AEP package boundaries.
 
 ## Acceptance Criteria
 

@@ -2,7 +2,14 @@
 
 Atelia Secretary は、リポジトリ、外部サービス、自動化エージェントへのアクセスを制御します。そのため、セキュリティ上重要な daemon として設計されなければなりません。
 
-Extension / Hook の規範的な安全モデルは [`atelia/docs/extension-security.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/extension-security.ja.md) を参照します。この文書では Secretary daemon 固有の security boundary を扱います。
+AEP package、Surface Protocol、service、broker boundary、Hook の規範的な安全モデルは次を参照します。
+
+- [`atelia/docs/aep-manifest.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.ja.md)
+- [`atelia/docs/aep-services.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/aep-services.ja.md)
+- [`atelia/docs/surface-protocol.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.ja.md)
+- [`atelia/docs/broker-boundary.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/broker-boundary.ja.md)
+
+この文書では Secretary daemon 固有の security boundary を扱います。
 
 ## 基本ルール
 

@@ -44,7 +44,7 @@ beta gate に加えて、release には次のものが必要です。
 - protocol compatibility checks
 - previous-minor protocol compatibility checks
 - manifest schema fixture validation
-- extension runtime compatibility checks
+- AEP backend package runtime compatibility checks
 - tool-output TOON / JSON golden fixtures
 - tool-output customizer compatibility fixtures
 - `crates/atelia-core/tests/fixtures/tool_output/` 配下の tool-output compatibility fixture checks

@@ -47,8 +47,8 @@ diagnostic metadata.
 This table is the required service contract, not merely a description of the
 current protobuf implementation. The current daemon exposes the health,
 repository, job, policy, event replay, project status, tool-output settings,
-`RenderToolOutput`, and extension RPC groups. Extension registry and blocklist
-operations are currently exposed through the daemon HTTP/JSON beta
+`RenderToolOutput`, and beta package-management RPC groups. Registry and
+blocklist operations are currently exposed through the daemon HTTP/JSON beta
 transport. The Rust RPC boundary in `ateliad` stays transport-neutral so a
 future proto/gRPC client path can bind to the same contract instead of
 redefining it. `WatchEvents` is the live beta subscription surface, while
@@ -71,14 +71,14 @@ Required RPC groups:
 | `ReplayEvents` | Replay ordered events from a cursor |
 | `CheckPolicy` | Preview policy outcome for a requested action |
 | `RenderToolOutput` | Render canonical tool result as TOON, JSON, or text |
-| `InstallExtension` | Install a new extension manifest |
-| `UpdateExtension` | Update an installed extension manifest |
-| `ExtensionStatus` | Inspect one extension installation and blocklist state |
-| `ListExtensions` | List installed extension statuses |
-| `RollbackExtension` | Restore the previous version of an extension |
-| `DisableExtension` | Disable an installed extension |
-| `EnableExtension` | Enable a disabled extension |
-| `RemoveExtension` | Remove an installed extension |
+| `InstallExtension` | Install a new AEP backend package manifest. Beta RPC name is retained for compatibility. |
+| `UpdateExtension` | Update an installed AEP backend package manifest |
+| `ExtensionStatus` | Inspect one package installation and blocklist state |
+| `ListExtensions` | List installed package statuses |
+| `RollbackExtension` | Restore the previous version of a package |
+| `DisableExtension` | Disable an installed package |
+| `EnableExtension` | Enable a disabled package |
+| `RemoveExtension` | Remove an installed package |
 | `ApplyBlocklist` | Add a blocklist entry |
 | `ListBlocklist` | Inspect the current blocklist |
 
@@ -98,12 +98,14 @@ The first beta server surface is intentionally small and currently projects
 only the built-in Secretary tools that are dispatchable in this beta slice:
 `fs.read` and `secretary.echo` as beta repertoire entries. Broader built-ins
 may exist in future or runtime-backed slices, but they are not claimed by
-`ListRepertoire` until dispatch exists. Extension-backed repertoire entries
+`ListRepertoire` until dispatch exists. Package-backed repertoire entries
 remain a future slice.
 
-For the beta slice, extension management APIs are operator-facing.
-Extension execution RPCs are not supported in beta. Endpoints may exist, but
-they must return unsupported-capability when invoked.
+For the beta slice, package management APIs are operator-facing. The RPC names
+still use `Extension*` because that is the current beta wire surface; docs and
+new product language should treat them as AEP backend package management, not a
+public package storefront. Package execution RPCs are not supported in beta.
+Endpoints may exist, but they must return unsupported-capability when invoked.
 
 ## Core Messages
 

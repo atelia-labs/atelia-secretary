@@ -5,16 +5,17 @@
 Atelia Secretary is the Rust backend daemon that runs the always-on project
 secretary inside Atelia.
 
-Project-wide philosophy, AX principles, AEP / extension specifications, Hooks,
-client UX, and governance live in the
+Project-wide philosophy, AX principles, AEP package specifications, Surface
+Protocol, Hooks, client UX, and governance live in the
 [`atelia`](https://github.com/atelia-labs/atelia) repository. This repository
 focuses on the daemon implementation that executes those contracts.
 
 Atelia Secretary is the reference backend host for
-[AEP](https://github.com/atelia-labs/atelia/pull/4). It owns the
-Rust / WASM backend runtime boundary, manifest validation slice, permission and
+[AEP](https://github.com/atelia-labs/atelia/blob/main/docs/aep.md). It owns
+the Secretary-side runtime boundary, manifest validation slice, permission and
 capability enforcement, brokered services, hook execution boundaries, audit,
-blocklist, install records, and rollback behavior.
+registry / blocklist enforcement, install records, quarantine, revocation, and
+rollback behavior.
 
 ## Scope
 
@@ -25,16 +26,16 @@ blocklist, install records, and rollback behavior.
 - agent delegation substrate
 - policy enforcement
 - AX Feedback storage and connection to Atelia-level workflows
-- extension host and capability boundary
+- AEP backend host and capability boundary
 - execution ledger and daemon logs
-- implementation of extension / Hook execution boundaries
+- implementation of package / Hook execution boundaries
 
 ## Out of Scope
 
 - Atelia-wide philosophy and specifications
 - Mac / iOS client UI
 - shared Swift logic in Atelia Kit
-- normative AEP / extension specification
+- normative AEP package specification
 - normative Hooks specification
 
 ## Docs
@@ -60,7 +61,7 @@ Implementation contracts:
 - [Tool Catalog](docs/tool-catalog.md)
 - [Tool Definition Schema](docs/tool-definition-schema.md)
 - [Tool Output Schema](docs/tool-output-schema.md)
-- [Extensions Runtime](docs/extensions-runtime.md)
+- [AEP Package Runtime](docs/extensions-runtime.md)
 - [Operational AX Analytics](docs/operational-ax-analytics.md)
 
 Release and research:
@@ -72,12 +73,14 @@ Release and research:
 Project-level docs:
 
 - [Atelia](https://github.com/atelia-labs/atelia)
-- [Atelia Extension Protocol / AEP Manifest / AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
-  is a temporary link to `atelia` PR `#4` until the individual docs land on
-  `atelia` main.
+- [Package Authoring, Remix, and Discovery](https://github.com/atelia-labs/atelia/blob/main/docs/package-authoring-discovery.md)
+- [Package Sharing and Source Policy](https://github.com/atelia-labs/atelia/blob/main/docs/package-sharing-source-policy.md)
+- [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.md)
+- [AEP Services](https://github.com/atelia-labs/atelia/blob/main/docs/aep-services.md)
+- [Surface Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.md)
+- [AEP Registry](https://github.com/atelia-labs/atelia/blob/main/docs/aep-registry.md)
+- [Broker Boundary](https://github.com/atelia-labs/atelia/blob/main/docs/broker-boundary.md)
 - [AX Feedback](https://github.com/atelia-labs/atelia/blob/main/docs/ax-feedback.md)
-- [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
-- [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md)
 - [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md)
 - [Client UX](https://github.com/atelia-labs/atelia/blob/main/docs/client-ux.md)
@@ -87,6 +90,7 @@ Project-level docs:
 Atelia Secretary is in its early design and first-product implementation stage.
 The current work is to make the Rust daemon architecture concrete enough for
 implementation: typed protocol, domain records, policy, job orchestration,
-execution ledger, tool execution, and extension boundaries. The beta protocol
+execution ledger, tool execution, service brokering, and AEP package
+boundaries. The beta protocol
 contract is locked in `docs/protocol-contract.md`; the shipping transport is
 HTTP/JSON, and generated proto/gRPC client and server paths remain future work.
