@@ -3824,6 +3824,8 @@ mod tests {
                 repository: Some("https://github.com/example/extensions".to_string()),
                 commit: Some("deadbeef".to_string()),
                 registry_identity: Some("third-party-registry".to_string()),
+                lineage: None,
+                publication: None,
                 artifact_digest: artifact_digest.to_string(),
                 manifest_digest: manifest_digest.to_string(),
                 signature: Some("signature".to_string()),

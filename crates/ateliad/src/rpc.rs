@@ -633,6 +633,7 @@ fn registry_error_to_rpc(error: atelia_core::RegistryError) -> RpcError {
         },
         atelia_core::RegistryError::Blocked { .. }
         | atelia_core::RegistryError::DigestConflict { .. }
+        | atelia_core::RegistryError::SourceChangeRequiresApproval { .. }
         | atelia_core::RegistryError::RollbackUnavailable { .. } => RpcError {
             code: RpcErrorCode::Conflict,
             reason: error.to_string(),
@@ -2517,6 +2518,8 @@ mod tests {
                 repository: Some("https://github.com/example/extensions".to_string()),
                 commit: Some("deadbeef".to_string()),
                 registry_identity: Some("third-party-registry".to_string()),
+                lineage: None,
+                publication: None,
                 artifact_digest: artifact_digest.to_string(),
                 manifest_digest: manifest_digest.to_string(),
                 signature: Some("signature".to_string()),
@@ -4785,6 +4788,7 @@ mod tests {
                 manifest: manifest_v1,
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .expect("install should succeed");
         assert_eq!(install.record.version, "1.0.0");
@@ -4794,6 +4798,7 @@ mod tests {
                 manifest: manifest_v2,
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .expect("update should succeed");
         assert_eq!(updated.metadata.protocol_version, "1.0.0");
