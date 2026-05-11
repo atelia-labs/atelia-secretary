@@ -88,13 +88,13 @@ R0/R1 capability は contract が許す範囲で daemon policy により自動 g
 - [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.ja.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.ja.md)
 
-## Tool / Extension 実装メモ
+## Tool / Package 実装メモ
 
 Secretary 側の tool category、tool output rendering、AEP backend package runtime、operational AX analytics の実装契約は次の文書で扱います。
 
 - [Tool Catalog](tool-catalog.ja.md)
 - [Tool Definition Schema](tool-definition-schema.ja.md)
 - [Tool Output Schema](tool-output-schema.ja.md)
-- [Extensions Runtime](extensions-runtime.ja.md)
+- [AEP Package Runtime](extensions-runtime.ja.md)
 - [Operational AX Analytics](operational-ax-analytics.ja.md)
 - [Secretary Runtime Architecture](runtime-architecture.ja.md)

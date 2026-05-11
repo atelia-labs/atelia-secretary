@@ -61,7 +61,7 @@ the Secretary daemon implements those contracts.
 
 ## AEP Packages
 
-- [Extensions Runtime](extensions-runtime.md)
+- [AEP Package Runtime](extensions-runtime.md)
 
 Atelia Secretary is the AEP backend host reference implementation. Normative
 AEP, package authoring, Surface Protocol, registry, service, hook, and broker

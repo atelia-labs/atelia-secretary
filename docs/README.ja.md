@@ -46,7 +46,7 @@ Atelia 全体の product philosophy、client UX、AEP package 仕様、Surface P
 
 ## AEP Packages
 
-- [Extensions Runtime](extensions-runtime.ja.md)
+- [AEP Package Runtime](extensions-runtime.ja.md)
 
 Atelia Secretary は AEP の backend host reference implementation です。規範的な AEP、package authoring、Surface Protocol、registry、service、broker boundary、Hook 仕様は project repository に置きます。
 

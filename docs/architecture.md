@@ -118,7 +118,7 @@ Protocol, registry, service, broker, and Hook specs.
 - [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md)
 
-## Tool And Extension Implementation Notes
+## Tool And Package Implementation Notes
 
 Secretary's implementation contracts for tool categories, tool output rendering,
 AEP backend package runtime behavior, and operational AX analytics live in:
@@ -126,6 +126,6 @@ AEP backend package runtime behavior, and operational AX analytics live in:
 - [Tool Catalog](tool-catalog.md)
 - [Tool Definition Schema](tool-definition-schema.md)
 - [Tool Output Schema](tool-output-schema.md)
-- [Extensions Runtime](extensions-runtime.md)
+- [AEP Package Runtime](extensions-runtime.md)
 - [Operational AX Analytics](operational-ax-analytics.md)
 - [Secretary Runtime Architecture](runtime-architecture.md)
