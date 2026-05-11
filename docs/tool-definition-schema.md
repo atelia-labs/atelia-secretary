@@ -62,8 +62,9 @@ customization:
 Tool ids are stable and namespaced:
 
 - built-in: `fs.search`, `proc.run`, `job.status`
-- package-provided beta: `extension.<package_id>.<tool_id>` while the current
-  beta wire/API surface still uses `extension`
+- package-provided beta: `extension.<package_id>.<tool_id>`; the literal
+  `extension` prefix is retained in the current beta wire/API for
+  compatibility, while `<package_id>` identifies the AEP package
 - remote: `remote.<provider_id>.<tool_id>`
 - workflow: `workflow.<workflow_id>.<tool_id>`
 

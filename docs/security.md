@@ -10,6 +10,7 @@ broker boundaries, and Hooks lives in:
 - [`atelia/docs/aep-services.md`](https://github.com/atelia-labs/atelia/blob/main/docs/aep-services.md)
 - [`atelia/docs/surface-protocol.md`](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.md)
 - [`atelia/docs/broker-boundary.md`](https://github.com/atelia-labs/atelia/blob/main/docs/broker-boundary.md)
+- [`atelia/docs/hooks.md`](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md)
 
 This document covers Secretary daemon-specific security boundaries.
 

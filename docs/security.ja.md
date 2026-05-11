@@ -8,6 +8,7 @@ AEP package、Surface Protocol、service、broker boundary、Hook の規範的�
 - [`atelia/docs/aep-services.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/aep-services.ja.md)
 - [`atelia/docs/surface-protocol.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.ja.md)
 - [`atelia/docs/broker-boundary.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/broker-boundary.ja.md)
+- [`atelia/docs/hooks.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.ja.md)
 
 この文書では Secretary daemon 固有の security boundary を扱います。
 
