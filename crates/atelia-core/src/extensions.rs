@@ -2306,7 +2306,6 @@ impl ExtensionSourceSnapshot {
     fn matches_authority(&self, other: &Self) -> bool {
         self.source == other.source
             && self.repository == other.repository
-            && self.commit == other.commit
             && self.registry_identity == other.registry_identity
             && self.lineage == other.lineage
     }
@@ -3637,6 +3636,30 @@ mod tests {
             record.source,
             ExtensionSourceSnapshot::from_provenance(&next.provenance)
         );
+    }
+
+    #[test]
+    fn same_github_repository_commit_update_does_not_require_source_approval() {
+        let mut first = manifest("com.example.extension");
+        first.provenance.source = ProvenanceSource::Github;
+        first.provenance.repository = Some("https://github.com/example/package".to_string());
+        first.provenance.commit = Some("1111111".to_string());
+        first.provenance.registry_identity = None;
+
+        let mut registry = ExtensionRegistry::in_memory();
+        registry.install(first, InstallOptions::default()).unwrap();
+
+        let mut next = manifest("com.example.extension");
+        next.version = "1.1.0".to_string();
+        next.provenance.source = ProvenanceSource::Github;
+        next.provenance.repository = Some("https://github.com/example/package".to_string());
+        next.provenance.commit = Some("2222222".to_string());
+        next.provenance.registry_identity = None;
+        next.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        next.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        let record = registry.install(next, InstallOptions::default()).unwrap();
+        assert_eq!(record.source.commit.as_deref(), Some("2222222"));
     }
 
     #[test]
