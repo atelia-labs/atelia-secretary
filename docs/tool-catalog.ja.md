@@ -2,7 +2,7 @@
 
 この文書は、Atelia Secretary が built-in として expose する小さな tool surface を整理します。便利な integration は AEP package に寄せます。
 
-[Tool Definition Schema](tool-definition-schema.ja.md)、[Tool Output Schema](tool-output-schema.ja.md)、[Extensions Runtime](extensions-runtime.ja.md)、Atelia の [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.ja.md)、[Surface Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.ja.md)、[Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.ja.md) も参照します。Agent Repertoire は現在の context にある live tool surface の computed projection です。
+[Tool Definition Schema](tool-definition-schema.ja.md)、[Tool Output Schema](tool-output-schema.ja.md)、[AEP Package Runtime](extensions-runtime.ja.md)、Atelia の [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.ja.md)、[Surface Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.ja.md)、[Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.ja.md) も参照します。Agent Repertoire は現在の context にある live tool surface の computed projection です。
 
 Secretary core は general harness を提供します。filesystem、shell、search、job、event、policy、AEP backend hosting、service broker、hook intake、output rendering、agent delegation substrate が中心です。Git、GitHub、Linear、memory provider、memory strategy、notification、review agent、approval agent は package-provided surface として扱います。
 

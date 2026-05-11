@@ -142,7 +142,7 @@ built-in は小さく、信頼できる状態に保ちます。
 - approval agents
 - delegated agent providers
 
-Git は bounded process tool 経由の shell/process 利用から始められます。より豊かな Git surface は後で official extension にできます。
+Git は bounded process tool 経由の shell/process 利用から始められます。より豊かな Git surface は後で official package にできます。
 
 ## Policy Foundation
 

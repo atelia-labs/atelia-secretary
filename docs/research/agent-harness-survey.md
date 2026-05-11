@@ -133,13 +133,13 @@ Atelia Secretary design. Implementation contracts live in:
 - [Tool Catalog](../tool-catalog.md)
 - [Tool Definition Schema](../tool-definition-schema.md)
 - [Tool Output Schema](../tool-output-schema.md)
-- [Extensions Runtime](../extensions-runtime.md)
+- [AEP Package Runtime](../extensions-runtime.md)
 - [Operational AX Analytics](../operational-ax-analytics.md)
 
 When research is promoted into specification, review it against the Atelia and
 Secretary philosophy documents. In particular, check Secretary's agency,
 workplace growth, AX Feedback, token-efficient tool output, and whether
-extensions or hooks preserve rather than replace judgment.
+packages or hooks preserve rather than replace judgment.
 
 ## Sources
 

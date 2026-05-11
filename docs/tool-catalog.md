@@ -4,7 +4,7 @@ This document organizes the small built-in tool surface Atelia Secretary can
 expose. Convenience integrations belong to AEP packages.
 
 See also [Tool Definition Schema](tool-definition-schema.md), [Tool Output
-Schema](tool-output-schema.md), [Extensions Runtime](extensions-runtime.md),
+Schema](tool-output-schema.md), [AEP Package Runtime](extensions-runtime.md),
 Atelia [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.md),
 [Surface Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.md),
 and [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md) as the computed projection of the live tool surface in the current context.

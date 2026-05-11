@@ -141,8 +141,8 @@ Initial threat model work should cover:
   input schemas, effects, runtime behavior, and customization surfaces.
 - [Tool Output Schema](tool-output-schema.md) defines agent-facing output,
   audit separation, redaction, and TOON/JSON format selection.
-- [Extensions Runtime](extensions-runtime.md) defines manifest enforcement,
-  extension sandboxing, provenance, rollback, and blocklist behavior.
+- [AEP Package Runtime](extensions-runtime.md) defines manifest enforcement,
+  package sandboxing, provenance, rollback, and blocklist behavior.
 - [Operational AX Analytics](operational-ax-analytics.md) defines
   privacy-preserving analytics for AX improvement.
 

@@ -49,15 +49,15 @@ In addition to the beta gate, a release should require:
 - tool-output TOON / JSON golden fixtures;
 - tool-output customizer compatibility fixtures;
 - tool-output compatibility fixture checks under `crates/atelia-core/tests/fixtures/tool_output/`;
-- extension compatibility matrix updates;
-- AX impact review when tool-output defaults, permission model, extension
+- package compatibility matrix updates;
+- AX impact review when tool-output defaults, permission model, package
   contracts, or Hook behavior change;
 - permission migration tests when permission names or risk tiers change;
-- blocklist and rollback behavior tests when extension enforcement changes;
+- blocklist and rollback behavior tests when package enforcement changes;
 - Docker build;
 - security-sensitive change review where applicable.
 
-Any Secretary release that changes enforcement of Atelia extension, hook,
+Any Secretary release that changes enforcement of Atelia package, hook,
 permission, or tool-output contracts must cite the Atelia specification version
 or commit it implements.
 
@@ -69,7 +69,7 @@ The changelog should distinguish:
 - daemon behavior changes;
 - protocol changes;
 - policy / orchestration changes;
-- extension / hook compatibility changes;
+- package / hook compatibility changes;
 - tool-output schema and default-format changes;
 - security fixes;
 - breaking changes.

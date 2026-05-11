@@ -390,11 +390,11 @@ plaintext secret は audit に残しません。
 
 ## Agency Preservation
 
-extension は Secretary の判断を支援するためのものです。
+package は Secretary の判断を支援するためのものです。
 
 Review questions:
 
-- この extension は Secretary がより良い判断をする助けになるか
+- この package は Secretary がより良い判断をする助けになるか
 - Secretary に見えない場所で判断を置き換えていないか
 - memory、notification、review flow、delegation、tool default を変更する場合、その impact を manifest に宣言しているか
 - Secretary は変更内容、理由、戻し方を確認できるか

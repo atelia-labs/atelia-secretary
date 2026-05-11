@@ -170,7 +170,7 @@ Defer:
 - delegated agent providers.
 
 Git can start as shell/process usage through the bounded process tool. A richer
-Git surface can become an official extension later.
+Git surface can become an official package later.
 
 ## Policy Foundation
 
