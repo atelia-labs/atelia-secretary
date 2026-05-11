@@ -1750,11 +1750,16 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::process::id(),
         WRITE_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(&temp_path)?;
     file.write_all(bytes)?;
     file.flush()?;
     file.sync_all()?;
@@ -4656,6 +4661,8 @@ mod tests {
     use crate::tool_output::{OutputFormat, RenderedToolOutput};
     use std::cell::Cell;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
@@ -8108,6 +8115,18 @@ mod tests {
                 .map(|event| event.id.clone()),
             Some(repository_event_id)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_bytes_atomically_creates_owner_only_file_on_unix() {
+        let storage_dir = durable_storage_dir("atomic-write-permissions");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+
+        write_bytes_atomically(&snapshot_path, b"{}").unwrap();
+
+        let mode = fs::metadata(snapshot_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
