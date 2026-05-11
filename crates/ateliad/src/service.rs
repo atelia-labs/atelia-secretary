@@ -10,7 +10,8 @@ use atelia_core::{
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
     CancelJobReceipt, DefaultPolicyEngine, DisableExtensionRequest, DisableExtensionResponse,
     EchoTool, EnableExtensionRequest, EnableExtensionResponse, EventCursor, EventPage, EventQuery,
-    ExtensionRegistryService, ExtensionStatusRequest, ExtensionStatusResponse, FsReadTool,
+    ExtensionBlocklistMatch, ExtensionBoundary, ExtensionInstallStatus, ExtensionRegistryService,
+    ExtensionSourceSnapshot, ExtensionStatusRequest, ExtensionStatusResponse, FsReadTool,
     InMemoryStore, InMemoryToolOutputSettingsService, InstallExtensionRequest,
     InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService, JobPage, JobQuery,
     JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest, ListBlocklistResponse,
@@ -23,7 +24,7 @@ use atelia_core::{
     ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
     TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse, WatchJobEvent,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -42,6 +43,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "policy.v1",
     "repertoire.v1",
     "extensions.registry.v1",
+    "package_trust_index.v1",
     "tool_output_settings.v1",
     "tool_output_render.v1",
     "project_status.v1",
@@ -160,6 +162,9 @@ pub struct GetProjectStatusRequest {
     pub repository_id: RepositoryId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ListPackageTrustIndexRequest {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectStatusSnapshot {
     pub repository: RepositoryRecord,
@@ -168,6 +173,52 @@ pub struct ProjectStatusSnapshot {
     pub latest_event: Option<JobEvent>,
     pub daemon_status: DaemonStatus,
     pub storage_status: StorageStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListPackageTrustIndexResponse {
+    pub packages: Vec<PackageTrustIndexEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageTrustIndexEntry {
+    pub package_id: String,
+    pub version: Option<String>,
+    pub status: Option<ExtensionInstallStatus>,
+    pub boundary: Option<ExtensionBoundary>,
+    pub manifest_digest: Option<String>,
+    pub artifact_digest: Option<String>,
+    pub source: Option<ExtensionSourceSnapshot>,
+    pub block: Option<ExtensionBlocklistMatch>,
+}
+
+impl From<ExtensionStatusResponse> for PackageTrustIndexEntry {
+    fn from(status: ExtensionStatusResponse) -> Self {
+        let (version, install_status, boundary, manifest_digest, artifact_digest, source) = status
+            .record
+            .map(|record| {
+                (
+                    Some(record.version),
+                    Some(record.status),
+                    Some(record.boundary),
+                    Some(record.manifest_digest),
+                    Some(record.artifact_digest),
+                    Some(record.source),
+                )
+            })
+            .unwrap_or((None, None, None, None, None, None));
+
+        Self {
+            package_id: status.extension_id,
+            version,
+            status: install_status,
+            boundary,
+            manifest_digest,
+            artifact_digest,
+            source,
+            block: status.block,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,6 +1283,22 @@ impl SecretaryService {
             .map_err(ServiceError::from)
     }
 
+    pub fn list_package_trust_index(
+        &self,
+        _request: ListPackageTrustIndexRequest,
+    ) -> ServiceResult<ListPackageTrustIndexResponse> {
+        let response = self.list_extensions(ListExtensionsRequest {
+            include_blocked: true,
+        })?;
+        Ok(ListPackageTrustIndexResponse {
+            packages: response
+                .extensions
+                .into_iter()
+                .map(PackageTrustIndexEntry::from)
+                .collect(),
+        })
+    }
+
     pub fn rollback_extension(
         &self,
         request: RollbackExtensionRequest,
@@ -1943,6 +2010,9 @@ mod tests {
             .contains(&"extensions.registry.v1".to_string()));
         assert!(health
             .capabilities
+            .contains(&"package_trust_index.v1".to_string()));
+        assert!(health
+            .capabilities
             .contains(&"tool_output_settings.v1".to_string()));
         assert!(health
             .capabilities
@@ -2126,6 +2196,115 @@ mod tests {
             missing_after_remove,
             ServiceError::ExtensionRegistry(RegistryError::NotInstalled { .. })
         ));
+    }
+
+    #[test]
+    fn package_trust_index_lists_active_and_blocked_packages_with_provenance() {
+        let svc = ready_service();
+
+        const ACTIVE_ARTIFACT: &str =
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        const ACTIVE_MANIFEST: &str =
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        const BLOCKED_ARTIFACT: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const BLOCKED_MANIFEST: &str =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+        let mut active = extension_manifest(
+            "com.example.active",
+            "1.0.0",
+            ACTIVE_ARTIFACT,
+            ACTIVE_MANIFEST,
+        );
+        active.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
+        });
+
+        let mut blocked = extension_manifest(
+            "com.example.blocked",
+            "1.0.0",
+            BLOCKED_ARTIFACT,
+            BLOCKED_MANIFEST,
+        );
+        blocked.provenance.lineage = Some(atelia_core::ExtensionLineage {
+            parent_id: "com.example.parent".to_string(),
+            parent_version: Some("0.9.0".to_string()),
+            parent_manifest_digest: Some(ACTIVE_MANIFEST.to_string()),
+            relationship: atelia_core::ExtensionLineageRelationship::Fork,
+        });
+        blocked.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PrivateRemix,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::NotSubmitted,
+        });
+
+        svc.install_extension(InstallExtensionRequest {
+            manifest: active,
+            approve_local_unsigned: false,
+            allow_local_process_runtime: false,
+            approve_source_change: false,
+        })
+        .expect("active install should succeed");
+        svc.install_extension(InstallExtensionRequest {
+            manifest: blocked,
+            approve_local_unsigned: false,
+            allow_local_process_runtime: false,
+            approve_source_change: false,
+        })
+        .expect("blocked install should succeed");
+        svc.apply_blocklist(ApplyBlocklistRequest {
+            entry: atelia_core::BlocklistEntry {
+                key: BlockKey::ExtensionId("com.example.blocked".to_string()),
+                reason: BlockReason::PolicyViolation,
+                note: Some("blocked for trust index".to_string()),
+            },
+        })
+        .expect("blocklist should apply");
+
+        let index = svc
+            .list_package_trust_index(ListPackageTrustIndexRequest::default())
+            .expect("package trust index should succeed");
+
+        assert_eq!(index.packages.len(), 2);
+
+        let active_entry = index
+            .packages
+            .iter()
+            .find(|entry| entry.package_id == "com.example.active")
+            .expect("active package should be listed");
+        assert_eq!(active_entry.status, Some(ExtensionInstallStatus::Installed));
+        assert_eq!(
+            active_entry.source.as_ref().unwrap().publication,
+            Some(atelia_core::ExtensionPublication {
+                visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+                registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
+            })
+        );
+
+        let blocked_entry = index
+            .packages
+            .iter()
+            .find(|entry| entry.package_id == "com.example.blocked")
+            .expect("blocked package should remain visible");
+        assert_eq!(blocked_entry.status, Some(ExtensionInstallStatus::Blocked));
+        assert!(blocked_entry.block.is_some());
+        assert_eq!(
+            blocked_entry.source.as_ref().unwrap().publication,
+            Some(atelia_core::ExtensionPublication {
+                visibility: atelia_core::ExtensionPublicationVisibility::PrivateRemix,
+                registry_submission: atelia_core::ExtensionRegistrySubmission::NotSubmitted,
+            })
+        );
+        assert_eq!(
+            blocked_entry.source.as_ref().unwrap().lineage,
+            Some(atelia_core::ExtensionLineage {
+                parent_id: "com.example.parent".to_string(),
+                parent_version: Some("0.9.0".to_string()),
+                parent_manifest_digest: Some(ACTIVE_MANIFEST.to_string()),
+                relationship: atelia_core::ExtensionLineageRelationship::Fork,
+            })
+        );
     }
 
     #[test]
@@ -2419,6 +2598,9 @@ mod tests {
         assert!(metadata
             .capabilities
             .contains(&"extensions.registry.v1".to_string()));
+        assert!(metadata
+            .capabilities
+            .contains(&"package_trust_index.v1".to_string()));
         assert!(metadata
             .capabilities
             .contains(&"tool_output_settings.v1".to_string()));

@@ -143,6 +143,16 @@ to operator-facing clients; execution-oriented requests are intentionally
 unavailable and return structured unsupported-capability errors instead of
 silently pretending to run.
 
+This slice also exposes a read-only package trust index beta surface for
+resolver clients that inspect package status and metadata. It projects installed
+packages without hiding blocked ones,
+keeps the installed source/provenance/publication snapshot already present in
+the record, and intentionally omits mutable install-only fields such as
+approved permissions and rollback snapshots. Publisher, compatibility,
+broker-family, content-risk, and data-disclosure summaries require a later
+manifest-summary projection because those fields are not yet persisted in the
+install record.
+
 The current Rust identifiers and RPC names still use `extension` for beta
 compatibility. That is implementation vocabulary, not product positioning.
 

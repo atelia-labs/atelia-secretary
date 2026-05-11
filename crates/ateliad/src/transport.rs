@@ -76,6 +76,7 @@ enum Route {
     InstallExtension,
     UpdateExtension,
     ListExtensions,
+    ListPackageTrustIndex,
     ExtensionExecution { extension_id: String },
     ExtensionStatus { extension_id: String },
     RollbackExtension { extension_id: String },
@@ -186,6 +187,7 @@ fn route_for_path(path: &str) -> Route {
         "/v1/extensions/install" => Route::InstallExtension,
         "/v1/extensions/update" => Route::UpdateExtension,
         "/v1/extensions/list" => Route::ListExtensions,
+        "/v1/package-trust-index:list" => Route::ListPackageTrustIndex,
         "/v1/extensions/blocklist/apply" => Route::ApplyBlocklist,
         "/v1/extensions/blocklist/list" => Route::ListBlocklist,
         "/v1/tool-results:render" => Route::RenderToolOutput,
@@ -1536,6 +1538,15 @@ fn serialize_list_extensions_response(response: rpc::ListExtensionsResponse) -> 
     })
 }
 
+fn serialize_list_package_trust_index_response(
+    response: rpc::ListPackageTrustIndexResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "packages": response.packages,
+    })
+}
+
 fn serialize_rollback_extension_response(
     response: rpc::RollbackExtensionResponse,
 ) -> serde_json::Value {
@@ -2649,6 +2660,33 @@ async fn dispatch_list_extensions(state: RpcServerState, request: Request<Body>)
     }
 }
 
+async fn dispatch_list_package_trust_index(
+    state: RpcServerState,
+    request: Request<Body>,
+) -> Response {
+    if let Err(error) = body_or_empty_json::<rpc::ListPackageTrustIndexRequest>(request).await {
+        let rpc_server = state.read().await;
+        let next_state = rpc_next_state(&rpc_server);
+        return error.into_response(next_state);
+    }
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.list_package_trust_index(rpc::ListPackageTrustIndexRequest {}) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(
+                serialize_list_package_trust_index_response(response),
+            )),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
 async fn dispatch_render_tool_output(state: RpcServerState, request: Request<Body>) -> Response {
     let payload = match body_or_empty_json::<RenderToolOutputRequestPayload>(request).await {
         Ok(payload) => payload,
@@ -3228,6 +3266,26 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                     dispatch_list_extensions(state, request).await
                 }
             }
+            Route::ListPackageTrustIndex => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_list_package_trust_index(state, request).await
+                }
+            }
             Route::ExtensionExecution { extension_id } => {
                 if method != Method::POST {
                     let mut response = make_error_response(
@@ -3499,6 +3557,7 @@ pub fn build_router(rpc_server: RpcServerState, auth: LocalAuthConfig) -> Router
         .route("/v1/extensions/install", any(dispatch_route))
         .route("/v1/extensions/update", any(dispatch_route))
         .route("/v1/extensions/list", any(dispatch_route))
+        .route("/v1/package-trust-index:list", any(dispatch_route))
         .route("/v1/extensions/blocklist/apply", any(dispatch_route))
         .route("/v1/extensions/blocklist/list", any(dispatch_route))
         .route("/v1/extensions/{*path}", any(dispatch_route))
@@ -3891,6 +3950,10 @@ mod tests {
             Route::UpdateExtension
         );
         assert_eq!(route_for_path("/v1/extensions/list"), Route::ListExtensions);
+        assert_eq!(
+            route_for_path("/v1/package-trust-index:list"),
+            Route::ListPackageTrustIndex
+        );
         assert_eq!(
             route_for_path("/v1/extensions/blocklist/apply"),
             Route::ApplyBlocklist
@@ -5636,6 +5699,32 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+
+        let trust_index_response =
+            send_request(&rpc_server, Method::POST, "/v1/package-trust-index:list").await;
+        assert_eq!(trust_index_response.status(), StatusCode::OK);
+        let trust_index_payload = to_bytes(trust_index_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(
+            trust_index_payload["data"]["packages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            trust_index_payload["data"]["packages"][0]["package_id"],
+            "com.example.review.extension"
+        );
+        assert_eq!(
+            trust_index_payload["data"]["packages"][0]["status"],
+            "blocked"
+        );
+        assert!(trust_index_payload["data"]["packages"][0]
+            .get("approved_permissions")
+            .is_none());
 
         let execute_response = send_request(
             &rpc_server,
