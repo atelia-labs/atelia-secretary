@@ -4,6 +4,8 @@
 
 tool definition は仕事場の contract です。その tool が何をできるか、どの authority を必要とするか、どの evidence を返すか、どう失敗するか、AX のために結果をどう調整できるかを Secretary に伝えます。
 
+beta schema の `provider.kind: extension` enum value は、実装が追いつくまで package-provided tool の wire/API vocabulary として保持します。
+
 ## Minimum Definition
 
 ```yaml

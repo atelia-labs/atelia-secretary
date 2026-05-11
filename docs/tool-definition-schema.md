@@ -7,6 +7,10 @@ A tool definition is a workplace contract. It tells Secretary what the tool can
 do, what authority it needs, what evidence it returns, how it fails, and how the
 result can be shaped for AX.
 
+The `provider.kind: extension` enum value in the beta schema is retained as
+wire/API vocabulary for package-provided tools until the implementation catches
+up.
+
 ## Minimum Definition
 
 ```yaml

@@ -63,7 +63,8 @@ Secretary currently validates a backend-only compatibility slice. The public AEP
 package schema is `aep.package.v0`; this daemon slice is still
 `atelia.extension.v1` while implementation catches up. New product and docs
 language should still describe the concept as AEP packages, not generic
-extensions.
+extensions. Schema enum values such as `failure.degrade: disable_extension`
+also retain the beta schema vocabulary until the compatibility slice moves.
 
 ```yaml
 schema: atelia.extension.v1
