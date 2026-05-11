@@ -30,7 +30,7 @@ client-visible error は次を含みます。
 | `TIMEOUT` | execution exceeded timeout | `retry_with_narrower_scope` |
 | `CANCELED` | job or tool was canceled | `inspect_audit_record` |
 | `STORE_UNAVAILABLE` | local store unavailable | `wait_for_daemon` |
-| `CURSOR_EXPIRED` | event cursor can no longer resume | `refresh_status` |
+| `CURSOR_EXPIRED` | live watch stream が continuity を失い、新しい snapshot が必要 | `refresh_status` |
 | `OUTPUT_TRUNCATED` | output is partial | `inspect_tool_result` |
 | `INTERNAL` | unexpected daemon error | `inspect_audit_record` |
 
@@ -58,6 +58,9 @@ client は次を表示できるべきです。
 - audit ref if available
 
 stack trace を product copy として expose しません。
+
+page token の syntax 不正や replay/query cursor syntax の不正は `INVALID_REQUEST` のままです。
+replay/query の unknown event id も `INVALID_REQUEST` のままです。`CURSOR_EXPIRED` は、live watch stream が最後の sequence から継続できない場合にだけ使います。
 
 ## Agent Behavior
 

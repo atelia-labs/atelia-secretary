@@ -3139,7 +3139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_events_live_drains_retained_pages_before_streaming() {
+    async fn watch_events_live_drains_retained_events_before_streaming() {
         let svc = ready_service();
         let root = test_repo_dir("watch-events-live-retained-pages");
 

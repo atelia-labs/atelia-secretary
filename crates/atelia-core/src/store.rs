@@ -126,6 +126,7 @@ pub enum StoreError {
     InvalidCursor {
         reason: String,
     },
+    /// The live event stream lost continuity and must be refreshed.
     CursorExpired {
         reason: String,
     },
@@ -152,7 +153,7 @@ impl fmt::Display for StoreError {
                 write!(f, "{collection} invalid reference: {reason}")
             }
             StoreError::InvalidCursor { reason } => write!(f, "invalid event cursor: {reason}"),
-            StoreError::CursorExpired { reason } => write!(f, "cursor expired: {reason}"),
+            StoreError::CursorExpired { reason } => write!(f, "expired event cursor: {reason}"),
             StoreError::SequenceOverflow => write!(f, "job event sequence overflowed"),
             StoreError::InvalidRecord { collection, reason } => {
                 write!(f, "{collection} invalid record: {reason}")
@@ -893,17 +894,19 @@ impl SecretaryStore for InMemoryStore {
         limit: Option<usize>,
     ) -> StoreResult<Vec<JobEvent>> {
         let inner = self.lock()?;
-        let after_sequence = match cursor {
-            EventCursor::Beginning => 0,
-            EventCursor::AfterSequence(sequence) => sequence,
-            EventCursor::AfterEventId(id) => {
-                let event = inner
-                    .job_events_by_id
-                    .get(&id)
-                    .ok_or_else(|| cursor_expired_event_id("replay_job_events", &id))?;
-                event.sequence_number
-            }
-        };
+        let after_sequence =
+            match cursor {
+                EventCursor::Beginning => 0,
+                EventCursor::AfterSequence(sequence) => sequence,
+                EventCursor::AfterEventId(id) => {
+                    let event = inner.job_events_by_id.get(&id).ok_or_else(|| {
+                        StoreError::InvalidCursor {
+                            reason: format!("unknown event id: {}", id_debug(&id)),
+                        }
+                    })?;
+                    event.sequence_number
+                }
+            };
 
         let mut events = Vec::new();
         if let Some(start_sequence) = after_sequence.checked_add(1) {
@@ -936,7 +939,7 @@ impl SecretaryStore for InMemoryStore {
         let (after_sequence, resolved_cursor_sequence, live_cutoff_sequence) = {
             let inner = self.lock()?;
             let resolved_cursor_sequence =
-                resolve_event_cursor_sequence(&inner, query.cursor.clone())?;
+                resolve_live_event_cursor_sequence(&inner, query.cursor.clone())?;
             let after_sequence = resolved_cursor_sequence.unwrap_or(0);
             let live_cutoff_sequence = match resolved_cursor_sequence {
                 Some(resolved) => Some(resolved.max(inner.next_event_sequence)),
@@ -2997,18 +3000,50 @@ fn resolve_event_cursor_sequence(
     }
 }
 
+fn resolve_live_event_cursor_sequence(
+    inner: &InMemoryInner,
+    cursor: EventCursor,
+) -> StoreResult<Option<u64>> {
+    match cursor {
+        EventCursor::AfterEventId(id) => inner
+            .job_events_by_id
+            .get(&id)
+            .map(|event| Some(event.sequence_number))
+            .ok_or_else(|| cursor_expired_live_event_id(&id)),
+        cursor => resolve_event_cursor_sequence(inner, cursor),
+    }
+}
+
 fn event_cursor_sequence(inner: &InMemoryInner, cursor: EventCursor) -> StoreResult<u64> {
     match cursor {
         EventCursor::Beginning => Ok(0),
         EventCursor::AfterSequence(sequence) => Ok(sequence),
         EventCursor::AfterEventId(id) => {
-            let event = inner
-                .job_events_by_id
-                .get(&id)
-                .ok_or_else(|| cursor_expired_event_id("event_cursor_sequence", &id))?;
+            let event =
+                inner
+                    .job_events_by_id
+                    .get(&id)
+                    .ok_or_else(|| StoreError::InvalidCursor {
+                        reason: format!("unknown event id: {}", id_debug(&id)),
+                    })?;
             Ok(event.sequence_number)
         }
     }
+}
+
+fn cursor_expired_live_event_id(id: &JobEventId) -> StoreError {
+    let reason = format!(
+        "live watch event cursor {} is no longer retained; refresh status before opening a live watch",
+        id_debug(id)
+    );
+    tracing::warn!(
+        error.kind = "cursor_expired",
+        context = "watch_events_live_cursor",
+        event_id = id_debug(id),
+        reason = %reason,
+        "watch events cursor expired"
+    );
+    StoreError::CursorExpired { reason }
 }
 
 fn cursor_expired_lagged_live_filter(skipped: u64, query: &EventQuery) -> StoreError {
@@ -3033,18 +3068,6 @@ fn cursor_expired_live_snapshot(retained_events: usize) -> StoreError {
         context = "watch_events_live_snapshot",
         retained_events,
         max_live_watch_snapshot = MAX_LIVE_WATCH_SNAPSHOT,
-        reason = %reason,
-        "watch events cursor expired"
-    );
-    StoreError::CursorExpired { reason }
-}
-
-fn cursor_expired_event_id(context: &'static str, id: &JobEventId) -> StoreError {
-    let reason = format!("event id is not retained: {}", id_debug(id));
-    tracing::warn!(
-        error.kind = "cursor_expired",
-        context,
-        event_id = %id_debug(id),
         reason = %reason,
         "watch events cursor expired"
     );
@@ -6813,6 +6836,59 @@ mod tests {
                 .unwrap(),
             vec![third]
         );
+    }
+
+    #[test]
+    /// Reject replay requests that point at an event ID the store no longer retains.
+    fn replay_after_unknown_event_id_returns_invalid_cursor() {
+        let store = InMemoryStore::new();
+        let cursor = EventCursor::AfterEventId(
+            JobEventId::try_from_string("evt_12345678-1234-1234-1234-123456789abc").unwrap(),
+        );
+        assert!(matches!(
+            store.replay_job_events(cursor, None),
+            Err(StoreError::InvalidCursor { reason }) if reason.contains("unknown event id")
+        ));
+    }
+
+    #[test]
+    /// Treat missing event-id cursors as recovery-required for live watches.
+    fn live_watch_after_unknown_event_id_returns_cursor_expired() {
+        let store = InMemoryStore::new();
+        let cursor = EventCursor::AfterEventId(
+            JobEventId::try_from_string("evt_12345678-1234-1234-1234-123456789abc").unwrap(),
+        );
+        assert!(matches!(
+            store.watch_job_events_live(EventQuery {
+                repository_id: None,
+                cursor,
+                subject_ids: Vec::new(),
+                job_ids: Vec::new(),
+                min_severity: None,
+                page_size: None,
+                page_token: None,
+            }),
+            Err(StoreError::CursorExpired { reason })
+                if reason.contains("no longer retained")
+                    && reason.contains("refresh status")
+        ));
+    }
+
+    #[test]
+    /// Reject malformed page tokens before they reach pagination logic.
+    fn query_jobs_rejects_bad_page_token_syntax_as_invalid_cursor() {
+        let store = InMemoryStore::new();
+
+        assert!(matches!(
+            store.query_jobs(JobQuery {
+                repository_id: None,
+                status: None,
+                requester: None,
+                page_size: Some(1),
+                page_token: Some("not-a-number".to_string()),
+            }),
+            Err(StoreError::InvalidCursor { reason }) if reason.contains("page token is not a numeric offset")
+        ));
     }
 
     #[test]

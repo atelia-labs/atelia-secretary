@@ -1901,9 +1901,9 @@ fn rpc_error_status(code: rpc::RpcErrorCode) -> (StatusCode, bool) {
     match code {
         rpc::RpcErrorCode::InvalidArgument => (StatusCode::BAD_REQUEST, false),
         rpc::RpcErrorCode::NotFound => (StatusCode::NOT_FOUND, false),
+        rpc::RpcErrorCode::CursorExpired => (StatusCode::GONE, true),
         rpc::RpcErrorCode::Conflict => (StatusCode::CONFLICT, true),
         rpc::RpcErrorCode::UnsupportedCapability => (StatusCode::NOT_IMPLEMENTED, true),
-        rpc::RpcErrorCode::CursorExpired => (StatusCode::BAD_REQUEST, true),
         rpc::RpcErrorCode::Internal => (StatusCode::INTERNAL_SERVER_ERROR, false),
     }
 }
@@ -2384,7 +2384,7 @@ fn watch_events_stream_body(
 
 fn watch_events_cursor_expired_response(reason: impl Into<String>) -> Response {
     Response::builder()
-        .status(StatusCode::OK)
+        .status(StatusCode::GONE)
         .header(header::CONTENT_TYPE, "application/x-ndjson")
         .body(ndjson_body_from_frame(
             serialize_watch_events_recovery_error(reason),
@@ -4535,7 +4535,7 @@ mod tests {
     #[tokio::test]
     async fn watch_events_stream_reports_cursor_expired_recovery() {
         let response = watch_events_cursor_expired_response("event id is not retained");
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::GONE);
         assert_eq!(
             response
                 .headers()
@@ -4891,7 +4891,7 @@ mod tests {
         );
         assert_eq!(
             rpc_error_status(rpc::RpcErrorCode::CursorExpired),
-            (StatusCode::BAD_REQUEST, true)
+            (StatusCode::GONE, true)
         );
     }
 

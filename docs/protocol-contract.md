@@ -182,6 +182,10 @@ process-local: within the same daemon process, clients can resume the live
 surface without losing job history. After a daemon restart, call
 `GetProjectStatus` to discover the latest durable state, or `ReplayEvents` if
 you need the bounded replay-only compatibility path.
+Replay and query requests that name an unknown event id still return
+`INVALID_REQUEST`. If the live watch stream loses continuity, `WatchEvents`
+returns `CURSOR_EXPIRED` and clients should refresh status. Malformed page
+tokens or replay/query cursor syntax still return `INVALID_REQUEST`.
 
 ### Policy Decision
 
@@ -216,6 +220,8 @@ If the daemon cannot guarantee continuity within the current process,
 call `GetProjectStatus`. After a restart, clients should use
 `GetProjectStatus` for the latest durable snapshot or `ReplayEvents` for the
 bounded replay-only semantics that beta clients still depend on.
+Replay and query requests that name an unknown event id still return
+`INVALID_REQUEST`.
 
 ## Error Shape
 

@@ -656,9 +656,10 @@ fn registry_error_to_rpc(error: atelia_core::RegistryError) -> RpcError {
 pub enum RpcErrorCode {
     InvalidArgument,
     NotFound,
+    /// The live watch stream cursor has expired and must be refreshed.
+    CursorExpired,
     Conflict,
     UnsupportedCapability,
-    CursorExpired,
     Internal,
 }
 
@@ -2282,10 +2283,9 @@ fn store_error_to_rpc(error: StoreError) -> RpcError {
     let code = match error {
         StoreError::NotFound { .. } => RpcErrorCode::NotFound,
         StoreError::DuplicateId { .. } | StoreError::Conflict { .. } => RpcErrorCode::Conflict,
-        StoreError::InvalidReference { .. } | StoreError::InvalidRecord { .. } => {
-            RpcErrorCode::InvalidArgument
-        }
-        StoreError::InvalidCursor { .. } => RpcErrorCode::InvalidArgument,
+        StoreError::InvalidReference { .. }
+        | StoreError::InvalidCursor { .. }
+        | StoreError::InvalidRecord { .. } => RpcErrorCode::InvalidArgument,
         StoreError::CursorExpired { .. } => RpcErrorCode::CursorExpired,
         StoreError::SequenceOverflow => RpcErrorCode::Internal,
     };
@@ -4311,6 +4311,17 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    /// Map stale replay cursors to the ordinary invalid-argument RPC error.
+    fn store_invalid_cursor_maps_to_invalid_argument_rpc_error() {
+        let error = store_error_to_rpc(StoreError::InvalidCursor {
+            reason: "unknown event id: event-123".to_string(),
+        });
+
+        assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+        assert!(error.reason.contains("unknown event id"));
     }
 
     #[test]
