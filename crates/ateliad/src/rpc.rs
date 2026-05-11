@@ -2516,6 +2516,8 @@ mod tests {
             provenance: atelia_core::ExtensionProvenance {
                 source: ProvenanceSource::Registry,
                 repository: Some("https://github.com/example/extensions".to_string()),
+                source_ref: None,
+                manifest_path: None,
                 commit: Some("deadbeef".to_string()),
                 registry_identity: Some("third-party-registry".to_string()),
                 lineage: None,

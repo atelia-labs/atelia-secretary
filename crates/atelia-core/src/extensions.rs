@@ -87,6 +87,8 @@ impl Default for ExtensionManifest {
             provenance: ExtensionProvenance {
                 source: ProvenanceSource::Local,
                 repository: None,
+                source_ref: None,
+                manifest_path: None,
                 commit: None,
                 registry_identity: None,
                 lineage: None,
@@ -295,6 +297,10 @@ pub enum RetryPolicy {
 pub struct ExtensionProvenance {
     pub source: ProvenanceSource,
     pub repository: Option<String>,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_path: Option<String>,
     pub commit: Option<String>,
     pub registry_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -761,6 +767,18 @@ fn validate_provenance(
                 return Err(ExtensionValidationError::ProvenanceRequired {
                     field: "provenance.repository",
                     reason: "github-sourced extensions must declare a repository".to_string(),
+                });
+            }
+            if !has_non_empty_trimmed(manifest.provenance.source_ref.as_deref()) {
+                return Err(ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.ref",
+                    reason: "github-sourced extensions must declare a ref".to_string(),
+                });
+            }
+            if !has_non_empty_trimmed(manifest.provenance.manifest_path.as_deref()) {
+                return Err(ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.manifest_path",
+                    reason: "github-sourced extensions must declare a manifest path".to_string(),
                 });
             }
             if !has_non_empty_trimmed(manifest.provenance.commit.as_deref()) {
@@ -2313,6 +2331,12 @@ pub struct ExtensionSourceSnapshot {
     pub source: ProvenanceSource,
     /// Source repository, when the package is repository-backed.
     pub repository: Option<String>,
+    /// Source ref, when the package is repository-backed.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    /// Manifest path inside the source repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_path: Option<String>,
     /// Source commit retained for audit, but not treated as authority identity.
     pub commit: Option<String>,
     /// Registry identity, when the package came from a registry.
@@ -2328,9 +2352,11 @@ impl ExtensionSourceSnapshot {
     pub fn from_provenance(provenance: &ExtensionProvenance) -> Self {
         Self {
             source: provenance.source,
-            repository: provenance.repository.clone(),
+            repository: trim_optional_string(provenance.repository.as_deref()),
+            source_ref: trim_optional_string(provenance.source_ref.as_deref()),
+            manifest_path: trim_optional_string(provenance.manifest_path.as_deref()),
             commit: provenance.commit.clone(),
-            registry_identity: provenance.registry_identity.clone(),
+            registry_identity: trim_optional_string(provenance.registry_identity.as_deref()),
             lineage: provenance.lineage.clone(),
             publication: provenance.publication.clone(),
         }
@@ -2338,10 +2364,24 @@ impl ExtensionSourceSnapshot {
 
     fn matches_authority(&self, other: &Self) -> bool {
         self.source == other.source
-            && self.repository == other.repository
-            && self.registry_identity == other.registry_identity
+            && trim_optional_str(self.repository.as_deref())
+                == trim_optional_str(other.repository.as_deref())
+            && trim_optional_str(self.source_ref.as_deref())
+                == trim_optional_str(other.source_ref.as_deref())
+            && trim_optional_str(self.manifest_path.as_deref())
+                == trim_optional_str(other.manifest_path.as_deref())
+            && trim_optional_str(self.registry_identity.as_deref())
+                == trim_optional_str(other.registry_identity.as_deref())
             && self.lineage == other.lineage
     }
+}
+
+fn trim_optional_string(value: Option<&str>) -> Option<String> {
+    trim_optional_str(value).map(ToString::to_string)
+}
+
+fn trim_optional_str(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|trimmed| !trimmed.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2542,6 +2582,10 @@ mod tests {
         "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const OTHER_MANIFEST_DIGEST: &str =
         "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const THIRD_ARTIFACT_DIGEST: &str =
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const THIRD_MANIFEST_DIGEST: &str =
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     const DEFAULT_TOOL_PERMISSION: &str = "tool.ping";
 
     fn permission(description: &str) -> ExtensionPermission {
@@ -2595,6 +2639,8 @@ mod tests {
             provenance: ExtensionProvenance {
                 source: ProvenanceSource::Registry,
                 repository: None,
+                source_ref: None,
+                manifest_path: None,
                 commit: None,
                 registry_identity: Some("third-party-registry".to_string()),
                 lineage: None,
@@ -2606,6 +2652,17 @@ mod tests {
             },
             ..ExtensionManifest::default()
         }
+    }
+
+    fn github_manifest(id: &str) -> ExtensionManifest {
+        let mut manifest = manifest(id);
+        manifest.provenance.source = ProvenanceSource::Github;
+        manifest.provenance.repository = Some("https://github.com/example/package".to_string());
+        manifest.provenance.source_ref = Some("refs/heads/main".to_string());
+        manifest.provenance.manifest_path = Some("atelia.package.yaml".to_string());
+        manifest.provenance.commit = Some("1111111".to_string());
+        manifest.provenance.registry_identity = None;
+        manifest
     }
 
     fn service_provider(id: &str, permission_name: &str) -> ExtensionManifest {
@@ -3209,6 +3266,35 @@ mod tests {
     }
 
     #[test]
+    fn github_source_reference_fields_are_required() {
+        let mut missing_ref = github_manifest("com.example.github");
+        missing_ref.provenance.source_ref = None;
+        let err = missing_ref
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::ProvenanceRequired {
+                field: "provenance.ref",
+                ..
+            }
+        ));
+
+        let mut missing_manifest_path = github_manifest("com.example.github");
+        missing_manifest_path.provenance.manifest_path = Some("   ".to_string());
+        let err = missing_manifest_path
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::ProvenanceRequired {
+                field: "provenance.manifest_path",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn backend_process_runtime_is_local_development_only() {
         let mut process = manifest("local.test.process");
         process.provenance.source = ProvenanceSource::Local;
@@ -3366,6 +3452,8 @@ mod tests {
         blocked.provenance.source = ProvenanceSource::Github;
         blocked.provenance.registry_identity = Some("github-registry".to_string());
         blocked.provenance.repository = Some(" https://example.com/repo ".to_string());
+        blocked.provenance.source_ref = Some("refs/heads/main".to_string());
+        blocked.provenance.manifest_path = Some("atelia.package.yaml".to_string());
         blocked.provenance.commit = Some("abc123".to_string());
 
         let err = registry
@@ -3673,26 +3761,101 @@ mod tests {
 
     #[test]
     fn same_github_repository_commit_update_does_not_require_source_approval() {
-        let mut first = manifest("com.example.extension");
-        first.provenance.source = ProvenanceSource::Github;
-        first.provenance.repository = Some("https://github.com/example/package".to_string());
-        first.provenance.commit = Some("1111111".to_string());
-        first.provenance.registry_identity = None;
-
         let mut registry = ExtensionRegistry::in_memory();
-        registry.install(first, InstallOptions::default()).unwrap();
+        registry
+            .install(
+                github_manifest("com.example.extension"),
+                InstallOptions::default(),
+            )
+            .unwrap();
 
-        let mut next = manifest("com.example.extension");
+        let mut next = github_manifest("com.example.extension");
         next.version = "1.1.0".to_string();
-        next.provenance.source = ProvenanceSource::Github;
-        next.provenance.repository = Some("https://github.com/example/package".to_string());
         next.provenance.commit = Some("2222222".to_string());
-        next.provenance.registry_identity = None;
         next.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
         next.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
 
         let record = registry.install(next, InstallOptions::default()).unwrap();
         assert_eq!(record.source.commit.as_deref(), Some("2222222"));
+        assert_eq!(record.source.source_ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(
+            record.source.manifest_path.as_deref(),
+            Some("atelia.package.yaml")
+        );
+    }
+
+    #[test]
+    fn github_source_reference_snapshot_trims_authority_fields() {
+        let mut registry = ExtensionRegistry::in_memory();
+        let mut first = github_manifest("com.example.extension");
+        first.provenance.repository = Some(" https://github.com/example/package ".to_string());
+        first.provenance.source_ref = Some(" refs/heads/main ".to_string());
+        first.provenance.manifest_path = Some(" atelia.package.yaml ".to_string());
+
+        let record = registry.install(first, InstallOptions::default()).unwrap();
+        assert_eq!(
+            record.source.repository.as_deref(),
+            Some("https://github.com/example/package")
+        );
+        assert_eq!(record.source.source_ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(
+            record.source.manifest_path.as_deref(),
+            Some("atelia.package.yaml")
+        );
+
+        let mut next = github_manifest("com.example.extension");
+        next.version = "1.1.0".to_string();
+        next.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        next.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        registry.install(next, InstallOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn github_ref_or_manifest_path_change_requires_source_approval() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(
+                github_manifest("com.example.extension"),
+                InstallOptions::default(),
+            )
+            .unwrap();
+
+        let mut changed_ref = github_manifest("com.example.extension");
+        changed_ref.version = "1.1.0".to_string();
+        changed_ref.provenance.source_ref = Some("refs/heads/release".to_string());
+        changed_ref.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        changed_ref.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        let err = registry
+            .install(changed_ref.clone(), InstallOptions::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::SourceChangeRequiresApproval { .. }
+        ));
+
+        registry
+            .install(
+                changed_ref,
+                InstallOptions::default().approve_source_change(),
+            )
+            .unwrap();
+
+        let mut changed_manifest_path = github_manifest("com.example.extension");
+        changed_manifest_path.version = "1.2.0".to_string();
+        changed_manifest_path.provenance.source_ref = Some("refs/heads/release".to_string());
+        changed_manifest_path.provenance.manifest_path = Some("packages/review.yaml".to_string());
+        changed_manifest_path.provenance.manifest_digest = THIRD_MANIFEST_DIGEST.to_string();
+        changed_manifest_path.provenance.artifact_digest = THIRD_ARTIFACT_DIGEST.to_string();
+
+        let err = registry
+            .install(changed_manifest_path, InstallOptions::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::SourceChangeRequiresApproval { .. }
+        ));
     }
 
     #[test]
