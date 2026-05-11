@@ -77,7 +77,7 @@ The daemon should start conservative:
 - one mutating job per repository;
 - multiple bounded read jobs allowed if store and policy permit;
 - process execution limited by daemon concurrency budget;
-- extension/provider concurrency explicit later.
+- package/provider concurrency explicit later.
 
 Concurrent jobs must not interleave writes without a recorded policy and
 `lock_decision`. A `lock_decision` records `id`, `repository_id`,

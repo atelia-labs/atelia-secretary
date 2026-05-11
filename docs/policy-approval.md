@@ -14,7 +14,7 @@ decision.
 | R3 | external effect, broad mutation, secret use, or approval-sensitive action | needs approval |
 | R4 | blocked by policy or unsupported capability | blocked |
 
-Tiers are defaults. Repository trust, user preferences, extension provenance,
+Tiers are defaults. Repository trust, user preferences, package provenance,
 and current context can raise risk.
 
 ## Policy Inputs
@@ -69,7 +69,7 @@ Initial defaults:
 - process execution with explicit argv, cwd, timeout, env allowlist: R2 or R3
 - broad repository mutation: R3
 - destructive repository action: R4 until explicit policy exists
-- external network or service call: extension-only, R3 by default
+- external network or service call: package-only, R3 by default
 - secret access: R3
 
 ## Policy Versioning

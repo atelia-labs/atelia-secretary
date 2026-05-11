@@ -62,7 +62,7 @@ daemon は保守的に始めます。
 - repository ごとに mutating job は1つ
 - bounded read job は store と policy が許す場合に複数可
 - process execution は daemon concurrency budget で制限
-- extension/provider concurrency は後で明示
+- package/provider concurrency は後で明示
 
 concurrent job は、recorded policy と `lock_decision` なしに write を interleave してはいけません。`lock_decision` は `id`、`repository_id`、`policy_decision_id`、owner job/process id、locked path または repository scope、`locked_at`、`expires_at`、status を記録します。active lock は `(repository_id, locked_scope, active status)` で unique であり、同じ scope を保持できる mutating job は1つだけです。`policy_decision_id` は linkage metadata であり ownership key には含めません。reclaim は idempotent です。同じ `lock_decision.id` と owner job/process id に対する repeated reclaim は、最初の persisted reclaim 以後 no-op success を返します。restart recovery は、expired lock について `lock_decision.id`、owner id、`reclaimed_at` を持つ reclaim record を append した後にだけ、その lock を reclaimed と扱います。その job の execution state transition はこの record より前に始めてはいけません。reclaim persistence 後、daemon は `policy_decision_id` が参照する policy rule を再評価して次の action を決めます。
 
