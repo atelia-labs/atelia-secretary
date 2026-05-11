@@ -810,14 +810,87 @@ fn validate_provenance(
         }
     }
 
-    if let Some(publication) = &manifest.provenance.publication {
-        if publication.visibility == ExtensionPublicationVisibility::PrivateRemix
-            && publication.registry_submission != ExtensionRegistrySubmission::NotSubmitted
-        {
-            return Err(ExtensionValidationError::InvalidField {
-                field: "provenance.publication.registry_submission",
-                reason: "private remixes must not claim registry submission".to_string(),
-            });
+    validate_publication(manifest, boundary, policy)?;
+
+    Ok(())
+}
+
+fn validate_publication(
+    manifest: &ExtensionManifest,
+    boundary: ExtensionBoundary,
+    policy: &ManifestValidationPolicy,
+) -> ExtensionValidationResult<()> {
+    let Some(publication) = &manifest.provenance.publication else {
+        return Ok(());
+    };
+
+    match publication.visibility {
+        ExtensionPublicationVisibility::PrivateRemix => {
+            if publication.registry_submission != ExtensionRegistrySubmission::NotSubmitted {
+                return Err(ExtensionValidationError::InvalidField {
+                    field: "provenance.publication.registry_submission",
+                    reason: "private remixes must not claim registry submission".to_string(),
+                });
+            }
+        }
+        ExtensionPublicationVisibility::UnlistedShare => {
+            if publication.registry_submission == ExtensionRegistrySubmission::Rejected {
+                return Err(ExtensionValidationError::InvalidField {
+                    field: "provenance.publication.registry_submission",
+                    reason: "unlisted shares cannot rely on rejected registry submission"
+                        .to_string(),
+                });
+            }
+            if matches!(
+                publication.registry_submission,
+                ExtensionRegistrySubmission::Submitted | ExtensionRegistrySubmission::Accepted
+            ) && !has_non_empty_trimmed(manifest.provenance.registry_identity.as_deref())
+            {
+                return Err(ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.registry_identity",
+                    reason: "registry-submitted unlisted shares must declare registry identity"
+                        .to_string(),
+                });
+            }
+        }
+        ExtensionPublicationVisibility::PublicSearchable => {
+            if !has_non_empty_trimmed(manifest.provenance.registry_identity.as_deref()) {
+                return Err(ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.registry_identity",
+                    reason: "public packages must declare registry identity".to_string(),
+                });
+            }
+            if matches!(
+                publication.registry_submission,
+                ExtensionRegistrySubmission::NotSubmitted | ExtensionRegistrySubmission::Rejected
+            ) {
+                return Err(ExtensionValidationError::InvalidField {
+                    field: "provenance.publication.registry_submission",
+                    reason: "public packages must be submitted or accepted by the registry"
+                        .to_string(),
+                });
+            }
+        }
+        ExtensionPublicationVisibility::Official => {
+            if boundary != ExtensionBoundary::Official {
+                return Err(ExtensionValidationError::BoundaryViolation {
+                    reason: "official publication requires official package authority".to_string(),
+                });
+            }
+            if manifest.provenance.registry_identity.as_deref()
+                != Some(policy.official_registry_identity.as_str())
+            {
+                return Err(ExtensionValidationError::BoundaryViolation {
+                    reason: "official publication must use the official registry identity"
+                        .to_string(),
+                });
+            }
+            if publication.registry_submission != ExtensionRegistrySubmission::Accepted {
+                return Err(ExtensionValidationError::InvalidField {
+                    field: "provenance.publication.registry_submission",
+                    reason: "official packages must be accepted by the registry".to_string(),
+                });
+            }
         }
     }
 
@@ -3894,7 +3967,7 @@ mod tests {
             relationship: ExtensionLineageRelationship::Remix,
         });
         manifest.provenance.publication = Some(ExtensionPublication {
-            visibility: ExtensionPublicationVisibility::PrivateRemix,
+            visibility: ExtensionPublicationVisibility::UnlistedShare,
             registry_submission: ExtensionRegistrySubmission::NotSubmitted,
         });
 
@@ -3918,9 +3991,187 @@ mod tests {
 
     #[test]
     fn private_remix_cannot_claim_registry_submission() {
-        let mut manifest = manifest("com.example.extension");
+        let mut manifest = manifest("local.example.extension");
+        manifest.provenance.source = ProvenanceSource::Local;
+        manifest.provenance.registry_identity = None;
+        manifest.provenance.signature = None;
+        manifest.provenance.signer = None;
         manifest.provenance.publication = Some(ExtensionPublication {
             visibility: ExtensionPublicationVisibility::PrivateRemix,
+            registry_submission: ExtensionRegistrySubmission::Submitted,
+        });
+
+        let err = manifest
+            .validate(&ManifestValidationPolicy::default().with_local_unsigned())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "provenance.publication.registry_submission",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn private_remix_can_stay_local_and_unsubmitted() {
+        let mut manifest = manifest("local.example.extension");
+        manifest.provenance.source = ProvenanceSource::Local;
+        manifest.provenance.registry_identity = None;
+        manifest.provenance.signature = None;
+        manifest.provenance.signer = None;
+        manifest.provenance.publication = Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::PrivateRemix,
+            registry_submission: ExtensionRegistrySubmission::NotSubmitted,
+        });
+
+        let validated = manifest
+            .validate(&ManifestValidationPolicy::default().with_local_unsigned())
+            .unwrap();
+        assert_eq!(
+            validated.manifest.provenance.publication,
+            manifest.provenance.publication
+        );
+    }
+
+    #[test]
+    fn private_remix_can_be_github_sourced_and_unsubmitted() {
+        let mut manifest = github_manifest("com.example.extension");
+        manifest.provenance.publication = Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::PrivateRemix,
+            registry_submission: ExtensionRegistrySubmission::NotSubmitted,
+        });
+
+        let validated = manifest
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap();
+        assert_eq!(
+            validated.manifest.provenance.publication,
+            manifest.provenance.publication
+        );
+    }
+
+    #[test]
+    fn unlisted_share_can_be_local_and_unsubmitted() {
+        let mut manifest = manifest("local.example.extension");
+        manifest.provenance.source = ProvenanceSource::Local;
+        manifest.provenance.registry_identity = None;
+        manifest.provenance.signature = None;
+        manifest.provenance.signer = None;
+        manifest.provenance.publication = Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::UnlistedShare,
+            registry_submission: ExtensionRegistrySubmission::NotSubmitted,
+        });
+
+        let validated = manifest
+            .validate(&ManifestValidationPolicy::default().with_local_unsigned())
+            .unwrap();
+        assert_eq!(
+            validated.manifest.provenance.publication,
+            manifest.provenance.publication
+        );
+    }
+
+    #[test]
+    fn unlisted_share_rejects_rejected_submission() {
+        let mut manifest = github_manifest("com.example.extension");
+        manifest.provenance.publication = Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::UnlistedShare,
+            registry_submission: ExtensionRegistrySubmission::Rejected,
+        });
+
+        let err = manifest
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "provenance.publication.registry_submission",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unlisted_share_requires_registry_identity_when_registry_submitted() {
+        for registry_submission in [
+            ExtensionRegistrySubmission::Submitted,
+            ExtensionRegistrySubmission::Accepted,
+        ] {
+            let mut manifest = github_manifest("com.example.extension");
+            manifest.provenance.publication = Some(ExtensionPublication {
+                visibility: ExtensionPublicationVisibility::UnlistedShare,
+                registry_submission,
+            });
+
+            let err = manifest
+                .validate(&ManifestValidationPolicy::default())
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.registry_identity",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn public_searchable_allows_submitted_or_accepted_with_registry_identity() {
+        for registry_submission in [
+            ExtensionRegistrySubmission::Submitted,
+            ExtensionRegistrySubmission::Accepted,
+        ] {
+            let mut manifest = github_manifest("com.example.extension");
+            manifest.provenance.registry_identity = Some("third-party-registry".to_string());
+            manifest.provenance.publication = Some(ExtensionPublication {
+                visibility: ExtensionPublicationVisibility::PublicSearchable,
+                registry_submission,
+            });
+
+            let validated = manifest
+                .validate(&ManifestValidationPolicy::default())
+                .unwrap();
+            assert_eq!(
+                validated.manifest.provenance.publication,
+                manifest.provenance.publication
+            );
+        }
+    }
+
+    #[test]
+    fn public_searchable_rejects_not_submitted_and_rejected_states() {
+        for registry_submission in [
+            ExtensionRegistrySubmission::NotSubmitted,
+            ExtensionRegistrySubmission::Rejected,
+        ] {
+            let mut manifest = github_manifest("com.example.extension");
+            manifest.provenance.registry_identity = Some("third-party-registry".to_string());
+            manifest.provenance.publication = Some(ExtensionPublication {
+                visibility: ExtensionPublicationVisibility::PublicSearchable,
+                registry_submission,
+            });
+
+            let err = manifest
+                .validate(&ManifestValidationPolicy::default())
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ExtensionValidationError::InvalidField {
+                    field: "provenance.publication.registry_submission",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn official_publication_requires_official_identity_and_accepted_submission() {
+        let mut manifest = manifest("ai.atelia.example");
+        manifest.provenance.registry_identity = Some("atelia-official".to_string());
+        manifest.provenance.publication = Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::Official,
             registry_submission: ExtensionRegistrySubmission::Submitted,
         });
 
@@ -3934,6 +4185,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn official_publication_rejects_non_official_registry_identity_even_when_accepted() {
+        let mut manifest = manifest("ai.atelia.example");
+        manifest.provenance.registry_identity = Some("third-party-registry".to_string());
+        manifest.provenance.publication = Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::Official,
+            registry_submission: ExtensionRegistrySubmission::Accepted,
+        });
+
+        let err = manifest
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::BoundaryViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn official_publication_is_allowed_with_official_identity_and_accepted_submission() {
+        let mut manifest = manifest("ai.atelia.example");
+        manifest.provenance.registry_identity = Some("atelia-official".to_string());
+        manifest.provenance.publication = Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::Official,
+            registry_submission: ExtensionRegistrySubmission::Accepted,
+        });
+
+        let validated = manifest
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap();
+        assert_eq!(validated.boundary, ExtensionBoundary::Official);
+        assert_eq!(
+            validated.manifest.provenance.publication,
+            manifest.provenance.publication
+        );
     }
 
     #[test]
