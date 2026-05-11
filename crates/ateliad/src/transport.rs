@@ -2384,7 +2384,7 @@ fn watch_events_stream_body(
 
 fn watch_events_cursor_expired_response(reason: impl Into<String>) -> Response {
     Response::builder()
-        .status(StatusCode::OK)
+        .status(StatusCode::GONE)
         .header(header::CONTENT_TYPE, "application/x-ndjson")
         .body(ndjson_body_from_frame(
             serialize_watch_events_recovery_error(reason),
@@ -4535,7 +4535,7 @@ mod tests {
     #[tokio::test]
     async fn watch_events_stream_reports_cursor_expired_recovery() {
         let response = watch_events_cursor_expired_response("event id is not retained");
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::GONE);
         assert_eq!(
             response
                 .headers()
