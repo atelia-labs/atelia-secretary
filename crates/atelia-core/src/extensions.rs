@@ -87,8 +87,12 @@ impl Default for ExtensionManifest {
             provenance: ExtensionProvenance {
                 source: ProvenanceSource::Local,
                 repository: None,
+                source_ref: None,
+                manifest_path: None,
                 commit: None,
                 registry_identity: None,
+                lineage: None,
+                publication: None,
                 artifact_digest: String::new(),
                 manifest_digest: String::new(),
                 signature: None,
@@ -293,12 +297,82 @@ pub enum RetryPolicy {
 pub struct ExtensionProvenance {
     pub source: ProvenanceSource,
     pub repository: Option<String>,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_path: Option<String>,
     pub commit: Option<String>,
     pub registry_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<ExtensionLineage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<ExtensionPublication>,
     pub artifact_digest: String,
     pub manifest_digest: String,
     pub signature: Option<String>,
     pub signer: Option<String>,
+}
+
+/// Lineage metadata for a package derived from another package.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionLineage {
+    /// Parent package id that the current package derives from.
+    pub parent_id: String,
+    /// Parent package version when the derivation target is versioned.
+    pub parent_version: Option<String>,
+    /// Parent manifest digest when the exact source manifest is known.
+    pub parent_manifest_digest: Option<String>,
+    /// Relationship between the current package and its parent.
+    pub relationship: ExtensionLineageRelationship,
+}
+
+/// Relationship between a derived package and its lineage parent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionLineageRelationship {
+    /// User-owned remix that remains tied to its parent package identity.
+    Remix,
+    /// Fork that preserves source ancestry while allowing independent evolution.
+    Fork,
+    /// Derived package with a looser provenance relationship to the parent.
+    Derived,
+}
+
+/// Publication metadata that describes registry visibility separately from source authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionPublication {
+    /// Current visibility state for discovery and sharing.
+    pub visibility: ExtensionPublicationVisibility,
+    /// Registry submission state for this package revision.
+    pub registry_submission: ExtensionRegistrySubmission,
+}
+
+/// Visibility state for a package publication.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionPublicationVisibility {
+    /// Private remix visible only inside the user's harness or workspace.
+    PrivateRemix,
+    /// Shared directly without public registry searchability.
+    UnlistedShare,
+    /// Publicly searchable through the registry subject to submission policy.
+    PublicSearchable,
+    /// Official publication controlled by host policy.
+    Official,
+}
+
+/// Registry submission state for package publication.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionRegistrySubmission {
+    /// Not submitted to a registry.
+    NotSubmitted,
+    /// Submitted and awaiting registry decision.
+    Submitted,
+    /// Accepted by registry policy.
+    Accepted,
+    /// Rejected by registry policy.
+    Rejected,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -695,6 +769,18 @@ fn validate_provenance(
                     reason: "github-sourced extensions must declare a repository".to_string(),
                 });
             }
+            if !has_non_empty_trimmed(manifest.provenance.source_ref.as_deref()) {
+                return Err(ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.ref",
+                    reason: "github-sourced extensions must declare a ref".to_string(),
+                });
+            }
+            if !has_non_empty_trimmed(manifest.provenance.manifest_path.as_deref()) {
+                return Err(ExtensionValidationError::ProvenanceRequired {
+                    field: "provenance.manifest_path",
+                    reason: "github-sourced extensions must declare a manifest path".to_string(),
+                });
+            }
             if !has_non_empty_trimmed(manifest.provenance.commit.as_deref()) {
                 return Err(ExtensionValidationError::ProvenanceRequired {
                     field: "provenance.commit",
@@ -712,6 +798,27 @@ fn validate_provenance(
             }
         }
         ProvenanceSource::Local => {}
+    }
+
+    if let Some(lineage) = &manifest.provenance.lineage {
+        require_reverse_dns_id("provenance.lineage.parent_id", &lineage.parent_id)?;
+        if let Some(version) = &lineage.parent_version {
+            require_semver("provenance.lineage.parent_version", version)?;
+        }
+        if let Some(digest) = &lineage.parent_manifest_digest {
+            require_digest("provenance.lineage.parent_manifest_digest", digest)?;
+        }
+    }
+
+    if let Some(publication) = &manifest.provenance.publication {
+        if publication.visibility == ExtensionPublicationVisibility::PrivateRemix
+            && publication.registry_submission != ExtensionRegistrySubmission::NotSubmitted
+        {
+            return Err(ExtensionValidationError::InvalidField {
+                field: "provenance.publication.registry_submission",
+                reason: "private remixes must not claim registry submission".to_string(),
+            });
+        }
     }
 
     Ok(())
@@ -1445,6 +1552,7 @@ impl ExtensionRegistry {
         let validated = manifest.validate(&validation_policy)?;
         self.ensure_not_blocked(&validated.manifest)?;
         self.ensure_same_version_digest_is_stable(&validated.manifest)?;
+        self.ensure_source_change_is_approved(&validated.manifest, options)?;
 
         let previous_version = self.active_versions.get(&validated.manifest.id).cloned();
         let approved_permissions = validated
@@ -1459,6 +1567,7 @@ impl ExtensionRegistry {
             version: validated.manifest.version.clone(),
             manifest_digest: validated.manifest.provenance.manifest_digest.clone(),
             artifact_digest: validated.manifest.provenance.artifact_digest.clone(),
+            source: ExtensionSourceSnapshot::from_provenance(&validated.manifest.provenance),
             boundary: validated.boundary,
             status: ExtensionInstallStatus::Installed,
             previous_version,
@@ -1802,6 +1911,25 @@ impl ExtensionRegistry {
         Ok(())
     }
 
+    fn ensure_source_change_is_approved(
+        &self,
+        manifest: &ExtensionManifest,
+        options: InstallOptions,
+    ) -> RegistryResult<()> {
+        let Some(current) = self.active_record(&manifest.id) else {
+            return Ok(());
+        };
+
+        let next = ExtensionSourceSnapshot::from_provenance(&manifest.provenance);
+        if current.source.matches_authority(&next) || options.approve_source_change == Some(true) {
+            return Ok(());
+        }
+
+        Err(RegistryError::SourceChangeRequiresApproval {
+            extension_id: manifest.id.clone(),
+        })
+    }
+
     fn ensure_not_blocked(&self, manifest: &ExtensionManifest) -> RegistryResult<()> {
         if let Some(entry) = self.find_blocklist_hit(manifest) {
             return Err(RegistryError::Blocked {
@@ -1835,6 +1963,9 @@ pub struct InstallExtensionRequest {
     pub approve_local_unsigned: bool,
     #[serde(default)]
     pub allow_local_process_runtime: bool,
+    /// Explicitly approve a source authority change for an install or update.
+    #[serde(default)]
+    pub approve_source_change: bool,
 }
 
 impl InstallExtensionRequest {
@@ -1843,6 +1974,7 @@ impl InstallExtensionRequest {
             manifest,
             approve_local_unsigned: false,
             allow_local_process_runtime: false,
+            approve_source_change: false,
         }
     }
 }
@@ -1862,6 +1994,9 @@ impl From<&InstallExtensionRequest> for InstallOptions {
         if request.allow_local_process_runtime {
             options = options.allow_local_process_runtime();
         }
+        if request.approve_source_change {
+            options = options.approve_source_change();
+        }
         options
     }
 }
@@ -1878,6 +2013,9 @@ pub struct UpdateExtensionRequest {
     pub approve_local_unsigned: bool,
     #[serde(default)]
     pub allow_local_process_runtime: bool,
+    /// Explicitly approve a source authority change for this update.
+    #[serde(default)]
+    pub approve_source_change: bool,
 }
 
 impl From<UpdateExtensionRequest> for InstallOptions {
@@ -1894,6 +2032,9 @@ impl From<&UpdateExtensionRequest> for InstallOptions {
         }
         if request.allow_local_process_runtime {
             options = options.allow_local_process_runtime();
+        }
+        if request.approve_source_change {
+            options = options.approve_source_change();
         }
         options
     }
@@ -2148,6 +2289,7 @@ impl From<ExtensionStatusSnapshot> for ExtensionStatusResponse {
 pub struct InstallOptions {
     pub approve_local_unsigned: Option<bool>,
     pub allow_local_process_runtime: Option<bool>,
+    pub approve_source_change: Option<bool>,
 }
 
 impl InstallOptions {
@@ -2160,6 +2302,12 @@ impl InstallOptions {
         self.allow_local_process_runtime = Some(true);
         self
     }
+
+    /// Allow an install or update to replace the package's recorded source authority.
+    pub fn approve_source_change(mut self) -> Self {
+        self.approve_source_change = Some(true);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2168,11 +2316,72 @@ pub struct ExtensionInstallRecord {
     pub version: String,
     pub manifest_digest: String,
     pub artifact_digest: String,
+    pub source: ExtensionSourceSnapshot,
     pub boundary: ExtensionBoundary,
     pub status: ExtensionInstallStatus,
     pub previous_version: Option<String>,
     pub approved_permissions: Vec<String>,
     pub rollback_snapshot: Option<RollbackSnapshot>,
+}
+
+/// Persisted source provenance snapshot for an installed package revision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionSourceSnapshot {
+    /// Source class that produced this package revision.
+    pub source: ProvenanceSource,
+    /// Source repository, when the package is repository-backed.
+    pub repository: Option<String>,
+    /// Source ref, when the package is repository-backed.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    /// Manifest path inside the source repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_path: Option<String>,
+    /// Source commit retained for audit, but not treated as authority identity.
+    pub commit: Option<String>,
+    /// Registry identity, when the package came from a registry.
+    pub registry_identity: Option<String>,
+    /// Package lineage retained with the installed revision.
+    pub lineage: Option<ExtensionLineage>,
+    /// Publication state retained with the installed revision.
+    pub publication: Option<ExtensionPublication>,
+}
+
+impl ExtensionSourceSnapshot {
+    /// Build an install-record source snapshot from manifest provenance.
+    pub fn from_provenance(provenance: &ExtensionProvenance) -> Self {
+        Self {
+            source: provenance.source,
+            repository: trim_optional_string(provenance.repository.as_deref()),
+            source_ref: trim_optional_string(provenance.source_ref.as_deref()),
+            manifest_path: trim_optional_string(provenance.manifest_path.as_deref()),
+            commit: provenance.commit.clone(),
+            registry_identity: trim_optional_string(provenance.registry_identity.as_deref()),
+            lineage: provenance.lineage.clone(),
+            publication: provenance.publication.clone(),
+        }
+    }
+
+    fn matches_authority(&self, other: &Self) -> bool {
+        self.source == other.source
+            && trim_optional_str(self.repository.as_deref())
+                == trim_optional_str(other.repository.as_deref())
+            && trim_optional_str(self.source_ref.as_deref())
+                == trim_optional_str(other.source_ref.as_deref())
+            && trim_optional_str(self.manifest_path.as_deref())
+                == trim_optional_str(other.manifest_path.as_deref())
+            && trim_optional_str(self.registry_identity.as_deref())
+                == trim_optional_str(other.registry_identity.as_deref())
+            && self.lineage == other.lineage
+    }
+}
+
+fn trim_optional_string(value: Option<&str>) -> Option<String> {
+    trim_optional_str(value).map(ToString::to_string)
+}
+
+fn trim_optional_str(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|trimmed| !trimmed.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2296,6 +2505,9 @@ pub enum RegistryError {
         extension_id: String,
         version: String,
     },
+    SourceChangeRequiresApproval {
+        extension_id: String,
+    },
     NotInstalled {
         extension_id: String,
     },
@@ -2332,6 +2544,10 @@ impl fmt::Display for RegistryError {
                 f,
                 "extension {extension_id} version {version} changed digest"
             ),
+            Self::SourceChangeRequiresApproval { extension_id } => write!(
+                f,
+                "extension {extension_id} changed source provenance and requires explicit approval"
+            ),
             Self::NotInstalled { extension_id } => {
                 write!(f, "extension {extension_id} is not installed")
             }
@@ -2366,6 +2582,10 @@ mod tests {
         "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const OTHER_MANIFEST_DIGEST: &str =
         "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const THIRD_ARTIFACT_DIGEST: &str =
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const THIRD_MANIFEST_DIGEST: &str =
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     const DEFAULT_TOOL_PERMISSION: &str = "tool.ping";
 
     fn permission(description: &str) -> ExtensionPermission {
@@ -2419,8 +2639,12 @@ mod tests {
             provenance: ExtensionProvenance {
                 source: ProvenanceSource::Registry,
                 repository: None,
+                source_ref: None,
+                manifest_path: None,
                 commit: None,
                 registry_identity: Some("third-party-registry".to_string()),
+                lineage: None,
+                publication: None,
                 artifact_digest: ARTIFACT_DIGEST.to_string(),
                 manifest_digest: MANIFEST_DIGEST.to_string(),
                 signature: Some("signature".to_string()),
@@ -2428,6 +2652,17 @@ mod tests {
             },
             ..ExtensionManifest::default()
         }
+    }
+
+    fn github_manifest(id: &str) -> ExtensionManifest {
+        let mut manifest = manifest(id);
+        manifest.provenance.source = ProvenanceSource::Github;
+        manifest.provenance.repository = Some("https://github.com/example/package".to_string());
+        manifest.provenance.source_ref = Some("refs/heads/main".to_string());
+        manifest.provenance.manifest_path = Some("atelia.package.yaml".to_string());
+        manifest.provenance.commit = Some("1111111".to_string());
+        manifest.provenance.registry_identity = None;
+        manifest
     }
 
     fn service_provider(id: &str, permission_name: &str) -> ExtensionManifest {
@@ -3031,6 +3266,35 @@ mod tests {
     }
 
     #[test]
+    fn github_source_reference_fields_are_required() {
+        let mut missing_ref = github_manifest("com.example.github");
+        missing_ref.provenance.source_ref = None;
+        let err = missing_ref
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::ProvenanceRequired {
+                field: "provenance.ref",
+                ..
+            }
+        ));
+
+        let mut missing_manifest_path = github_manifest("com.example.github");
+        missing_manifest_path.provenance.manifest_path = Some("   ".to_string());
+        let err = missing_manifest_path
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::ProvenanceRequired {
+                field: "provenance.manifest_path",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn backend_process_runtime_is_local_development_only() {
         let mut process = manifest("local.test.process");
         process.provenance.source = ProvenanceSource::Local;
@@ -3188,6 +3452,8 @@ mod tests {
         blocked.provenance.source = ProvenanceSource::Github;
         blocked.provenance.registry_identity = Some("github-registry".to_string());
         blocked.provenance.repository = Some(" https://example.com/repo ".to_string());
+        blocked.provenance.source_ref = Some("refs/heads/main".to_string());
+        blocked.provenance.manifest_path = Some("atelia.package.yaml".to_string());
         blocked.provenance.commit = Some("abc123".to_string());
 
         let err = registry
@@ -3418,9 +3684,13 @@ mod tests {
     #[test]
     fn rollback_restores_previous_active_version() {
         let mut registry = ExtensionRegistry::in_memory();
-        registry
+        let installed = registry
             .install(manifest("com.example.extension"), InstallOptions::default())
             .unwrap();
+        assert_eq!(
+            installed.source,
+            ExtensionSourceSnapshot::from_provenance(&manifest("com.example.extension").provenance)
+        );
 
         let mut next = manifest("com.example.extension");
         next.version = "1.1.0".to_string();
@@ -3442,6 +3712,231 @@ mod tests {
     }
 
     #[test]
+    fn install_rejects_source_provenance_change_without_approval() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let mut next = manifest("com.example.extension");
+        next.version = "1.1.0".to_string();
+        next.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        next.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        next.provenance.registry_identity = Some("other-registry".to_string());
+
+        let err = registry
+            .install(next, InstallOptions::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::SourceChangeRequiresApproval { extension_id }
+                if extension_id == "com.example.extension"
+        ));
+    }
+
+    #[test]
+    fn install_accepts_source_provenance_change_with_approval() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let mut next = manifest("com.example.extension");
+        next.version = "1.1.0".to_string();
+        next.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        next.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        next.provenance.registry_identity = Some("other-registry".to_string());
+
+        let record = registry
+            .install(
+                next.clone(),
+                InstallOptions::default().approve_source_change(),
+            )
+            .unwrap();
+        assert_eq!(
+            record.source,
+            ExtensionSourceSnapshot::from_provenance(&next.provenance)
+        );
+    }
+
+    #[test]
+    fn same_github_repository_commit_update_does_not_require_source_approval() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(
+                github_manifest("com.example.extension"),
+                InstallOptions::default(),
+            )
+            .unwrap();
+
+        let mut next = github_manifest("com.example.extension");
+        next.version = "1.1.0".to_string();
+        next.provenance.commit = Some("2222222".to_string());
+        next.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        next.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        let record = registry.install(next, InstallOptions::default()).unwrap();
+        assert_eq!(record.source.commit.as_deref(), Some("2222222"));
+        assert_eq!(record.source.source_ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(
+            record.source.manifest_path.as_deref(),
+            Some("atelia.package.yaml")
+        );
+    }
+
+    #[test]
+    fn github_source_reference_snapshot_trims_authority_fields() {
+        let mut registry = ExtensionRegistry::in_memory();
+        let mut first = github_manifest("com.example.extension");
+        first.provenance.repository = Some(" https://github.com/example/package ".to_string());
+        first.provenance.source_ref = Some(" refs/heads/main ".to_string());
+        first.provenance.manifest_path = Some(" atelia.package.yaml ".to_string());
+
+        let record = registry.install(first, InstallOptions::default()).unwrap();
+        assert_eq!(
+            record.source.repository.as_deref(),
+            Some("https://github.com/example/package")
+        );
+        assert_eq!(record.source.source_ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(
+            record.source.manifest_path.as_deref(),
+            Some("atelia.package.yaml")
+        );
+
+        let mut next = github_manifest("com.example.extension");
+        next.version = "1.1.0".to_string();
+        next.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        next.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        registry.install(next, InstallOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn github_ref_or_manifest_path_change_requires_source_approval() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(
+                github_manifest("com.example.extension"),
+                InstallOptions::default(),
+            )
+            .unwrap();
+
+        let mut changed_ref = github_manifest("com.example.extension");
+        changed_ref.version = "1.1.0".to_string();
+        changed_ref.provenance.source_ref = Some("refs/heads/release".to_string());
+        changed_ref.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        changed_ref.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        let err = registry
+            .install(changed_ref.clone(), InstallOptions::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::SourceChangeRequiresApproval { .. }
+        ));
+
+        registry
+            .install(
+                changed_ref,
+                InstallOptions::default().approve_source_change(),
+            )
+            .unwrap();
+
+        let mut changed_manifest_path = github_manifest("com.example.extension");
+        changed_manifest_path.version = "1.2.0".to_string();
+        changed_manifest_path.provenance.source_ref = Some("refs/heads/release".to_string());
+        changed_manifest_path.provenance.manifest_path = Some("packages/review.yaml".to_string());
+        changed_manifest_path.provenance.manifest_digest = THIRD_MANIFEST_DIGEST.to_string();
+        changed_manifest_path.provenance.artifact_digest = THIRD_ARTIFACT_DIGEST.to_string();
+
+        let err = registry
+            .install(changed_manifest_path, InstallOptions::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::SourceChangeRequiresApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn publication_state_change_does_not_require_source_approval() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let mut next = manifest("com.example.extension");
+        next.version = "1.1.0".to_string();
+        next.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        next.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        next.provenance.publication = Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: ExtensionRegistrySubmission::Submitted,
+        });
+
+        let record = registry.install(next, InstallOptions::default()).unwrap();
+        assert_eq!(
+            record.source.publication,
+            Some(ExtensionPublication {
+                visibility: ExtensionPublicationVisibility::PublicSearchable,
+                registry_submission: ExtensionRegistrySubmission::Submitted,
+            })
+        );
+    }
+
+    #[test]
+    fn provenance_lineage_and_publication_are_validated_and_preserved() {
+        let mut manifest = manifest("com.example.extension");
+        manifest.provenance.lineage = Some(ExtensionLineage {
+            parent_id: "com.example.parent".to_string(),
+            parent_version: Some("1.2.3".to_string()),
+            parent_manifest_digest: Some(OTHER_MANIFEST_DIGEST.to_string()),
+            relationship: ExtensionLineageRelationship::Remix,
+        });
+        manifest.provenance.publication = Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::PrivateRemix,
+            registry_submission: ExtensionRegistrySubmission::NotSubmitted,
+        });
+
+        let validated = manifest
+            .clone()
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap();
+        assert_eq!(
+            validated.manifest.provenance.lineage,
+            manifest.provenance.lineage
+        );
+        assert_eq!(
+            validated.manifest.provenance.publication,
+            manifest.provenance.publication
+        );
+
+        let serialized = serde_json::to_string(&validated.manifest).unwrap();
+        assert!(serialized.contains("\"lineage\""));
+        assert!(serialized.contains("\"publication\""));
+    }
+
+    #[test]
+    fn private_remix_cannot_claim_registry_submission() {
+        let mut manifest = manifest("com.example.extension");
+        manifest.provenance.publication = Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::PrivateRemix,
+            registry_submission: ExtensionRegistrySubmission::Submitted,
+        });
+
+        let err = manifest
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField {
+                field: "provenance.publication.registry_submission",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn extension_service_install_status_and_list_returns_installed_extensions() {
         let mut service = ExtensionRegistryService::new();
         service
@@ -3449,6 +3944,7 @@ mod tests {
                 manifest: manifest("com.example.extension"),
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .unwrap();
         service
@@ -3456,6 +3952,7 @@ mod tests {
                 manifest: manifest("com.example.other"),
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .unwrap();
 
@@ -3490,6 +3987,7 @@ mod tests {
                 manifest: manifest("com.example.extension"),
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .unwrap();
 
@@ -3502,6 +4000,7 @@ mod tests {
                 manifest: updated,
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .unwrap();
 
@@ -3533,6 +4032,7 @@ mod tests {
                 manifest: manifest("com.example.extension"),
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .unwrap();
 
@@ -3551,6 +4051,7 @@ mod tests {
                 manifest: manifest("com.example.extension"),
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .unwrap_err();
         assert!(matches!(
@@ -3932,6 +4433,7 @@ mod tests {
                 manifest: manifest("com.example.extension"),
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .unwrap();
         service
@@ -3939,6 +4441,7 @@ mod tests {
                 manifest: manifest("com.example.other"),
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .unwrap();
 

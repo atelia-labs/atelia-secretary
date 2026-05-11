@@ -633,6 +633,7 @@ fn registry_error_to_rpc(error: atelia_core::RegistryError) -> RpcError {
         },
         atelia_core::RegistryError::Blocked { .. }
         | atelia_core::RegistryError::DigestConflict { .. }
+        | atelia_core::RegistryError::SourceChangeRequiresApproval { .. }
         | atelia_core::RegistryError::RollbackUnavailable { .. } => RpcError {
             code: RpcErrorCode::Conflict,
             reason: error.to_string(),
@@ -656,9 +657,10 @@ fn registry_error_to_rpc(error: atelia_core::RegistryError) -> RpcError {
 pub enum RpcErrorCode {
     InvalidArgument,
     NotFound,
+    /// The live watch stream cursor has expired and must be refreshed.
+    CursorExpired,
     Conflict,
     UnsupportedCapability,
-    CursorExpired,
     Internal,
 }
 
@@ -2282,10 +2284,9 @@ fn store_error_to_rpc(error: StoreError) -> RpcError {
     let code = match error {
         StoreError::NotFound { .. } => RpcErrorCode::NotFound,
         StoreError::DuplicateId { .. } | StoreError::Conflict { .. } => RpcErrorCode::Conflict,
-        StoreError::InvalidReference { .. } | StoreError::InvalidRecord { .. } => {
-            RpcErrorCode::InvalidArgument
-        }
-        StoreError::InvalidCursor { .. } => RpcErrorCode::InvalidArgument,
+        StoreError::InvalidReference { .. }
+        | StoreError::InvalidCursor { .. }
+        | StoreError::InvalidRecord { .. } => RpcErrorCode::InvalidArgument,
         StoreError::CursorExpired { .. } => RpcErrorCode::CursorExpired,
         StoreError::SequenceOverflow => RpcErrorCode::Internal,
     };
@@ -2515,8 +2516,12 @@ mod tests {
             provenance: atelia_core::ExtensionProvenance {
                 source: ProvenanceSource::Registry,
                 repository: Some("https://github.com/example/extensions".to_string()),
+                source_ref: None,
+                manifest_path: None,
                 commit: Some("deadbeef".to_string()),
                 registry_identity: Some("third-party-registry".to_string()),
+                lineage: None,
+                publication: None,
                 artifact_digest: artifact_digest.to_string(),
                 manifest_digest: manifest_digest.to_string(),
                 signature: Some("signature".to_string()),
@@ -4314,6 +4319,17 @@ mod tests {
     }
 
     #[test]
+    /// Map stale replay cursors to the ordinary invalid-argument RPC error.
+    fn store_invalid_cursor_maps_to_invalid_argument_rpc_error() {
+        let error = store_error_to_rpc(StoreError::InvalidCursor {
+            reason: "unknown event id: event-123".to_string(),
+        });
+
+        assert_eq!(error.code, RpcErrorCode::InvalidArgument);
+        assert!(error.reason.contains("unknown event id"));
+    }
+
+    #[test]
     fn submit_job_rejects_unsupported_path_scope_patterns() {
         let server = ready_server();
         let root = test_repo_dir("unsupported-path-scope");
@@ -4774,6 +4790,7 @@ mod tests {
                 manifest: manifest_v1,
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .expect("install should succeed");
         assert_eq!(install.record.version, "1.0.0");
@@ -4783,6 +4800,7 @@ mod tests {
                 manifest: manifest_v2,
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .expect("update should succeed");
         assert_eq!(updated.metadata.protocol_version, "1.0.0");
@@ -4875,6 +4893,62 @@ mod tests {
             })
             .expect_err("removed extension should not have active status");
         assert_eq!(missing_after_remove.code, RpcErrorCode::NotFound);
+    }
+
+    #[test]
+    fn extension_update_requires_explicit_source_change_approval() {
+        const ARTIFACT_V1: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const MANIFEST_V1: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const ARTIFACT_V2: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const MANIFEST_V2: &str =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let server = ready_server();
+        let manifest_v1 = extension_manifest(
+            "com.example.review.extension",
+            "1.0.0",
+            ARTIFACT_V1,
+            MANIFEST_V1,
+        );
+        let mut manifest_v2 = extension_manifest(
+            "com.example.review.extension",
+            "2.0.0",
+            ARTIFACT_V2,
+            MANIFEST_V2,
+        );
+        manifest_v2.provenance.repository = Some("https://github.com/example/other".to_string());
+
+        server
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest_v1,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("initial install should succeed");
+
+        let denied = server
+            .update_extension(UpdateExtensionRequest {
+                manifest: manifest_v2.clone(),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect_err("source change should require explicit approval");
+        assert_eq!(denied.code, RpcErrorCode::Conflict);
+
+        let approved = server
+            .update_extension(UpdateExtensionRequest {
+                manifest: manifest_v2,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: true,
+            })
+            .expect("approved source change should succeed");
+        assert_eq!(approved.record.version, "2.0.0");
     }
 
     #[test]

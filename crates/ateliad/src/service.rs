@@ -1857,8 +1857,12 @@ mod tests {
             provenance: atelia_core::ExtensionProvenance {
                 source: ProvenanceSource::Registry,
                 repository: Some("https://github.com/example/extensions".to_string()),
+                source_ref: None,
+                manifest_path: None,
                 commit: Some("deadbeef".to_string()),
                 registry_identity: Some("third-party-registry".to_string()),
+                lineage: None,
+                publication: None,
                 artifact_digest: artifact_digest.to_string(),
                 manifest_digest: manifest_digest.to_string(),
                 signature: Some("signature".to_string()),
@@ -1994,6 +1998,7 @@ mod tests {
                 manifest: manifest_v1.clone(),
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .expect("first install should succeed");
         assert_eq!(installed_v1.record.version, "1.0.0");
@@ -2003,6 +2008,7 @@ mod tests {
                 manifest: manifest_v2.clone(),
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .expect("second install should succeed");
         assert_eq!(installed_v2.record.version, "2.0.0");
@@ -2146,6 +2152,7 @@ mod tests {
                 manifest: manifest.clone(),
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
+                approve_source_change: false,
             })
             .map(|_| "install_extension"),
             svc.extension_status(atelia_core::ExtensionStatusRequest {
@@ -3139,7 +3146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_events_live_drains_retained_pages_before_streaming() {
+    async fn watch_events_live_drains_retained_events_before_streaming() {
         let svc = ready_service();
         let root = test_repo_dir("watch-events-live-retained-pages");
 

@@ -1901,9 +1901,9 @@ fn rpc_error_status(code: rpc::RpcErrorCode) -> (StatusCode, bool) {
     match code {
         rpc::RpcErrorCode::InvalidArgument => (StatusCode::BAD_REQUEST, false),
         rpc::RpcErrorCode::NotFound => (StatusCode::NOT_FOUND, false),
+        rpc::RpcErrorCode::CursorExpired => (StatusCode::GONE, true),
         rpc::RpcErrorCode::Conflict => (StatusCode::CONFLICT, true),
         rpc::RpcErrorCode::UnsupportedCapability => (StatusCode::NOT_IMPLEMENTED, true),
-        rpc::RpcErrorCode::CursorExpired => (StatusCode::BAD_REQUEST, true),
         rpc::RpcErrorCode::Internal => (StatusCode::INTERNAL_SERVER_ERROR, false),
     }
 }
@@ -2384,7 +2384,7 @@ fn watch_events_stream_body(
 
 fn watch_events_cursor_expired_response(reason: impl Into<String>) -> Response {
     Response::builder()
-        .status(StatusCode::OK)
+        .status(StatusCode::GONE)
         .header(header::CONTENT_TYPE, "application/x-ndjson")
         .body(ndjson_body_from_frame(
             serialize_watch_events_recovery_error(reason),
@@ -3487,7 +3487,7 @@ pub fn build_router(rpc_server: RpcServerState, auth: LocalAuthConfig) -> Router
         .route("/v1/health", any(dispatch_route))
         .route("/v1/jobs/submit", any(dispatch_route))
         .route("/v1/jobs/list", any(dispatch_route))
-        .route("/v1/jobs/*path", any(dispatch_route))
+        .route("/v1/jobs/{*path}", any(dispatch_route))
         .route("/v1/repositories:list", any(dispatch_route))
         .route("/v1/repertoire:list", any(dispatch_route))
         .route("/v1/events/list", any(dispatch_route))
@@ -3501,7 +3501,7 @@ pub fn build_router(rpc_server: RpcServerState, auth: LocalAuthConfig) -> Router
         .route("/v1/extensions/list", any(dispatch_route))
         .route("/v1/extensions/blocklist/apply", any(dispatch_route))
         .route("/v1/extensions/blocklist/list", any(dispatch_route))
-        .route("/v1/extensions/*path", any(dispatch_route))
+        .route("/v1/extensions/{*path}", any(dispatch_route))
         .route("/v1/tool-results:render", any(dispatch_route))
         .route("/v1/project-status:get", any(dispatch_route))
         .fallback(fallback_route)
@@ -3822,8 +3822,12 @@ mod tests {
             provenance: atelia_core::ExtensionProvenance {
                 source: ProvenanceSource::Registry,
                 repository: Some("https://github.com/example/extensions".to_string()),
+                source_ref: None,
+                manifest_path: None,
                 commit: Some("deadbeef".to_string()),
                 registry_identity: Some("third-party-registry".to_string()),
+                lineage: None,
+                publication: None,
                 artifact_digest: artifact_digest.to_string(),
                 manifest_digest: manifest_digest.to_string(),
                 signature: Some("signature".to_string()),
@@ -4535,7 +4539,7 @@ mod tests {
     #[tokio::test]
     async fn watch_events_stream_reports_cursor_expired_recovery() {
         let response = watch_events_cursor_expired_response("event id is not retained");
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::GONE);
         assert_eq!(
             response
                 .headers()
@@ -4891,7 +4895,7 @@ mod tests {
         );
         assert_eq!(
             rpc_error_status(rpc::RpcErrorCode::CursorExpired),
-            (StatusCode::BAD_REQUEST, true)
+            (StatusCode::GONE, true)
         );
     }
 
