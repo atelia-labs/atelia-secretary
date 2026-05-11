@@ -121,6 +121,12 @@ approved permissions や rollback snapshot のような mutable install-only fie
 content-risk、data-disclosure summary は install record にまだ永続化されて
 いないため、後続の manifest-summary projection が必要です。
 
+HTTP/JSON beta transport はこの surface をすでに `ListPackageTrustIndex` として
+ship しており、proto でも同じ read-only contract を予約しています。含まれるのは
+`package_id`、`version`、`status`、`boundary`、`manifest_digest`、
+`artifact_digest`、source snapshot、lineage、publication、block marker です。
+install / update / execute の flow や audit / quarantine history までは広げません。
+
 ## Permission And Capability
 
 permission と capability を分けます。

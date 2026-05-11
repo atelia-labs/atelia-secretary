@@ -49,11 +49,12 @@ current protobuf implementation. The current daemon exposes the health,
 repository, job, policy, event replay, project status, tool-output settings,
 `RenderToolOutput`, and beta package-management RPC groups. Registry and
 blocklist operations are currently exposed through the daemon HTTP/JSON beta
-transport. The Rust RPC boundary in `ateliad` stays transport-neutral so a
-future proto/gRPC client path can bind to the same contract instead of
-redefining it. `WatchEvents` is the live beta subscription surface, while
-`ReplayEvents` and `/v1/events/replay` remain available for bounded replay and
-compatibility.
+transport. The read-only package trust index beta surface is already shipped in
+HTTP/JSON as `ListPackageTrustIndex`, and proto now reserves the same contract.
+The Rust RPC boundary in `ateliad` stays transport-neutral so a future
+proto/gRPC client path can bind to the same contract instead of redefining it.
+`WatchEvents` is the live beta subscription surface, while `ReplayEvents` and
+`/v1/events/replay` remain available for bounded replay and compatibility.
 
 Required RPC groups:
 
@@ -71,6 +72,7 @@ Required RPC groups:
 | `ReplayEvents` | Replay ordered events from a cursor |
 | `CheckPolicy` | Preview policy outcome for a requested action |
 | `RenderToolOutput` | Render canonical tool result as TOON, JSON, or text |
+| `ListPackageTrustIndex` | Read the package trust index with provenance and block markers |
 | `InstallExtension` | Install a new AEP backend package manifest. Beta RPC name is retained for compatibility. |
 | `UpdateExtension` | Update an installed AEP backend package manifest |
 | `ExtensionStatus` | Inspect one package installation and blocklist state |
@@ -205,6 +207,24 @@ tokens or replay/query cursor syntax still return `INVALID_REQUEST`.
 `ToolResultRef` points to canonical structured output. The protocol returns refs
 by default and renders output through `RenderToolOutput` so clients can choose
 TOON, JSON, or text without changing the underlying result.
+
+### Package Trust Index
+
+`ListPackageTrustIndex` is read-only. It returns a package projection with:
+
+- `package_id`
+- `version`
+- `status`
+- `boundary`
+- `manifest_digest`
+- `artifact_digest`
+- source snapshot, including lineage and publication
+- block marker
+
+It preserves the installed source, provenance, and publication snapshot already
+present in the record. It does not add install/update/execute flows, or
+audit/quarantine history, and it intentionally omits mutable install-only
+fields such as approved permissions and rollback snapshots.
 
 ## Event Ordering
 
