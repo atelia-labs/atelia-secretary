@@ -144,7 +144,8 @@ unavailable and return structured unsupported-capability errors instead of
 silently pretending to run.
 
 This slice also exposes a read-only package trust index beta surface for
-resolver clients. It projects installed packages without hiding blocked ones,
+resolver clients that inspect package status and metadata. It projects installed
+packages without hiding blocked ones,
 keeps the installed source/provenance/publication snapshot already present in
 the record, and intentionally omits mutable install-only fields such as
 approved permissions and rollback snapshots. Publisher, compatibility,

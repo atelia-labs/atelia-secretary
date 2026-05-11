@@ -112,8 +112,9 @@ WASM execution はまだ実装しません。
 提供します。execution を伴う request は意図的に未実装であり、黙って実行した
 ふりをせず、structured unsupported-capability error を返します。
 
-この slice では resolver client 向けに read-only の package trust index beta
-surface も公開します。installed package を blocked でも隠さず投影し、
+この slice では package status と metadata を inspect する resolver client 向けに
+read-only の package trust index beta surface も公開します。installed package を
+blocked でも隠さず投影し、
 record にすでにある source / provenance / publication snapshot を保持し、
 approved permissions や rollback snapshot のような mutable install-only fields
 は意図的に含めません。publisher、compatibility、broker-family、
