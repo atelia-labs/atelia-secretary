@@ -5768,6 +5768,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extension_update_endpoint_requires_explicit_source_change_approval() {
+        const ARTIFACT_V1: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const MANIFEST_V1: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const ARTIFACT_V2: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const MANIFEST_V2: &str =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let rpc_server = ready_rpc_server();
+        let manifest_v1 = extension_manifest(
+            "com.example.source-boundary",
+            "1.0.0",
+            ARTIFACT_V1,
+            MANIFEST_V1,
+        );
+        let mut manifest_v2 = extension_manifest(
+            "com.example.source-boundary",
+            "2.0.0",
+            ARTIFACT_V2,
+            MANIFEST_V2,
+        );
+        manifest_v2.provenance.source_ref = Some("refs/heads/release".to_string());
+
+        let install_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/install",
+            serde_json::json!({
+                "manifest": manifest_v1,
+                "approve_local_unsigned": false,
+                "allow_local_process_runtime": false,
+            }),
+        )
+        .await;
+        assert_eq!(install_response.status(), StatusCode::OK);
+
+        let denied_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/update",
+            serde_json::json!({
+                "manifest": manifest_v2,
+                "approve_local_unsigned": false,
+                "allow_local_process_runtime": false,
+            }),
+        )
+        .await;
+        assert_eq!(denied_response.status(), StatusCode::CONFLICT);
+        let denied_payload = to_bytes(denied_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(denied_payload["status"], "error");
+        assert_eq!(denied_payload["error"]["code"], "rpc_error");
+        assert!(denied_payload["error"]["recoverable"].as_bool().unwrap());
+        assert!(denied_payload["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("changed source provenance"));
+
+        let approved_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/update",
+            serde_json::json!({
+                "manifest": manifest_v2,
+                "approve_local_unsigned": false,
+                "allow_local_process_runtime": false,
+                "approve_source_change": true,
+            }),
+        )
+        .await;
+        assert_eq!(approved_response.status(), StatusCode::OK);
+        let approved_payload = to_bytes(approved_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(approved_payload["data"]["record"]["version"], "2.0.0");
+        assert_eq!(
+            approved_payload["data"]["record"]["source"]["ref"],
+            "refs/heads/release"
+        );
+    }
+
+    #[tokio::test]
     async fn render_tool_output_endpoint_returns_rendered_output() {
         let rpc_server = ready_rpc_server();
         let root = test_repo_dir("render-tool-output");
