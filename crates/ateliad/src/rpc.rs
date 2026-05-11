@@ -4894,6 +4894,62 @@ mod tests {
     }
 
     #[test]
+    fn extension_update_requires_explicit_source_change_approval() {
+        const ARTIFACT_V1: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const MANIFEST_V1: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const ARTIFACT_V2: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const MANIFEST_V2: &str =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let server = ready_server();
+        let manifest_v1 = extension_manifest(
+            "com.example.review.extension",
+            "1.0.0",
+            ARTIFACT_V1,
+            MANIFEST_V1,
+        );
+        let mut manifest_v2 = extension_manifest(
+            "com.example.review.extension",
+            "2.0.0",
+            ARTIFACT_V2,
+            MANIFEST_V2,
+        );
+        manifest_v2.provenance.repository = Some("https://github.com/example/other".to_string());
+
+        server
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest_v1,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("initial install should succeed");
+
+        let denied = server
+            .update_extension(UpdateExtensionRequest {
+                manifest: manifest_v2.clone(),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect_err("source change should require explicit approval");
+        assert_eq!(denied.code, RpcErrorCode::Conflict);
+
+        let approved = server
+            .update_extension(UpdateExtensionRequest {
+                manifest: manifest_v2,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: true,
+            })
+            .expect("approved source change should succeed");
+        assert_eq!(approved.record.version, "2.0.0");
+    }
+
+    #[test]
     fn missing_job_maps_to_not_found() {
         let server = ready_server();
         let missing = JobId::new();
