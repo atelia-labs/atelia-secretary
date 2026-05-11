@@ -18,7 +18,10 @@ use crate::service::{
     RenderToolOutputRequest as ServiceRenderToolOutputRequest, SecretaryService, ServiceError,
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
 };
-pub use crate::service::{ExtensionExecutionRequest, ExtensionExecutionResponse};
+pub use crate::service::{
+    ExtensionExecutionRequest, ExtensionExecutionResponse, ListPackageTrustIndexRequest,
+    PackageTrustIndexEntry,
+};
 use atelia_core::{
     Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState,
     DisableExtensionRequest, EnableExtensionRequest, EventCursor as CoreEventCursor, EventQuery,
@@ -337,6 +340,17 @@ impl SecretaryRpcServer {
         Ok(ListExtensionsResponse {
             metadata: self.metadata(),
             extensions: response.extensions,
+        })
+    }
+
+    pub fn list_package_trust_index(
+        &self,
+        request: ListPackageTrustIndexRequest,
+    ) -> RpcResult<ListPackageTrustIndexResponse> {
+        let response = self.service.list_package_trust_index(request)?;
+        Ok(ListPackageTrustIndexResponse {
+            metadata: self.metadata(),
+            packages: response.packages,
         })
     }
 
@@ -1454,6 +1468,12 @@ pub struct ExtensionStatusResponse {
 pub struct ListExtensionsResponse {
     pub metadata: ProtocolMetadata,
     pub extensions: Vec<atelia_core::ExtensionStatusResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListPackageTrustIndexResponse {
+    pub metadata: ProtocolMetadata,
+    pub packages: Vec<PackageTrustIndexEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2684,6 +2704,9 @@ mod tests {
         assert!(response
             .capabilities
             .contains(&"tool_output_settings.v1".to_string()));
+        assert!(response
+            .capabilities
+            .contains(&"package_trust_index.v1".to_string()));
         assert!(response
             .capabilities
             .contains(&"tool_output_render.v1".to_string()));
@@ -4893,6 +4916,105 @@ mod tests {
             })
             .expect_err("removed extension should not have active status");
         assert_eq!(missing_after_remove.code, RpcErrorCode::NotFound);
+    }
+
+    #[test]
+    fn package_trust_index_round_trip_through_rpc_surface_preserves_provenance() {
+        const ACTIVE_ARTIFACT: &str =
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        const ACTIVE_MANIFEST: &str =
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        const BLOCKED_ARTIFACT: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const BLOCKED_MANIFEST: &str =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+        let server = ready_server();
+        let mut active = extension_manifest(
+            "com.example.active",
+            "1.0.0",
+            ACTIVE_ARTIFACT,
+            ACTIVE_MANIFEST,
+        );
+        active.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
+        });
+
+        let mut blocked = extension_manifest(
+            "com.example.blocked",
+            "1.0.0",
+            BLOCKED_ARTIFACT,
+            BLOCKED_MANIFEST,
+        );
+        blocked.provenance.lineage = Some(atelia_core::ExtensionLineage {
+            parent_id: "com.example.parent".to_string(),
+            parent_version: Some("0.9.0".to_string()),
+            parent_manifest_digest: Some(ACTIVE_MANIFEST.to_string()),
+            relationship: atelia_core::ExtensionLineageRelationship::Fork,
+        });
+        blocked.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PrivateRemix,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::NotSubmitted,
+        });
+
+        server
+            .install_extension(InstallExtensionRequest {
+                manifest: active,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("active install should succeed");
+        server
+            .install_extension(InstallExtensionRequest {
+                manifest: blocked,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("blocked install should succeed");
+        server
+            .apply_blocklist(ApplyBlocklistRequest {
+                entry: atelia_core::BlocklistEntry {
+                    key: BlockKey::ExtensionId("com.example.blocked".to_string()),
+                    reason: BlockReason::PolicyViolation,
+                    note: Some("blocked for trust index".to_string()),
+                },
+            })
+            .expect("blocklist should apply");
+
+        let index = server
+            .list_package_trust_index(ListPackageTrustIndexRequest::default())
+            .expect("package trust index should succeed");
+
+        assert_eq!(index.packages.len(), 2);
+        let blocked_entry = index
+            .packages
+            .iter()
+            .find(|entry| entry.package_id == "com.example.blocked")
+            .expect("blocked package should be included");
+        assert_eq!(
+            blocked_entry.status,
+            Some(atelia_core::ExtensionInstallStatus::Blocked)
+        );
+        assert!(blocked_entry.block.is_some());
+        assert_eq!(
+            blocked_entry.source.as_ref().unwrap().publication,
+            Some(atelia_core::ExtensionPublication {
+                visibility: atelia_core::ExtensionPublicationVisibility::PrivateRemix,
+                registry_submission: atelia_core::ExtensionRegistrySubmission::NotSubmitted,
+            })
+        );
+        assert_eq!(
+            blocked_entry.source.as_ref().unwrap().lineage,
+            Some(atelia_core::ExtensionLineage {
+                parent_id: "com.example.parent".to_string(),
+                parent_version: Some("0.9.0".to_string()),
+                parent_manifest_digest: Some(ACTIVE_MANIFEST.to_string()),
+                relationship: atelia_core::ExtensionLineageRelationship::Fork,
+            })
+        );
     }
 
     #[test]
