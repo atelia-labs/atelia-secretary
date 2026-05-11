@@ -854,6 +854,13 @@ fn validate_publication(
             }
         }
         ExtensionPublicationVisibility::PublicSearchable => {
+            if boundary == ExtensionBoundary::LocalDevelopment {
+                return Err(ExtensionValidationError::BoundaryViolation {
+                    reason:
+                        "public searchable packages cannot use local-development package authority"
+                            .to_string(),
+                });
+            }
             if !has_non_empty_trimmed(manifest.provenance.registry_identity.as_deref()) {
                 return Err(ExtensionValidationError::ProvenanceRequired {
                     field: "provenance.registry_identity",
@@ -4164,6 +4171,27 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn public_searchable_rejects_local_development_authority() {
+        let mut manifest = manifest("local.example.extension");
+        manifest.provenance.source = ProvenanceSource::Local;
+        manifest.provenance.registry_identity = Some("third-party-registry".to_string());
+        manifest.provenance.signature = None;
+        manifest.provenance.signer = None;
+        manifest.provenance.publication = Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: ExtensionRegistrySubmission::Submitted,
+        });
+
+        let err = manifest
+            .validate(&ManifestValidationPolicy::default().with_local_unsigned())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExtensionValidationError::BoundaryViolation { .. }
+        ));
     }
 
     #[test]
