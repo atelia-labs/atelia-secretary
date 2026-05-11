@@ -44,18 +44,18 @@ beta gate に加えて、release には次のものが必要です。
 - protocol compatibility checks
 - previous-minor protocol compatibility checks
 - manifest schema fixture validation
-- extension runtime compatibility checks
+- AEP backend package runtime compatibility checks
 - tool-output TOON / JSON golden fixtures
 - tool-output customizer compatibility fixtures
 - `crates/atelia-core/tests/fixtures/tool_output/` 配下の tool-output compatibility fixture checks
-- extension compatibility matrix updates
-- tool-output default、permission model、extension contract、Hook behavior が変わる場合の AX impact review
+- package compatibility matrix updates
+- tool-output default、permission model、package contract、Hook behavior が変わる場合の AX impact review
 - permission name または risk tier が変わる場合の permission migration tests
-- extension enforcement が変わる場合の blocklist / rollback behavior tests
+- package enforcement が変わる場合の blocklist / rollback behavior tests
 - Docker build
 - 該当する場合、security-sensitive change review
 
-Atelia extension、hook、permission、tool-output contract の enforcement を変更する Secretary release は、実装対象の Atelia specification version または commit を明記します。
+Atelia package、hook、permission、tool-output contract の enforcement を変更する Secretary release は、実装対象の Atelia specification version または commit を明記します。
 
 ## 変更履歴
 
@@ -65,7 +65,7 @@ changelog では次のものを区別します。
 - daemon behavior changes
 - protocol changes
 - policy / orchestration changes
-- extension / hook compatibility changes
+- package / hook compatibility changes
 - tool-output schema and default-format changes
 - security fixes
 - breaking changes

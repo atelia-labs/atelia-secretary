@@ -1,34 +1,41 @@
-# Extensions Runtime
+# AEP Package Runtime
 
 This document defines how Atelia Secretary validates, installs, audits,
-rolls back, and manages Custom Extensions. Extension execution is disabled in
-beta and reserved for a future release.
+rolls back, quarantines, revokes, and manages AEP backend packages. Package
+execution is disabled in beta and reserved for a future release.
 
-The normative AEP, extension, composition, hook, tool-output, and security
-contracts live in the [`atelia`](https://github.com/atelia-labs/atelia)
-repository:
-[Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md),
-[Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md),
-[Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md),
-[Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.md),
-and [Extension Security](https://github.com/atelia-labs/atelia/blob/main/docs/extension-security.md).
-AEP overview and manifest docs are introduced by
-[atelia PR #4](https://github.com/atelia-labs/atelia/pull/4) and should be
-linked directly after that PR lands in the `atelia` repository.
+The normative AEP, package authoring, Surface Protocol, service, registry,
+hook, tool-output, and broker-boundary contracts live in the
+[`atelia`](https://github.com/atelia-labs/atelia) repository:
+[Package Authoring, Remix, and Discovery](https://github.com/atelia-labs/atelia/blob/main/docs/package-authoring-discovery.md),
+[Package Sharing and Source Policy](https://github.com/atelia-labs/atelia/blob/main/docs/package-sharing-source-policy.md),
+[AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.md),
+[AEP Services](https://github.com/atelia-labs/atelia/blob/main/docs/aep-services.md),
+[Surface Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.md),
+[AEP Registry](https://github.com/atelia-labs/atelia/blob/main/docs/aep-registry.md),
+[Broker Boundary](https://github.com/atelia-labs/atelia/blob/main/docs/broker-boundary.md),
+[Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md), and
+[Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.md).
 This document defines the daemon-side enforcement that gives Secretary a
-trustworthy extension workplace. In AEP terms, this is the backend host
+trustworthy package workplace. In AEP terms, this is the backend host
 reference implementation slice.
 
-## Extension Kinds
+Atelia is a user-owned harness, not a public storefront or native app
+distribution channel. Secretary therefore gates registry submission,
+searchability, installability, mount eligibility, quarantine, revocation,
+service execution, policy, audit, and rollback. It does not and cannot gate raw
+publication to GitHub outside Atelia.
 
-Extensions can declare multiple kinds. Each kind expands the visible permission
+## Package Kinds
+
+Packages can declare multiple kinds. Each kind expands the visible permission
 surface.
 
 - `tool`: exposes callable tools to Secretary / agents
-- `service`: exposes typed services other extensions can call through Secretary
+- `service`: exposes typed services other packages can call through Secretary
 - `tool_output_customizer`: controls result format, field order, omission,
   summaries, TOON/JSON defaults
-- `hook_provider`: registers protected extension-created hooks
+- `hook_provider`: registers protected package-created hooks
 - `webhook_receiver`: owns external event endpoints and verification rules
 - `workflow`: runs bounded multi-step jobs
 - `notification`: sends or formats notifications
@@ -54,12 +61,15 @@ permission, and provenance facts that those hosts must display.
 
 Secretary currently validates a backend-only compatibility slice. The public AEP
 package schema is `aep.package.v0`; this daemon slice is still
-`atelia.extension.v1` while implementation catches up.
+`atelia.extension.v1` while implementation catches up. New product and docs
+language should still describe the concept as AEP packages, not generic
+extensions. Schema enum values such as `failure.degrade: disable_extension`
+also retain the beta schema vocabulary until the compatibility slice moves.
 
 ```yaml
 schema: atelia.extension.v1
-id: com.example.extension
-name: Example Extension
+id: com.example.package
+name: Example Package
 version: 1.2.3
 publisher:
   name: Example Org
@@ -108,9 +118,11 @@ migration:
   notes: null
 ```
 
-`process` is local-development only and must be explicitly enabled. Docker,
-remote runtime, and native client executable extension profiles are future or
-special-purpose AEP profiles, not this beta backend slice.
+`process` is local-development only and must be explicitly enabled. Docker and
+remote runtime profiles are future or special-purpose AEP profiles, not this
+beta backend slice. Downloaded native client UI, JavaScript, WebView code,
+dynamic loaders, direct native API access, and native client executable
+extensions are not part of this Secretary backend host.
 
 These additive sections default to empty collections or null notes in the daemon
 manifest model, so older manifests can still deserialize cleanly. Validation
@@ -126,18 +138,21 @@ Initial backend enforcement lives in `atelia-core::extensions` as
 first slice accepts backend `wasm-rust` / `wasm` manifests, explicit
 local-development process manifests, per-version provenance digests, blocklist
 checks, rollback pointers, and brokered service-call authorization. It does not
-execute WASM yet. In this beta slice, extension management APIs are available
+execute WASM yet. In this beta slice, package management APIs are available
 to operator-facing clients; execution-oriented requests are intentionally
 unavailable and return structured unsupported-capability errors instead of
 silently pretending to run.
 
+The current Rust identifiers and RPC names still use `extension` for beta
+compatibility. That is implementation vocabulary, not product positioning.
+
 The initial implementation also reserves concrete id boundaries:
 
-- official backend extensions use the `ai.atelia.*` namespace and the
+- official backend packages use the `ai.atelia.*` namespace and the
   `atelia-official` registry identity
-- local development extensions use the `local.*` namespace and require explicit
+- local development packages use the `local.*` namespace and require explicit
   unsigned dev-mode approval when unsigned
-- third-party extensions cannot use the official or local namespaces
+- third-party packages cannot use the official or local namespaces
 
 ## Permission And Capability
 
@@ -182,7 +197,7 @@ Examples:
 - `browser.use`
 - `computer.use`
 
-Capability grants include expiry, invocation id, actor, extension version,
+Capability grants include expiry, invocation id, actor, package version,
 requested operation, input digest, policy decision, and max effect.
 
 Default lifecycle:
@@ -192,13 +207,13 @@ Default lifecycle:
   short-lived task grant.
 - R3/R4 grants expire at invocation boundary and carry approval refs.
 - Grant renewal creates a new policy decision.
-- Revocation happens on extension disable, blocklist hit, manifest mismatch,
+- Revocation happens on package disable, blocklist hit, manifest mismatch,
   approval withdrawal, permission change, version change, policy update, or
   task cancellation.
 
 ## Tool Output Customization
 
-Tool output customization is a security-sensitive AX extension.
+Tool output customization is a security-sensitive AEP package capability.
 
 Rules:
 
@@ -223,26 +238,43 @@ Customizable:
 
 ## Service Broker
 
-Secretary brokers service calls. Extensions do not communicate with each other
-directly.
+Secretary brokers service calls. Packages do not communicate with each other
+directly over HTTP, local sockets, hidden process channels, or client-side
+shortcuts.
 
 For each service call, Secretary verifies:
 
-- caller extension id / version
-- callee extension id / version
+- caller package id / component / version
+- callee package id / component / version
 - service name, method, and schema version
 - caller `services.consumes` declaration
 - callee `services.provides` declaration
-- required permission and capability grant
+- provider-owned `provides.required_permissions`
+- consumer-requested `consumes.grants`
+- runtime capability grant from policy
 - input digest, output digest, redaction, and failure
+
+Permission authority is provider-owned. Canonical service permission names,
+risk tiers, and descriptions live in the provider package. A consumer references
+those permissions through `consumes.grants`; it does not redefine them in its
+own package vocabulary and cannot downgrade the provider's risk tier. Secretary
+rejects install or execution if a grant does not match the provider's
+`provides.required_permissions`, if the provider definition changed outside the
+approved version range, or if the consumer attempts to self-authorize.
 
 Service calls inside the same bundle still require explicit provide / consume
 declarations and permissions. The bundle install flow can group approval UI, but
 it does not automatically elevate permissions.
 
-When a service dependency is missing, Secretary treats the extension as
+When a service dependency is missing, Secretary treats the package as
 partially unavailable or as blocked composition and returns structured
 unavailable status.
+
+All service execution crosses the Policy Engine, Service Broker, and Audit Log.
+The broker enforces resolver-issued correlation ids, replay rejection, consent,
+rate limits, schema version, redaction, fallback behavior, and audit events.
+Secretary runtime may host a Secretary-side service target, but it does not
+bypass the broker.
 
 ## Hook And Webhook Execution
 
@@ -251,8 +283,8 @@ Hooks are persisted objects.
 ```yaml
 hook_id: hk_...
 created_by:
-  kind: user | extension | automation
-  extension_id: null
+  kind: user | package | automation
+  package_id: null
 trigger:
   source: atelia | github | external
   event: pull_request.opened
@@ -261,16 +293,16 @@ verification:
   method: hmac | github_signature | oidc | none_for_local_only
 required_capabilities: []
 action:
-  kind: workflow | tool | notification | memory_update | extension_action
+  kind: workflow | tool | notification | memory_update | package_action
 status: enabled | disabled | blocked | needs_approval
 ```
 
 Rules:
 
-- user-created and extension-created hooks are shown separately
-- extension-created hooks are protected objects
-- users can disable or block extension-created hooks
-- behavior-changing edits fork the hook or require extension update
+- user-created and package-created hooks are shown separately
+- package-created hooks are protected objects
+- users can disable or block package-created hooks
+- behavior-changing edits fork the hook or require package update
 - trigger, event source, verification, or permission changes require re-approval
 - external webhooks require signatures, timestamp windows, delivery id dedupe,
   and source allowlists
@@ -293,14 +325,14 @@ Before install/update, Secretary verifies per-version provenance:
 - signature over manifest and artifact digest
 - build provenance when available
 
-Same-version different-digest extensions are blocked. Local unsigned extensions
+Same-version different-digest packages are blocked. Local unsigned packages
 require explicit dev-mode approval and visible client labeling.
 
 ## Runtime And Sandbox
 
 Beta backend runtime matrix:
 
-- WASM (Rust): first-class runtime for backend extensions
+- WASM (Rust): first-class runtime for backend packages
 - Non-Rust WASM: reserved for reviewed cases that still fit the WASM host
   boundary
 - process: local-development only and disabled unless policy explicitly enables
@@ -310,17 +342,17 @@ Reserved future or special-purpose AEP runtime profiles:
 
 - Docker: heavy work that does not fit WASM and requires stricter host policy
 - remote: future / explicitly permissioned runtime
-- native client executable extension: future, platform-specific, high-trust
-  profile outside the Secretary backend host
+- native client executable extension: not part of this launch path and outside
+  the Secretary backend host
 
-Secretary-side backend extensions use Rust -> WASM as the primary target.
-Official backend extensions are written in Rust by default. Community backend
-extensions initially use or strongly prefer Rust / WASM.
+Secretary-side backend packages use Rust -> WASM as the primary target.
+Official backend packages are written in Rust by default. Community backend
+packages initially use or strongly prefer Rust / WASM.
 
 Atelia does not treat arbitrary WASM as inherently safe. Rust provides a typed
 SDK and memory-safe default, while WASM provides controlled host capabilities,
 linear memory isolation, fuel / timeout limits, and auditable imports. Non-Rust
-WASM, process, Docker, remote, and native client executable profiles require
+WASM, process, Docker, and remote profiles require
 stricter review, capability limits, provenance checks, and runtime policy.
 
 Defaults:
@@ -377,7 +409,7 @@ Updates that change permissions, hooks, webhooks, runtime, source, or trigger
 conditions require re-approval.
 
 Rollback restores previous version, disabled hooks, removed capabilities, and
-extension-owned state. Migrations include dry-run, touched data areas, and
+package-owned state. Migrations include dry-run, touched data areas, and
 rollback notes.
 
 Rollback state:
@@ -388,9 +420,9 @@ Rollback state:
 4. `rollback_in_progress`
 5. `installed_previous_version`
 
-In-flight extension jobs are cancelled when cancellation is supported. Jobs with
+In-flight package jobs are cancelled when cancellation is supported. Jobs with
 external side effects are quarantined for review. Hook deliveries received during
-rollback are held until the previous version is restored or the extension is
+rollback are held until the previous version is restored or the package is
 blocked.
 
 ## Blocklist
@@ -399,7 +431,7 @@ Blocklist wins over local enablement.
 
 Block keys:
 
-- extension id
+- package id
 - version range
 - artifact digest
 - signer
@@ -435,7 +467,7 @@ Minimum events:
 - capability grant
 - hook creation / change
 - webhook receipt
-- future extension execution start / end, once execution is enabled
+- future package execution start / end, once execution is enabled
 - policy decision
 - secret access
 - repo mutation
@@ -448,11 +480,11 @@ Plaintext secrets stay out of logs.
 
 ## Agency Preservation
 
-Extensions support Secretary's judgment.
+Packages support Secretary's judgment.
 
 Review questions:
 
-- Does this extension help Secretary make a better judgment?
+- Does this package help Secretary make a better judgment?
 - Does it make every judgment-affecting change visible to Secretary?
 - If it changes memory, notifications, review flow, delegation, or tool
   defaults, does the manifest declare the impact?

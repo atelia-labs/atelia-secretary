@@ -3,8 +3,15 @@
 Atelia Secretary controls access to repositories, external services, and
 automation agents. It must be designed as a security-sensitive daemon.
 
-The normative security model for extensions and Hooks lives in
-[`atelia/docs/extension-security.md`](https://github.com/atelia-labs/atelia/blob/main/docs/extension-security.md).
+The normative security model for AEP packages, Surface Protocol, services,
+broker boundaries, and Hooks lives in:
+
+- [`atelia/docs/aep-manifest.md`](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.md)
+- [`atelia/docs/aep-services.md`](https://github.com/atelia-labs/atelia/blob/main/docs/aep-services.md)
+- [`atelia/docs/surface-protocol.md`](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.md)
+- [`atelia/docs/broker-boundary.md`](https://github.com/atelia-labs/atelia/blob/main/docs/broker-boundary.md)
+- [`atelia/docs/hooks.md`](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md)
+
 This document covers Secretary daemon-specific security boundaries.
 
 ## Baseline Rules
@@ -135,8 +142,8 @@ Initial threat model work should cover:
   input schemas, effects, runtime behavior, and customization surfaces.
 - [Tool Output Schema](tool-output-schema.md) defines agent-facing output,
   audit separation, redaction, and TOON/JSON format selection.
-- [Extensions Runtime](extensions-runtime.md) defines manifest enforcement,
-  extension sandboxing, provenance, rollback, and blocklist behavior.
+- [AEP Package Runtime](extensions-runtime.md) defines manifest enforcement,
+  package sandboxing, provenance, rollback, and blocklist behavior.
 - [Operational AX Analytics](operational-ax-analytics.md) defines
   privacy-preserving analytics for AX improvement.
 

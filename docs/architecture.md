@@ -1,13 +1,14 @@
 # Architecture
 
-Atelia Secretary is the backend daemon for Atelia. Normative client, AEP /
-extension, and Hook specifications live in the
+Atelia Secretary is the backend daemon for Atelia. Normative client, AEP
+package, Surface Protocol, and Hook specifications live in the
 [`atelia`](https://github.com/atelia-labs/atelia) repository. This document
 covers only the daemon implementation boundary.
 
 Within AEP, Secretary is the reference backend host. It implements backend
 runtime boundaries, permission and capability enforcement, service brokering,
-hook execution boundaries, audit, blocklist, install records, and rollback.
+hook execution boundaries, audit, registry / blocklist enforcement, install
+records, quarantine, revocation, and rollback.
 
 ## Shape
 
@@ -24,7 +25,7 @@ Atelia clients and agents
    Atelia Secretary
    Rust daemon in Docker
           |
-repositories, extension host, policy,
+repositories, AEP backend host, policy,
 jobs, events, AX Feedback,
 execution ledger, execution boundaries
 ```
@@ -38,7 +39,8 @@ Initial backend crate boundaries:
 - `atelia-core`: domain model and policy primitives.
 - `ateliad`: daemon binary and service runtime.
 - `atelia-protocol`: generated or hand-authored protocol bindings.
-- `atelia-extensions`: extension host, manifest, and capability boundaries.
+- `atelia-extensions`: current beta crate for AEP backend package manifests,
+  host runtime, and capability boundaries.
 - `atelia-agents`: agent delegation substrate and provider abstractions.
 
 The daemon should be designed as a long-running process. Docker is the primary
@@ -78,43 +80,52 @@ contracts and compatibility expectations.
 
 ## Execution Boundaries
 
-Atelia Secretary implements extension and Hook execution boundaries according to
-project-level Atelia specifications.
+Atelia Secretary implements AEP package, service broker, and Hook execution
+boundaries according to project-level Atelia specifications.
 
 Daemon responsibilities:
 
-- validating manifests and compatibility contracts;
-- checking extension / Hook execution permissions;
+- validating manifests, source policy, registry metadata, and compatibility
+  contracts;
+- checking package / Hook execution permissions;
 - allowing, denying, or requesting approval according to policy;
 - recording audit logs;
-- enforcing access boundaries for repositories, secrets, extensions, and
-  external services;
+- enforcing access boundaries for repositories, secrets, packages, brokered
+  services, and external services;
 - blocking dangerous execution paths.
+
+Secretary does not gate raw GitHub publication. A user can create a repository,
+fork, branch, release, or pull request outside Atelia. Secretary gates what
+Atelia can resolve, search, install, mount, quarantine, revoke, and execute
+through registry submission, source-policy checks, manifest validation,
+permission analysis, service broker policy, and audit.
 
 R0/R1 capabilities can be granted automatically by daemon policy when the
 contract permits it. R2 capabilities require audit and checkpoint behavior where
 applicable. R3/R4 capabilities require visible Secretary judgment and, when the
 policy requires it, human approval.
 
-See the project-level Atelia documents for normative extension and Hook specs.
+See the project-level Atelia documents for normative AEP package, Surface
+Protocol, registry, service, broker, and Hook specs.
 
-- [Atelia Extension Protocol / AEP Manifest / AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
-  is a temporary link to `atelia` PR `#4` until the individual docs land on
-  `atelia` main.
-- [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
-- [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md)
+- [Package Authoring, Remix, and Discovery](https://github.com/atelia-labs/atelia/blob/main/docs/package-authoring-discovery.md)
+- [Package Sharing and Source Policy](https://github.com/atelia-labs/atelia/blob/main/docs/package-sharing-source-policy.md)
+- [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.md)
+- [AEP Services](https://github.com/atelia-labs/atelia/blob/main/docs/aep-services.md)
+- [Surface Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.md)
+- [AEP Registry](https://github.com/atelia-labs/atelia/blob/main/docs/aep-registry.md)
+- [Broker Boundary](https://github.com/atelia-labs/atelia/blob/main/docs/broker-boundary.md)
 - [Tool Output](https://github.com/atelia-labs/atelia/blob/main/docs/tool-output.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md)
-- [Extension Security](https://github.com/atelia-labs/atelia/blob/main/docs/extension-security.md)
 
-## Tool And Extension Implementation Notes
+## Tool And Package Implementation Notes
 
 Secretary's implementation contracts for tool categories, tool output rendering,
-extension runtime behavior, and operational AX analytics live in:
+AEP backend package runtime behavior, and operational AX analytics live in:
 
 - [Tool Catalog](tool-catalog.md)
 - [Tool Definition Schema](tool-definition-schema.md)
 - [Tool Output Schema](tool-output-schema.md)
-- [Extensions Runtime](extensions-runtime.md)
+- [AEP Package Runtime](extensions-runtime.md)
 - [Operational AX Analytics](operational-ax-analytics.md)
 - [Secretary Runtime Architecture](runtime-architecture.md)

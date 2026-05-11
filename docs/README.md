@@ -3,9 +3,10 @@
 This directory contains the daemon-side design and implementation contracts for
 Atelia Secretary.
 
-Project-wide product philosophy, client UX, AEP / extension specifications,
-hooks, and governance live in [`atelia`](https://github.com/atelia-labs/atelia). This
-repository explains how the Secretary daemon implements those contracts.
+Project-wide product philosophy, client UX, AEP package specifications, Surface
+Protocol, hooks, and governance live in
+[`atelia`](https://github.com/atelia-labs/atelia). This repository explains how
+the Secretary daemon implements those contracts.
 
 ## Reading Order
 
@@ -22,7 +23,7 @@ repository explains how the Secretary daemon implements those contracts.
 11. [Tool Catalog](tool-catalog.md)
 12. [Tool Definition Schema](tool-definition-schema.md)
 13. [Tool Output Schema](tool-output-schema.md)
-14. [Extensions Runtime](extensions-runtime.md)
+14. [AEP Package Runtime](extensions-runtime.md)
 15. [Security](security.md)
 
 ## Core Design
@@ -58,19 +59,21 @@ repository explains how the Secretary daemon implements those contracts.
 - [Operational AX Analytics](operational-ax-analytics.md)
 - [Agent Repertoire](https://github.com/atelia-labs/atelia/blob/main/docs/agent-repertoire.md) - computed projection of the live tool surface in the current context
 
-## Extensions
+## AEP Packages
 
-- [Extensions Runtime](extensions-runtime.md)
+- [AEP Package Runtime](extensions-runtime.md)
 
 Atelia Secretary is the AEP backend host reference implementation. Normative
-AEP, extension, hook, and extension composition specs live in the project
-repository:
+AEP, package authoring, Surface Protocol, registry, service, hook, and broker
+boundary specs live in the project repository:
 
-- [Atelia Extension Protocol / AEP Manifest / AEP Package Model](https://github.com/atelia-labs/atelia/pull/4)
-  is a temporary link to `atelia` PR `#4` until the individual docs land on
-  `atelia` main.
-- [Extensions](https://github.com/atelia-labs/atelia/blob/main/docs/extensions.md)
-- [Extension Composition](https://github.com/atelia-labs/atelia/blob/main/docs/extension-composition.md)
+- [Package Authoring, Remix, and Discovery](https://github.com/atelia-labs/atelia/blob/main/docs/package-authoring-discovery.md)
+- [Package Sharing and Source Policy](https://github.com/atelia-labs/atelia/blob/main/docs/package-sharing-source-policy.md)
+- [AEP Manifest](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.md)
+- [AEP Services](https://github.com/atelia-labs/atelia/blob/main/docs/aep-services.md)
+- [Surface Protocol](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.md)
+- [AEP Registry](https://github.com/atelia-labs/atelia/blob/main/docs/aep-registry.md)
+- [Broker Boundary](https://github.com/atelia-labs/atelia/blob/main/docs/broker-boundary.md)
 - [Hooks](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.md)
 
 ## Release And Research

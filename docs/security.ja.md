@@ -2,7 +2,15 @@
 
 Atelia Secretary は、リポジトリ、外部サービス、自動化エージェントへのアクセスを制御します。そのため、セキュリティ上重要な daemon として設計されなければなりません。
 
-Extension / Hook の規範的な安全モデルは [`atelia/docs/extension-security.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/extension-security.ja.md) を参照します。この文書では Secretary daemon 固有の security boundary を扱います。
+AEP package、Surface Protocol、service、broker boundary、Hook の規範的な安全モデルは次を参照します。
+
+- [`atelia/docs/aep-manifest.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/aep-manifest.ja.md)
+- [`atelia/docs/aep-services.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/aep-services.ja.md)
+- [`atelia/docs/surface-protocol.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/surface-protocol.ja.md)
+- [`atelia/docs/broker-boundary.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/broker-boundary.ja.md)
+- [`atelia/docs/hooks.ja.md`](https://github.com/atelia-labs/atelia/blob/main/docs/hooks.ja.md)
+
+この文書では Secretary daemon 固有の security boundary を扱います。
 
 ## 基本ルール
 
@@ -126,7 +134,7 @@ Secretary が現在提供している local boundary の mitigation は次の 2 
 - [Tool Catalog](tool-catalog.ja.md): capability area と default risk tier を定義します。
 - [Tool Definition Schema](tool-definition-schema.ja.md): tool identity、input schema、effects、runtime behavior、customization surface を定義します。
 - [Tool Output Schema](tool-output-schema.ja.md): agent-facing output、audit separation、redaction、TOON / JSON format selection を定義します。
-- [Extensions Runtime](extensions-runtime.ja.md): manifest enforcement、extension sandbox、provenance、rollback、blocklist behavior を定義します。
+- [AEP Package Runtime](extensions-runtime.ja.md): manifest enforcement、package sandbox、provenance、rollback、blocklist behavior を定義します。
 - [Operational AX Analytics](operational-ax-analytics.ja.md): AX 改善のための privacy-preserving analytics を定義します。
 
 ## 報告

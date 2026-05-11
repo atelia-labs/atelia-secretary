@@ -55,8 +55,8 @@ of the analytics stream.
 - `AXFeedbackResolved`
 - `HookTriggered`
 - `HookBlocked`
-- `ExtensionExecuted`
-- `ExtensionBlocked`
+- `PackageExecuted`
+- `PackageBlocked`
 - `RecoveryUsed`
 - `HumanCorrectionReceived`
 
@@ -249,7 +249,7 @@ Local workplace path:
 
 1. Analytics detects a friction pattern.
 2. Secretary or AX improvement agent reviews the pattern.
-3. A local setting, extension, Hook, memory update, notification, or workflow
+3. A local setting, package, Hook, memory update, notification, or workflow
    improvement is proposed.
 4. The change is implemented and verified.
 5. Analytics watches whether friction declines.

@@ -20,7 +20,7 @@ Atelia Secretary には、複雑な database より先に local ledger が必要
 | `jobs` | requested work |
 | `job_events` | ordered lifecycle and observation events |
 | `policy_decisions` | policy outcome before execution |
-| `tool_invocations` | attempted built-in or extension tool calls |
+| `tool_invocations` | attempted built-in or package tool calls |
 | `tool_results` | canonical structured outputs |
 | `audit_records` | durable policy and execution evidence |
 | `lock_decisions` | durable repository/path mutual-exclusion decisions |

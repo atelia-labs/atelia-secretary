@@ -173,7 +173,7 @@ Useful cases:
 
 ## Schema Compatibility
 
-`tool_result.v1` is a public implementation contract once extensions, clients,
+`tool_result.v1` is a public implementation contract once packages, clients,
 or golden fixtures depend on it.
 
 Compatibility rules:
@@ -242,7 +242,7 @@ product vocabulary for workplace ergonomics, not the wire schema.
 Preferences are workplace ergonomics.
 
 These preferences express Secretary's professional judgment about its workplace.
-Clients, extensions, and supporting agents can propose changes; Secretary owns
+Clients, packages, and supporting agents can propose changes; Secretary owns
 the persistent preference.
 The daemon exposes shipped settings through
 `/v1/tool-output/settings/get`, `/v1/tool-output/settings/update`, and

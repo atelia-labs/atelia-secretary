@@ -7,6 +7,10 @@ A tool definition is a workplace contract. It tells Secretary what the tool can
 do, what authority it needs, what evidence it returns, how it fails, and how the
 result can be shaped for AX.
 
+The `provider.kind: extension` enum value in the beta schema is retained as
+wire/API vocabulary for package-provided tools until the implementation catches
+up.
+
 ## Minimum Definition
 
 ```yaml
@@ -58,7 +62,9 @@ customization:
 Tool ids are stable and namespaced:
 
 - built-in: `fs.search`, `proc.run`, `job.status`
-- extension: `extension.<extension_id>.<tool_id>`
+- package-provided beta: `extension.<package_id>.<tool_id>`; the literal
+  `extension` prefix is retained in the current beta wire/API for
+  compatibility, while `<package_id>` identifies the AEP package
 - remote: `remote.<provider_id>.<tool_id>`
 - workflow: `workflow.<workflow_id>.<tool_id>`
 
@@ -160,12 +166,12 @@ Future or non-shipped built-ins:
 - `agent.takeover`
 
 Git helpers, GitHub, Linear, memory providers, memory strategies, notification,
-review agents, and approval agents are defined by extensions using the same
+review agents, and approval agents are defined by AEP packages using the same
 schema.
 
 The `approval.*` built-ins are boundary tools for submitting and verifying
-decisions. Approval judgment itself comes from humans or Approval Agent
-extensions.
+decisions. Approval judgment itself comes from humans or approval-agent
+packages.
 
 ## Output Schema
 
@@ -253,13 +259,13 @@ Protected:
 - required evidence identifiers
 
 Persistent defaults are owned by Secretary preferences. Supporting agents and
-extensions can propose changes through visible preference updates.
+packages can propose changes through visible preference updates.
 
-## Extension Tools
+## Package Tools
 
-Extension-provided tools declare the same schema as built-ins. The extension
-manifest references each tool definition and the permissions needed to expose
-it.
+Package-provided tools declare the same schema as built-ins. The AEP package
+manifest references each tool definition and the package-owned permissions
+needed to expose it.
 
 Secretary validates:
 
@@ -268,6 +274,6 @@ Secretary validates:
 - supported output schema range
 - required audit fields
 - runtime availability
-- provenance and extension version
+- provenance and package version
 
 If validation fails, the tool is unavailable with structured reason.

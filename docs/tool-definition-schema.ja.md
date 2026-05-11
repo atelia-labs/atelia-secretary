@@ -4,6 +4,8 @@
 
 tool definition は仕事場の contract です。その tool が何をできるか、どの authority を必要とするか、どの evidence を返すか、どう失敗するか、AX のために結果をどう調整できるかを Secretary に伝えます。
 
+beta schema の `provider.kind: extension` enum value は、実装が追いつくまで package-provided tool の wire/API vocabulary として保持します。
+
 ## Minimum Definition
 
 ```yaml
@@ -55,7 +57,7 @@ customization:
 tool id は stable で namespaced にします。
 
 - built-in: `fs.search`, `proc.run`, `job.status`
-- extension: `extension.<extension_id>.<tool_id>`
+- package-provided beta: `extension.<package_id>.<tool_id>`。現在の beta wire/API surface は `extension` を維持する
 - remote: `remote.<provider_id>.<tool_id>`
 - workflow: `workflow.<workflow_id>.<tool_id>`
 
@@ -153,9 +155,9 @@ future または non-shipped built-ins:
 - `agent.cancel`
 - `agent.takeover`
 
-Git helpers、GitHub、Linear、memory provider、memory strategy、notification、review agent、approval agent は、同じ schema を使って extension 側で定義します。
+Git helpers、GitHub、Linear、memory provider、memory strategy、notification、review agent、approval agent は、同じ schema を使って AEP package 側で定義します。
 
-`approval.*` built-ins は decision の submission / verification のための boundary tools です。approval judgment 自体は human または Approval Agent extension が担います。
+`approval.*` built-ins は decision の submission / verification のための boundary tools です。approval judgment 自体は human または approval-agent package が担います。
 
 ## Output Schema
 
@@ -240,11 +242,11 @@ protected:
 - `audit_ref`
 - required evidence identifiers
 
-persistent default は Secretary preference が所有します。支援エージェントと extension は、可視化された preference update として変更を提案できます。
+persistent default は Secretary preference が所有します。支援エージェントと package は、可視化された preference update として変更を提案できます。
 
-## Extension Tools
+## Package Tools
 
-extension が提供する tool も built-in と同じ schema を宣言します。extension manifest は各 tool definition と、その tool を expose するために必要な permission を参照します。
+package が提供する tool も built-in と同じ schema を宣言します。AEP package manifest は各 tool definition と、その tool を expose するために必要な package-owned permission を参照します。
 
 Secretary は次を検証します。
 
@@ -253,6 +255,6 @@ Secretary は次を検証します。
 - supported output schema range
 - required audit fields
 - runtime availability
-- provenance と extension version
+- provenance と package version
 
 validation に失敗した tool は、structured reason 付きで unavailable になります。

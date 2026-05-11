@@ -12,7 +12,7 @@ policy は Secretary の judgment と daemon execution の境界です。daemon 
 | R3 | external effect, broad mutation, secret use, or approval-sensitive action | needs approval |
 | R4 | blocked by policy or unsupported capability | blocked |
 
-tier は default です。repository trust、user preference、extension provenance、current context により risk は上がり得ます。
+tier は default です。repository trust、user preference、package provenance、current context により risk は上がり得ます。
 
 ## Policy Inputs
 
@@ -64,7 +64,7 @@ full human approval UI が存在する前でも、daemon は approval record を
 - explicit argv、cwd、timeout、env allowlist を持つ process execution: R2 or R3
 - broad repository mutation: R3
 - destructive repository action: explicit policy ができるまで R4
-- external network or service call: extension-only、default R3
+- external network or service call: package-only、default R3
 - secret access: R3
 
 ## Policy Versioning
