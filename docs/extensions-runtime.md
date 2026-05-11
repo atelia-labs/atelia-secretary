@@ -153,6 +153,12 @@ broker-family, content-risk, and data-disclosure summaries require a later
 manifest-summary projection because those fields are not yet persisted in the
 install record.
 
+The shipping HTTP/JSON beta transport already exposes this surface as
+`ListPackageTrustIndex`, and proto now reserves the same read-only contract. It
+includes `package_id`, `version`, `status`, `boundary`, `manifest_digest`,
+`artifact_digest`, source snapshot, lineage, publication, and block marker. It
+does not expand into install/update/execute flows or audit/quarantine history.
+
 The current Rust identifiers and RPC names still use `extension` for beta
 compatibility. That is implementation vocabulary, not product positioning.
 
