@@ -267,6 +267,7 @@ fn open_canonical_file_within_scope(canonical: &CanonicalPath) -> io::Result<Fil
 
 fn open_artifact_file_within_scope(path: &Path) -> io::Result<File> {
     let expected_metadata = fs::metadata(path)?;
+    #[cfg(target_os = "linux")]
     let expected_path = path.canonicalize()?;
     #[cfg(unix)]
     let (expected_dev, expected_ino) = (expected_metadata.dev(), expected_metadata.ino());
@@ -387,7 +388,7 @@ fn open_no_follow_in_parent_dir(
             parent.as_raw_fd(),
             cstring.as_ptr(),
             flags,
-            0o666 as libc::mode_t,
+            0o666 as libc::c_int,
         )
     };
     if fd < 0 {
@@ -410,7 +411,7 @@ fn open_read_no_follow_in_parent_dir(parent: &File, name: &std::ffi::OsStr) -> i
             parent.as_raw_fd(),
             cstring.as_ptr(),
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o666 as libc::mode_t,
+            0o666 as libc::c_int,
         )
     };
     if fd < 0 {
@@ -455,7 +456,7 @@ fn open_or_create_no_follow_in_parent_dir(
             parent.as_raw_fd(),
             cstring.as_ptr(),
             libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o666 as libc::mode_t,
+            0o666 as libc::c_int,
         )
     };
     if fd < 0 {
@@ -3662,7 +3663,8 @@ fn ensure_named_entry_matches(
 
     // SAFETY: `fstatat` returned success and initialized `stat`.
     let stat = unsafe { stat.assume_init() };
-    if stat.st_dev != expected.dev() || stat.st_ino != expected.ino() {
+    if stat.st_dev != expected.dev() as libc::dev_t || stat.st_ino != expected.ino() as libc::ino_t
+    {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, context));
     }
 
@@ -3699,7 +3701,10 @@ fn named_entry_matches_metadata(
 
     // SAFETY: `fstatat` returned success and initialized `stat`.
     let stat = unsafe { stat.assume_init() };
-    Ok(stat.st_dev == expected.dev() && stat.st_ino == expected.ino())
+    Ok(
+        stat.st_dev == expected.dev() as libc::dev_t
+            && stat.st_ino == expected.ino() as libc::ino_t,
+    )
 }
 
 #[cfg(unix)]
