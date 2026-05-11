@@ -307,43 +307,65 @@ pub struct ExtensionProvenance {
     pub signer: Option<String>,
 }
 
+/// Lineage metadata for a package derived from another package.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtensionLineage {
+    /// Parent package id that the current package derives from.
     pub parent_id: String,
+    /// Parent package version when the derivation target is versioned.
     pub parent_version: Option<String>,
+    /// Parent manifest digest when the exact source manifest is known.
     pub parent_manifest_digest: Option<String>,
+    /// Relationship between the current package and its parent.
     pub relationship: ExtensionLineageRelationship,
 }
 
+/// Relationship between a derived package and its lineage parent.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionLineageRelationship {
+    /// User-owned remix that remains tied to its parent package identity.
     Remix,
+    /// Fork that preserves source ancestry while allowing independent evolution.
     Fork,
+    /// Derived package with a looser provenance relationship to the parent.
     Derived,
 }
 
+/// Publication metadata that describes registry visibility separately from source authority.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtensionPublication {
+    /// Current visibility state for discovery and sharing.
     pub visibility: ExtensionPublicationVisibility,
+    /// Registry submission state for this package revision.
     pub registry_submission: ExtensionRegistrySubmission,
 }
 
+/// Visibility state for a package publication.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionPublicationVisibility {
+    /// Private remix visible only inside the user's harness or workspace.
     PrivateRemix,
+    /// Shared directly without public registry searchability.
     UnlistedShare,
+    /// Publicly searchable through the registry subject to submission policy.
     PublicSearchable,
+    /// Official publication controlled by host policy.
     Official,
 }
 
+/// Registry submission state for package publication.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionRegistrySubmission {
+    /// Not submitted to a registry.
     NotSubmitted,
+    /// Submitted and awaiting registry decision.
     Submitted,
+    /// Accepted by registry policy.
     Accepted,
+    /// Rejected by registry policy.
     Rejected,
 }
 
@@ -1923,6 +1945,7 @@ pub struct InstallExtensionRequest {
     pub approve_local_unsigned: bool,
     #[serde(default)]
     pub allow_local_process_runtime: bool,
+    /// Explicitly approve a source authority change for an install or update.
     #[serde(default)]
     pub approve_source_change: bool,
 }
@@ -1972,6 +1995,7 @@ pub struct UpdateExtensionRequest {
     pub approve_local_unsigned: bool,
     #[serde(default)]
     pub allow_local_process_runtime: bool,
+    /// Explicitly approve a source authority change for this update.
     #[serde(default)]
     pub approve_source_change: bool,
 }
@@ -2261,6 +2285,7 @@ impl InstallOptions {
         self
     }
 
+    /// Allow an install or update to replace the package's recorded source authority.
     pub fn approve_source_change(mut self) -> Self {
         self.approve_source_change = Some(true);
         self
@@ -2281,17 +2306,25 @@ pub struct ExtensionInstallRecord {
     pub rollback_snapshot: Option<RollbackSnapshot>,
 }
 
+/// Persisted source provenance snapshot for an installed package revision.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtensionSourceSnapshot {
+    /// Source class that produced this package revision.
     pub source: ProvenanceSource,
+    /// Source repository, when the package is repository-backed.
     pub repository: Option<String>,
+    /// Source commit retained for audit, but not treated as authority identity.
     pub commit: Option<String>,
+    /// Registry identity, when the package came from a registry.
     pub registry_identity: Option<String>,
+    /// Package lineage retained with the installed revision.
     pub lineage: Option<ExtensionLineage>,
+    /// Publication state retained with the installed revision.
     pub publication: Option<ExtensionPublication>,
 }
 
 impl ExtensionSourceSnapshot {
+    /// Build an install-record source snapshot from manifest provenance.
     pub fn from_provenance(provenance: &ExtensionProvenance) -> Self {
         Self {
             source: provenance.source,
