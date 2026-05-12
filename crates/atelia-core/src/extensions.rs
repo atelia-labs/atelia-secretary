@@ -1685,7 +1685,11 @@ impl ExtensionRegistry {
     ) -> RegistryResult<ExtensionInstallRecord> {
         let validated = self.run_validation_checks(manifest, options)?;
 
-        let previous_version = self.active_versions.get(&validated.manifest.id).cloned();
+        let previous_version = self
+            .active_versions
+            .get(&validated.manifest.id)
+            .filter(|version| *version != &validated.manifest.version)
+            .cloned();
         let approved_permissions = validated
             .manifest
             .permissions
@@ -2130,6 +2134,20 @@ fn validate_extension_registry_snapshot(
                     "record version {} does not match extension map key {}",
                     record.version, version
                 ));
+            }
+            if let Some(previous_version) = &record.previous_version {
+                if previous_version == version {
+                    return Err(format!(
+                        "record {extension_id}:{version} has self-referential previous_version"
+                    ));
+                }
+                if !manifests.contains_key(previous_version)
+                    || !records.contains_key(previous_version)
+                {
+                    return Err(format!(
+                        "record {extension_id}:{version} references missing previous_version {previous_version}"
+                    ));
+                }
             }
             if manifest.id != *extension_id {
                 return Err(format!(
@@ -3103,6 +3121,42 @@ mod tests {
         }
     }
 
+    fn extension_record(
+        manifest: &ExtensionManifest,
+        previous_version: Option<&str>,
+    ) -> ExtensionInstallRecord {
+        ExtensionInstallRecord {
+            id: manifest.id.clone(),
+            version: manifest.version.clone(),
+            manifest_digest: manifest.provenance.manifest_digest.clone(),
+            artifact_digest: manifest.provenance.artifact_digest.clone(),
+            source: ExtensionSourceSnapshot::from_provenance(&manifest.provenance),
+            boundary: ExtensionBoundary::ThirdParty,
+            status: ExtensionInstallStatus::Installed,
+            previous_version: previous_version.map(str::to_string),
+            approved_permissions: Vec::new(),
+            rollback_snapshot: None,
+        }
+    }
+
+    fn extension_snapshot(
+        manifest_versions: BTreeMap<String, ExtensionManifest>,
+        record_versions: BTreeMap<String, ExtensionInstallRecord>,
+    ) -> ExtensionRegistrySnapshot {
+        let mut manifests = BTreeMap::new();
+        manifests.insert("com.example.extension".to_string(), manifest_versions);
+
+        let mut records = BTreeMap::new();
+        records.insert("com.example.extension".to_string(), record_versions);
+
+        ExtensionRegistrySnapshot {
+            manifests,
+            records,
+            active_versions: BTreeMap::new(),
+            blocklist: Vec::new(),
+        }
+    }
+
     #[test]
     fn validates_backend_wasm_rust_manifest() {
         let validated = manifest("com.example.extension")
@@ -3994,6 +4048,22 @@ mod tests {
     }
 
     #[test]
+    fn same_version_reinstall_does_not_create_self_referential_rollback() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let reinstalled = registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        assert_eq!(reinstalled.version, "1.0.0");
+        assert_eq!(reinstalled.previous_version, None);
+        registry.snapshot().validate().unwrap();
+    }
+
+    #[test]
     fn same_bundle_service_call_requires_explicit_consume_declaration() {
         let permission_name = "service.review.comments";
         let provider_id = "com.example.provider";
@@ -4216,6 +4286,41 @@ mod tests {
                 .version,
             "1.0.0"
         );
+    }
+
+    #[test]
+    fn extension_snapshot_rejects_self_referential_previous_version() {
+        let first = manifest("com.example.extension");
+        let snapshot = extension_snapshot(
+            BTreeMap::from([(first.version.clone(), first.clone())]),
+            BTreeMap::from([(
+                first.version.clone(),
+                extension_record(&first, Some(&first.version)),
+            )]),
+        );
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("self-referential previous_version"));
+    }
+
+    #[test]
+    fn extension_snapshot_rejects_missing_previous_version_manifest() {
+        let mut second = manifest("com.example.extension");
+        second.version = "1.1.0".to_string();
+        second.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        second.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        let snapshot = extension_snapshot(
+            BTreeMap::from([(second.version.clone(), second.clone())]),
+            BTreeMap::from([(
+                second.version.clone(),
+                extension_record(&second, Some("0.9.0")),
+            )]),
+        );
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("references missing previous_version"));
+        assert!(err.contains("0.9.0"));
     }
 
     #[test]

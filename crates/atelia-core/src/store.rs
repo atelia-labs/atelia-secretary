@@ -365,12 +365,13 @@ impl InMemoryStore {
 
     pub fn with_durable_snapshot_path(snapshot_path: impl Into<PathBuf>) -> StoreResult<Self> {
         let snapshot_path = snapshot_path.into();
-        let inner = if snapshot_path.exists() {
+        let mut inner = if snapshot_path.exists() {
             load_durable_snapshot(&snapshot_path)?
         } else {
             InMemoryInner::default()
         };
 
+        repair_loaded_extension_registry_snapshot(&mut inner.extension_registry_snapshot);
         validate_loaded_store(&inner)?;
 
         Ok(Self {
@@ -1994,6 +1995,16 @@ fn validate_loaded_store(inner: &InMemoryInner) -> StoreResult<()> {
     validate_loaded_job_event_sequence(inner)?;
 
     Ok(())
+}
+
+fn repair_loaded_extension_registry_snapshot(snapshot: &mut ExtensionRegistrySnapshot) {
+    for records in snapshot.records.values_mut() {
+        for (version, record) in records {
+            if record.previous_version.as_ref() == Some(version) {
+                record.previous_version = None;
+            }
+        }
+    }
 }
 
 fn validate_loaded_job_record(inner: &InMemoryInner, job: &JobRecord) -> StoreResult<()> {
@@ -8650,6 +8661,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn durable_store_repairs_self_referential_extension_rollback_snapshot() {
+        let storage_dir = durable_storage_dir("repair-self-referential-extension-rollback");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let manifest = extension_manifest(
+            "com.example.extension",
+            "1.0.0",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let mut record = extension_record(&manifest, "1.0.0");
+        record.previous_version = Some("1.0.0".to_string());
+
+        let mut manifests = BTreeMap::new();
+        let mut manifest_versions = BTreeMap::new();
+        manifest_versions.insert(manifest.version.clone(), manifest.clone());
+        manifests.insert(manifest.id.clone(), manifest_versions);
+
+        let mut records = BTreeMap::new();
+        let mut record_versions = BTreeMap::new();
+        record_versions.insert(record.version.clone(), record);
+        records.insert(manifest.id.clone(), record_versions);
+
+        let inner = InMemoryInner {
+            extension_registry_snapshot: extension_registry_snapshot(manifests, records),
+            ..Default::default()
+        };
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner,
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let store = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        let snapshot = store.extension_registry_snapshot().unwrap();
+        let previous_version = snapshot
+            .records
+            .get("com.example.extension")
+            .unwrap()
+            .get("1.0.0")
+            .unwrap()
+            .previous_version
+            .as_deref();
+        assert_eq!(previous_version, None);
     }
 
     #[test]
