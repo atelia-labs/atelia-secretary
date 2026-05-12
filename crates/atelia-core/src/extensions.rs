@@ -105,6 +105,7 @@ impl Default for ExtensionManifest {
 }
 
 impl ExtensionManifest {
+    /// Validate a manifest with install-equivalent policy checks without recording it.
     pub fn validate(
         &self,
         policy: &ManifestValidationPolicy,
@@ -1616,11 +1617,11 @@ impl ExtensionRegistry {
         Ok(())
     }
 
-    pub fn install(
-        &mut self,
+    fn run_validation_checks(
+        &self,
         manifest: ExtensionManifest,
         options: InstallOptions,
-    ) -> RegistryResult<ExtensionInstallRecord> {
+    ) -> RegistryResult<ValidatedExtensionManifest> {
         let mut validation_policy = self.validation_policy.clone();
         if let Some(approve_local_unsigned) = options.approve_local_unsigned {
             validation_policy.allow_local_unsigned = approve_local_unsigned;
@@ -1633,6 +1634,15 @@ impl ExtensionRegistry {
         self.ensure_not_blocked(&validated.manifest)?;
         self.ensure_same_version_digest_is_stable(&validated.manifest)?;
         self.ensure_source_change_is_approved(&validated.manifest, options)?;
+        Ok(validated)
+    }
+
+    pub fn install(
+        &mut self,
+        manifest: ExtensionManifest,
+        options: InstallOptions,
+    ) -> RegistryResult<ExtensionInstallRecord> {
+        let validated = self.run_validation_checks(manifest, options)?;
 
         let previous_version = self.active_versions.get(&validated.manifest.id).cloned();
         let approved_permissions = validated
@@ -1670,6 +1680,20 @@ impl ExtensionRegistry {
             .insert(record.id.clone(), record.version.clone());
 
         Ok(record)
+    }
+
+    /// Validate a manifest with the same preflight checks used by install.
+    pub fn validate(
+        &self,
+        manifest: ExtensionManifest,
+        options: InstallOptions,
+    ) -> RegistryResult<ValidateExtensionManifestResponse> {
+        let validated = self.run_validation_checks(manifest, options)?;
+
+        Ok(ValidateExtensionManifestResponse {
+            manifest: validated.manifest,
+            boundary: validated.boundary,
+        })
     }
 
     pub fn rollback(&mut self, extension_id: &str) -> RegistryResult<ExtensionInstallRecord> {
@@ -2067,6 +2091,67 @@ pub struct InstallExtensionRequest {
     pub approve_source_change: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Request body for side-effect-free manifest validation.
+pub struct ValidateExtensionManifestRequest {
+    /// Manifest to validate.
+    pub manifest: ExtensionManifest,
+    /// Allow unsigned local-development manifests for this validation.
+    #[serde(default)]
+    pub approve_local_unsigned: bool,
+    /// Allow local process runtimes for this validation.
+    #[serde(default)]
+    pub allow_local_process_runtime: bool,
+    /// Explicitly approve a source authority change for this validation.
+    #[serde(default)]
+    pub approve_source_change: bool,
+}
+
+impl ValidateExtensionManifestRequest {
+    /// Build a validation request using the same defaults as install requests.
+    pub fn with_defaults(manifest: ExtensionManifest) -> Self {
+        Self {
+            manifest,
+            approve_local_unsigned: false,
+            allow_local_process_runtime: false,
+            approve_source_change: false,
+        }
+    }
+}
+
+impl From<ValidateExtensionManifestRequest> for InstallOptions {
+    /// Convert an owned validation request into registry install-policy options.
+    fn from(request: ValidateExtensionManifestRequest) -> Self {
+        Self::from(&request)
+    }
+}
+
+impl From<&ValidateExtensionManifestRequest> for InstallOptions {
+    /// Convert a borrowed validation request into registry install-policy options.
+    fn from(request: &ValidateExtensionManifestRequest) -> Self {
+        let mut options = InstallOptions::default();
+        if request.approve_local_unsigned {
+            options = options.approve_local_unsigned();
+        }
+        if request.allow_local_process_runtime {
+            options = options.allow_local_process_runtime();
+        }
+        if request.approve_source_change {
+            options = options.approve_source_change();
+        }
+        options
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Registry response returned after manifest validation succeeds.
+pub struct ValidateExtensionManifestResponse {
+    /// Manifest after schema validation and normalization.
+    pub manifest: ExtensionManifest,
+    /// Computed execution boundary for the validated manifest.
+    pub boundary: ExtensionBoundary,
+}
+
 impl InstallExtensionRequest {
     pub fn with_defaults(manifest: ExtensionManifest) -> Self {
         Self {
@@ -2264,6 +2349,15 @@ impl ExtensionRegistryService {
             .install(request.manifest, options)
             .map(|record| InstallExtensionResponse { record })?;
         Ok(record)
+    }
+
+    /// Validate a manifest against registry policy without installing it.
+    pub fn validate_extension_manifest(
+        &self,
+        request: ValidateExtensionManifestRequest,
+    ) -> RegistryResult<ValidateExtensionManifestResponse> {
+        let options = InstallOptions::from(&request);
+        self.registry.validate(request.manifest, options)
     }
 
     pub fn update_extension(
@@ -3492,6 +3586,74 @@ mod tests {
         registry
             .install(process, InstallOptions::default())
             .unwrap();
+    }
+
+    #[test]
+    /// Validating a candidate manifest succeeds without mutating registry maps.
+    fn validate_extension_manifest_passes_without_mutating_registry_state() {
+        let mut registry = ExtensionRegistry::in_memory();
+        let mut manifest_v1 = manifest("com.example.extension");
+        manifest_v1.version = "1.0.0".to_string();
+        registry
+            .install(manifest_v1.clone(), InstallOptions::default())
+            .unwrap();
+
+        let manifests_before = registry.manifests.clone();
+        let records_before = registry.records.clone();
+        let active_versions_before = registry.active_versions.clone();
+        let blocklist_before = registry.blocklist.clone();
+
+        let mut manifest_v2 = manifest("com.example.extension");
+        manifest_v2.version = "1.1.0".to_string();
+        manifest_v2.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        manifest_v2.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        let validated = registry
+            .validate(manifest_v2.clone(), InstallOptions::default())
+            .unwrap();
+        assert_eq!(validated.manifest.version, manifest_v2.version);
+        assert_eq!(validated.boundary, ExtensionBoundary::ThirdParty);
+
+        assert_eq!(registry.manifests, manifests_before);
+        assert_eq!(registry.records, records_before);
+        assert_eq!(registry.active_versions, active_versions_before);
+        assert_eq!(registry.blocklist, blocklist_before);
+    }
+
+    #[test]
+    /// Invalid manifest validation fails without mutating registry maps.
+    fn validate_extension_manifest_rejects_invalid_manifest_without_mutating_registry_state() {
+        let mut registry = ExtensionRegistry::in_memory();
+        let mut manifest_v1 = manifest("com.example.extension");
+        manifest_v1.version = "1.0.0".to_string();
+        registry
+            .install(manifest_v1.clone(), InstallOptions::default())
+            .unwrap();
+
+        let manifests_before = registry.manifests.clone();
+        let records_before = registry.records.clone();
+        let active_versions_before = registry.active_versions.clone();
+        let blocklist_before = registry.blocklist.clone();
+
+        let mut manifest_v2 = manifest("com.example.extension");
+        manifest_v2.version = "not-semver".to_string();
+
+        let err = registry
+            .validate(manifest_v2, InstallOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RegistryError::Validation(ExtensionValidationError::InvalidField {
+                field: "version",
+                ..
+            })
+        ));
+
+        assert_eq!(registry.manifests, manifests_before);
+        assert_eq!(registry.records, records_before);
+        assert_eq!(registry.active_versions, active_versions_before);
+        assert_eq!(registry.blocklist, blocklist_before);
     }
 
     #[test]

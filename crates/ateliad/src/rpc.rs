@@ -32,7 +32,7 @@ use atelia_core::{
     RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier, RollbackExtensionRequest,
     StoreError, ToolInvocationId, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity, ToolResultId,
-    TruncationMetadata, UpdateExtensionRequest, WatchJobEvent,
+    TruncationMetadata, UpdateExtensionRequest, ValidateExtensionManifestRequest, WatchJobEvent,
 };
 use std::convert::TryFrom;
 use tokio::sync::mpsc;
@@ -307,6 +307,19 @@ impl SecretaryRpcServer {
         Ok(InstallExtensionResponse {
             metadata: self.metadata(),
             record: response.record,
+        })
+    }
+
+    /// Validate an extension manifest without installing or mutating registry state.
+    pub fn validate_extension(
+        &self,
+        request: ValidateExtensionManifestRequest,
+    ) -> RpcResult<ValidateExtensionResponse> {
+        let response = self.service.validate_extension(request)?;
+        Ok(ValidateExtensionResponse {
+            metadata: self.metadata(),
+            manifest: response.manifest,
+            boundary: response.boundary,
         })
     }
 
@@ -1450,6 +1463,17 @@ pub struct RpcEventRefs {
 pub struct InstallExtensionResponse {
     pub metadata: ProtocolMetadata,
     pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// RPC response for manifest validation preflight checks.
+pub struct ValidateExtensionResponse {
+    /// Protocol metadata for the validation response.
+    pub metadata: ProtocolMetadata,
+    /// Manifest accepted by the validation pipeline.
+    pub manifest: atelia_core::ExtensionManifest,
+    /// Execution boundary computed from the manifest.
+    pub boundary: atelia_core::ExtensionBoundary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4784,6 +4808,7 @@ mod tests {
     }
 
     #[test]
+    /// Exercises extension registry operations, including validation, through the RPC layer.
     fn extension_registry_round_trip_through_rpc_surface() {
         const ARTIFACT_V1: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -4810,13 +4835,28 @@ mod tests {
 
         let install = server
             .install_extension(InstallExtensionRequest {
-                manifest: manifest_v1,
+                manifest: manifest_v1.clone(),
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
             })
             .expect("install should succeed");
         assert_eq!(install.record.version, "1.0.0");
+
+        let validated = server
+            .validate_extension(atelia_core::ValidateExtensionManifestRequest {
+                manifest: manifest_v1,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("validation should succeed");
+        assert_eq!(validated.manifest.id, "com.example.review.extension");
+        assert_eq!(validated.manifest.version, "1.0.0");
+        assert_eq!(
+            validated.boundary,
+            atelia_core::ExtensionBoundary::ThirdParty
+        );
 
         let updated = server
             .update_extension(UpdateExtensionRequest {
