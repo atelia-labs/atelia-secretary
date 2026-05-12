@@ -4835,16 +4835,25 @@ mod tests {
         artifact_digest: &str,
         manifest_digest: &str,
     ) -> ExtensionManifest {
-        let mut manifest = ExtensionManifest::default();
-        manifest.id = id.to_string();
-        manifest.version = version.to_string();
-        manifest.provenance.artifact_digest = artifact_digest.to_string();
-        manifest.provenance.manifest_digest = manifest_digest.to_string();
-        manifest.provenance.source = ProvenanceSource::Registry;
-        manifest.provenance.registry_identity = Some("test-registry".to_string());
-        manifest.provenance.signature = Some("signature".to_string());
-        manifest.provenance.signer = Some("test@example.com".to_string());
-        manifest
+        ExtensionManifest {
+            id: id.to_string(),
+            version: version.to_string(),
+            provenance: crate::ExtensionProvenance {
+                artifact_digest: artifact_digest.to_string(),
+                manifest_digest: manifest_digest.to_string(),
+                source: ProvenanceSource::Registry,
+                repository: None,
+                source_ref: None,
+                manifest_path: None,
+                commit: None,
+                registry_identity: Some("test-registry".to_string()),
+                lineage: None,
+                publication: None,
+                signature: Some("signature".to_string()),
+                signer: Some("test@example.com".to_string()),
+            },
+            ..Default::default()
+        }
     }
 
     fn extension_record(manifest: &ExtensionManifest, version: &str) -> ExtensionInstallRecord {
@@ -8587,8 +8596,10 @@ mod tests {
         record_versions.insert("2.0.0".to_string(), other_record);
         records.insert(manifest.id.clone(), record_versions);
 
-        let mut inner = InMemoryInner::default();
-        inner.extension_registry_snapshot = extension_registry_snapshot(manifests, records);
+        let inner = InMemoryInner {
+            extension_registry_snapshot: extension_registry_snapshot(manifests, records),
+            ..Default::default()
+        };
         let snapshot = DurableStoreSnapshot {
             schema_version: DURABLE_STORE_SCHEMA_VERSION,
             inner,
@@ -8645,9 +8656,13 @@ mod tests {
     fn durable_store_rejects_unsupported_extension_blocklist_snapshot() {
         let storage_dir = durable_storage_dir("invalid-extension-blocklist");
         let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
-        let mut inner = InMemoryInner::default();
-        inner.extension_registry_snapshot =
-            extension_registry_snapshot(BTreeMap::new(), BTreeMap::new());
+        let mut inner = InMemoryInner {
+            extension_registry_snapshot: extension_registry_snapshot(
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            ..Default::default()
+        };
         inner
             .extension_registry_snapshot
             .blocklist
