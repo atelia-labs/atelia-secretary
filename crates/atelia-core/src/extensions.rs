@@ -1593,6 +1593,20 @@ pub struct ExtensionRegistry {
     validation_policy: ManifestValidationPolicy,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionRegistrySnapshot {
+    pub manifests: BTreeMap<String, BTreeMap<String, ExtensionManifest>>,
+    pub records: BTreeMap<String, BTreeMap<String, ExtensionInstallRecord>>,
+    pub active_versions: BTreeMap<String, String>,
+    pub blocklist: Vec<BlocklistEntry>,
+}
+
+impl ExtensionRegistrySnapshot {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_extension_registry_snapshot(self)
+    }
+}
+
 impl ExtensionRegistry {
     pub fn new(validation_policy: ManifestValidationPolicy) -> Self {
         Self {
@@ -1601,6 +1615,26 @@ impl ExtensionRegistry {
             active_versions: BTreeMap::new(),
             blocklist: Vec::new(),
             validation_policy,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: ExtensionRegistrySnapshot) -> Result<Self, String> {
+        snapshot.validate()?;
+        Ok(Self {
+            manifests: snapshot.manifests,
+            records: snapshot.records,
+            active_versions: snapshot.active_versions,
+            blocklist: snapshot.blocklist,
+            validation_policy: ManifestValidationPolicy::default(),
+        })
+    }
+
+    pub fn snapshot(&self) -> ExtensionRegistrySnapshot {
+        ExtensionRegistrySnapshot {
+            manifests: self.manifests.clone(),
+            records: self.records.clone(),
+            active_versions: self.active_versions.clone(),
+            blocklist: self.blocklist.clone(),
         }
     }
 
@@ -2066,6 +2100,114 @@ impl ExtensionRegistry {
     }
 }
 
+fn validate_extension_registry_snapshot(
+    snapshot: &ExtensionRegistrySnapshot,
+) -> Result<(), String> {
+    for (extension_id, records) in &snapshot.records {
+        for (version, record) in records {
+            let manifests = snapshot.manifests.get(extension_id).ok_or_else(|| {
+                format!("missing manifests map for extension {extension_id} in snapshot")
+            })?;
+            let manifest = manifests.get(version).ok_or_else(|| {
+                format!("active manifest missing for extension {extension_id} version {version}")
+            })?;
+
+            if record.id != *extension_id {
+                return Err(format!(
+                    "record id {} does not match extension map key {}",
+                    record.id, extension_id
+                ));
+            }
+            if record.version != *version {
+                return Err(format!(
+                    "record version {} does not match extension map key {}",
+                    record.version, version
+                ));
+            }
+            if manifest.id != *extension_id {
+                return Err(format!(
+                    "manifest id {} does not match extension map key {}",
+                    manifest.id, extension_id
+                ));
+            }
+            if manifest.version != *version {
+                return Err(format!(
+                    "manifest version {} does not match extension map key {}",
+                    manifest.version, version
+                ));
+            }
+            if manifest.provenance.artifact_digest != record.artifact_digest {
+                return Err(format!(
+                    "artifact digest mismatch for extension {extension_id} version {version}"
+                ));
+            }
+            if manifest.provenance.manifest_digest != record.manifest_digest {
+                return Err(format!(
+                    "manifest digest mismatch for extension {extension_id} version {version}"
+                ));
+            }
+        }
+    }
+
+    for (extension_id, manifests) in &snapshot.manifests {
+        for (version, manifest) in manifests {
+            let records = snapshot.records.get(extension_id).ok_or_else(|| {
+                format!("missing records map for extension {extension_id} in snapshot")
+            })?;
+            let record = records.get(version).ok_or_else(|| {
+                format!("missing record for extension {extension_id} version {version}")
+            })?;
+
+            if manifest.id != *extension_id || manifest.version != *version {
+                return Err(format!(
+                    "manifest key {extension_id}:{version} does not match manifest body {}:{}",
+                    manifest.id, manifest.version
+                ));
+            }
+            if manifest.provenance.artifact_digest != record.artifact_digest {
+                return Err(format!(
+                    "record artifact digest mismatch for extension {extension_id} version {version}"
+                ));
+            }
+            if manifest.provenance.manifest_digest != record.manifest_digest {
+                return Err(format!(
+                    "record manifest digest mismatch for extension {extension_id} version {version}"
+                ));
+            }
+        }
+    }
+
+    for (extension_id, active_version) in &snapshot.active_versions {
+        let records = snapshot
+            .records
+            .get(extension_id)
+            .ok_or_else(|| format!("active extension {extension_id} has no record map"))?;
+        records.get(active_version).ok_or_else(|| {
+            format!("active extension {extension_id} references unknown version {active_version}")
+        })?;
+
+        let manifests = snapshot
+            .manifests
+            .get(extension_id)
+            .ok_or_else(|| format!("active extension {extension_id} has no manifest map"))?;
+        manifests.get(active_version).ok_or_else(|| {
+            format!(
+                "active extension {extension_id} references unknown manifest version {active_version}"
+            )
+        })?;
+    }
+
+    if snapshot
+        .blocklist
+        .iter()
+        .any(|entry| matches!(entry.key, BlockKey::VulnerabilityId(_)))
+    {
+        return Err("extension blocklist contains unsupported vulnerability_id key".to_string());
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtensionBlocklistMatch {
     pub reason: BlockReason,
@@ -2337,6 +2479,10 @@ impl ExtensionRegistryService {
 
     pub fn with_registry(registry: ExtensionRegistry) -> Self {
         Self { registry }
+    }
+
+    pub fn snapshot(&self) -> ExtensionRegistrySnapshot {
+        self.registry.snapshot()
     }
 
     pub fn install_extension(
