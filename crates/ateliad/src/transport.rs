@@ -120,7 +120,7 @@ fn route_for_path(path: &str) -> Route {
         };
     }
     if let Some(extension_id) = path
-        .strip_prefix("/v1/extensions/")
+        .strip_prefix("/v1/packages/")
         .and_then(|path| path.strip_suffix("/authoring-flow"))
         .and_then(valid_extension_id)
     {
@@ -129,7 +129,7 @@ fn route_for_path(path: &str) -> Route {
         };
     }
     if let Some(extension_id) = path
-        .strip_prefix("/v1/extensions/")
+        .strip_prefix("/v1/packages/")
         .and_then(|path| path.strip_suffix("/remix"))
         .and_then(valid_extension_id)
     {
@@ -138,7 +138,7 @@ fn route_for_path(path: &str) -> Route {
         };
     }
     if let Some(extension_id) = path
-        .strip_prefix("/v1/extensions/")
+        .strip_prefix("/v1/packages/")
         .and_then(|path| path.strip_suffix("/publication"))
         .and_then(valid_extension_id)
     {
@@ -147,7 +147,7 @@ fn route_for_path(path: &str) -> Route {
         };
     }
     if let Some(extension_id) = path
-        .strip_prefix("/v1/extensions/")
+        .strip_prefix("/v1/packages/")
         .and_then(|path| path.strip_suffix("/registry-submission"))
         .and_then(valid_extension_id)
     {
@@ -156,7 +156,7 @@ fn route_for_path(path: &str) -> Route {
         };
     }
     if let Some(extension_id) = path
-        .strip_prefix("/v1/extensions/")
+        .strip_prefix("/v1/packages/")
         .and_then(|path| path.strip_suffix("/status"))
         .and_then(valid_extension_id)
     {
@@ -165,7 +165,7 @@ fn route_for_path(path: &str) -> Route {
         };
     }
     if let Some(extension_id) = path
-        .strip_prefix("/v1/extensions/")
+        .strip_prefix("/v1/packages/")
         .and_then(|path| path.strip_suffix("/rollback"))
         .and_then(valid_extension_id)
     {
@@ -174,7 +174,7 @@ fn route_for_path(path: &str) -> Route {
         };
     }
     if let Some(extension_id) = path
-        .strip_prefix("/v1/extensions/")
+        .strip_prefix("/v1/packages/")
         .and_then(|path| path.strip_suffix("/disable"))
         .and_then(valid_extension_id)
     {
@@ -183,7 +183,7 @@ fn route_for_path(path: &str) -> Route {
         };
     }
     if let Some(extension_id) = path
-        .strip_prefix("/v1/extensions/")
+        .strip_prefix("/v1/packages/")
         .and_then(|path| path.strip_suffix("/enable"))
         .and_then(valid_extension_id)
     {
@@ -192,7 +192,7 @@ fn route_for_path(path: &str) -> Route {
         };
     }
     if let Some(extension_id) = path
-        .strip_prefix("/v1/extensions/")
+        .strip_prefix("/v1/packages/")
         .and_then(|path| path.strip_suffix("/remove"))
         .and_then(valid_extension_id)
     {
@@ -201,12 +201,8 @@ fn route_for_path(path: &str) -> Route {
         };
     }
     if let Some(extension_id) = path
-        .strip_prefix("/v1/extensions/")
-        .and_then(|path| {
-            path.strip_suffix("/execute")
-                .or_else(|| path.strip_suffix("/invoke"))
-                .or_else(|| path.strip_suffix("/run"))
-        })
+        .strip_prefix("/v1/packages/")
+        .and_then(|path| path.strip_suffix("/execute"))
         .and_then(valid_extension_id)
     {
         return Route::ExtensionExecution {
@@ -225,13 +221,13 @@ fn route_for_path(path: &str) -> Route {
         "/v1/tool-output/settings/get" => Route::GetToolOutputDefaults,
         "/v1/tool-output/settings/update" => Route::UpdateToolOutputDefaults,
         "/v1/tool-output/settings/history:list" => Route::ListToolOutputSettingsHistory,
-        "/v1/extensions/install" => Route::InstallExtension,
-        "/v1/extensions/validate" => Route::ValidateExtension,
-        "/v1/extensions/update" => Route::UpdateExtension,
-        "/v1/extensions/list" => Route::ListExtensions,
+        "/v1/packages/install" => Route::InstallExtension,
+        "/v1/packages/validate" => Route::ValidateExtension,
+        "/v1/packages/update" => Route::UpdateExtension,
+        "/v1/packages/list" => Route::ListExtensions,
         "/v1/package-trust-index:list" => Route::ListPackageTrustIndex,
-        "/v1/extensions/blocklist/apply" => Route::ApplyBlocklist,
-        "/v1/extensions/blocklist/list" => Route::ListBlocklist,
+        "/v1/packages/blocklist/apply" => Route::ApplyBlocklist,
+        "/v1/packages/blocklist/list" => Route::ListBlocklist,
         "/v1/tool-results:render" => Route::RenderToolOutput,
         "/v1/project-status:get" => Route::ProjectStatus,
         _ => Route::Unsupported,
@@ -2960,17 +2956,16 @@ async fn dispatch_package_remix(
             next_state,
         );
     }
-    if matches!(
-        payload.source_class,
-        Some(rpc::PackageSourceClass::HostShippedBuiltIn | rpc::PackageSourceClass::WorkspaceLocal)
-    ) && payload.source.is_some()
+    if payload.source.is_some()
+        && payload.source_class.is_some()
+        && payload.source_class != Some(rpc::PackageSourceClass::UserSelected)
     {
         let rpc_server = state.read().await;
         let next_state = rpc_next_state(&rpc_server);
         return make_error_response(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
-            "github source cannot be paired with host-shipped or workspace-local source_class",
+            "github source cannot be paired with a non-user-selected source_class",
             false,
             next_state,
         );
@@ -4111,14 +4106,14 @@ pub fn build_router(rpc_server: RpcServerState, auth: LocalAuthConfig) -> Router
         .route("/v1/tool-output/settings/get", any(dispatch_route))
         .route("/v1/tool-output/settings/update", any(dispatch_route))
         .route("/v1/tool-output/settings/history:list", any(dispatch_route))
-        .route("/v1/extensions/install", any(dispatch_route))
-        .route("/v1/extensions/validate", any(dispatch_route))
-        .route("/v1/extensions/update", any(dispatch_route))
-        .route("/v1/extensions/list", any(dispatch_route))
+        .route("/v1/packages/install", any(dispatch_route))
+        .route("/v1/packages/validate", any(dispatch_route))
+        .route("/v1/packages/update", any(dispatch_route))
+        .route("/v1/packages/list", any(dispatch_route))
         .route("/v1/package-trust-index:list", any(dispatch_route))
-        .route("/v1/extensions/blocklist/apply", any(dispatch_route))
-        .route("/v1/extensions/blocklist/list", any(dispatch_route))
-        .route("/v1/extensions/{*path}", any(dispatch_route))
+        .route("/v1/packages/blocklist/apply", any(dispatch_route))
+        .route("/v1/packages/blocklist/list", any(dispatch_route))
+        .route("/v1/packages/{*path}", any(dispatch_route))
         .route("/v1/tool-results:render", any(dispatch_route))
         .route("/v1/project-status:get", any(dispatch_route))
         .fallback(fallback_route)
@@ -4500,113 +4495,106 @@ mod tests {
             Route::ListToolOutputSettingsHistory
         );
         assert_eq!(
-            route_for_path("/v1/extensions/install"),
+            route_for_path("/v1/packages/install"),
             Route::InstallExtension
         );
         assert_eq!(
-            route_for_path("/v1/extensions/validate"),
+            route_for_path("/v1/packages/validate"),
             Route::ValidateExtension
         );
         assert_eq!(
-            route_for_path("/v1/extensions/update"),
+            route_for_path("/v1/packages/update"),
             Route::UpdateExtension
         );
-        assert_eq!(route_for_path("/v1/extensions/list"), Route::ListExtensions);
+        assert_eq!(route_for_path("/v1/packages/list"), Route::ListExtensions);
         assert_eq!(
             route_for_path("/v1/package-trust-index:list"),
             Route::ListPackageTrustIndex
         );
         assert_eq!(
-            route_for_path("/v1/extensions/blocklist/apply"),
+            route_for_path("/v1/packages/blocklist/apply"),
             Route::ApplyBlocklist
         );
         assert_eq!(
-            route_for_path("/v1/extensions/blocklist/list"),
+            route_for_path("/v1/packages/blocklist/list"),
             Route::ListBlocklist
         );
         assert_eq!(
-            route_for_path("/v1/extensions/com.example.extension/authoring-flow"),
+            route_for_path("/v1/packages/com.example.extension/authoring-flow"),
             Route::PackageAuthoringFlow {
                 extension_id: "com.example.extension".to_string()
             }
         );
         assert_eq!(
-            route_for_path("/v1/extensions/com.example.extension/remix"),
+            route_for_path("/v1/packages/com.example.extension/remix"),
             Route::PackageRemix {
                 extension_id: "com.example.extension".to_string()
             }
         );
         assert_eq!(
-            route_for_path("/v1/extensions/com.example.extension/publication"),
+            route_for_path("/v1/packages/com.example.extension/publication"),
             Route::PackagePublication {
                 extension_id: "com.example.extension".to_string()
             }
         );
         assert_eq!(
-            route_for_path("/v1/extensions/com.example.extension/registry-submission"),
+            route_for_path("/v1/packages/com.example.extension/registry-submission"),
             Route::PackageRegistrySubmission {
                 extension_id: "com.example.extension".to_string()
             }
         );
         assert_eq!(
-            route_for_path("/v1/extensions/com.example.extension/status"),
+            route_for_path("/v1/packages/com.example.extension/status"),
             Route::ExtensionStatus {
                 extension_id: "com.example.extension".to_string()
             }
         );
         assert_eq!(
-            route_for_path("/v1/extensions/com.example.extension/rollback"),
+            route_for_path("/v1/packages/com.example.extension/rollback"),
             Route::RollbackExtension {
                 extension_id: "com.example.extension".to_string()
             }
         );
         assert_eq!(
-            route_for_path("/v1/extensions/com.example.extension/disable"),
+            route_for_path("/v1/packages/com.example.extension/disable"),
             Route::DisableExtension {
                 extension_id: "com.example.extension".to_string()
             }
         );
         assert_eq!(
-            route_for_path("/v1/extensions/com.example.extension/enable"),
+            route_for_path("/v1/packages/com.example.extension/enable"),
             Route::EnableExtension {
                 extension_id: "com.example.extension".to_string()
             }
         );
         assert_eq!(
-            route_for_path("/v1/extensions/com.example.extension/remove"),
+            route_for_path("/v1/packages/com.example.extension/remove"),
             Route::RemoveExtension {
                 extension_id: "com.example.extension".to_string()
             }
         );
         assert_eq!(
-            route_for_path("/v1/extensions/com.example.extension/execute"),
+            route_for_path("/v1/packages/com.example.extension/execute"),
             Route::ExtensionExecution {
                 extension_id: "com.example.extension".to_string()
             }
         );
         assert_eq!(
-            route_for_path("/v1/extensions/com.example.extension/invoke"),
-            Route::ExtensionExecution {
-                extension_id: "com.example.extension".to_string()
-            }
-        );
-        assert_eq!(
-            route_for_path("/v1/extensions/com.example.extension/run"),
-            Route::ExtensionExecution {
-                extension_id: "com.example.extension".to_string()
-            }
-        );
-        assert_eq!(route_for_path("/v1/extensions//status"), Route::Unsupported);
-        assert_eq!(
-            route_for_path("/v1/extensions/a/b/status"),
+            route_for_path("/v1/packages/com.example.extension/invoke"),
             Route::Unsupported
         );
         assert_eq!(
-            route_for_path("/v1/extensions//rollback"),
+            route_for_path("/v1/packages/com.example.extension/run"),
             Route::Unsupported
         );
+        assert_eq!(route_for_path("/v1/packages//status"), Route::Unsupported);
         assert_eq!(
-            route_for_path("/v1/extensions/a/b/rollback"),
+            route_for_path("/v1/packages/a/b/status"),
+            Route::Unsupported
+        );
+        assert_eq!(route_for_path("/v1/packages//rollback"), Route::Unsupported);
+        assert_eq!(
+            route_for_path("/v1/packages/a/b/rollback"),
             Route::Unsupported
         );
         assert_eq!(
@@ -6156,7 +6144,7 @@ mod tests {
         let accepted_install_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/install",
+            "/v1/packages/install",
             serde_json::json!({
                 "manifest": accepted_manifest_v1,
                 "approve_local_unsigned": false,
@@ -6173,7 +6161,7 @@ mod tests {
         let rejected_validate_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/validate",
+            "/v1/packages/validate",
             serde_json::json!({
                 "manifest": rejected_manifest_v1,
                 "approve_local_unsigned": false,
@@ -6186,7 +6174,7 @@ mod tests {
         let install_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/install",
+            "/v1/packages/install",
             serde_json::json!({
                 "manifest": manifest_v1,
                 "approve_local_unsigned": false,
@@ -6205,7 +6193,7 @@ mod tests {
         let list_before_validate_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/list",
+            "/v1/packages/list",
             serde_json::json!({
                 "include_blocked": true,
             }),
@@ -6221,7 +6209,7 @@ mod tests {
         let validate_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/validate",
+            "/v1/packages/validate",
             serde_json::json!({
                 "manifest": manifest_v1,
                 "approve_local_unsigned": false,
@@ -6245,7 +6233,7 @@ mod tests {
         let list_after_validate_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/list",
+            "/v1/packages/list",
             serde_json::json!({
                 "include_blocked": true,
             }),
@@ -6270,7 +6258,7 @@ mod tests {
         let accepted_update_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/update",
+            "/v1/packages/update",
             serde_json::json!({
                 "manifest": accepted_manifest_v2,
                 "approve_local_unsigned": false,
@@ -6283,7 +6271,7 @@ mod tests {
         let update_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/update",
+            "/v1/packages/update",
             serde_json::json!({
                 "manifest": manifest_v2,
                 "approve_local_unsigned": false,
@@ -6296,7 +6284,7 @@ mod tests {
         let status_response = send_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/status",
+            "/v1/packages/com.example.review.extension/status",
         )
         .await;
         assert_eq!(status_response.status(), StatusCode::OK);
@@ -6316,7 +6304,7 @@ mod tests {
         let rollback_response = send_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/rollback",
+            "/v1/packages/com.example.review.extension/rollback",
         )
         .await;
         assert_eq!(rollback_response.status(), StatusCode::OK);
@@ -6329,7 +6317,7 @@ mod tests {
         let disable_response = send_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/disable",
+            "/v1/packages/com.example.review.extension/disable",
         )
         .await;
         assert_eq!(disable_response.status(), StatusCode::OK);
@@ -6342,7 +6330,7 @@ mod tests {
         let enable_response = send_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/enable",
+            "/v1/packages/com.example.review.extension/enable",
         )
         .await;
         assert_eq!(enable_response.status(), StatusCode::OK);
@@ -6355,7 +6343,7 @@ mod tests {
         let authoring_flow_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/authoring-flow",
+            "/v1/packages/com.example.review.extension/authoring-flow",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "include_private_steps": true,
@@ -6384,7 +6372,7 @@ mod tests {
         let remix_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/remix",
+            "/v1/packages/com.example.review.extension/remix",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "source_class": "workspace-local"
@@ -6409,7 +6397,7 @@ mod tests {
         let invalid_remix_source_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/remix",
+            "/v1/packages/com.example.review.extension/remix",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "source": {
@@ -6426,7 +6414,7 @@ mod tests {
         let invalid_remix_missing_source_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/remix",
+            "/v1/packages/com.example.review.extension/remix",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "source_class": "user-selected"
@@ -6437,11 +6425,29 @@ mod tests {
             invalid_remix_missing_source_response.status(),
             StatusCode::BAD_REQUEST
         );
+        let invalid_remix_registry_source_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/packages/com.example.review.extension/remix",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "source_class": "verified-registry",
+                "source": {
+                    "repository": "https://github.com/example/package",
+                    "manifest_path": "atelia.package.yaml"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            invalid_remix_registry_source_response.status(),
+            StatusCode::BAD_REQUEST
+        );
 
         let unlisted_publication_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/publication",
+            "/v1/packages/com.example.review.extension/publication",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "visibility": "unlisted_share",
@@ -6476,7 +6482,7 @@ mod tests {
         let publication_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/publication",
+            "/v1/packages/com.example.review.extension/publication",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "visibility": "public_searchable",
@@ -6502,7 +6508,7 @@ mod tests {
         let github_remix_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/remix",
+            "/v1/packages/com.example.review.extension/remix",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "source_class": "user-selected",
@@ -6534,7 +6540,7 @@ mod tests {
         let blank_registry_identity_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/registry-submission",
+            "/v1/packages/com.example.review.extension/registry-submission",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "state": "submitted",
@@ -6549,7 +6555,7 @@ mod tests {
         let padded_registry_identity_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/registry-submission",
+            "/v1/packages/com.example.review.extension/registry-submission",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "state": "submitted",
@@ -6565,7 +6571,7 @@ mod tests {
         let self_accepted_registry_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/registry-submission",
+            "/v1/packages/com.example.review.extension/registry-submission",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "state": "accepted",
@@ -6580,7 +6586,7 @@ mod tests {
         let self_rejected_registry_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/registry-submission",
+            "/v1/packages/com.example.review.extension/registry-submission",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "state": "rejected",
@@ -6596,7 +6602,7 @@ mod tests {
         let registry_submission_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/registry-submission",
+            "/v1/packages/com.example.review.extension/registry-submission",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "state": "submitted",
@@ -6625,7 +6631,7 @@ mod tests {
         let authoring_flow_after_submission_response = send_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/authoring-flow",
+            "/v1/packages/com.example.review.extension/authoring-flow",
         )
         .await;
         assert_eq!(
@@ -6655,7 +6661,7 @@ mod tests {
         let preserve_submission_publication_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/publication",
+            "/v1/packages/com.example.review.extension/publication",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
                 "visibility": "unlisted_share",
@@ -6690,7 +6696,7 @@ mod tests {
         let block_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/blocklist/apply",
+            "/v1/packages/blocklist/apply",
             serde_json::json!({
                 "entry": {
                     "key": serde_json::to_value(BlockKey::ExtensionId("com.example.review.extension".to_string())).expect("block key"),
@@ -6705,7 +6711,7 @@ mod tests {
         let blocked_status_response = send_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/status",
+            "/v1/packages/com.example.review.extension/status",
         )
         .await;
         assert_eq!(blocked_status_response.status(), StatusCode::OK);
@@ -6721,7 +6727,7 @@ mod tests {
         let list_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/list",
+            "/v1/packages/list",
             serde_json::json!({ "include_blocked": false }),
         )
         .await;
@@ -6788,7 +6794,7 @@ mod tests {
         let execute_response = send_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/execute",
+            "/v1/packages/com.example.review.extension/execute",
         )
         .await;
         assert_eq!(execute_response.status(), StatusCode::NOT_IMPLEMENTED);
@@ -6807,7 +6813,7 @@ mod tests {
         let remove_response = send_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/remove",
+            "/v1/packages/com.example.review.extension/remove",
         )
         .await;
         assert_eq!(remove_response.status(), StatusCode::OK);
@@ -6820,7 +6826,7 @@ mod tests {
         let removed_status_response = send_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/com.example.review.extension/status",
+            "/v1/packages/com.example.review.extension/status",
         )
         .await;
         assert_eq!(removed_status_response.status(), StatusCode::NOT_FOUND);
@@ -6855,7 +6861,7 @@ mod tests {
         let install_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/install",
+            "/v1/packages/install",
             serde_json::json!({
                 "manifest": manifest_v1,
                 "approve_local_unsigned": false,
@@ -6868,7 +6874,7 @@ mod tests {
         let denied_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/update",
+            "/v1/packages/update",
             serde_json::json!({
                 "manifest": manifest_v2,
                 "approve_local_unsigned": false,
@@ -6892,7 +6898,7 @@ mod tests {
         let approved_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/update",
+            "/v1/packages/update",
             serde_json::json!({
                 "manifest": manifest_v2,
                 "approve_local_unsigned": false,
@@ -6917,7 +6923,7 @@ mod tests {
     /// Verifies the validation route rejects non-POST methods with an Allow header.
     async fn extension_validate_route_rejects_get_with_allow_post() {
         let rpc_server = ready_rpc_server();
-        let response = send_request(&rpc_server, Method::GET, "/v1/extensions/validate").await;
+        let response = send_request(&rpc_server, Method::GET, "/v1/packages/validate").await;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(
             response.headers().get(header::ALLOW),
@@ -6950,7 +6956,7 @@ mod tests {
         let install_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/install",
+            "/v1/packages/install",
             serde_json::json!({
                 "manifest": manifest_v1.clone(),
                 "approve_local_unsigned": false,
@@ -6963,7 +6969,7 @@ mod tests {
         let list_before = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/list",
+            "/v1/packages/list",
             serde_json::json!({ "include_blocked": true }),
         )
         .await;
@@ -6978,7 +6984,7 @@ mod tests {
         let invalid_response = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/validate",
+            "/v1/packages/validate",
             serde_json::json!({
                 "manifest": invalid_manifest,
                 "approve_local_unsigned": false,
@@ -6997,7 +7003,7 @@ mod tests {
         let list_after = send_json_request(
             &rpc_server,
             Method::POST,
-            "/v1/extensions/list",
+            "/v1/packages/list",
             serde_json::json!({ "include_blocked": true }),
         )
         .await;
