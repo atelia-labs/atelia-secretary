@@ -420,6 +420,19 @@ mod tests {
     }
 
     #[test]
+    fn default_policy_input_uses_default_policy_identity() {
+        let input = PolicyInput::default();
+
+        assert_eq!(DEFAULT_POLICY_VERSION, input.policy_version);
+        assert_eq!(
+            Actor::System {
+                id: "policy-default".to_string(),
+            },
+            input.requester
+        );
+    }
+
+    #[test]
     fn r1_bounded_filesystem_read_is_allowed() {
         for capability in ["filesystem.read", "filesystem.diff", "fs.diff"] {
             let decision = decide(input(capability));
