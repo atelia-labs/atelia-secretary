@@ -9,12 +9,16 @@ use crate::domain::{
 };
 use crate::policy::{REASON_REPOSITORY_BLOCKED, SCOPE_KIND_REPOSITORY, SCOPE_VALUE_ROOT};
 use crate::runtime::RuntimeJobReceipt;
-use crate::ExtensionRegistrySnapshot;
 #[cfg(test)]
 use crate::{
-    BlockKey, BlockReason, BlocklistEntry, ExtensionBoundary, ExtensionInstallRecord,
-    ExtensionInstallStatus, ExtensionManifest, ExtensionSourceSnapshot, ProvenanceSource,
+    BlockKey, BlockReason, BlocklistEntry, DegradeBehavior, ExtensionBoundary,
+    ExtensionCompatibility, ExtensionEntrypoints, ExtensionFailure, ExtensionInstallRecord,
+    ExtensionInstallStatus, ExtensionKind, ExtensionManifest, ExtensionPermission,
+    ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionSourceSnapshot,
+    ExtensionToolDefinition, ProvenanceSource, RetryPolicy, EXTENSION_MANIFEST_SCHEMA,
+    EXTENSION_RPC_PROTOCOL,
 };
+use crate::{ExtensionRegistrySnapshot, ManifestValidationPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -407,7 +411,7 @@ impl InMemoryStore {
         snapshot: ExtensionRegistrySnapshot,
     ) -> StoreResult<()> {
         snapshot
-            .validate()
+            .validate_with_policy(&ManifestValidationPolicy::default())
             .map_err(|reason| StoreError::InvalidRecord {
                 collection: "extension_registry",
                 reason,
@@ -1991,7 +1995,7 @@ fn validate_loaded_store(inner: &InMemoryInner) -> StoreResult<()> {
 
     inner
         .extension_registry_snapshot
-        .validate()
+        .validate_with_policy(&ManifestValidationPolicy::default())
         .map_err(|reason| StoreError::InvalidRecord {
             collection: "extension_registry",
             reason,
@@ -4854,9 +4858,48 @@ mod tests {
         artifact_digest: &str,
         manifest_digest: &str,
     ) -> ExtensionManifest {
+        let mut permissions = BTreeMap::new();
+        permissions.insert(
+            "tool.ping".to_string(),
+            ExtensionPermission {
+                description: "allows ping tool execution".to_string(),
+                risk_tier: Some("R1".to_string()),
+            },
+        );
+
         ExtensionManifest {
+            schema: EXTENSION_MANIFEST_SCHEMA.to_string(),
             id: id.to_string(),
+            name: "Example Extension".to_string(),
             version: version.to_string(),
+            publisher: ExtensionPublisher {
+                name: "Example Publisher".to_string(),
+                url: Some("https://example.com".to_string()),
+            },
+            description: "A focused test extension".to_string(),
+            types: vec![ExtensionKind::Tool],
+            compatibility: ExtensionCompatibility {
+                atelia_protocol: ">=0.1 <0.3".to_string(),
+                atelia_secretary: ">=0.1 <0.2".to_string(),
+            },
+            entrypoints: ExtensionEntrypoints {
+                realm: ExtensionRealm::Backend,
+                runtime: ExtensionRuntime::WasmRust,
+                command: None,
+                image: None,
+                wasm: Some("extension.wasm".to_string()),
+                protocol: EXTENSION_RPC_PROTOCOL.to_string(),
+            },
+            permissions,
+            tools: vec![ExtensionToolDefinition {
+                id: "ping".to_string(),
+                permissions: vec!["tool.ping".to_string()],
+                permissions_required: Vec::new(),
+            }],
+            failure: ExtensionFailure {
+                degrade: DegradeBehavior::ReturnUnavailable,
+                retry_policy: RetryPolicy::Bounded,
+            },
             provenance: crate::ExtensionProvenance {
                 artifact_digest: artifact_digest.to_string(),
                 manifest_digest: manifest_digest.to_string(),
@@ -8657,6 +8700,40 @@ mod tests {
         let mut records = BTreeMap::new();
         let mut record_versions = BTreeMap::new();
         record_versions.insert("2.0.0".to_string(), other_record);
+        records.insert(manifest.id.clone(), record_versions);
+
+        let err = store
+            .set_extension_registry_snapshot(extension_registry_snapshot(manifests, records))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidRecord {
+                collection: "extension_registry",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn store_rejects_extension_registry_snapshot_boundary_mismatch_on_set() {
+        let store = InMemoryStore::new();
+        let manifest = extension_manifest(
+            "com.example.extension",
+            "1.0.0",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let mut record = extension_record(&manifest, "1.0.0");
+        record.boundary = ExtensionBoundary::Official;
+
+        let mut manifests = BTreeMap::new();
+        let mut manifest_versions = BTreeMap::new();
+        manifest_versions.insert(manifest.version.clone(), manifest.clone());
+        manifests.insert(manifest.id.clone(), manifest_versions);
+
+        let mut records = BTreeMap::new();
+        let mut record_versions = BTreeMap::new();
+        record_versions.insert(record.version.clone(), record);
         records.insert(manifest.id.clone(), record_versions);
 
         let err = store

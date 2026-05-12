@@ -1605,6 +1605,11 @@ impl ExtensionRegistrySnapshot {
     pub fn validate(&self) -> Result<(), String> {
         validate_extension_registry_snapshot(self)
     }
+
+    pub fn validate_with_policy(&self, policy: &ManifestValidationPolicy) -> Result<(), String> {
+        validate_extension_registry_snapshot(self)?;
+        validate_extension_registry_snapshot_manifests(self, policy)
+    }
 }
 
 impl ExtensionRegistry {
@@ -1622,7 +1627,7 @@ impl ExtensionRegistry {
         snapshot: ExtensionRegistrySnapshot,
         validation_policy: ManifestValidationPolicy,
     ) -> Result<Self, String> {
-        snapshot.validate()?;
+        snapshot.validate_with_policy(&validation_policy)?;
         Ok(Self {
             manifests: snapshot.manifests,
             records: snapshot.records,
@@ -2233,6 +2238,34 @@ fn validate_extension_registry_snapshot(
         .any(|entry| matches!(entry.key, BlockKey::VulnerabilityId(_)))
     {
         return Err("extension blocklist contains unsupported vulnerability_id key".to_string());
+    }
+
+    Ok(())
+}
+
+fn validate_extension_registry_snapshot_manifests(
+    snapshot: &ExtensionRegistrySnapshot,
+    policy: &ManifestValidationPolicy,
+) -> Result<(), String> {
+    for (extension_id, records) in &snapshot.records {
+        for (version, record) in records {
+            let manifest = snapshot
+                .manifests
+                .get(extension_id)
+                .and_then(|manifests| manifests.get(version))
+                .ok_or_else(|| {
+                    format!("manifest missing for extension {extension_id} version {version}")
+                })?;
+            let validated = manifest.validate(policy).map_err(|error| {
+                format!("manifest validation failed for extension {extension_id} version {version}: {error}")
+            })?;
+            if validated.boundary != record.boundary {
+                return Err(format!(
+                    "boundary mismatch for extension {extension_id} version {version}: manifest validates as {:?}, record stores {:?}",
+                    validated.boundary, record.boundary
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -4321,6 +4354,38 @@ mod tests {
         let err = snapshot.validate().unwrap_err();
         assert!(err.contains("references missing previous_version"));
         assert!(err.contains("0.9.0"));
+    }
+
+    #[test]
+    fn extension_snapshot_hydration_rejects_invalid_manifest() {
+        let mut invalid = manifest("com.example.extension");
+        invalid.name.clear();
+        let snapshot = extension_snapshot(
+            BTreeMap::from([(invalid.version.clone(), invalid.clone())]),
+            BTreeMap::from([(invalid.version.clone(), extension_record(&invalid, None))]),
+        );
+
+        snapshot.validate().unwrap();
+        let err = ExtensionRegistry::from_snapshot(snapshot, ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(err.contains("manifest validation failed"));
+        assert!(err.contains("com.example.extension"));
+    }
+
+    #[test]
+    fn extension_snapshot_hydration_rejects_boundary_mismatch() {
+        let third_party = manifest("com.example.extension");
+        let mut record = extension_record(&third_party, None);
+        record.boundary = ExtensionBoundary::Official;
+        let snapshot = extension_snapshot(
+            BTreeMap::from([(third_party.version.clone(), third_party.clone())]),
+            BTreeMap::from([(third_party.version.clone(), record)]),
+        );
+
+        snapshot.validate().unwrap();
+        let err = ExtensionRegistry::from_snapshot(snapshot, ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(err.contains("boundary mismatch"));
     }
 
     #[test]
