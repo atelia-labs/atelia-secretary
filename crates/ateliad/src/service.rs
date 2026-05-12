@@ -22,7 +22,8 @@ use atelia_core::{
     RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
     SubmitJobIdempotencyRecord, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
-    TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse, WatchJobEvent,
+    TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse,
+    ValidateExtensionManifestRequest, ValidateExtensionManifestResponse, WatchJobEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -1256,6 +1257,16 @@ impl SecretaryService {
             .map_err(ServiceError::from)
     }
 
+    /// Validate an extension manifest through the registry without installation side effects.
+    pub fn validate_extension(
+        &self,
+        request: ValidateExtensionManifestRequest,
+    ) -> ServiceResult<ValidateExtensionManifestResponse> {
+        self.lock_extension_registry()?
+            .validate_extension_manifest(request)
+            .map_err(ServiceError::from)
+    }
+
     pub fn update_extension(
         &self,
         request: UpdateExtensionRequest,
@@ -1799,8 +1810,8 @@ mod tests {
         ExtensionRuntime, ExtensionServices, InstallExtensionRequest, JobEventId, JobEventKind,
         LedgerTimestamp, ListBlocklistRequest, ListExtensionsRequest, PolicyDecision,
         PolicyDecisionId, PolicyOutcome, ProvenanceSource, RepositoryTrustState, ResourceScope,
-        RetryPolicy, RiskTier, RollbackExtensionRequest, EXTENSION_MANIFEST_SCHEMA,
-        EXTENSION_RPC_PROTOCOL,
+        RetryPolicy, RiskTier, RollbackExtensionRequest, ValidateExtensionManifestRequest,
+        EXTENSION_MANIFEST_SCHEMA, EXTENSION_RPC_PROTOCOL,
     };
     use std::collections::BTreeMap;
     use std::collections::HashSet;
@@ -2308,6 +2319,140 @@ mod tests {
     }
 
     #[test]
+    /// Valid manifest preflight validation leaves service-visible extension state unchanged.
+    fn extension_validation_does_not_mutate_extension_state() {
+        let svc = ready_service();
+
+        let manifest_v1 = extension_manifest(
+            "com.example.validate.extension",
+            "1.0.0",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let manifest_v2 = extension_manifest(
+            "com.example.validate.extension",
+            "2.0.0",
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        );
+
+        svc.install_extension(InstallExtensionRequest {
+            manifest: manifest_v1,
+            approve_local_unsigned: false,
+            allow_local_process_runtime: false,
+            approve_source_change: false,
+        })
+        .expect("baseline install should succeed");
+
+        let pre_extensions = svc
+            .list_extensions(ListExtensionsRequest {
+                include_blocked: true,
+            })
+            .expect("baseline extension list should succeed");
+        let pre_blocklist = svc
+            .list_blocklist(ListBlocklistRequest {})
+            .expect("baseline blocklist should succeed");
+        let pre_jobs = svc
+            .list_jobs(None, None, None, None, None)
+            .expect("baseline job query should succeed");
+        let pre_trust_index = svc
+            .list_package_trust_index(ListPackageTrustIndexRequest::default())
+            .expect("baseline trust index should succeed");
+
+        let validated = svc
+            .validate_extension(ValidateExtensionManifestRequest {
+                manifest: manifest_v2,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("validation should succeed");
+        assert_eq!(validated.boundary, ExtensionBoundary::ThirdParty);
+        assert_eq!(validated.manifest.id, "com.example.validate.extension");
+
+        let post_extensions = svc
+            .list_extensions(ListExtensionsRequest {
+                include_blocked: true,
+            })
+            .expect("post validation extension list should succeed");
+        let post_blocklist = svc
+            .list_blocklist(ListBlocklistRequest {})
+            .expect("post validation blocklist should succeed");
+        let post_jobs = svc
+            .list_jobs(None, None, None, None, None)
+            .expect("post validation job query should succeed");
+        let post_trust_index = svc
+            .list_package_trust_index(ListPackageTrustIndexRequest::default())
+            .expect("post trust index should succeed");
+
+        assert_eq!(post_extensions, pre_extensions);
+        assert_eq!(post_blocklist, pre_blocklist);
+        assert_eq!(post_jobs, pre_jobs);
+        assert_eq!(post_trust_index, pre_trust_index);
+    }
+
+    #[test]
+    /// Invalid manifest preflight validation leaves service-visible extension state unchanged.
+    fn extension_validation_rejects_invalid_manifest_without_state_change() {
+        let svc = ready_service();
+
+        let invalid_manifest = extension_manifest(
+            "com.example.validate.extension",
+            "not-semver",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+
+        let pre_extensions = svc
+            .list_extensions(ListExtensionsRequest {
+                include_blocked: true,
+            })
+            .expect("baseline extension list should succeed");
+        let pre_blocklist = svc
+            .list_blocklist(ListBlocklistRequest {})
+            .expect("baseline blocklist should succeed");
+        let pre_jobs = svc
+            .list_jobs(None, None, None, None, None)
+            .expect("baseline job query should succeed");
+        let pre_trust_index = svc
+            .list_package_trust_index(ListPackageTrustIndexRequest::default())
+            .expect("baseline trust index should succeed");
+
+        let err = svc
+            .validate_extension(ValidateExtensionManifestRequest {
+                manifest: invalid_manifest,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServiceError::ExtensionRegistry(RegistryError::Validation(_))
+        ));
+
+        let post_extensions = svc
+            .list_extensions(ListExtensionsRequest {
+                include_blocked: true,
+            })
+            .expect("post validation extension list should succeed");
+        let post_blocklist = svc
+            .list_blocklist(ListBlocklistRequest {})
+            .expect("post validation blocklist should succeed");
+        let post_jobs = svc
+            .list_jobs(None, None, None, None, None)
+            .expect("post validation job query should succeed");
+        let post_trust_index = svc
+            .list_package_trust_index(ListPackageTrustIndexRequest::default())
+            .expect("post trust index should succeed");
+
+        assert_eq!(post_extensions, pre_extensions);
+        assert_eq!(post_blocklist, pre_blocklist);
+        assert_eq!(post_jobs, pre_jobs);
+        assert_eq!(post_trust_index, pre_trust_index);
+    }
+
+    #[test]
     fn extension_registry_lock_poisoning_returns_service_error() {
         let svc = Arc::new(ready_service());
         let poisoned = Arc::clone(&svc);
@@ -2334,6 +2479,13 @@ mod tests {
                 approve_source_change: false,
             })
             .map(|_| "install_extension"),
+            svc.validate_extension(ValidateExtensionManifestRequest {
+                manifest: manifest.clone(),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .map(|_| "validate_extension"),
             svc.extension_status(atelia_core::ExtensionStatusRequest {
                 extension_id: "com.example.review.extension".to_string(),
             })

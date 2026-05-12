@@ -47,7 +47,8 @@ diagnostic metadata.
 This table is the required service contract, not merely a description of the
 current protobuf implementation. The current daemon exposes the health,
 repository, job, policy, event replay, project status, tool-output settings,
-`RenderToolOutput`, and beta package-management RPC groups. Registry and
+`RenderToolOutput`, and beta package-management RPC groups, including read-only
+AEP backend package manifest validation. Registry and
 blocklist operations are currently exposed through the daemon HTTP/JSON beta
 transport. The read-only package trust index beta surface is already shipped in
 HTTP/JSON as `ListPackageTrustIndex`, and proto now reserves the same contract.
@@ -73,6 +74,7 @@ Required RPC groups:
 | `CheckPolicy` | Preview policy outcome for a requested action |
 | `RenderToolOutput` | Render canonical tool result as TOON, JSON, or text |
 | `ListPackageTrustIndex` | Read the package trust index with provenance and block markers |
+| `ValidateExtension` | Validate an AEP backend package manifest without installing or mutating registry state. Beta RPC name is retained for compatibility. |
 | `InstallExtension` | Install a new AEP backend package manifest. Beta RPC name is retained for compatibility. |
 | `UpdateExtension` | Update an installed AEP backend package manifest |
 | `ExtensionStatus` | Inspect one package installation and blocklist state |

@@ -74,6 +74,7 @@ enum Route {
     UpdateToolOutputDefaults,
     ListToolOutputSettingsHistory,
     InstallExtension,
+    ValidateExtension,
     UpdateExtension,
     ListExtensions,
     ListPackageTrustIndex,
@@ -185,6 +186,7 @@ fn route_for_path(path: &str) -> Route {
         "/v1/tool-output/settings/update" => Route::UpdateToolOutputDefaults,
         "/v1/tool-output/settings/history:list" => Route::ListToolOutputSettingsHistory,
         "/v1/extensions/install" => Route::InstallExtension,
+        "/v1/extensions/validate" => Route::ValidateExtension,
         "/v1/extensions/update" => Route::UpdateExtension,
         "/v1/extensions/list" => Route::ListExtensions,
         "/v1/package-trust-index:list" => Route::ListPackageTrustIndex,
@@ -1513,6 +1515,17 @@ fn serialize_install_extension_response(
     })
 }
 
+/// Serialize a successful manifest validation response for the HTTP boundary.
+fn serialize_validate_extension_response(
+    response: rpc::ValidateExtensionResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "manifest": response.manifest,
+        "boundary": response.boundary,
+    })
+}
+
 fn serialize_update_extension_response(
     response: rpc::UpdateExtensionResponse,
 ) -> serde_json::Value {
@@ -2580,6 +2593,35 @@ async fn dispatch_install_extension(state: RpcServerState, request: Request<Body
     }
 }
 
+/// Dispatch manifest validation without installing the submitted manifest.
+async fn dispatch_validate_extension(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload =
+        match body_or_empty_json::<atelia_core::ValidateExtensionManifestRequest>(request).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                let rpc_server = state.read().await;
+                let next_state = rpc_next_state(&rpc_server);
+                return error.into_response(next_state);
+            }
+        };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.validate_extension(payload) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_validate_extension_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
 async fn dispatch_update_extension(state: RpcServerState, request: Request<Body>) -> Response {
     let payload = match body_or_empty_json::<atelia_core::UpdateExtensionRequest>(request).await {
         Ok(payload) => payload,
@@ -3226,6 +3268,26 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                     dispatch_install_extension(state, request).await
                 }
             }
+            Route::ValidateExtension => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_validate_extension(state, request).await
+                }
+            }
             Route::UpdateExtension => {
                 if method != Method::POST {
                     let mut response = make_error_response(
@@ -3555,6 +3617,7 @@ pub fn build_router(rpc_server: RpcServerState, auth: LocalAuthConfig) -> Router
         .route("/v1/tool-output/settings/update", any(dispatch_route))
         .route("/v1/tool-output/settings/history:list", any(dispatch_route))
         .route("/v1/extensions/install", any(dispatch_route))
+        .route("/v1/extensions/validate", any(dispatch_route))
         .route("/v1/extensions/update", any(dispatch_route))
         .route("/v1/extensions/list", any(dispatch_route))
         .route("/v1/package-trust-index:list", any(dispatch_route))
@@ -3944,6 +4007,10 @@ mod tests {
         assert_eq!(
             route_for_path("/v1/extensions/install"),
             Route::InstallExtension
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/validate"),
+            Route::ValidateExtension
         );
         assert_eq!(
             route_for_path("/v1/extensions/update"),
@@ -5537,6 +5604,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Exercises extension registry endpoints, including validation, through HTTP dispatch.
     async fn extension_registry_endpoints_are_reachable_inprocess() {
         const ARTIFACT_V1: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -5579,6 +5647,66 @@ mod tests {
             .expect("response bytes");
         assert_eq!(install_payload["status"], "ok");
         assert_eq!(install_payload["data"]["record"]["version"], "1.0.0");
+
+        let list_before_validate_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/list",
+            serde_json::json!({
+                "include_blocked": true,
+            }),
+        )
+        .await;
+        assert_eq!(list_before_validate_response.status(), StatusCode::OK);
+        let list_before_validate_payload =
+            to_bytes(list_before_validate_response.into_body(), usize::MAX)
+                .await
+                .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+                .expect("response bytes");
+
+        let validate_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/validate",
+            serde_json::json!({
+                "manifest": manifest_v1,
+                "approve_local_unsigned": false,
+                "allow_local_process_runtime": false,
+            }),
+        )
+        .await;
+        assert_eq!(validate_response.status(), StatusCode::OK);
+        let validate_payload = to_bytes(validate_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(validate_payload["status"], "ok");
+        assert_eq!(
+            validate_payload["data"]["manifest"]["id"],
+            "com.example.review.extension"
+        );
+        assert_eq!(validate_payload["data"]["manifest"]["version"], "1.0.0");
+        assert_eq!(validate_payload["data"]["boundary"], "third_party");
+
+        let list_after_validate_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/list",
+            serde_json::json!({
+                "include_blocked": true,
+            }),
+        )
+        .await;
+        assert_eq!(list_after_validate_response.status(), StatusCode::OK);
+        let list_after_validate_payload =
+            to_bytes(list_after_validate_response.into_body(), usize::MAX)
+                .await
+                .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+                .expect("response bytes");
+        assert_eq!(
+            list_after_validate_payload["data"]["extensions"],
+            list_before_validate_payload["data"]["extensions"]
+        );
 
         let update_response = send_json_request(
             &rpc_server,
@@ -5851,6 +5979,105 @@ mod tests {
         assert_eq!(
             approved_payload["data"]["record"]["source"]["ref"],
             "refs/heads/release"
+        );
+    }
+
+    #[tokio::test]
+    /// Verifies the validation route rejects non-POST methods with an Allow header.
+    async fn extension_validate_route_rejects_get_with_allow_post() {
+        let rpc_server = ready_rpc_server();
+        let response = send_request(&rpc_server, Method::GET, "/v1/extensions/validate").await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get(header::ALLOW),
+            Some(&header::HeaderValue::from_static("POST"))
+        );
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["error"]["code"], "method_not_allowed");
+    }
+
+    #[tokio::test]
+    /// Verifies invalid HTTP validation requests leave installed extension state unchanged.
+    async fn extension_validate_route_rejects_invalid_manifest_without_state_change() {
+        const ARTIFACT_V1: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const MANIFEST_V1: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let rpc_server = ready_rpc_server();
+        let manifest_v1 = extension_manifest(
+            "com.example.review.extension",
+            "1.0.0",
+            ARTIFACT_V1,
+            MANIFEST_V1,
+        );
+
+        let install_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/install",
+            serde_json::json!({
+                "manifest": manifest_v1.clone(),
+                "approve_local_unsigned": false,
+                "allow_local_process_runtime": false,
+            }),
+        )
+        .await;
+        assert_eq!(install_response.status(), StatusCode::OK);
+
+        let list_before = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/list",
+            serde_json::json!({ "include_blocked": true }),
+        )
+        .await;
+        assert_eq!(list_before.status(), StatusCode::OK);
+        let list_before_payload = to_bytes(list_before.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+
+        let mut invalid_manifest = manifest_v1;
+        invalid_manifest.version = "not-semver".to_string();
+        let invalid_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/validate",
+            serde_json::json!({
+                "manifest": invalid_manifest,
+                "approve_local_unsigned": false,
+                "allow_local_process_runtime": false,
+            }),
+        )
+        .await;
+        assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+        let invalid_payload = to_bytes(invalid_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(invalid_payload["status"], "error");
+        assert_eq!(invalid_payload["error"]["code"], "rpc_error");
+
+        let list_after = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/list",
+            serde_json::json!({ "include_blocked": true }),
+        )
+        .await;
+        assert_eq!(list_after.status(), StatusCode::OK);
+        let list_after_payload = to_bytes(list_after.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(
+            list_after_payload["data"]["extensions"],
+            list_before_payload["data"]["extensions"]
         );
     }
 
