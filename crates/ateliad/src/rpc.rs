@@ -4968,6 +4968,10 @@ mod tests {
             "sha256:1111111111111111111111111111111111111111111111111111111111111111";
         const BLOCKED_MANIFEST: &str =
             "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        const SUBMITTED_ARTIFACT: &str =
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        const SUBMITTED_MANIFEST: &str =
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444";
 
         let server = ready_server();
         let mut active = extension_manifest(
@@ -4997,6 +5001,16 @@ mod tests {
             visibility: atelia_core::ExtensionPublicationVisibility::PrivateRemix,
             registry_submission: atelia_core::ExtensionRegistrySubmission::NotSubmitted,
         });
+        let mut submitted = extension_manifest(
+            "com.example.submitted",
+            "1.0.0",
+            SUBMITTED_ARTIFACT,
+            SUBMITTED_MANIFEST,
+        );
+        submitted.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Submitted,
+        });
 
         server
             .install_extension(InstallExtensionRequest {
@@ -5015,6 +5029,14 @@ mod tests {
             })
             .expect("blocked install should succeed");
         server
+            .install_extension(InstallExtensionRequest {
+                manifest: submitted,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("submitted install should succeed");
+        server
             .apply_blocklist(ApplyBlocklistRequest {
                 entry: atelia_core::BlocklistEntry {
                     key: BlockKey::ExtensionId("com.example.blocked".to_string()),
@@ -5028,7 +5050,20 @@ mod tests {
             .list_package_trust_index(ListPackageTrustIndexRequest::default())
             .expect("package trust index should succeed");
 
-        assert_eq!(index.packages.len(), 2);
+        assert_eq!(index.packages.len(), 3);
+
+        let unblocked_index = server
+            .list_package_trust_index(ListPackageTrustIndexRequest {
+                include_blocked: false,
+                discovery_only: false,
+            })
+            .expect("unblocked package trust index should succeed");
+        assert_eq!(unblocked_index.packages.len(), 2);
+        assert!(unblocked_index
+            .packages
+            .iter()
+            .all(|entry| entry.package_id != "com.example.blocked"));
+
         let blocked_entry = index
             .packages
             .iter()
@@ -5054,6 +5089,19 @@ mod tests {
                 parent_manifest_digest: Some(ACTIVE_MANIFEST.to_string()),
                 relationship: atelia_core::ExtensionLineageRelationship::Fork,
             })
+        );
+
+        let discovery_index = server
+            .list_package_trust_index(ListPackageTrustIndexRequest {
+                include_blocked: true,
+                discovery_only: true,
+            })
+            .expect("discovery trust index should succeed");
+        assert_eq!(discovery_index.packages.len(), 1);
+        assert_eq!(discovery_index.packages[0].package_id, "com.example.active");
+        assert_eq!(
+            discovery_index.packages[0].status,
+            Some(atelia_core::ExtensionInstallStatus::Installed)
         );
     }
 
