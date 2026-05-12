@@ -1736,11 +1736,15 @@ impl ExtensionRegistry {
             ));
         }
 
-        let previous_version = self
-            .active_versions
-            .get(&validated.manifest.id)
-            .filter(|version| *version != &validated.manifest.version)
-            .cloned();
+        let previous_version = match self.active_versions.get(&validated.manifest.id) {
+            Some(active_version) if active_version == &validated.manifest.version => self
+                .records
+                .get(&validated.manifest.id)
+                .and_then(|records| records.get(active_version))
+                .and_then(|existing| existing.previous_version.clone()),
+            Some(active_version) => Some(active_version.clone()),
+            None => None,
+        };
         let approved_permissions = validated
             .manifest
             .permissions
@@ -4160,6 +4164,37 @@ mod tests {
 
         assert_eq!(reinstalled.version, "1.0.0");
         assert_eq!(reinstalled.previous_version, None);
+        registry.snapshot().validate().unwrap();
+    }
+
+    #[test]
+    fn same_version_reinstall_after_update_preserves_previous_version() {
+        let mut registry = ExtensionRegistry::in_memory();
+        let mut manifest_v1 = manifest("com.example.extension");
+        manifest_v1.version = "1.0.0".to_string();
+        manifest_v1.provenance.manifest_digest = MANIFEST_DIGEST.to_string();
+        manifest_v1.provenance.artifact_digest = ARTIFACT_DIGEST.to_string();
+        registry
+            .install(manifest_v1, InstallOptions::default())
+            .unwrap();
+
+        let mut manifest_v2 = manifest("com.example.extension");
+        manifest_v2.version = "1.1.0".to_string();
+        manifest_v2.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        manifest_v2.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        registry
+            .install(manifest_v2.clone(), InstallOptions::default())
+            .unwrap();
+
+        let reinstalled = registry
+            .install(manifest_v2, InstallOptions::default())
+            .unwrap();
+
+        assert_eq!(reinstalled.version, "1.1.0");
+        assert_eq!(reinstalled.previous_version.as_deref(), Some("1.0.0"));
+
+        let rolled_back = registry.rollback("com.example.extension").unwrap();
+        assert_eq!(rolled_back.version, "1.0.0");
         registry.snapshot().validate().unwrap();
     }
 
