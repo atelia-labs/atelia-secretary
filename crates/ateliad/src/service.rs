@@ -22,9 +22,10 @@ use atelia_core::{
     RollbackExtensionRequest, RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt,
     RuntimeJobRequest, SecretaryStore, StoreError, SubmitJobIdempotencyRecord, ToolInvocationId,
     ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
-    ToolOutputSettingsScope, ToolResultId, TruncationMetadata, UpdateExtensionRequest,
-    UpdateExtensionResponse, ValidateExtensionManifestRequest, ValidateExtensionManifestResponse,
-    WatchJobEvent,
+    ToolOutputSettingsScope, ToolResultId, TruncationMetadata, UpdateExtensionPublicationRequest,
+    UpdateExtensionPublicationResponse, UpdateExtensionRegistrySubmissionRequest,
+    UpdateExtensionRegistrySubmissionResponse, UpdateExtensionRequest, UpdateExtensionResponse,
+    ValidateExtensionManifestRequest, ValidateExtensionManifestResponse, WatchJobEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -45,6 +46,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "policy.v1",
     "repertoire.v1",
     "extensions.registry.v1",
+    "extensions.authoring.v1",
     "package_trust_index.v1",
     "tool_output_settings.v1",
     "tool_output_render.v1",
@@ -1423,6 +1425,22 @@ impl SecretaryService {
         request: RemoveExtensionRequest,
     ) -> ServiceResult<RemoveExtensionResponse> {
         self.mutate_extension_registry(|registry| registry.remove_extension(request))
+    }
+
+    pub fn update_extension_publication(
+        &self,
+        request: UpdateExtensionPublicationRequest,
+    ) -> ServiceResult<UpdateExtensionPublicationResponse> {
+        self.mutate_extension_registry(|registry| registry.update_extension_publication(request))
+    }
+
+    pub fn update_extension_registry_submission(
+        &self,
+        request: UpdateExtensionRegistrySubmissionRequest,
+    ) -> ServiceResult<UpdateExtensionRegistrySubmissionResponse> {
+        self.mutate_extension_registry(|registry| {
+            registry.update_extension_registry_submission(request)
+        })
     }
 
     pub fn apply_blocklist(

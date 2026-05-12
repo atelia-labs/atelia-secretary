@@ -78,6 +78,10 @@ enum Route {
     UpdateExtension,
     ListExtensions,
     ListPackageTrustIndex,
+    PackageAuthoringFlow { extension_id: String },
+    PackageRemix { extension_id: String },
+    PackagePublication { extension_id: String },
+    PackageRegistrySubmission { extension_id: String },
     ExtensionExecution { extension_id: String },
     ExtensionStatus { extension_id: String },
     RollbackExtension { extension_id: String },
@@ -113,6 +117,42 @@ fn route_for_path(path: &str) -> Route {
     if let Some(job_id) = path.strip_prefix("/v1/jobs/").and_then(valid_job_id) {
         return Route::GetJob {
             job_id: job_id.to_string(),
+        };
+    }
+    if let Some(extension_id) = path
+        .strip_prefix("/v1/extensions/")
+        .and_then(|path| path.strip_suffix("/authoring-flow"))
+        .and_then(valid_extension_id)
+    {
+        return Route::PackageAuthoringFlow {
+            extension_id: extension_id.to_string(),
+        };
+    }
+    if let Some(extension_id) = path
+        .strip_prefix("/v1/extensions/")
+        .and_then(|path| path.strip_suffix("/remix"))
+        .and_then(valid_extension_id)
+    {
+        return Route::PackageRemix {
+            extension_id: extension_id.to_string(),
+        };
+    }
+    if let Some(extension_id) = path
+        .strip_prefix("/v1/extensions/")
+        .and_then(|path| path.strip_suffix("/publication"))
+        .and_then(valid_extension_id)
+    {
+        return Route::PackagePublication {
+            extension_id: extension_id.to_string(),
+        };
+    }
+    if let Some(extension_id) = path
+        .strip_prefix("/v1/extensions/")
+        .and_then(|path| path.strip_suffix("/registry-submission"))
+        .and_then(valid_extension_id)
+    {
+        return Route::PackageRegistrySubmission {
+            extension_id: extension_id.to_string(),
         };
     }
     if let Some(extension_id) = path
@@ -250,6 +290,53 @@ impl ApiResponse {
                 next_state: next_state.into(),
             },
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageAuthoringFlowRequestPayload {
+    package_id: Option<String>,
+    include_private_steps: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageRemixRequestPayload {
+    package_id: Option<String>,
+    #[serde(default)]
+    source_class: Option<rpc::PackageSourceClass>,
+    #[serde(default)]
+    source: Option<rpc::PackageGitHubSourceReference>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackagePublicationRequestPayload {
+    package_id: Option<String>,
+    visibility: rpc::PackagePublicationVisibility,
+    #[serde(default = "default_true")]
+    requires_registry_submission: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageRegistrySubmissionRequestPayload {
+    package_id: Option<String>,
+    #[serde(default)]
+    state: Option<rpc::PackageRegistrySubmissionState>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn package_id_from_path_and_payload(
+    path_extension_id: String,
+    payload_package_id: Option<String>,
+) -> Result<String, String> {
+    match payload_package_id {
+        Some(package_id) if package_id == path_extension_id => Ok(package_id),
+        Some(package_id) => Err(format!(
+            "package_id {package_id} does not match path package id {path_extension_id}"
+        )),
+        None => Ok(path_extension_id),
     }
 }
 
@@ -1560,6 +1647,42 @@ fn serialize_list_package_trust_index_response(
     })
 }
 
+fn serialize_package_authoring_flow_response(
+    response: rpc::PackageAuthoringFlowResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "flow": response.flow,
+    })
+}
+
+fn serialize_package_remix_response(response: rpc::PackageRemixResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "flow": response.flow,
+    })
+}
+
+fn serialize_package_publication_response(
+    response: rpc::PackagePublicationResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "flow": response.flow,
+    })
+}
+
+fn serialize_package_registry_submission_response(
+    response: rpc::PackageRegistrySubmissionResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "package_id": response.package_id,
+        "state": response.state,
+        "flow": response.flow,
+    })
+}
+
 fn serialize_rollback_extension_response(
     response: rpc::RollbackExtensionResponse,
 ) -> serde_json::Value {
@@ -2732,6 +2855,203 @@ async fn dispatch_list_package_trust_index(
     }
 }
 
+async fn dispatch_package_authoring_flow(
+    state: RpcServerState,
+    extension_id: String,
+    request: Request<Body>,
+) -> Response {
+    let payload = match body_or_empty_json::<PackageAuthoringFlowRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+    let package_id = match package_id_from_path_and_payload(extension_id, payload.package_id) {
+        Ok(package_id) => package_id,
+        Err(reason) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                reason,
+                false,
+                next_state,
+            );
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.package_authoring_flow(rpc::PackageAuthoringFlowRequest {
+        package_id,
+        include_private_steps: payload.include_private_steps.unwrap_or(true),
+    }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_package_authoring_flow_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_package_remix(
+    state: RpcServerState,
+    extension_id: String,
+    request: Request<Body>,
+) -> Response {
+    let payload = match body_or_empty_json::<PackageRemixRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+    let package_id = match package_id_from_path_and_payload(extension_id, payload.package_id) {
+        Ok(package_id) => package_id,
+        Err(reason) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                reason,
+                false,
+                next_state,
+            );
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.remix_package(rpc::PackageRemixRequest {
+        package_id,
+        source_class: payload
+            .source_class
+            .unwrap_or(rpc::PackageSourceClass::WorkspaceLocal),
+        source: payload.source,
+    }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_package_remix_response(response))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_package_publication(
+    state: RpcServerState,
+    extension_id: String,
+    request: Request<Body>,
+) -> Response {
+    let payload = match body_or_empty_json::<PackagePublicationRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+    let package_id = match package_id_from_path_and_payload(extension_id, payload.package_id) {
+        Ok(package_id) => package_id,
+        Err(reason) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                reason,
+                false,
+                next_state,
+            );
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.prepare_package_publication(rpc::PackagePublicationRequest {
+        package_id,
+        visibility: payload.visibility,
+        requires_registry_submission: payload.requires_registry_submission,
+    }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_package_publication_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_package_registry_submission(
+    state: RpcServerState,
+    extension_id: String,
+    request: Request<Body>,
+) -> Response {
+    let payload = match body_or_empty_json::<PackageRegistrySubmissionRequestPayload>(request).await
+    {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+    let package_id = match package_id_from_path_and_payload(extension_id, payload.package_id) {
+        Ok(package_id) => package_id,
+        Err(reason) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                reason,
+                false,
+                next_state,
+            );
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.submit_package_registry_submission(rpc::PackageRegistrySubmissionRequest {
+        package_id,
+        state: payload
+            .state
+            .unwrap_or(rpc::PackageRegistrySubmissionState::Submitted),
+    }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(
+                serialize_package_registry_submission_response(response),
+            )),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
 async fn dispatch_render_tool_output(state: RpcServerState, request: Request<Body>) -> Response {
     let payload = match body_or_empty_json::<RenderToolOutputRequestPayload>(request).await {
         Ok(payload) => payload,
@@ -3349,6 +3669,86 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                     response
                 } else {
                     dispatch_list_package_trust_index(state, request).await
+                }
+            }
+            Route::PackageAuthoringFlow { extension_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_package_authoring_flow(state, extension_id, request).await
+                }
+            }
+            Route::PackageRemix { extension_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_package_remix(state, extension_id, request).await
+                }
+            }
+            Route::PackagePublication { extension_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_package_publication(state, extension_id, request).await
+                }
+            }
+            Route::PackageRegistrySubmission { extension_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_package_registry_submission(state, extension_id, request).await
                 }
             }
             Route::ExtensionExecution { extension_id } => {
@@ -4031,6 +4431,30 @@ mod tests {
         assert_eq!(
             route_for_path("/v1/extensions/blocklist/list"),
             Route::ListBlocklist
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/com.example.extension/authoring-flow"),
+            Route::PackageAuthoringFlow {
+                extension_id: "com.example.extension".to_string()
+            }
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/com.example.extension/remix"),
+            Route::PackageRemix {
+                extension_id: "com.example.extension".to_string()
+            }
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/com.example.extension/publication"),
+            Route::PackagePublication {
+                extension_id: "com.example.extension".to_string()
+            }
+        );
+        assert_eq!(
+            route_for_path("/v1/extensions/com.example.extension/registry-submission"),
+            Route::PackageRegistrySubmission {
+                extension_id: "com.example.extension".to_string()
+            }
         );
         assert_eq!(
             route_for_path("/v1/extensions/com.example.extension/status"),
@@ -5782,6 +6206,144 @@ mod tests {
             .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
             .expect("response bytes");
         assert_eq!(enable_payload["data"]["record"]["status"], "installed");
+
+        let authoring_flow_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/authoring-flow",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "include_private_steps": true,
+            }),
+        )
+        .await;
+        assert_eq!(authoring_flow_response.status(), StatusCode::OK);
+        let authoring_flow_payload = to_bytes(authoring_flow_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(
+            authoring_flow_payload["data"]["flow"]["package_id"],
+            "com.example.review.extension"
+        );
+        assert_eq!(
+            authoring_flow_payload["data"]["flow"]["source_class"],
+            "verified-registry"
+        );
+        assert!(authoring_flow_payload["data"]["flow"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["id"] == "remix"));
+
+        let remix_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/remix",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "source_class": "workspace-local"
+            }),
+        )
+        .await;
+        assert_eq!(remix_response.status(), StatusCode::OK);
+        let remix_payload = to_bytes(remix_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(
+            remix_payload["data"]["flow"]["source_class"],
+            "workspace-local"
+        );
+        assert!(remix_payload["data"]["flow"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["id"] == "remix" && step["state"] == "complete"));
+
+        let publication_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/publication",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "visibility": "public_searchable",
+                "requires_registry_submission": true
+            }),
+        )
+        .await;
+        assert_eq!(publication_response.status(), StatusCode::OK);
+        let publication_payload = to_bytes(publication_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(
+            publication_payload["data"]["flow"]["publication_plan"]["visibility"],
+            "public_searchable"
+        );
+        assert!(publication_payload["data"]["flow"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["id"] == "registry_search" && step["state"] == "in_progress"));
+
+        let registry_submission_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/registry-submission",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "state": "submitted"
+            }),
+        )
+        .await;
+        assert_eq!(registry_submission_response.status(), StatusCode::OK);
+        let registry_submission_payload =
+            to_bytes(registry_submission_response.into_body(), usize::MAX)
+                .await
+                .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+                .expect("response bytes");
+        assert_eq!(registry_submission_payload["data"]["state"], "submitted");
+        assert_eq!(
+            registry_submission_payload["data"]["flow"]["publication_plan"]
+                ["requires_registry_submission"],
+            true
+        );
+        assert!(registry_submission_payload["data"]["flow"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["id"] == "registry_search" && step["state"] == "in_progress"));
+
+        let authoring_flow_after_submission_response = send_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/authoring-flow",
+        )
+        .await;
+        assert_eq!(
+            authoring_flow_after_submission_response.status(),
+            StatusCode::OK
+        );
+        let authoring_flow_after_submission_payload = to_bytes(
+            authoring_flow_after_submission_response.into_body(),
+            usize::MAX,
+        )
+        .await
+        .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+        .expect("response bytes");
+        assert_eq!(
+            authoring_flow_after_submission_payload["data"]["flow"]["publication_plan"]
+                ["visibility"],
+            "public_searchable"
+        );
+        assert!(
+            authoring_flow_after_submission_payload["data"]["flow"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["id"] == "registry_search" && step["state"] == "in_progress")
+        );
 
         let block_response = send_json_request(
             &rpc_server,

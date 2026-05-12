@@ -1916,6 +1916,88 @@ impl ExtensionRegistry {
         Ok(record.clone())
     }
 
+    pub fn update_publication(
+        &mut self,
+        extension_id: &str,
+        publication: ExtensionPublication,
+    ) -> RegistryResult<ExtensionInstallRecord> {
+        let version = self
+            .active_versions
+            .get(extension_id)
+            .cloned()
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+        let mut manifest = self
+            .manifests
+            .get(extension_id)
+            .and_then(|records| records.get(&version))
+            .cloned()
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+        let record = self
+            .records
+            .get(extension_id)
+            .and_then(|records| records.get(&version))
+            .cloned()
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+
+        manifest.provenance.publication = Some(publication);
+        let effective_policy = with_record_approvals(&self.validation_policy, &record);
+        manifest.validate(&effective_policy)?;
+        self.ensure_not_blocked(&manifest)?;
+
+        self.manifests
+            .get_mut(extension_id)
+            .and_then(|records| records.get_mut(&version))
+            .expect("manifest existence checked before publication update")
+            .provenance
+            .publication = manifest.provenance.publication.clone();
+
+        let record = self
+            .records
+            .get_mut(extension_id)
+            .and_then(|records| records.get_mut(&version))
+            .expect("record existence checked before publication update");
+        record.source.publication = manifest.provenance.publication;
+        Ok(record.clone())
+    }
+
+    pub fn update_registry_submission(
+        &mut self,
+        extension_id: &str,
+        registry_submission: ExtensionRegistrySubmission,
+    ) -> RegistryResult<ExtensionInstallRecord> {
+        let version = self
+            .active_versions
+            .get(extension_id)
+            .cloned()
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+        let existing_publication = self
+            .records
+            .get(extension_id)
+            .and_then(|records| records.get(&version))
+            .and_then(|record| record.source.publication.clone())
+            .ok_or_else(|| {
+                RegistryError::Validation(ExtensionValidationError::MissingField {
+                    field: "provenance.publication",
+                })
+            })?;
+
+        self.update_publication(
+            extension_id,
+            ExtensionPublication {
+                registry_submission,
+                ..existing_publication
+            },
+        )
+    }
+
     pub fn active_record(&self, extension_id: &str) -> Option<ExtensionInstallRecord> {
         let version = self.active_versions.get(extension_id)?;
         self.records.get(extension_id)?.get(version).cloned()
@@ -2600,6 +2682,28 @@ pub struct RemoveExtensionResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateExtensionPublicationRequest {
+    pub extension_id: String,
+    pub publication: ExtensionPublication,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateExtensionPublicationResponse {
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateExtensionRegistrySubmissionRequest {
+    pub extension_id: String,
+    pub registry_submission: ExtensionRegistrySubmission,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateExtensionRegistrySubmissionResponse {
+    pub record: ExtensionInstallRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApplyBlocklistRequest {
     pub entry: BlocklistEntry,
 }
@@ -2741,6 +2845,28 @@ impl ExtensionRegistryService {
             .registry
             .remove(&request.extension_id)
             .map(|record| RemoveExtensionResponse { record })?;
+        Ok(record)
+    }
+
+    pub fn update_extension_publication(
+        &mut self,
+        request: UpdateExtensionPublicationRequest,
+    ) -> RegistryResult<UpdateExtensionPublicationResponse> {
+        let record = self
+            .registry
+            .update_publication(&request.extension_id, request.publication)
+            .map(|record| UpdateExtensionPublicationResponse { record })?;
+        Ok(record)
+    }
+
+    pub fn update_extension_registry_submission(
+        &mut self,
+        request: UpdateExtensionRegistrySubmissionRequest,
+    ) -> RegistryResult<UpdateExtensionRegistrySubmissionResponse> {
+        let record = self
+            .registry
+            .update_registry_submission(&request.extension_id, request.registry_submission)
+            .map(|record| UpdateExtensionRegistrySubmissionResponse { record })?;
         Ok(record)
     }
 

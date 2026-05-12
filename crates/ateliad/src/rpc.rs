@@ -25,15 +25,19 @@ pub use crate::service::{
 use atelia_core::{
     Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState,
     DisableExtensionRequest, EnableExtensionRequest, EventCursor as CoreEventCursor, EventQuery,
-    EventSeverity, EventSubjectType, ExtensionInstallRecord, ExtensionStatusRequest,
+    EventSeverity, EventSubjectType, ExtensionInstallRecord, ExtensionPublication,
+    ExtensionPublicationVisibility, ExtensionRegistrySubmission, ExtensionStatusRequest,
     InstallExtensionRequest, JobEvent, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
     ListBlocklistRequest, ListExtensionsRequest, OutputFormat, OversizeOutputPolicy, PathScope,
     PolicyOutcome, ProjectId, RemoveExtensionRequest, RenderOptions, RepositoryId,
     RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier, RollbackExtensionRequest,
     StoreError, ToolInvocationId, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity, ToolResultId,
-    TruncationMetadata, UpdateExtensionRequest, ValidateExtensionManifestRequest, WatchJobEvent,
+    TruncationMetadata, UpdateExtensionPublicationRequest,
+    UpdateExtensionRegistrySubmissionRequest, UpdateExtensionRequest,
+    ValidateExtensionManifestRequest, WatchJobEvent,
 };
+use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use tokio::sync::mpsc;
 
@@ -364,6 +368,100 @@ impl SecretaryRpcServer {
         Ok(ListPackageTrustIndexResponse {
             metadata: self.metadata(),
             packages: response.packages,
+        })
+    }
+
+    pub fn package_authoring_flow(
+        &self,
+        request: PackageAuthoringFlowRequest,
+    ) -> RpcResult<PackageAuthoringFlowResponse> {
+        let extension = self.service.extension_status(ExtensionStatusRequest {
+            extension_id: request.package_id,
+        })?;
+        Ok(PackageAuthoringFlowResponse {
+            metadata: self.metadata(),
+            flow: package_authoring_flow_from_status(&extension, request.include_private_steps),
+        })
+    }
+
+    pub fn remix_package(&self, request: PackageRemixRequest) -> RpcResult<PackageRemixResponse> {
+        let extension = self.service.extension_status(ExtensionStatusRequest {
+            extension_id: request.package_id,
+        })?;
+        let mut flow = package_authoring_flow_from_status(&extension, true);
+        flow.source_class = request.source_class;
+        flow.source = request.source.or(flow.source);
+        mark_package_authoring_step(
+            &mut flow,
+            PackageAuthoringStage::Remix,
+            PackageAuthoringStepState::Complete,
+        );
+        mark_package_authoring_step(
+            &mut flow,
+            PackageAuthoringStage::Publish,
+            PackageAuthoringStepState::Available,
+        );
+        Ok(PackageRemixResponse {
+            metadata: self.metadata(),
+            flow,
+        })
+    }
+
+    pub fn prepare_package_publication(
+        &self,
+        request: PackagePublicationRequest,
+    ) -> RpcResult<PackagePublicationResponse> {
+        let publication_visibility = request.visibility;
+        self.service
+            .update_extension_publication(UpdateExtensionPublicationRequest {
+                extension_id: request.package_id.clone(),
+                publication: ExtensionPublication {
+                    visibility: ExtensionPublicationVisibility::from(publication_visibility),
+                    registry_submission: if request.requires_registry_submission {
+                        ExtensionRegistrySubmission::Submitted
+                    } else {
+                        ExtensionRegistrySubmission::NotSubmitted
+                    },
+                },
+            })?;
+        let extension = self.service.extension_status(ExtensionStatusRequest {
+            extension_id: request.package_id,
+        })?;
+        Ok(PackagePublicationResponse {
+            metadata: self.metadata(),
+            flow: package_authoring_flow_from_status(&extension, true),
+        })
+    }
+
+    pub fn submit_package_registry_submission(
+        &self,
+        request: PackageRegistrySubmissionRequest,
+    ) -> RpcResult<PackageRegistrySubmissionResponse> {
+        self.service.update_extension_registry_submission(
+            UpdateExtensionRegistrySubmissionRequest {
+                extension_id: request.package_id.clone(),
+                registry_submission: ExtensionRegistrySubmission::from(request.state),
+            },
+        )?;
+        let extension = self.service.extension_status(ExtensionStatusRequest {
+            extension_id: request.package_id.clone(),
+        })?;
+        let state = extension
+            .record
+            .as_ref()
+            .and_then(|record| record.source.publication.as_ref())
+            .map(|publication| {
+                PackageRegistrySubmissionState::from(publication.registry_submission)
+            })
+            .ok_or_else(|| RpcError {
+                code: RpcErrorCode::Internal,
+                reason: "registry submission update did not persist publication state".to_string(),
+            })?;
+        Ok(PackageRegistrySubmissionResponse {
+            metadata: self.metadata(),
+            package_id: request.package_id,
+            state,
+            flow: Some(package_authoring_flow_from_status(&extension, true)),
         })
     }
 
@@ -1500,6 +1598,198 @@ pub struct ListPackageTrustIndexResponse {
     pub packages: Vec<PackageTrustIndexEntry>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PackageSourceClass {
+    HostShippedBuiltIn,
+    WorkspaceLocal,
+    UserSelected,
+    VerifiedRegistry,
+    BundledOfficial,
+    Development,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageAuthoringStage {
+    Install,
+    Inspect,
+    Validate,
+    Remix,
+    Publish,
+    RegistrySearch,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageAuthoringStepState {
+    Available,
+    Blocked,
+    RequiresValidation,
+    RequiresConsent,
+    InProgress,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageGitHubPublicationAction {
+    CreateRepository,
+    ForkRepository,
+    CreateBranch,
+    CommitChanges,
+    OpenPullRequest,
+    PrepareReleaseMetadata,
+    SubmitRegistryMetadata,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackagePublicationVisibility {
+    PrivateRemix,
+    UnlistedShare,
+    PublicSearchable,
+    Official,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageRegistrySubmissionState {
+    NotSubmitted,
+    Submitted,
+    Accepted,
+    Rejected,
+}
+
+impl From<PackagePublicationVisibility> for ExtensionPublicationVisibility {
+    fn from(value: PackagePublicationVisibility) -> Self {
+        match value {
+            PackagePublicationVisibility::PrivateRemix => Self::PrivateRemix,
+            PackagePublicationVisibility::UnlistedShare => Self::UnlistedShare,
+            PackagePublicationVisibility::PublicSearchable => Self::PublicSearchable,
+            PackagePublicationVisibility::Official => Self::Official,
+        }
+    }
+}
+
+impl From<PackageRegistrySubmissionState> for ExtensionRegistrySubmission {
+    fn from(value: PackageRegistrySubmissionState) -> Self {
+        match value {
+            PackageRegistrySubmissionState::NotSubmitted => Self::NotSubmitted,
+            PackageRegistrySubmissionState::Submitted => Self::Submitted,
+            PackageRegistrySubmissionState::Accepted => Self::Accepted,
+            PackageRegistrySubmissionState::Rejected => Self::Rejected,
+        }
+    }
+}
+
+impl From<ExtensionRegistrySubmission> for PackageRegistrySubmissionState {
+    fn from(value: ExtensionRegistrySubmission) -> Self {
+        match value {
+            ExtensionRegistrySubmission::NotSubmitted => Self::NotSubmitted,
+            ExtensionRegistrySubmission::Submitted => Self::Submitted,
+            ExtensionRegistrySubmission::Accepted => Self::Accepted,
+            ExtensionRegistrySubmission::Rejected => Self::Rejected,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackageGitHubSourceReference {
+    pub repository: String,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    pub manifest_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_digest: Option<String>,
+    #[serde(default)]
+    pub artifact_digests: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackagePublicationPlan {
+    pub visibility: PackagePublicationVisibility,
+    pub source_class: PackageSourceClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PackageGitHubSourceReference>,
+    #[serde(default)]
+    pub github_actions: Vec<PackageGitHubPublicationAction>,
+    pub requires_registry_submission: bool,
+    pub production_installable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackageAuthoringFlowStep {
+    pub id: PackageAuthoringStage,
+    pub title: String,
+    pub state: PackageAuthoringStepState,
+    pub requires_explicit_consent: bool,
+    pub policy_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackageAuthoringFlow {
+    pub package_id: String,
+    pub source_class: PackageSourceClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PackageGitHubSourceReference>,
+    pub steps: Vec<PackageAuthoringFlowStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_plan: Option<PackagePublicationPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageAuthoringFlowRequest {
+    pub package_id: String,
+    pub include_private_steps: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageAuthoringFlowResponse {
+    pub metadata: ProtocolMetadata,
+    pub flow: PackageAuthoringFlow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageRemixRequest {
+    pub package_id: String,
+    pub source_class: PackageSourceClass,
+    pub source: Option<PackageGitHubSourceReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageRemixResponse {
+    pub metadata: ProtocolMetadata,
+    pub flow: PackageAuthoringFlow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackagePublicationRequest {
+    pub package_id: String,
+    pub visibility: PackagePublicationVisibility,
+    pub requires_registry_submission: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackagePublicationResponse {
+    pub metadata: ProtocolMetadata,
+    pub flow: PackageAuthoringFlow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageRegistrySubmissionRequest {
+    pub package_id: String,
+    pub state: PackageRegistrySubmissionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageRegistrySubmissionResponse {
+    pub metadata: ProtocolMetadata,
+    pub package_id: String,
+    pub state: PackageRegistrySubmissionState,
+    pub flow: Option<PackageAuthoringFlow>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackExtensionResponse {
     pub metadata: ProtocolMetadata,
@@ -1679,6 +1969,222 @@ pub struct PolicyDecision {
     pub reason: String,
     pub approval_request_ref: Option<String>,
     pub audit_ref: Option<String>,
+}
+
+fn package_authoring_flow_from_status(
+    status: &atelia_core::ExtensionStatusResponse,
+    include_private_steps: bool,
+) -> PackageAuthoringFlow {
+    let record = status
+        .record
+        .as_ref()
+        .expect("extension_status responses include active records");
+    let source_class = package_source_class_from_record(record);
+    let source = package_source_reference_from_record(record);
+    let publication_plan = record
+        .source
+        .publication
+        .as_ref()
+        .map(|publication| package_publication_plan_from_record(record, publication));
+    let blocked = status.block.is_some()
+        || matches!(record.status, atelia_core::ExtensionInstallStatus::Blocked);
+    let validation_state = if blocked {
+        PackageAuthoringStepState::Blocked
+    } else {
+        PackageAuthoringStepState::Complete
+    };
+    let registry_state = record
+        .source
+        .publication
+        .as_ref()
+        .map(package_registry_search_state)
+        .unwrap_or(PackageAuthoringStepState::Available);
+
+    let mut steps = vec![
+        package_authoring_step(
+            PackageAuthoringStage::Install,
+            "Install",
+            PackageAuthoringStepState::Complete,
+            false,
+            Vec::new(),
+        ),
+        package_authoring_step(
+            PackageAuthoringStage::Inspect,
+            "Inspect",
+            PackageAuthoringStepState::Complete,
+            false,
+            Vec::new(),
+        ),
+        package_authoring_step(
+            PackageAuthoringStage::Validate,
+            "Validate",
+            validation_state,
+            false,
+            status
+                .block
+                .as_ref()
+                .map(|block| vec![format!("Package is blocked by {:?}", block.reason)])
+                .unwrap_or_default(),
+        ),
+        package_authoring_step(
+            PackageAuthoringStage::Remix,
+            "Remix",
+            PackageAuthoringStepState::Available,
+            true,
+            Vec::new(),
+        ),
+        package_authoring_step(
+            PackageAuthoringStage::Publish,
+            "Publish",
+            publication_plan
+                .as_ref()
+                .map(|_| PackageAuthoringStepState::Complete)
+                .unwrap_or(PackageAuthoringStepState::Available),
+            true,
+            Vec::new(),
+        ),
+        package_authoring_step(
+            PackageAuthoringStage::RegistrySearch,
+            "Registry Search",
+            registry_state,
+            true,
+            Vec::new(),
+        ),
+    ];
+
+    if !include_private_steps {
+        steps.retain(|step| {
+            !matches!(
+                step.id,
+                PackageAuthoringStage::Remix | PackageAuthoringStage::Publish
+            )
+        });
+    }
+
+    PackageAuthoringFlow {
+        package_id: status.extension_id.clone(),
+        source_class,
+        source,
+        steps,
+        publication_plan,
+    }
+}
+
+fn package_authoring_step(
+    id: PackageAuthoringStage,
+    title: &'static str,
+    state: PackageAuthoringStepState,
+    requires_explicit_consent: bool,
+    policy_notes: Vec<String>,
+) -> PackageAuthoringFlowStep {
+    PackageAuthoringFlowStep {
+        id,
+        title: title.to_string(),
+        state,
+        requires_explicit_consent,
+        policy_notes,
+    }
+}
+
+fn mark_package_authoring_step(
+    flow: &mut PackageAuthoringFlow,
+    stage: PackageAuthoringStage,
+    state: PackageAuthoringStepState,
+) {
+    if let Some(step) = flow.steps.iter_mut().find(|step| step.id == stage) {
+        step.state = state;
+    }
+}
+
+fn package_registry_search_state(
+    publication: &atelia_core::ExtensionPublication,
+) -> PackageAuthoringStepState {
+    match (publication.visibility, publication.registry_submission) {
+        (
+            atelia_core::ExtensionPublicationVisibility::PrivateRemix,
+            atelia_core::ExtensionRegistrySubmission::NotSubmitted,
+        ) => PackageAuthoringStepState::Complete,
+        (_, atelia_core::ExtensionRegistrySubmission::NotSubmitted) => {
+            PackageAuthoringStepState::RequiresConsent
+        }
+        (_, atelia_core::ExtensionRegistrySubmission::Submitted) => {
+            PackageAuthoringStepState::InProgress
+        }
+        (_, atelia_core::ExtensionRegistrySubmission::Accepted) => {
+            PackageAuthoringStepState::Complete
+        }
+        (_, atelia_core::ExtensionRegistrySubmission::Rejected) => {
+            PackageAuthoringStepState::Blocked
+        }
+    }
+}
+
+fn package_source_class_from_record(record: &ExtensionInstallRecord) -> PackageSourceClass {
+    match record.boundary {
+        atelia_core::ExtensionBoundary::Official => PackageSourceClass::BundledOfficial,
+        atelia_core::ExtensionBoundary::LocalDevelopment => PackageSourceClass::Development,
+        atelia_core::ExtensionBoundary::ThirdParty => match record.source.source {
+            atelia_core::ProvenanceSource::Registry => PackageSourceClass::VerifiedRegistry,
+            atelia_core::ProvenanceSource::Github => PackageSourceClass::UserSelected,
+            atelia_core::ProvenanceSource::Local => PackageSourceClass::WorkspaceLocal,
+        },
+    }
+}
+
+fn package_source_reference_from_record(
+    record: &ExtensionInstallRecord,
+) -> Option<PackageGitHubSourceReference> {
+    Some(PackageGitHubSourceReference {
+        repository: record.source.repository.clone()?,
+        source_ref: record.source.source_ref.clone(),
+        manifest_path: record.source.manifest_path.clone()?,
+        manifest_digest: Some(record.manifest_digest.clone()),
+        artifact_digests: vec![record.artifact_digest.clone()],
+    })
+}
+
+fn package_publication_plan_from_record(
+    record: &ExtensionInstallRecord,
+    publication: &atelia_core::ExtensionPublication,
+) -> PackagePublicationPlan {
+    PackagePublicationPlan {
+        visibility: match publication.visibility {
+            atelia_core::ExtensionPublicationVisibility::PrivateRemix => {
+                PackagePublicationVisibility::PrivateRemix
+            }
+            atelia_core::ExtensionPublicationVisibility::UnlistedShare => {
+                PackagePublicationVisibility::UnlistedShare
+            }
+            atelia_core::ExtensionPublicationVisibility::PublicSearchable => {
+                PackagePublicationVisibility::PublicSearchable
+            }
+            atelia_core::ExtensionPublicationVisibility::Official => {
+                PackagePublicationVisibility::Official
+            }
+        },
+        source_class: package_source_class_from_record(record),
+        source: package_source_reference_from_record(record),
+        github_actions: default_package_publication_actions(),
+        requires_registry_submission: !matches!(
+            publication.registry_submission,
+            atelia_core::ExtensionRegistrySubmission::NotSubmitted
+        ),
+        production_installable: matches!(
+            publication.registry_submission,
+            atelia_core::ExtensionRegistrySubmission::Accepted
+        ),
+    }
+}
+
+fn default_package_publication_actions() -> Vec<PackageGitHubPublicationAction> {
+    vec![
+        PackageGitHubPublicationAction::CreateRepository,
+        PackageGitHubPublicationAction::CreateBranch,
+        PackageGitHubPublicationAction::CommitChanges,
+        PackageGitHubPublicationAction::OpenPullRequest,
+        PackageGitHubPublicationAction::PrepareReleaseMetadata,
+        PackageGitHubPublicationAction::SubmitRegistryMetadata,
+    ]
 }
 
 fn parse_repository_id(value: &str) -> RpcResult<RepositoryId> {
