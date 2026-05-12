@@ -16,12 +16,12 @@ use atelia_core::{
     InstallExtensionRequest, InstallExtensionResponse, JobEvent, JobId, JobKind,
     JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
     ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
-    OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput, PolicyOutcome,
-    RegistryError, RemoveExtensionRequest, RemoveExtensionResponse, RenderedToolOutput,
-    RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RollbackExtensionRequest,
-    RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore,
-    StoreError, SubmitJobIdempotencyRecord, ToolInvocationId, ToolOutputDefaults,
-    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
+    ManifestValidationPolicy, OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput,
+    PolicyOutcome, RegistryError, RemoveExtensionRequest, RemoveExtensionResponse,
+    RenderedToolOutput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
+    RollbackExtensionRequest, RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt,
+    RuntimeJobRequest, SecretaryStore, StoreError, SubmitJobIdempotencyRecord, ToolInvocationId,
+    ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
     ToolOutputSettingsScope, ToolResultId, TruncationMetadata, UpdateExtensionRequest,
     UpdateExtensionResponse, ValidateExtensionManifestRequest, ValidateExtensionManifestResponse,
     WatchJobEvent,
@@ -496,14 +496,16 @@ impl SecretaryService {
 
     fn from_store(store: InMemoryStore) -> ServiceResult<Self> {
         let extension_registry = ExtensionRegistryService::with_registry(
-            ExtensionRegistry::from_snapshot(store.extension_registry_snapshot()?).map_err(
-                |reason| {
-                    ServiceError::Store(atelia_core::StoreError::InvalidRecord {
-                        collection: "extension_registry",
-                        reason,
-                    })
-                },
-            )?,
+            ExtensionRegistry::from_snapshot(
+                store.extension_registry_snapshot()?,
+                ManifestValidationPolicy::default(),
+            )
+            .map_err(|reason| {
+                ServiceError::Store(atelia_core::StoreError::InvalidRecord {
+                    collection: "extension_registry",
+                    reason,
+                })
+            })?,
         );
 
         Ok(Self {
@@ -540,13 +542,16 @@ impl SecretaryService {
         mutator: impl FnOnce(&mut ExtensionRegistryService) -> Result<R, RegistryError>,
     ) -> ServiceResult<R> {
         let mut registry = self.lock_extension_registry()?;
+        let validation_policy = registry.validation_policy();
         let mut draft = ExtensionRegistryService::with_registry(
-            ExtensionRegistry::from_snapshot(registry.snapshot()).map_err(|reason| {
-                ServiceError::Store(atelia_core::StoreError::InvalidRecord {
-                    collection: "extension_registry",
-                    reason,
-                })
-            })?,
+            ExtensionRegistry::from_snapshot(registry.snapshot(), validation_policy).map_err(
+                |reason| {
+                    ServiceError::Store(atelia_core::StoreError::InvalidRecord {
+                        collection: "extension_registry",
+                        reason,
+                    })
+                },
+            )?,
         );
         let response = mutator(&mut draft).map_err(ServiceError::from)?;
         self.persist_extension_registry_snapshot(&draft)?;

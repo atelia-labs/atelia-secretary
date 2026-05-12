@@ -1618,14 +1618,17 @@ impl ExtensionRegistry {
         }
     }
 
-    pub fn from_snapshot(snapshot: ExtensionRegistrySnapshot) -> Result<Self, String> {
+    pub fn from_snapshot(
+        snapshot: ExtensionRegistrySnapshot,
+        validation_policy: ManifestValidationPolicy,
+    ) -> Result<Self, String> {
         snapshot.validate()?;
         Ok(Self {
             manifests: snapshot.manifests,
             records: snapshot.records,
             active_versions: snapshot.active_versions,
             blocklist: snapshot.blocklist,
-            validation_policy: ManifestValidationPolicy::default(),
+            validation_policy,
         })
     }
 
@@ -1636,6 +1639,10 @@ impl ExtensionRegistry {
             active_versions: self.active_versions.clone(),
             blocklist: self.blocklist.clone(),
         }
+    }
+
+    pub fn validation_policy(&self) -> ManifestValidationPolicy {
+        self.validation_policy.clone()
     }
 
     pub fn in_memory() -> Self {
@@ -2146,6 +2153,11 @@ fn validate_extension_registry_snapshot(
                     "manifest digest mismatch for extension {extension_id} version {version}"
                 ));
             }
+            if record.source != ExtensionSourceSnapshot::from_provenance(&manifest.provenance) {
+                return Err(format!(
+                    "source snapshot mismatch for extension {extension_id} version {version}"
+                ));
+            }
         }
     }
 
@@ -2483,6 +2495,10 @@ impl ExtensionRegistryService {
 
     pub fn snapshot(&self) -> ExtensionRegistrySnapshot {
         self.registry.snapshot()
+    }
+
+    pub fn validation_policy(&self) -> ManifestValidationPolicy {
+        self.registry.validation_policy()
     }
 
     pub fn install_extension(
