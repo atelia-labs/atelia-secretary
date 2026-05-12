@@ -295,6 +295,7 @@ impl ApiResponse {
 
 /// HTTP payload for requesting a package authoring flow.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackageAuthoringFlowRequestPayload {
     package_id: Option<String>,
     include_private_steps: Option<bool>,
@@ -302,6 +303,7 @@ struct PackageAuthoringFlowRequestPayload {
 
 /// HTTP payload for previewing a package remix flow.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackageRemixRequestPayload {
     package_id: Option<String>,
     #[serde(default)]
@@ -312,6 +314,7 @@ struct PackageRemixRequestPayload {
 
 /// HTTP payload for preparing package publication.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackagePublicationRequestPayload {
     package_id: Option<String>,
     visibility: rpc::PackagePublicationVisibility,
@@ -321,10 +324,13 @@ struct PackagePublicationRequestPayload {
 
 /// HTTP payload for updating package registry submission state.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackageRegistrySubmissionRequestPayload {
     package_id: Option<String>,
     #[serde(default)]
     state: Option<rpc::PackageRegistrySubmissionState>,
+    #[serde(default)]
+    registry_identity: Option<String>,
 }
 
 /// Return the default registry-submission requirement for publication requests.
@@ -2898,7 +2904,7 @@ async fn dispatch_package_authoring_flow(
     let next_state = rpc_next_state(&rpc_server);
     match rpc_server.package_authoring_flow(rpc::PackageAuthoringFlowRequest {
         package_id,
-        include_private_steps: payload.include_private_steps.unwrap_or(true),
+        include_private_steps: payload.include_private_steps.unwrap_or(false),
     }) {
         Ok(response) => (
             StatusCode::OK,
@@ -3070,6 +3076,20 @@ async fn dispatch_package_registry_submission(
             );
         }
     };
+    let registry_identity = match payload.registry_identity {
+        Some(registry_identity) if registry_identity.trim().is_empty() => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "registry_identity must not be blank",
+                false,
+                next_state,
+            );
+        }
+        registry_identity => registry_identity,
+    };
 
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
@@ -3078,6 +3098,7 @@ async fn dispatch_package_registry_submission(
         state: payload
             .state
             .unwrap_or(rpc::PackageRegistrySubmissionState::Submitted),
+        registry_identity,
     }) {
         Ok(response) => (
             StatusCode::OK,
@@ -6346,13 +6367,30 @@ mod tests {
             .iter()
             .any(|step| step["id"] == "registry_search" && step["state"] == "requires_consent"));
 
+        let blank_registry_identity_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/registry-submission",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "state": "submitted",
+                "registry_identity": " \t "
+            }),
+        )
+        .await;
+        assert_eq!(
+            blank_registry_identity_response.status(),
+            StatusCode::BAD_REQUEST
+        );
+
         let registry_submission_response = send_json_request(
             &rpc_server,
             Method::POST,
             "/v1/extensions/com.example.review.extension/registry-submission",
             serde_json::json!({
                 "package_id": "com.example.review.extension",
-                "state": "submitted"
+                "state": "submitted",
+                "registry_identity": "third-party-registry"
             }),
         )
         .await;

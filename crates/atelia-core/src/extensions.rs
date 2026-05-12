@@ -1976,6 +1976,7 @@ impl ExtensionRegistry {
         &mut self,
         extension_id: &str,
         registry_submission: ExtensionRegistrySubmission,
+        registry_identity: Option<String>,
     ) -> RegistryResult<ExtensionInstallRecord> {
         let version = self
             .active_versions
@@ -1994,14 +1995,60 @@ impl ExtensionRegistry {
                     field: "provenance.publication",
                 })
             })?;
+        let record = self
+            .records
+            .get(extension_id)
+            .and_then(|records| records.get(&version))
+            .cloned()
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
+        let mut manifest = self
+            .manifests
+            .get(extension_id)
+            .and_then(|records| records.get(&version))
+            .cloned()
+            .ok_or_else(|| RegistryError::NotInstalled {
+                extension_id: extension_id.to_string(),
+            })?;
 
-        self.update_publication(
-            extension_id,
-            ExtensionPublication {
-                registry_submission,
-                ..existing_publication
-            },
-        )
+        let registry_identity = trim_optional_string(registry_identity.as_deref());
+        if let Some(registry_identity) = registry_identity.clone() {
+            manifest.provenance.registry_identity = Some(registry_identity);
+        }
+        manifest.provenance.publication = Some(ExtensionPublication {
+            registry_submission,
+            ..existing_publication
+        });
+        let effective_policy = with_record_approvals(&self.validation_policy, &record);
+        manifest.validate(&effective_policy)?;
+        self.ensure_not_blocked(&manifest)?;
+
+        let persisted_publication = manifest.provenance.publication.clone();
+        let persisted_registry_identity = manifest.provenance.registry_identity.clone();
+        {
+            self.manifests
+                .get_mut(extension_id)
+                .and_then(|records| records.get_mut(&version))
+                .expect("manifest existence checked before registry submission update")
+                .provenance
+                .registry_identity = persisted_registry_identity.clone();
+            self.manifests
+                .get_mut(extension_id)
+                .and_then(|records| records.get_mut(&version))
+                .expect("manifest existence checked before registry submission update")
+                .provenance
+                .publication = persisted_publication.clone();
+        }
+
+        let record = self
+            .records
+            .get_mut(extension_id)
+            .and_then(|records| records.get_mut(&version))
+            .expect("record existence checked before registry submission update");
+        record.source.registry_identity = persisted_registry_identity;
+        record.source.publication = persisted_publication;
+        Ok(record.clone())
     }
 
     pub fn active_record(&self, extension_id: &str) -> Option<ExtensionInstallRecord> {
@@ -2710,6 +2757,8 @@ pub struct UpdateExtensionRegistrySubmissionRequest {
     pub extension_id: String,
     /// Registry submission state to persist.
     pub registry_submission: ExtensionRegistrySubmission,
+    /// Registry identity to persist when advancing a registry-backed submission.
+    pub registry_identity: Option<String>,
 }
 
 /// Response containing the install record after registry submission changes.
@@ -2883,7 +2932,11 @@ impl ExtensionRegistryService {
     ) -> RegistryResult<UpdateExtensionRegistrySubmissionResponse> {
         let record = self
             .registry
-            .update_registry_submission(&request.extension_id, request.registry_submission)
+            .update_registry_submission(
+                &request.extension_id,
+                request.registry_submission,
+                request.registry_identity,
+            )
             .map(|record| UpdateExtensionRegistrySubmissionResponse { record })?;
         Ok(record)
     }
@@ -5161,6 +5214,59 @@ mod tests {
                 .and_then(|versions| versions.get(active_version))
                 .and_then(|record| record.source.publication.clone()),
             Some(publication)
+        );
+    }
+
+    #[test]
+    fn update_registry_submission_persists_registry_identity_for_public_submission() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(
+                github_manifest("com.example.extension"),
+                InstallOptions::default(),
+            )
+            .unwrap();
+
+        registry
+            .update_publication(
+                "com.example.extension",
+                ExtensionPublication {
+                    visibility: ExtensionPublicationVisibility::PublicSearchable,
+                    registry_submission: ExtensionRegistrySubmission::AwaitingSubmission,
+                },
+            )
+            .unwrap();
+
+        let record = registry
+            .update_registry_submission(
+                "com.example.extension",
+                ExtensionRegistrySubmission::Submitted,
+                Some(" third-party-registry ".to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            record.source.registry_identity.as_deref(),
+            Some("third-party-registry")
+        );
+        assert_eq!(
+            record.source.publication,
+            Some(ExtensionPublication {
+                visibility: ExtensionPublicationVisibility::PublicSearchable,
+                registry_submission: ExtensionRegistrySubmission::Submitted,
+            })
+        );
+        let active_version = registry
+            .active_versions
+            .get("com.example.extension")
+            .expect("active version should exist");
+        assert_eq!(
+            registry
+                .manifests
+                .get("com.example.extension")
+                .and_then(|versions| versions.get(active_version))
+                .and_then(|manifest| manifest.provenance.registry_identity.as_deref()),
+            Some("third-party-registry")
         );
     }
 

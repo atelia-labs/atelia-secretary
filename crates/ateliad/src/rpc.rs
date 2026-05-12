@@ -445,6 +445,7 @@ impl SecretaryRpcServer {
             UpdateExtensionRegistrySubmissionRequest {
                 extension_id: request.package_id.clone(),
                 registry_submission: ExtensionRegistrySubmission::from(request.state),
+                registry_identity: request.registry_identity,
             },
         )?;
         let extension = self.service.extension_status(ExtensionStatusRequest {
@@ -1878,6 +1879,8 @@ pub struct PackageRegistrySubmissionRequest {
     pub package_id: String,
     /// Registry submission state to persist.
     pub state: PackageRegistrySubmissionState,
+    /// Registry identity to persist when submitting to a registry.
+    pub registry_identity: Option<String>,
 }
 
 /// Response containing persisted registry submission state and flow.
