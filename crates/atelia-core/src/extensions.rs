@@ -1924,7 +1924,7 @@ impl ExtensionRegistry {
     pub fn update_publication(
         &mut self,
         extension_id: &str,
-        publication: ExtensionPublication,
+        mut publication: ExtensionPublication,
     ) -> RegistryResult<ExtensionInstallRecord> {
         let version = self
             .active_versions
@@ -1950,6 +1950,18 @@ impl ExtensionRegistry {
                 extension_id: extension_id.to_string(),
             })?;
 
+        if let Some(
+            state @ (ExtensionRegistrySubmission::Submitted
+            | ExtensionRegistrySubmission::Accepted
+            | ExtensionRegistrySubmission::Rejected),
+        ) = record
+            .source
+            .publication
+            .as_ref()
+            .map(|publication| publication.registry_submission)
+        {
+            publication.registry_submission = state;
+        }
         manifest.provenance.publication = Some(publication);
         let effective_policy = with_record_approvals(&self.validation_policy, &record);
         manifest.validate(&effective_policy)?;
@@ -5215,6 +5227,49 @@ mod tests {
                 .and_then(|record| record.source.publication.clone()),
             Some(publication)
         );
+    }
+
+    #[test]
+    fn update_publication_preserves_registry_owned_submission_state() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+        registry
+            .update_publication(
+                "com.example.extension",
+                ExtensionPublication {
+                    visibility: ExtensionPublicationVisibility::PublicSearchable,
+                    registry_submission: ExtensionRegistrySubmission::AwaitingSubmission,
+                },
+            )
+            .unwrap();
+        registry
+            .update_registry_submission(
+                "com.example.extension",
+                ExtensionRegistrySubmission::Submitted,
+                Some("third-party-registry".to_string()),
+            )
+            .unwrap();
+
+        let record = registry
+            .update_publication(
+                "com.example.extension",
+                ExtensionPublication {
+                    visibility: ExtensionPublicationVisibility::UnlistedShare,
+                    registry_submission: ExtensionRegistrySubmission::NotSubmitted,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            record.source.publication,
+            Some(ExtensionPublication {
+                visibility: ExtensionPublicationVisibility::UnlistedShare,
+                registry_submission: ExtensionRegistrySubmission::Submitted,
+            })
+        );
+        registry.snapshot().validate().unwrap();
     }
 
     #[test]

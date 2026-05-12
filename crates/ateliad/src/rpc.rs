@@ -422,29 +422,15 @@ impl SecretaryRpcServer {
         request: PackagePublicationRequest,
     ) -> RpcResult<PackagePublicationResponse> {
         let publication_visibility = request.visibility;
-        let existing = self.service.extension_status(ExtensionStatusRequest {
-            extension_id: request.package_id.clone(),
-        })?;
-        let existing_registry_submission = existing
-            .record
-            .as_ref()
-            .and_then(|record| record.source.publication.as_ref())
-            .map(|publication| publication.registry_submission);
         self.service
             .update_extension_publication(UpdateExtensionPublicationRequest {
                 extension_id: request.package_id.clone(),
                 publication: ExtensionPublication {
                     visibility: ExtensionPublicationVisibility::from(publication_visibility),
-                    registry_submission: match existing_registry_submission {
-                        Some(
-                            state @ (ExtensionRegistrySubmission::Submitted
-                            | ExtensionRegistrySubmission::Accepted
-                            | ExtensionRegistrySubmission::Rejected),
-                        ) => state,
-                        _ if request.requires_registry_submission => {
-                            ExtensionRegistrySubmission::AwaitingSubmission
-                        }
-                        _ => ExtensionRegistrySubmission::NotSubmitted,
+                    registry_submission: if request.requires_registry_submission {
+                        ExtensionRegistrySubmission::AwaitingSubmission
+                    } else {
+                        ExtensionRegistrySubmission::NotSubmitted
                     },
                 },
             })?;
@@ -2265,6 +2251,10 @@ fn package_registry_search_state(
             atelia_core::ExtensionPublicationVisibility::PrivateRemix,
             atelia_core::ExtensionRegistrySubmission::NotSubmitted,
         ) => PackageAuthoringStepState::Complete,
+        (
+            atelia_core::ExtensionPublicationVisibility::UnlistedShare,
+            atelia_core::ExtensionRegistrySubmission::NotSubmitted,
+        ) => PackageAuthoringStepState::Complete,
         (_, atelia_core::ExtensionRegistrySubmission::AwaitingSubmission) => {
             PackageAuthoringStepState::RequiresConsent
         }
@@ -2311,6 +2301,16 @@ fn package_publication_plan_from_record(
     record: &ExtensionInstallRecord,
     publication: &atelia_core::ExtensionPublication,
 ) -> PackagePublicationPlan {
+    let requires_registry_submission = !matches!(
+        publication.registry_submission,
+        atelia_core::ExtensionRegistrySubmission::NotSubmitted
+    );
+    let mut github_actions = default_package_publication_actions();
+    if !requires_registry_submission {
+        github_actions
+            .retain(|action| *action != PackageGitHubPublicationAction::SubmitRegistryMetadata);
+    }
+
     PackagePublicationPlan {
         visibility: match publication.visibility {
             atelia_core::ExtensionPublicationVisibility::PrivateRemix => {
@@ -2328,11 +2328,8 @@ fn package_publication_plan_from_record(
         },
         source_class: package_source_class_from_record(record),
         source: package_source_reference_from_record(record),
-        github_actions: default_package_publication_actions(),
-        requires_registry_submission: !matches!(
-            publication.registry_submission,
-            atelia_core::ExtensionRegistrySubmission::NotSubmitted
-        ),
+        github_actions,
+        requires_registry_submission,
         production_installable: matches!(
             publication.registry_submission,
             atelia_core::ExtensionRegistrySubmission::Accepted

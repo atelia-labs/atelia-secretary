@@ -6438,6 +6438,41 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
+        let unlisted_publication_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/publication",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "visibility": "unlisted_share",
+                "requires_registry_submission": false
+            }),
+        )
+        .await;
+        assert_eq!(unlisted_publication_response.status(), StatusCode::OK);
+        let unlisted_publication_payload =
+            to_bytes(unlisted_publication_response.into_body(), usize::MAX)
+                .await
+                .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+                .expect("response bytes");
+        assert_eq!(
+            unlisted_publication_payload["data"]["flow"]["publication_plan"]
+                ["requires_registry_submission"],
+            false
+        );
+        assert!(
+            !unlisted_publication_payload["data"]["flow"]["publication_plan"]["github_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action == "submit_registry_metadata")
+        );
+        assert!(unlisted_publication_payload["data"]["flow"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["id"] == "registry_search" && step["state"] == "complete"));
+
         let publication_response = send_json_request(
             &rpc_server,
             Method::POST,
