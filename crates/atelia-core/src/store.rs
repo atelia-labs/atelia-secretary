@@ -365,14 +365,19 @@ impl InMemoryStore {
 
     pub fn with_durable_snapshot_path(snapshot_path: impl Into<PathBuf>) -> StoreResult<Self> {
         let snapshot_path = snapshot_path.into();
-        let mut inner = if snapshot_path.exists() {
+        let loaded_snapshot = snapshot_path.exists();
+        let mut inner = if loaded_snapshot {
             load_durable_snapshot(&snapshot_path)?
         } else {
             InMemoryInner::default()
         };
 
-        repair_loaded_extension_registry_snapshot(&mut inner.extension_registry_snapshot);
+        let repaired =
+            repair_loaded_extension_registry_snapshot(&mut inner.extension_registry_snapshot);
         validate_loaded_store(&inner)?;
+        if loaded_snapshot && repaired {
+            persist_durable_snapshot(&snapshot_path, &inner)?;
+        }
 
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -1997,14 +2002,17 @@ fn validate_loaded_store(inner: &InMemoryInner) -> StoreResult<()> {
     Ok(())
 }
 
-fn repair_loaded_extension_registry_snapshot(snapshot: &mut ExtensionRegistrySnapshot) {
+fn repair_loaded_extension_registry_snapshot(snapshot: &mut ExtensionRegistrySnapshot) -> bool {
+    let mut repaired = false;
     for records in snapshot.records.values_mut() {
         for (version, record) in records {
             if record.previous_version.as_ref() == Some(version) {
                 record.previous_version = None;
+                repaired = true;
             }
         }
     }
+    repaired
 }
 
 fn validate_loaded_job_record(inner: &InMemoryInner, job: &JobRecord) -> StoreResult<()> {
@@ -8711,6 +8719,20 @@ mod tests {
             .previous_version
             .as_deref();
         assert_eq!(previous_version, None);
+
+        let repaired_snapshot: DurableStoreSnapshot =
+            serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+        let repaired_previous_version = repaired_snapshot
+            .inner
+            .extension_registry_snapshot
+            .records
+            .get("com.example.extension")
+            .unwrap()
+            .get("1.0.0")
+            .unwrap()
+            .previous_version
+            .as_deref();
+        assert_eq!(repaired_previous_version, None);
     }
 
     #[test]
