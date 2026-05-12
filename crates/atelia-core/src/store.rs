@@ -9,6 +9,16 @@ use crate::domain::{
 };
 use crate::policy::{REASON_REPOSITORY_BLOCKED, SCOPE_KIND_REPOSITORY, SCOPE_VALUE_ROOT};
 use crate::runtime::RuntimeJobReceipt;
+#[cfg(test)]
+use crate::{
+    BlockKey, BlockReason, BlocklistEntry, DegradeBehavior, ExtensionBoundary,
+    ExtensionCompatibility, ExtensionEntrypoints, ExtensionFailure, ExtensionInstallRecord,
+    ExtensionInstallStatus, ExtensionKind, ExtensionManifest, ExtensionPermission,
+    ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionSourceSnapshot,
+    ExtensionToolDefinition, ProvenanceSource, RetryPolicy, EXTENSION_MANIFEST_SCHEMA,
+    EXTENSION_RPC_PROTOCOL,
+};
+use crate::{ExtensionRegistrySnapshot, ManifestValidationPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -323,6 +333,7 @@ struct InMemoryInner {
     tool_results: HashMap<ToolResultId, ToolResult>,
     audit_records: HashMap<AuditRecordId, AuditRecord>,
     idempotent_submit_jobs: HashMap<String, SubmitJobIdempotencyRecord>,
+    extension_registry_snapshot: ExtensionRegistrySnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -358,13 +369,19 @@ impl InMemoryStore {
 
     pub fn with_durable_snapshot_path(snapshot_path: impl Into<PathBuf>) -> StoreResult<Self> {
         let snapshot_path = snapshot_path.into();
-        let inner = if snapshot_path.exists() {
+        let loaded_snapshot = snapshot_path.exists();
+        let mut inner = if loaded_snapshot {
             load_durable_snapshot(&snapshot_path)?
         } else {
             InMemoryInner::default()
         };
 
+        let repaired =
+            repair_loaded_extension_registry_snapshot(&mut inner.extension_registry_snapshot);
         validate_loaded_store(&inner)?;
+        if loaded_snapshot && repaired {
+            persist_durable_snapshot(&snapshot_path, &inner)?;
+        }
 
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -383,6 +400,26 @@ impl InMemoryStore {
 
     pub fn uses_durable_snapshot(&self) -> bool {
         self.durable_snapshot_path.is_some()
+    }
+
+    pub fn extension_registry_snapshot(&self) -> StoreResult<ExtensionRegistrySnapshot> {
+        Ok(self.lock()?.extension_registry_snapshot.clone())
+    }
+
+    pub fn set_extension_registry_snapshot(
+        &self,
+        snapshot: ExtensionRegistrySnapshot,
+    ) -> StoreResult<()> {
+        snapshot
+            .validate_with_policy(&ManifestValidationPolicy::default())
+            .map_err(|reason| StoreError::InvalidRecord {
+                collection: "extension_registry",
+                reason,
+            })?;
+        self.mutate(|inner| {
+            inner.extension_registry_snapshot = snapshot;
+            Ok(())
+        })
     }
 
     pub fn subscribe_job_events(&self) -> broadcast::Receiver<JobEvent> {
@@ -1956,9 +1993,30 @@ fn validate_loaded_store(inner: &InMemoryInner) -> StoreResult<()> {
         validate_submit_job_idempotency_record(inner, idempotency_key, submission)?;
     }
 
+    inner
+        .extension_registry_snapshot
+        .validate_with_policy(&ManifestValidationPolicy::default())
+        .map_err(|reason| StoreError::InvalidRecord {
+            collection: "extension_registry",
+            reason,
+        })?;
+
     validate_loaded_job_event_sequence(inner)?;
 
     Ok(())
+}
+
+fn repair_loaded_extension_registry_snapshot(snapshot: &mut ExtensionRegistrySnapshot) -> bool {
+    let mut repaired = false;
+    for records in snapshot.records.values_mut() {
+        for (version, record) in records {
+            if record.previous_version.as_ref() == Some(version) {
+                record.previous_version = None;
+                repaired = true;
+            }
+        }
+    }
+    repaired
 }
 
 fn validate_loaded_job_record(inner: &InMemoryInner, job: &JobRecord) -> StoreResult<()> {
@@ -4792,6 +4850,110 @@ mod tests {
             timestamp(6),
         )
         .unwrap()
+    }
+
+    fn extension_manifest(
+        id: &str,
+        version: &str,
+        artifact_digest: &str,
+        manifest_digest: &str,
+    ) -> ExtensionManifest {
+        let mut permissions = BTreeMap::new();
+        permissions.insert(
+            "tool.ping".to_string(),
+            ExtensionPermission {
+                description: "allows ping tool execution".to_string(),
+                risk_tier: Some("R1".to_string()),
+            },
+        );
+
+        ExtensionManifest {
+            schema: EXTENSION_MANIFEST_SCHEMA.to_string(),
+            id: id.to_string(),
+            name: "Example Extension".to_string(),
+            version: version.to_string(),
+            publisher: ExtensionPublisher {
+                name: "Example Publisher".to_string(),
+                url: Some("https://example.com".to_string()),
+            },
+            description: "A focused test extension".to_string(),
+            types: vec![ExtensionKind::Tool],
+            compatibility: ExtensionCompatibility {
+                atelia_protocol: ">=0.1 <0.3".to_string(),
+                atelia_secretary: ">=0.1 <0.2".to_string(),
+            },
+            entrypoints: ExtensionEntrypoints {
+                realm: ExtensionRealm::Backend,
+                runtime: ExtensionRuntime::WasmRust,
+                command: None,
+                image: None,
+                wasm: Some("extension.wasm".to_string()),
+                protocol: EXTENSION_RPC_PROTOCOL.to_string(),
+            },
+            permissions,
+            tools: vec![ExtensionToolDefinition {
+                id: "ping".to_string(),
+                permissions: vec!["tool.ping".to_string()],
+                permissions_required: Vec::new(),
+            }],
+            failure: ExtensionFailure {
+                degrade: DegradeBehavior::ReturnUnavailable,
+                retry_policy: RetryPolicy::Bounded,
+            },
+            provenance: crate::ExtensionProvenance {
+                artifact_digest: artifact_digest.to_string(),
+                manifest_digest: manifest_digest.to_string(),
+                source: ProvenanceSource::Registry,
+                repository: None,
+                source_ref: None,
+                manifest_path: None,
+                commit: None,
+                registry_identity: Some("test-registry".to_string()),
+                lineage: None,
+                publication: None,
+                signature: Some("signature".to_string()),
+                signer: Some("test@example.com".to_string()),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn extension_record(manifest: &ExtensionManifest, version: &str) -> ExtensionInstallRecord {
+        ExtensionInstallRecord {
+            id: manifest.id.clone(),
+            version: version.to_string(),
+            manifest_digest: manifest.provenance.manifest_digest.clone(),
+            artifact_digest: manifest.provenance.artifact_digest.clone(),
+            source: ExtensionSourceSnapshot {
+                source: manifest.provenance.source,
+                repository: manifest.provenance.repository.clone(),
+                source_ref: manifest.provenance.source_ref.clone(),
+                manifest_path: manifest.provenance.manifest_path.clone(),
+                commit: manifest.provenance.commit.clone(),
+                registry_identity: manifest.provenance.registry_identity.clone(),
+                lineage: manifest.provenance.lineage.clone(),
+                publication: manifest.provenance.publication.clone(),
+            },
+            boundary: ExtensionBoundary::ThirdParty,
+            status: ExtensionInstallStatus::Installed,
+            previous_version: None,
+            approved_permissions: Vec::new(),
+            approved_local_unsigned: false,
+            approved_local_process_runtime: false,
+            rollback_snapshot: None,
+        }
+    }
+
+    fn extension_registry_snapshot(
+        manifests: BTreeMap<String, BTreeMap<String, ExtensionManifest>>,
+        records: BTreeMap<String, BTreeMap<String, ExtensionInstallRecord>>,
+    ) -> ExtensionRegistrySnapshot {
+        ExtensionRegistrySnapshot {
+            manifests,
+            records,
+            active_versions: BTreeMap::new(),
+            blocklist: Vec::new(),
+        }
     }
 
     fn schema_migration_record() -> SchemaMigrationRecord {
@@ -8472,6 +8634,221 @@ mod tests {
             err,
             StoreError::NotFound {
                 collection: "repositories",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn durable_store_rejects_inconsistent_extension_registry_snapshot() {
+        let storage_dir = durable_storage_dir("invalid-extension-registry");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let manifest = extension_manifest(
+            "com.example.extension",
+            "1.0.0",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let other_record = extension_record(&manifest, "2.0.0");
+        let mut manifests = BTreeMap::new();
+        let mut manifest_versions = BTreeMap::new();
+        manifest_versions.insert(manifest.version.clone(), manifest.clone());
+        manifests.insert(manifest.id.clone(), manifest_versions);
+
+        let mut records = BTreeMap::new();
+        let mut record_versions = BTreeMap::new();
+        record_versions.insert("2.0.0".to_string(), other_record);
+        records.insert(manifest.id.clone(), record_versions);
+
+        let inner = InMemoryInner {
+            extension_registry_snapshot: extension_registry_snapshot(manifests, records),
+            ..Default::default()
+        };
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner,
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidRecord {
+                collection: "extension_registry",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn store_rejects_inconsistent_extension_registry_snapshot_on_set() {
+        let store = InMemoryStore::new();
+        let manifest = extension_manifest(
+            "com.example.extension",
+            "1.0.0",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let other_record = extension_record(&manifest, "2.0.0");
+        let mut manifests = BTreeMap::new();
+        let mut manifest_versions = BTreeMap::new();
+        manifest_versions.insert(manifest.version.clone(), manifest.clone());
+        manifests.insert(manifest.id.clone(), manifest_versions);
+
+        let mut records = BTreeMap::new();
+        let mut record_versions = BTreeMap::new();
+        record_versions.insert("2.0.0".to_string(), other_record);
+        records.insert(manifest.id.clone(), record_versions);
+
+        let err = store
+            .set_extension_registry_snapshot(extension_registry_snapshot(manifests, records))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidRecord {
+                collection: "extension_registry",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn store_rejects_extension_registry_snapshot_boundary_mismatch_on_set() {
+        let store = InMemoryStore::new();
+        let manifest = extension_manifest(
+            "com.example.extension",
+            "1.0.0",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let mut record = extension_record(&manifest, "1.0.0");
+        record.boundary = ExtensionBoundary::Official;
+
+        let mut manifests = BTreeMap::new();
+        let mut manifest_versions = BTreeMap::new();
+        manifest_versions.insert(manifest.version.clone(), manifest.clone());
+        manifests.insert(manifest.id.clone(), manifest_versions);
+
+        let mut records = BTreeMap::new();
+        let mut record_versions = BTreeMap::new();
+        record_versions.insert(record.version.clone(), record);
+        records.insert(manifest.id.clone(), record_versions);
+
+        let err = store
+            .set_extension_registry_snapshot(extension_registry_snapshot(manifests, records))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidRecord {
+                collection: "extension_registry",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn durable_store_repairs_self_referential_extension_rollback_snapshot() {
+        let storage_dir = durable_storage_dir("repair-self-referential-extension-rollback");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let manifest = extension_manifest(
+            "com.example.extension",
+            "1.0.0",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let mut record = extension_record(&manifest, "1.0.0");
+        record.previous_version = Some("1.0.0".to_string());
+
+        let mut manifests = BTreeMap::new();
+        let mut manifest_versions = BTreeMap::new();
+        manifest_versions.insert(manifest.version.clone(), manifest.clone());
+        manifests.insert(manifest.id.clone(), manifest_versions);
+
+        let mut records = BTreeMap::new();
+        let mut record_versions = BTreeMap::new();
+        record_versions.insert(record.version.clone(), record);
+        records.insert(manifest.id.clone(), record_versions);
+
+        let inner = InMemoryInner {
+            extension_registry_snapshot: extension_registry_snapshot(manifests, records),
+            ..Default::default()
+        };
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner,
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let store = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap();
+        let snapshot = store.extension_registry_snapshot().unwrap();
+        let previous_version = snapshot
+            .records
+            .get("com.example.extension")
+            .unwrap()
+            .get("1.0.0")
+            .unwrap()
+            .previous_version
+            .as_deref();
+        assert_eq!(previous_version, None);
+
+        let repaired_snapshot: DurableStoreSnapshot =
+            serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+        let repaired_previous_version = repaired_snapshot
+            .inner
+            .extension_registry_snapshot
+            .records
+            .get("com.example.extension")
+            .unwrap()
+            .get("1.0.0")
+            .unwrap()
+            .previous_version
+            .as_deref();
+        assert_eq!(repaired_previous_version, None);
+    }
+
+    #[test]
+    fn durable_store_rejects_unsupported_extension_blocklist_snapshot() {
+        let storage_dir = durable_storage_dir("invalid-extension-blocklist");
+        let snapshot_path = storage_dir.join(DURABLE_STORE_FILE_NAME);
+        let mut inner = InMemoryInner {
+            extension_registry_snapshot: extension_registry_snapshot(
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            ..Default::default()
+        };
+        inner
+            .extension_registry_snapshot
+            .blocklist
+            .push(BlocklistEntry {
+                key: BlockKey::VulnerabilityId("cve-2024-0001".to_string()),
+                reason: BlockReason::Malware,
+                note: None,
+            });
+
+        let snapshot = DurableStoreSnapshot {
+            schema_version: DURABLE_STORE_SCHEMA_VERSION,
+            inner,
+        };
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = InMemoryStore::with_durable_storage_dir(&storage_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidRecord {
+                collection: "extension_registry",
                 ..
             }
         ));

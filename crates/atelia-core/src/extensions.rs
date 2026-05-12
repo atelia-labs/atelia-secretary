@@ -1593,6 +1593,25 @@ pub struct ExtensionRegistry {
     validation_policy: ManifestValidationPolicy,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExtensionRegistrySnapshot {
+    pub manifests: BTreeMap<String, BTreeMap<String, ExtensionManifest>>,
+    pub records: BTreeMap<String, BTreeMap<String, ExtensionInstallRecord>>,
+    pub active_versions: BTreeMap<String, String>,
+    pub blocklist: Vec<BlocklistEntry>,
+}
+
+impl ExtensionRegistrySnapshot {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_extension_registry_snapshot(self)
+    }
+
+    pub fn validate_with_policy(&self, policy: &ManifestValidationPolicy) -> Result<(), String> {
+        validate_extension_registry_snapshot(self)?;
+        validate_extension_registry_snapshot_manifests(self, policy)
+    }
+}
+
 impl ExtensionRegistry {
     pub fn new(validation_policy: ManifestValidationPolicy) -> Self {
         Self {
@@ -1602,6 +1621,33 @@ impl ExtensionRegistry {
             blocklist: Vec::new(),
             validation_policy,
         }
+    }
+
+    pub fn from_snapshot(
+        snapshot: ExtensionRegistrySnapshot,
+        validation_policy: ManifestValidationPolicy,
+    ) -> Result<Self, String> {
+        snapshot.validate_with_policy(&validation_policy)?;
+        Ok(Self {
+            manifests: snapshot.manifests,
+            records: snapshot.records,
+            active_versions: snapshot.active_versions,
+            blocklist: snapshot.blocklist,
+            validation_policy,
+        })
+    }
+
+    pub fn snapshot(&self) -> ExtensionRegistrySnapshot {
+        ExtensionRegistrySnapshot {
+            manifests: self.manifests.clone(),
+            records: self.records.clone(),
+            active_versions: self.active_versions.clone(),
+            blocklist: self.blocklist.clone(),
+        }
+    }
+
+    pub fn validation_policy(&self) -> ManifestValidationPolicy {
+        self.validation_policy.clone()
     }
 
     pub fn in_memory() -> Self {
@@ -1621,7 +1667,7 @@ impl ExtensionRegistry {
         &self,
         manifest: ExtensionManifest,
         options: InstallOptions,
-    ) -> RegistryResult<ValidatedExtensionManifest> {
+    ) -> RegistryResult<(ValidatedExtensionManifest, ManifestValidationPolicy)> {
         let mut validation_policy = self.validation_policy.clone();
         if let Some(approve_local_unsigned) = options.approve_local_unsigned {
             validation_policy.allow_local_unsigned = approve_local_unsigned;
@@ -1634,7 +1680,28 @@ impl ExtensionRegistry {
         self.ensure_not_blocked(&validated.manifest)?;
         self.ensure_same_version_digest_is_stable(&validated.manifest)?;
         self.ensure_source_change_is_approved(&validated.manifest, options)?;
-        Ok(validated)
+        Ok((validated, validation_policy))
+    }
+
+    fn install_would_create_rollback_cycle(&self, extension_id: &str, version: &str) -> bool {
+        let mut visited_versions = BTreeSet::new();
+        let mut next_version = self.active_versions.get(extension_id);
+        while let Some(current_version) = next_version {
+            if current_version == version {
+                return true;
+            }
+            if !visited_versions.insert(current_version.as_str()) {
+                return false;
+            }
+
+            next_version = self
+                .records
+                .get(extension_id)
+                .and_then(|records| records.get(current_version))
+                .and_then(|record| record.previous_version.as_ref());
+        }
+
+        false
     }
 
     pub fn install(
@@ -1642,9 +1709,42 @@ impl ExtensionRegistry {
         manifest: ExtensionManifest,
         options: InstallOptions,
     ) -> RegistryResult<ExtensionInstallRecord> {
-        let validated = self.run_validation_checks(manifest, options)?;
+        let (validated, validation_policy) = self.run_validation_checks(manifest, options)?;
 
-        let previous_version = self.active_versions.get(&validated.manifest.id).cloned();
+        if self
+            .records
+            .get(&validated.manifest.id)
+            .and_then(|records| records.get(&validated.manifest.version))
+            .is_some()
+            && self
+                .active_versions
+                .get(&validated.manifest.id)
+                .is_some_and(|active_version| active_version != &validated.manifest.version)
+            && self.install_would_create_rollback_cycle(
+                &validated.manifest.id,
+                &validated.manifest.version,
+            )
+        {
+            return Err(RegistryError::Validation(
+                ExtensionValidationError::InvalidField {
+                    field: "version",
+                    reason: format!(
+                        "version {} is already installed for {} but inactive",
+                        validated.manifest.version, validated.manifest.id
+                    ),
+                },
+            ));
+        }
+
+        let previous_version = match self.active_versions.get(&validated.manifest.id) {
+            Some(active_version) if active_version == &validated.manifest.version => self
+                .records
+                .get(&validated.manifest.id)
+                .and_then(|records| records.get(active_version))
+                .and_then(|existing| existing.previous_version.clone()),
+            Some(active_version) => Some(active_version.clone()),
+            None => None,
+        };
         let approved_permissions = validated
             .manifest
             .permissions
@@ -1666,6 +1766,8 @@ impl ExtensionRegistry {
                 manifest_digest: validated.manifest.provenance.manifest_digest.clone(),
                 artifact_digest: validated.manifest.provenance.artifact_digest.clone(),
             }),
+            approved_local_unsigned: validation_policy.allow_local_unsigned,
+            approved_local_process_runtime: validation_policy.allow_local_process_runtime,
         };
 
         self.manifests
@@ -1688,7 +1790,7 @@ impl ExtensionRegistry {
         manifest: ExtensionManifest,
         options: InstallOptions,
     ) -> RegistryResult<ValidateExtensionManifestResponse> {
-        let validated = self.run_validation_checks(manifest, options)?;
+        let (validated, _) = self.run_validation_checks(manifest, options)?;
 
         Ok(ValidateExtensionManifestResponse {
             manifest: validated.manifest,
@@ -2066,6 +2168,197 @@ impl ExtensionRegistry {
     }
 }
 
+fn validate_extension_registry_snapshot(
+    snapshot: &ExtensionRegistrySnapshot,
+) -> Result<(), String> {
+    for (extension_id, records) in &snapshot.records {
+        for (version, record) in records {
+            let manifests = snapshot.manifests.get(extension_id).ok_or_else(|| {
+                format!("missing manifests map for extension {extension_id} in snapshot")
+            })?;
+            let manifest = manifests.get(version).ok_or_else(|| {
+                format!("active manifest missing for extension {extension_id} version {version}")
+            })?;
+
+            if record.id != *extension_id {
+                return Err(format!(
+                    "record id {} does not match extension map key {}",
+                    record.id, extension_id
+                ));
+            }
+            if record.version != *version {
+                return Err(format!(
+                    "record version {} does not match extension map key {}",
+                    record.version, version
+                ));
+            }
+            if let Some(previous_version) = &record.previous_version {
+                if previous_version == version {
+                    return Err(format!(
+                        "record {extension_id}:{version} has self-referential previous_version"
+                    ));
+                }
+                if !manifests.contains_key(previous_version)
+                    || !records.contains_key(previous_version)
+                {
+                    return Err(format!(
+                        "record {extension_id}:{version} references missing previous_version {previous_version}"
+                    ));
+                }
+            }
+            if let Some(cycle_entry_version) = detect_rollback_cycle(records, version) {
+                return Err(format!(
+                    "record {extension_id}:{version} has rollback-cycle previous_version chain involving {cycle_entry_version}"
+                ));
+            }
+            if manifest.id != *extension_id {
+                return Err(format!(
+                    "manifest id {} does not match extension map key {}",
+                    manifest.id, extension_id
+                ));
+            }
+            if manifest.version != *version {
+                return Err(format!(
+                    "manifest version {} does not match extension map key {}",
+                    manifest.version, version
+                ));
+            }
+            if manifest.provenance.artifact_digest != record.artifact_digest {
+                return Err(format!(
+                    "artifact digest mismatch for extension {extension_id} version {version}"
+                ));
+            }
+            if manifest.provenance.manifest_digest != record.manifest_digest {
+                return Err(format!(
+                    "manifest digest mismatch for extension {extension_id} version {version}"
+                ));
+            }
+            if record.source != ExtensionSourceSnapshot::from_provenance(&manifest.provenance) {
+                return Err(format!(
+                    "source snapshot mismatch for extension {extension_id} version {version}"
+                ));
+            }
+        }
+    }
+
+    for (extension_id, manifests) in &snapshot.manifests {
+        for (version, manifest) in manifests {
+            let records = snapshot.records.get(extension_id).ok_or_else(|| {
+                format!("missing records map for extension {extension_id} in snapshot")
+            })?;
+            let record = records.get(version).ok_or_else(|| {
+                format!("missing record for extension {extension_id} version {version}")
+            })?;
+
+            if manifest.id != *extension_id || manifest.version != *version {
+                return Err(format!(
+                    "manifest key {extension_id}:{version} does not match manifest body {}:{}",
+                    manifest.id, manifest.version
+                ));
+            }
+            if manifest.provenance.artifact_digest != record.artifact_digest {
+                return Err(format!(
+                    "record artifact digest mismatch for extension {extension_id} version {version}"
+                ));
+            }
+            if manifest.provenance.manifest_digest != record.manifest_digest {
+                return Err(format!(
+                    "record manifest digest mismatch for extension {extension_id} version {version}"
+                ));
+            }
+        }
+    }
+
+    for (extension_id, active_version) in &snapshot.active_versions {
+        let records = snapshot
+            .records
+            .get(extension_id)
+            .ok_or_else(|| format!("active extension {extension_id} has no record map"))?;
+        records.get(active_version).ok_or_else(|| {
+            format!("active extension {extension_id} references unknown version {active_version}")
+        })?;
+
+        let manifests = snapshot
+            .manifests
+            .get(extension_id)
+            .ok_or_else(|| format!("active extension {extension_id} has no manifest map"))?;
+        manifests.get(active_version).ok_or_else(|| {
+            format!(
+                "active extension {extension_id} references unknown manifest version {active_version}"
+            )
+        })?;
+    }
+
+    if snapshot
+        .blocklist
+        .iter()
+        .any(|entry| matches!(entry.key, BlockKey::VulnerabilityId(_)))
+    {
+        return Err("extension blocklist contains unsupported vulnerability_id key".to_string());
+    }
+
+    Ok(())
+}
+
+fn detect_rollback_cycle(
+    records: &BTreeMap<String, ExtensionInstallRecord>,
+    start_version: &str,
+) -> Option<String> {
+    let mut visited_versions = BTreeSet::new();
+    let mut current_version = start_version;
+
+    while let Some(record) = records.get(current_version) {
+        if !visited_versions.insert(current_version.to_string()) {
+            return Some(current_version.to_string());
+        }
+        current_version = record.previous_version.as_deref()?;
+    }
+    None
+}
+
+fn validate_extension_registry_snapshot_manifests(
+    snapshot: &ExtensionRegistrySnapshot,
+    policy: &ManifestValidationPolicy,
+) -> Result<(), String> {
+    for (extension_id, records) in &snapshot.records {
+        for (version, record) in records {
+            let manifest = snapshot
+                .manifests
+                .get(extension_id)
+                .and_then(|manifests| manifests.get(version))
+                .ok_or_else(|| {
+                    format!("manifest missing for extension {extension_id} version {version}")
+                })?;
+            let effective_policy = with_record_approvals(policy, record);
+            let validated = manifest.validate(&effective_policy).map_err(|error| {
+                format!("manifest validation failed for extension {extension_id} version {version}: {error}")
+            })?;
+            if validated.boundary != record.boundary {
+                return Err(format!(
+                    "boundary mismatch for extension {extension_id} version {version}: manifest validates as {:?}, record stores {:?}",
+                    validated.boundary, record.boundary
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn with_record_approvals(
+    policy: &ManifestValidationPolicy,
+    record: &ExtensionInstallRecord,
+) -> ManifestValidationPolicy {
+    let mut effective = policy.clone();
+    if record.approved_local_unsigned {
+        effective.allow_local_unsigned = true;
+    }
+    if record.approved_local_process_runtime {
+        effective.allow_local_process_runtime = true;
+    }
+    effective
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtensionBlocklistMatch {
     pub reason: BlockReason,
@@ -2339,6 +2632,14 @@ impl ExtensionRegistryService {
         Self { registry }
     }
 
+    pub fn snapshot(&self) -> ExtensionRegistrySnapshot {
+        self.registry.snapshot()
+    }
+
+    pub fn validation_policy(&self) -> ManifestValidationPolicy {
+        self.registry.validation_policy()
+    }
+
     pub fn install_extension(
         &mut self,
         request: InstallExtensionRequest,
@@ -2514,6 +2815,10 @@ pub struct ExtensionInstallRecord {
     pub status: ExtensionInstallStatus,
     pub previous_version: Option<String>,
     pub approved_permissions: Vec<String>,
+    #[serde(default)]
+    pub approved_local_unsigned: bool,
+    #[serde(default)]
+    pub approved_local_process_runtime: bool,
     pub rollback_snapshot: Option<RollbackSnapshot>,
 }
 
@@ -2938,6 +3243,44 @@ mod tests {
             verification: Some("hmac".to_string()),
             required_capabilities: vec!["network.webhook.receive:github".to_string()],
             status: Some("enabled".to_string()),
+        }
+    }
+
+    fn extension_record(
+        manifest: &ExtensionManifest,
+        previous_version: Option<&str>,
+    ) -> ExtensionInstallRecord {
+        ExtensionInstallRecord {
+            id: manifest.id.clone(),
+            version: manifest.version.clone(),
+            manifest_digest: manifest.provenance.manifest_digest.clone(),
+            artifact_digest: manifest.provenance.artifact_digest.clone(),
+            source: ExtensionSourceSnapshot::from_provenance(&manifest.provenance),
+            boundary: ExtensionBoundary::ThirdParty,
+            status: ExtensionInstallStatus::Installed,
+            previous_version: previous_version.map(str::to_string),
+            approved_permissions: Vec::new(),
+            approved_local_unsigned: false,
+            approved_local_process_runtime: false,
+            rollback_snapshot: None,
+        }
+    }
+
+    fn extension_snapshot(
+        manifest_versions: BTreeMap<String, ExtensionManifest>,
+        record_versions: BTreeMap<String, ExtensionInstallRecord>,
+    ) -> ExtensionRegistrySnapshot {
+        let mut manifests = BTreeMap::new();
+        manifests.insert("com.example.extension".to_string(), manifest_versions);
+
+        let mut records = BTreeMap::new();
+        records.insert("com.example.extension".to_string(), record_versions);
+
+        ExtensionRegistrySnapshot {
+            manifests,
+            records,
+            active_versions: BTreeMap::new(),
+            blocklist: Vec::new(),
         }
     }
 
@@ -3412,6 +3755,65 @@ mod tests {
     }
 
     #[test]
+    fn extension_snapshot_validation_applies_record_local_unsigned_approval() {
+        let mut local = manifest("local.test.unsigned.snapshot");
+        local.provenance.source = ProvenanceSource::Local;
+        local.provenance.registry_identity = None;
+        local.provenance.signature = None;
+        local.provenance.signer = None;
+
+        let snapshot = {
+            let mut manifest_versions = BTreeMap::new();
+            manifest_versions.insert(local.version.clone(), local.clone());
+
+            let mut record_versions = BTreeMap::new();
+            let mut record = extension_record(&local, None);
+            record.boundary = ExtensionBoundary::LocalDevelopment;
+            record.approved_local_unsigned = true;
+            record.approved_local_process_runtime = false;
+            record_versions.insert(local.version.clone(), record);
+
+            ExtensionRegistrySnapshot {
+                manifests: BTreeMap::from([(local.id.clone(), manifest_versions)]),
+                records: BTreeMap::from([(local.id.clone(), record_versions)]),
+                active_versions: BTreeMap::new(),
+                blocklist: Vec::new(),
+            }
+        };
+
+        snapshot
+            .validate_with_policy(&ManifestValidationPolicy::default())
+            .unwrap();
+
+        let unapproved_snapshot = {
+            let mut manifests = BTreeMap::new();
+            manifests.insert(
+                local.id.clone(),
+                BTreeMap::from([(local.version.clone(), local.clone())]),
+            );
+            let mut record_versions = BTreeMap::new();
+            let mut record = extension_record(&local, None);
+            record.boundary = ExtensionBoundary::LocalDevelopment;
+            record.approved_local_unsigned = false;
+            record.approved_local_process_runtime = false;
+            record_versions.insert(local.version.clone(), record);
+
+            ExtensionRegistrySnapshot {
+                manifests,
+                records: BTreeMap::from([(local.id.clone(), record_versions)]),
+                active_versions: BTreeMap::new(),
+                blocklist: Vec::new(),
+            }
+        };
+
+        let err = unapproved_snapshot
+            .validate_with_policy(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(err.contains("manifest validation failed"));
+        assert!(err.contains("local.test.unsigned.snapshot"));
+    }
+
+    #[test]
     fn whitespace_provenance_fields_are_treated_as_missing() {
         let mut local = manifest("local.test.whitespace");
         local.provenance.source = ProvenanceSource::Local;
@@ -3492,12 +3894,14 @@ mod tests {
         let mut process = manifest("local.test.process");
         process.provenance.source = ProvenanceSource::Local;
         process.provenance.registry_identity = None;
+        process.provenance.signature = Some("signature".to_string());
+        process.provenance.signer = Some("signer@example.com".to_string());
         process.entrypoints.runtime = ExtensionRuntime::Process;
         process.entrypoints.wasm = None;
         process.entrypoints.command = Some("cargo run".to_string());
 
         let err = process
-            .validate(&ManifestValidationPolicy::default().with_local_unsigned())
+            .validate(&ManifestValidationPolicy::default())
             .unwrap_err();
         assert!(matches!(
             err,
@@ -3508,12 +3912,70 @@ mod tests {
         ));
 
         process
-            .validate(
-                &ManifestValidationPolicy::default()
-                    .with_local_unsigned()
-                    .with_local_process_runtime(),
-            )
+            .validate(&ManifestValidationPolicy::default().with_local_process_runtime())
             .unwrap();
+    }
+
+    #[test]
+    fn extension_snapshot_validation_applies_record_local_process_approval() {
+        let mut process = manifest("local.test.process.snapshot");
+        process.provenance.source = ProvenanceSource::Local;
+        process.provenance.registry_identity = None;
+        process.provenance.signature = Some("signature".to_string());
+        process.provenance.signer = Some("signer@example.com".to_string());
+        process.entrypoints.runtime = ExtensionRuntime::Process;
+        process.entrypoints.wasm = None;
+        process.entrypoints.command = Some("cargo run".to_string());
+
+        let approved_snapshot = {
+            let mut manifest_versions = BTreeMap::new();
+            manifest_versions.insert(process.version.clone(), process.clone());
+
+            let mut record_versions = BTreeMap::new();
+            let mut record = extension_record(&process, None);
+            record.boundary = ExtensionBoundary::LocalDevelopment;
+            record.approved_local_unsigned = false;
+            record.approved_local_process_runtime = true;
+            record_versions.insert(process.version.clone(), record);
+
+            ExtensionRegistrySnapshot {
+                manifests: BTreeMap::from([(process.id.clone(), manifest_versions)]),
+                records: BTreeMap::from([(process.id.clone(), record_versions)]),
+                active_versions: BTreeMap::new(),
+                blocklist: Vec::new(),
+            }
+        };
+
+        approved_snapshot
+            .validate_with_policy(&ManifestValidationPolicy::default())
+            .unwrap();
+
+        let unapproved_snapshot = {
+            let mut manifests = BTreeMap::new();
+            manifests.insert(
+                process.id.clone(),
+                BTreeMap::from([(process.version.clone(), process.clone())]),
+            );
+            let mut record_versions = BTreeMap::new();
+            let mut record = extension_record(&process, None);
+            record.boundary = ExtensionBoundary::LocalDevelopment;
+            record.approved_local_unsigned = false;
+            record.approved_local_process_runtime = false;
+            record_versions.insert(process.version.clone(), record);
+
+            ExtensionRegistrySnapshot {
+                manifests,
+                records: BTreeMap::from([(process.id.clone(), record_versions)]),
+                active_versions: BTreeMap::new(),
+                blocklist: Vec::new(),
+            }
+        };
+
+        let err = unapproved_snapshot
+            .validate_with_policy(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(err.contains("manifest validation failed"));
+        assert!(err.contains("local.test.process.snapshot"));
     }
 
     #[test]
@@ -3832,6 +4294,194 @@ mod tests {
     }
 
     #[test]
+    fn same_version_reinstall_does_not_create_self_referential_rollback() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let reinstalled = registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        assert_eq!(reinstalled.version, "1.0.0");
+        assert_eq!(reinstalled.previous_version, None);
+        registry.snapshot().validate().unwrap();
+    }
+
+    #[test]
+    fn same_version_reinstall_after_update_preserves_previous_version() {
+        let mut registry = ExtensionRegistry::in_memory();
+        let mut manifest_v1 = manifest("com.example.extension");
+        manifest_v1.version = "1.0.0".to_string();
+        manifest_v1.provenance.manifest_digest = MANIFEST_DIGEST.to_string();
+        manifest_v1.provenance.artifact_digest = ARTIFACT_DIGEST.to_string();
+        registry
+            .install(manifest_v1, InstallOptions::default())
+            .unwrap();
+
+        let mut manifest_v2 = manifest("com.example.extension");
+        manifest_v2.version = "1.1.0".to_string();
+        manifest_v2.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        manifest_v2.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        registry
+            .install(manifest_v2.clone(), InstallOptions::default())
+            .unwrap();
+
+        let reinstalled = registry
+            .install(manifest_v2, InstallOptions::default())
+            .unwrap();
+
+        assert_eq!(reinstalled.version, "1.1.0");
+        assert_eq!(reinstalled.previous_version.as_deref(), Some("1.0.0"));
+
+        let rolled_back = registry.rollback("com.example.extension").unwrap();
+        assert_eq!(rolled_back.version, "1.0.0");
+        registry.snapshot().validate().unwrap();
+    }
+
+    #[test]
+    fn non_active_version_reinstall_is_rejected() {
+        let mut registry = ExtensionRegistry::in_memory();
+        let mut manifest_v1 = manifest("com.example.extension");
+        manifest_v1.version = "1.0.0".to_string();
+        manifest_v1.provenance.manifest_digest = MANIFEST_DIGEST.to_string();
+        manifest_v1.provenance.artifact_digest = ARTIFACT_DIGEST.to_string();
+        registry
+            .install(manifest_v1, InstallOptions::default())
+            .unwrap();
+
+        let mut manifest_v2 = manifest("com.example.extension");
+        manifest_v2.version = "1.1.0".to_string();
+        manifest_v2.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        manifest_v2.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        registry
+            .install(manifest_v2.clone(), InstallOptions::default())
+            .unwrap();
+
+        let mut manifest_v1_reinstall = manifest("com.example.extension");
+        manifest_v1_reinstall.version = "1.0.0".to_string();
+        manifest_v1_reinstall.provenance.manifest_digest = MANIFEST_DIGEST.to_string();
+        manifest_v1_reinstall.provenance.artifact_digest = ARTIFACT_DIGEST.to_string();
+        let err = registry
+            .install(manifest_v1_reinstall, InstallOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RegistryError::Validation(ExtensionValidationError::InvalidField { field, .. })
+                if field == "version"
+        ));
+        assert_eq!(
+            registry
+                .active_record("com.example.extension")
+                .unwrap()
+                .previous_version
+                .as_deref(),
+            Some("1.0.0")
+        );
+    }
+
+    #[test]
+    fn removed_version_can_be_reinstalled() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let removed = registry.remove("com.example.extension").unwrap();
+        assert_eq!(removed.status, ExtensionInstallStatus::Disabled);
+        assert!(registry.active_record("com.example.extension").is_none());
+
+        let reinstalled = registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+        assert_eq!(reinstalled.version, "1.0.0");
+        assert_eq!(reinstalled.previous_version, None);
+        assert_eq!(
+            registry
+                .active_record("com.example.extension")
+                .unwrap()
+                .status,
+            ExtensionInstallStatus::Installed
+        );
+    }
+
+    #[test]
+    fn removed_version_can_be_reinstalled_after_new_active_version() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let mut manifest_v2 = manifest("com.example.extension");
+        manifest_v2.version = "1.1.0".to_string();
+        manifest_v2.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        manifest_v2.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        registry
+            .install(manifest_v2.clone(), InstallOptions::default())
+            .unwrap();
+        registry.remove("com.example.extension").unwrap();
+        registry
+            .install(manifest_v2, InstallOptions::default())
+            .unwrap();
+
+        let reinstalled = registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+        assert_eq!(reinstalled.version, "1.0.0");
+        assert_eq!(reinstalled.previous_version.as_deref(), Some("1.1.0"));
+        registry.snapshot().validate().unwrap();
+    }
+
+    #[test]
+    fn update_then_rollback_after_rejecting_non_active_reinstall() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let mut manifest_v1 = manifest("com.example.extension");
+        manifest_v1.version = "1.1.0".to_string();
+        manifest_v1.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        manifest_v1.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        registry
+            .install(manifest_v1.clone(), InstallOptions::default())
+            .unwrap();
+
+        let mut manifest_v2 = manifest("com.example.extension");
+        manifest_v2.version = "1.2.0".to_string();
+        manifest_v2.provenance.manifest_digest = MANIFEST_DIGEST.to_string();
+        manifest_v2.provenance.artifact_digest = ARTIFACT_DIGEST.to_string();
+        let installed = registry
+            .install(manifest_v2.clone(), InstallOptions::default())
+            .unwrap();
+        assert_eq!(installed.previous_version.as_deref(), Some("1.1.0"));
+
+        let err = registry
+            .install(manifest_v1, InstallOptions::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::Validation(ExtensionValidationError::InvalidField { field, .. })
+                if field == "version"
+        ));
+
+        let rolled_back = registry.rollback("com.example.extension").unwrap();
+        assert_eq!(rolled_back.version, "1.1.0");
+        let rolled_back_again = registry.rollback("com.example.extension").unwrap();
+        assert_eq!(rolled_back_again.version, "1.0.0");
+        assert_eq!(
+            registry
+                .active_record("com.example.extension")
+                .unwrap()
+                .version,
+            "1.0.0"
+        );
+        registry.snapshot().validate().unwrap();
+    }
+
+    #[test]
     fn same_bundle_service_call_requires_explicit_consume_declaration() {
         let permission_name = "service.review.comments";
         let provider_id = "com.example.provider";
@@ -4054,6 +4704,109 @@ mod tests {
                 .version,
             "1.0.0"
         );
+    }
+
+    #[test]
+    fn extension_snapshot_rejects_self_referential_previous_version() {
+        let first = manifest("com.example.extension");
+        let snapshot = extension_snapshot(
+            BTreeMap::from([(first.version.clone(), first.clone())]),
+            BTreeMap::from([(
+                first.version.clone(),
+                extension_record(&first, Some(&first.version)),
+            )]),
+        );
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("self-referential previous_version"));
+    }
+
+    #[test]
+    fn extension_snapshot_rejects_multi_record_rollback_cycle() {
+        let first = manifest("com.example.extension");
+        let mut second = manifest("com.example.extension");
+        second.version = "1.1.0".to_string();
+        second.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        second.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        let first_version = first.version.clone();
+        let second_version = second.version.clone();
+
+        let snapshot = extension_snapshot(
+            BTreeMap::from([
+                (first_version.clone(), first.clone()),
+                (second_version.clone(), second.clone()),
+            ]),
+            BTreeMap::from([
+                (
+                    first_version.clone(),
+                    extension_record(&first, Some(&second_version)),
+                ),
+                (
+                    second_version.clone(),
+                    extension_record(&second, Some(&first_version)),
+                ),
+            ]),
+        );
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("rollback-cycle"));
+
+        let err = ExtensionRegistry::from_snapshot(snapshot, ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(err.contains("rollback-cycle"));
+    }
+
+    #[test]
+    fn extension_snapshot_rejects_missing_previous_version_manifest() {
+        let mut second = manifest("com.example.extension");
+        second.version = "1.1.0".to_string();
+        second.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        second.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        let snapshot = extension_snapshot(
+            BTreeMap::from([(second.version.clone(), second.clone())]),
+            BTreeMap::from([(
+                second.version.clone(),
+                extension_record(&second, Some("0.9.0")),
+            )]),
+        );
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("references missing previous_version"));
+        assert!(err.contains("0.9.0"));
+    }
+
+    #[test]
+    fn extension_snapshot_hydration_rejects_invalid_manifest() {
+        let mut invalid = manifest("com.example.extension");
+        invalid.name.clear();
+        let snapshot = extension_snapshot(
+            BTreeMap::from([(invalid.version.clone(), invalid.clone())]),
+            BTreeMap::from([(invalid.version.clone(), extension_record(&invalid, None))]),
+        );
+
+        snapshot.validate().unwrap();
+        let err = ExtensionRegistry::from_snapshot(snapshot, ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(err.contains("manifest validation failed"));
+        assert!(err.contains("com.example.extension"));
+    }
+
+    #[test]
+    fn extension_snapshot_hydration_rejects_boundary_mismatch() {
+        let third_party = manifest("com.example.extension");
+        let mut record = extension_record(&third_party, None);
+        record.boundary = ExtensionBoundary::Official;
+        let snapshot = extension_snapshot(
+            BTreeMap::from([(third_party.version.clone(), third_party.clone())]),
+            BTreeMap::from([(third_party.version.clone(), record)]),
+        );
+
+        snapshot.validate().unwrap();
+        let err = ExtensionRegistry::from_snapshot(snapshot, ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(err.contains("boundary mismatch"));
     }
 
     #[test]

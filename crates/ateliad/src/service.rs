@@ -10,20 +10,21 @@ use atelia_core::{
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
     CancelJobReceipt, DefaultPolicyEngine, DisableExtensionRequest, DisableExtensionResponse,
     EchoTool, EnableExtensionRequest, EnableExtensionResponse, EventCursor, EventPage, EventQuery,
-    ExtensionBlocklistMatch, ExtensionBoundary, ExtensionInstallStatus, ExtensionRegistryService,
-    ExtensionSourceSnapshot, ExtensionStatusRequest, ExtensionStatusResponse, FsReadTool,
-    InMemoryStore, InMemoryToolOutputSettingsService, InstallExtensionRequest,
-    InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService, JobPage, JobQuery,
-    JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest, ListBlocklistResponse,
-    ListExtensionsRequest, ListExtensionsResponse, OutputFormat, PathScope, PolicyDecision,
-    PolicyEngine, PolicyInput, PolicyOutcome, RegistryError, RemoveExtensionRequest,
-    RemoveExtensionResponse, RenderedToolOutput, RepositoryId, RepositoryRecord,
-    RepositoryTrustState, ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse,
-    RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError,
-    SubmitJobIdempotencyRecord, ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides,
-    ToolOutputSettingsChange, ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId,
-    TruncationMetadata, UpdateExtensionRequest, UpdateExtensionResponse,
-    ValidateExtensionManifestRequest, ValidateExtensionManifestResponse, WatchJobEvent,
+    ExtensionBlocklistMatch, ExtensionBoundary, ExtensionInstallStatus, ExtensionRegistry,
+    ExtensionRegistryService, ExtensionSourceSnapshot, ExtensionStatusRequest,
+    ExtensionStatusResponse, FsReadTool, InMemoryStore, InMemoryToolOutputSettingsService,
+    InstallExtensionRequest, InstallExtensionResponse, JobEvent, JobId, JobKind,
+    JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
+    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
+    ManifestValidationPolicy, OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput,
+    PolicyOutcome, RegistryError, RemoveExtensionRequest, RemoveExtensionResponse,
+    RenderedToolOutput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
+    RollbackExtensionRequest, RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt,
+    RuntimeJobRequest, SecretaryStore, StoreError, SubmitJobIdempotencyRecord, ToolInvocationId,
+    ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
+    ToolOutputSettingsScope, ToolResultId, TruncationMetadata, UpdateExtensionRequest,
+    UpdateExtensionResponse, ValidateExtensionManifestRequest, ValidateExtensionManifestResponse,
+    WatchJobEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -485,29 +486,77 @@ impl SecretaryService {
     /// Create a new service backed by an in-memory store and default policy.
     pub fn new() -> Self {
         Self::from_store(InMemoryStore::new())
+            .expect("in-memory secretary service should initialize")
     }
 
     pub fn new_durable(storage_dir: impl Into<PathBuf>) -> ServiceResult<Self> {
         let store = InMemoryStore::with_durable_storage_dir(storage_dir)?;
-        Ok(Self::from_store(store))
+        Self::from_store(store)
     }
 
-    fn from_store(store: InMemoryStore) -> Self {
-        Self {
+    fn from_store(store: InMemoryStore) -> ServiceResult<Self> {
+        let extension_registry = ExtensionRegistryService::with_registry(
+            ExtensionRegistry::from_snapshot(
+                store.extension_registry_snapshot()?,
+                ManifestValidationPolicy::default(),
+            )
+            .map_err(|reason| {
+                ServiceError::Store(atelia_core::StoreError::InvalidRecord {
+                    collection: "extension_registry",
+                    reason,
+                })
+            })?,
+        );
+
+        Ok(Self {
             lifecycle: JobLifecycleService::new(atelia_core::SecretaryRuntime::new(
                 store,
                 DefaultPolicyEngine::new(),
             )),
             started_at: LedgerTimestamp::now(),
             daemon_status: DaemonStatus::Starting,
-            extension_registry: Mutex::new(ExtensionRegistryService::new()),
+            extension_registry: Mutex::new(extension_registry),
             tool_output_settings: Mutex::new(InMemoryToolOutputSettingsService::new(
                 LedgerTimestamp::now(),
             )),
             idempotent_submissions: VecDeque::new().into(),
             idempotent_submission_locks: HashMap::new().into(),
             cancellation_requesters: HashMap::new().into(),
-        }
+        })
+    }
+
+    fn persist_extension_registry_snapshot(
+        &self,
+        registry: &ExtensionRegistryService,
+    ) -> ServiceResult<()> {
+        self.lifecycle
+            .runtime()
+            .store()
+            .set_extension_registry_snapshot(registry.snapshot())
+            .map_err(ServiceError::from)?;
+        Ok(())
+    }
+
+    fn mutate_extension_registry<R>(
+        &self,
+        mutator: impl FnOnce(&mut ExtensionRegistryService) -> Result<R, RegistryError>,
+    ) -> ServiceResult<R> {
+        let mut registry = self.lock_extension_registry()?;
+        let validation_policy = registry.validation_policy();
+        let mut draft = ExtensionRegistryService::with_registry(
+            ExtensionRegistry::from_snapshot(registry.snapshot(), validation_policy).map_err(
+                |reason| {
+                    ServiceError::Store(atelia_core::StoreError::InvalidRecord {
+                        collection: "extension_registry",
+                        reason,
+                    })
+                },
+            )?,
+        );
+        let response = mutator(&mut draft).map_err(ServiceError::from)?;
+        self.persist_extension_registry_snapshot(&draft)?;
+        *registry = draft;
+        Ok(response)
     }
 
     fn lock_tool_output_settings(
@@ -1252,9 +1301,7 @@ impl SecretaryService {
         &self,
         request: InstallExtensionRequest,
     ) -> ServiceResult<InstallExtensionResponse> {
-        self.lock_extension_registry()?
-            .install_extension(request)
-            .map_err(ServiceError::from)
+        self.mutate_extension_registry(|registry| registry.install_extension(request))
     }
 
     /// Validate an extension manifest through the registry without installation side effects.
@@ -1271,9 +1318,7 @@ impl SecretaryService {
         &self,
         request: UpdateExtensionRequest,
     ) -> ServiceResult<UpdateExtensionResponse> {
-        self.lock_extension_registry()?
-            .update_extension(request)
-            .map_err(ServiceError::from)
+        self.mutate_extension_registry(|registry| registry.update_extension(request))
     }
 
     pub fn extension_status(
@@ -1314,45 +1359,35 @@ impl SecretaryService {
         &self,
         request: RollbackExtensionRequest,
     ) -> ServiceResult<RollbackExtensionResponse> {
-        self.lock_extension_registry()?
-            .rollback_extension(request)
-            .map_err(ServiceError::from)
+        self.mutate_extension_registry(|registry| registry.rollback_extension(request))
     }
 
     pub fn disable_extension(
         &self,
         request: DisableExtensionRequest,
     ) -> ServiceResult<DisableExtensionResponse> {
-        self.lock_extension_registry()?
-            .disable_extension(request)
-            .map_err(ServiceError::from)
+        self.mutate_extension_registry(|registry| registry.disable_extension(request))
     }
 
     pub fn enable_extension(
         &self,
         request: EnableExtensionRequest,
     ) -> ServiceResult<EnableExtensionResponse> {
-        self.lock_extension_registry()?
-            .enable_extension(request)
-            .map_err(ServiceError::from)
+        self.mutate_extension_registry(|registry| registry.enable_extension(request))
     }
 
     pub fn remove_extension(
         &self,
         request: RemoveExtensionRequest,
     ) -> ServiceResult<RemoveExtensionResponse> {
-        self.lock_extension_registry()?
-            .remove_extension(request)
-            .map_err(ServiceError::from)
+        self.mutate_extension_registry(|registry| registry.remove_extension(request))
     }
 
     pub fn apply_blocklist(
         &self,
         request: ApplyBlocklistRequest,
     ) -> ServiceResult<ApplyBlocklistResponse> {
-        self.lock_extension_registry()?
-            .apply_blocklist(request)
-            .map_err(ServiceError::from)
+        self.mutate_extension_registry(|registry| registry.apply_blocklist(request))
     }
 
     pub fn list_blocklist(
@@ -1804,9 +1839,9 @@ impl Default for SecretaryService {
 mod tests {
     use super::*;
     use atelia_core::{
-        ApplyBlocklistRequest, BlockKey, BlockReason, EventRefs, EventSeverity, EventSubject,
-        ExtensionCompatibility, ExtensionEntrypoints, ExtensionFailure, ExtensionKind,
-        ExtensionManifest, ExtensionPermission, ExtensionPublisher, ExtensionRealm,
+        ApplyBlocklistRequest, BlockKey, BlockReason, BlocklistEntry, EventRefs, EventSeverity,
+        EventSubject, ExtensionCompatibility, ExtensionEntrypoints, ExtensionFailure,
+        ExtensionKind, ExtensionManifest, ExtensionPermission, ExtensionPublisher, ExtensionRealm,
         ExtensionRuntime, ExtensionServices, InstallExtensionRequest, JobEventId, JobEventKind,
         LedgerTimestamp, ListBlocklistRequest, ListExtensionsRequest, PolicyDecision,
         PolicyDecisionId, PolicyOutcome, ProvenanceSource, RepositoryTrustState, ResourceScope,
@@ -1949,6 +1984,36 @@ mod tests {
             bundle: None,
             migration: Default::default(),
         }
+    }
+
+    fn local_unsigned_extension_manifest(
+        id: &str,
+        version: &str,
+        artifact_digest: &str,
+        manifest_digest: &str,
+    ) -> ExtensionManifest {
+        let mut manifest = extension_manifest(id, version, artifact_digest, manifest_digest);
+        manifest.provenance.source = ProvenanceSource::Local;
+        manifest.provenance.registry_identity = None;
+        manifest.provenance.signature = None;
+        manifest.provenance.signer = None;
+        manifest
+    }
+
+    fn local_process_extension_manifest(
+        id: &str,
+        version: &str,
+        artifact_digest: &str,
+        manifest_digest: &str,
+    ) -> ExtensionManifest {
+        let mut manifest =
+            local_unsigned_extension_manifest(id, version, artifact_digest, manifest_digest);
+        manifest.provenance.signature = Some("signature".to_string());
+        manifest.provenance.signer = Some("signer@example.com".to_string());
+        manifest.entrypoints.runtime = ExtensionRuntime::Process;
+        manifest.entrypoints.wasm = None;
+        manifest.entrypoints.command = Some("cargo run".to_string());
+        manifest
     }
 
     // -- health tests -------------------------------------------------------
@@ -2723,6 +2788,285 @@ mod tests {
         assert_ne!(second.job.id, first_job_id);
 
         let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn durable_extension_registry_replays_update_rollback_disable_enable() {
+        let storage_dir = durable_storage_dir("extension-restart-cycle");
+        let service = SecretaryService::new_durable(storage_dir.clone()).expect("durable service");
+
+        const ARTIFACT_V1: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const MANIFEST_V1: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const ARTIFACT_V2: &str =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        const MANIFEST_V2: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        service
+            .install_extension(InstallExtensionRequest {
+                manifest: extension_manifest(
+                    "com.example.restart.extension",
+                    "1.0.0",
+                    ARTIFACT_V1,
+                    MANIFEST_V1,
+                ),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("first install should persist");
+        service
+            .install_extension(InstallExtensionRequest {
+                manifest: extension_manifest(
+                    "com.example.restart.extension",
+                    "2.0.0",
+                    ARTIFACT_V2,
+                    MANIFEST_V2,
+                ),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("update should persist");
+
+        let rolled_back = service
+            .rollback_extension(RollbackExtensionRequest {
+                extension_id: "com.example.restart.extension".to_string(),
+            })
+            .expect("rollback should persist");
+        assert_eq!(rolled_back.record.version, "1.0.0");
+
+        let disabled = service
+            .disable_extension(DisableExtensionRequest {
+                extension_id: "com.example.restart.extension".to_string(),
+            })
+            .expect("disable should persist");
+        assert_eq!(disabled.record.status, ExtensionInstallStatus::Disabled);
+
+        service
+            .enable_extension(EnableExtensionRequest {
+                extension_id: "com.example.restart.extension".to_string(),
+            })
+            .expect("enable should persist");
+
+        drop(service);
+
+        let service = SecretaryService::new_durable(storage_dir.clone()).expect("durable reload");
+        let status = service
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.restart.extension".to_string(),
+            })
+            .expect("status should restore");
+        let record = status.record.expect("record should be present");
+        assert_eq!(record.version, "1.0.0");
+        assert_eq!(record.status, ExtensionInstallStatus::Installed);
+
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn durable_extension_registry_persists_local_unsigned_approval() {
+        let storage_dir = durable_storage_dir("extension-local-unsigned");
+        let service = SecretaryService::new_durable(storage_dir.clone())
+            .expect("durable service should initialize");
+
+        let installed = service
+            .install_extension(InstallExtensionRequest {
+                manifest: local_unsigned_extension_manifest(
+                    "local.example.unsigned",
+                    "1.0.0",
+                    "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                    "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                ),
+                approve_local_unsigned: true,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("local unsigned install should persist");
+        assert_eq!(
+            installed.record.boundary,
+            ExtensionBoundary::LocalDevelopment
+        );
+
+        drop(service);
+
+        let service =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service reload");
+        let status = service
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "local.example.unsigned".to_string(),
+            })
+            .expect("extension should survive durable reload");
+        let record = status.record.expect("record should be present");
+        assert_eq!(record.version, "1.0.0");
+        assert_eq!(record.boundary, ExtensionBoundary::LocalDevelopment);
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn durable_extension_registry_persists_local_process_runtime_approval() {
+        let storage_dir = durable_storage_dir("extension-local-process");
+        let service = SecretaryService::new_durable(storage_dir.clone())
+            .expect("durable service should initialize");
+
+        let installed = service
+            .install_extension(InstallExtensionRequest {
+                manifest: local_process_extension_manifest(
+                    "local.example.process",
+                    "1.0.0",
+                    "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                    "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+                ),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: true,
+                approve_source_change: false,
+            })
+            .expect("local process install should persist");
+        assert_eq!(
+            installed.record.boundary,
+            ExtensionBoundary::LocalDevelopment
+        );
+
+        drop(service);
+
+        let service =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service reload");
+        let status = service
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "local.example.process".to_string(),
+            })
+            .expect("extension should survive durable reload");
+        let record = status.record.expect("record should be present");
+        assert_eq!(record.version, "1.0.0");
+        assert_eq!(record.boundary, ExtensionBoundary::LocalDevelopment);
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn durable_extension_registry_persists_removal() {
+        let storage_dir = durable_storage_dir("extension-restart-remove");
+        let service = SecretaryService::new_durable(storage_dir.clone()).expect("durable service");
+
+        service
+            .install_extension(InstallExtensionRequest {
+                manifest: extension_manifest(
+                    "com.example.removed.extension",
+                    "1.0.0",
+                    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                ),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("install should succeed");
+
+        let removed = service
+            .remove_extension(RemoveExtensionRequest {
+                extension_id: "com.example.removed.extension".to_string(),
+            })
+            .expect("remove should persist");
+        assert_eq!(removed.record.status, ExtensionInstallStatus::Disabled);
+
+        drop(service);
+
+        let service = SecretaryService::new_durable(storage_dir.clone()).expect("durable reload");
+        let extensions = service
+            .list_extensions(ListExtensionsRequest {
+                include_blocked: true,
+            })
+            .expect("extensions should be queryable after restart");
+        assert_eq!(extensions.extensions.len(), 0);
+
+        let err = service
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.removed.extension".to_string(),
+            })
+            .expect_err("removed extension should not be installed");
+        assert!(matches!(
+            err,
+            ServiceError::ExtensionRegistry(RegistryError::NotInstalled { .. })
+        ));
+
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn durable_extension_registry_persists_blocklist_state() {
+        let storage_dir = durable_storage_dir("extension-restart-blocklist");
+        let service = SecretaryService::new_durable(storage_dir.clone()).expect("durable service");
+
+        service
+            .install_extension(InstallExtensionRequest {
+                manifest: extension_manifest(
+                    "com.example.blocked.extension",
+                    "1.0.0",
+                    "sha256:1111111111111111111111111111111111111111111111111111111111111112",
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+                ),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("install should succeed");
+
+        let block = service
+            .apply_blocklist(ApplyBlocklistRequest {
+                entry: BlocklistEntry {
+                    key: BlockKey::ExtensionId("com.example.blocked.extension".to_string()),
+                    reason: BlockReason::UserBlocked,
+                    note: Some("blocked for restart".to_string()),
+                },
+            })
+            .expect("blocklist should persist");
+        assert_eq!(
+            block.entry.key,
+            BlockKey::ExtensionId("com.example.blocked.extension".to_string())
+        );
+
+        let before = service
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.blocked.extension".to_string(),
+            })
+            .expect("status should show block before restart");
+        assert_eq!(before.block.unwrap().key, block.entry.key);
+        assert_eq!(
+            before.record.unwrap().status,
+            ExtensionInstallStatus::Blocked
+        );
+
+        drop(service);
+
+        let service = SecretaryService::new_durable(storage_dir.clone()).expect("durable reload");
+        let after = service
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "com.example.blocked.extension".to_string(),
+            })
+            .expect("status should restore blocked state after restart");
+        let block = after
+            .block
+            .expect("blocked status should include block marker");
+        assert_eq!(
+            block.key,
+            BlockKey::ExtensionId("com.example.blocked.extension".to_string())
+        );
+        assert_eq!(
+            after.record.unwrap().status,
+            ExtensionInstallStatus::Blocked
+        );
+
+        let blocklist = service
+            .list_blocklist(ListBlocklistRequest {})
+            .expect("blocklist should restore");
+        assert_eq!(blocklist.entries.len(), 1);
+        assert_eq!(
+            blocklist.entries[0].key,
+            BlockKey::ExtensionId("com.example.blocked.extension".to_string())
+        );
+
         let _ = fs::remove_dir_all(storage_dir);
     }
 
