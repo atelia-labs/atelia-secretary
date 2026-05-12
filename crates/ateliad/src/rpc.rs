@@ -1602,72 +1602,105 @@ pub struct ListPackageTrustIndexResponse {
     pub packages: Vec<PackageTrustIndexEntry>,
 }
 
+/// Source class used by client package authoring flows.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-/// Source class used by client package authoring flows.
 pub enum PackageSourceClass {
+    /// Package shipped as baseline host surface.
     HostShippedBuiltIn,
+    /// Package sourced from the current workspace.
     WorkspaceLocal,
+    /// Package selected directly by the user.
     UserSelected,
+    /// Package discoverable through the registry trust index.
     VerifiedRegistry,
+    /// Official package bundled with the client or host.
     BundledOfficial,
+    /// Package in an authoring or local development state.
     Development,
 }
 
+/// Ordered stage in the package authoring flow.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-/// Ordered stage in the package authoring flow.
 pub enum PackageAuthoringStage {
+    /// Package installation stage.
     Install,
+    /// Package inspection stage.
     Inspect,
+    /// Package validation stage.
     Validate,
+    /// Package remix stage.
     Remix,
+    /// Package publication stage.
     Publish,
+    /// Registry search and submission stage.
     RegistrySearch,
 }
 
+/// State of a package authoring flow stage.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-/// State of a package authoring flow stage.
 pub enum PackageAuthoringStepState {
+    /// Step can be started by the client.
     Available,
+    /// Step is unavailable because policy or validation blocks it.
     Blocked,
+    /// Step requires package validation before proceeding.
     RequiresValidation,
+    /// Step requires explicit user consent.
     RequiresConsent,
+    /// Step is currently in progress.
     InProgress,
+    /// Step has completed.
     Complete,
 }
 
+/// GitHub action a client may need to complete package publication.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-/// GitHub action a client may need to complete package publication.
 pub enum PackageGitHubPublicationAction {
+    /// Create a GitHub repository for the package source.
     CreateRepository,
+    /// Fork an existing GitHub repository.
     ForkRepository,
+    /// Create a publication branch.
     CreateBranch,
+    /// Commit package changes.
     CommitChanges,
+    /// Open a pull request for package changes.
     OpenPullRequest,
+    /// Prepare release metadata.
     PrepareReleaseMetadata,
+    /// Submit registry metadata.
     SubmitRegistryMetadata,
 }
 
+/// Visibility chosen for package publication.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-/// Visibility chosen for package publication.
 pub enum PackagePublicationVisibility {
+    /// Package remains private to the user's harness.
     PrivateRemix,
+    /// Package can be shared by direct reference but is not searchable.
     UnlistedShare,
+    /// Package can be searched and installed through the registry.
     PublicSearchable,
+    /// Package is published as an official Atelia package.
     Official,
 }
 
+/// Registry submission state exposed through package authoring.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-/// Registry submission state exposed through package authoring.
 pub enum PackageRegistrySubmissionState {
+    /// Package has not been submitted to the registry.
     NotSubmitted,
+    /// Package has been submitted and is awaiting review.
     Submitted,
+    /// Package submission has been accepted.
     Accepted,
+    /// Package submission has been rejected.
     Rejected,
 }
 
@@ -1704,111 +1737,152 @@ impl From<ExtensionRegistrySubmission> for PackageRegistrySubmissionState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// GitHub-backed source reference for a package.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackageGitHubSourceReference {
+    /// GitHub repository containing the package source.
     pub repository: String,
+    /// Branch, tag, or commit reference for the package source.
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     pub source_ref: Option<String>,
+    /// Path to the package manifest within the repository.
     pub manifest_path: String,
+    /// Optional digest of the package manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_digest: Option<String>,
+    /// Artifact digests attached to the package source.
     #[serde(default)]
     pub artifact_digests: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// Publication plan derived from persisted package provenance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackagePublicationPlan {
+    /// Intended publication visibility.
     pub visibility: PackagePublicationVisibility,
+    /// Source class used to produce the publication plan.
     pub source_class: PackageSourceClass,
+    /// GitHub source reference used for publication when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<PackageGitHubSourceReference>,
+    /// GitHub actions the client may need to complete.
     #[serde(default)]
     pub github_actions: Vec<PackageGitHubPublicationAction>,
+    /// Whether the package should be submitted to the registry.
     pub requires_registry_submission: bool,
+    /// Whether the package is eligible for production installation.
     pub production_installable: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// Single step in a package authoring flow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackageAuthoringFlowStep {
+    /// Stable stage identifier.
     pub id: PackageAuthoringStage,
+    /// Human-readable stage title.
     pub title: String,
+    /// Current stage state.
     pub state: PackageAuthoringStepState,
+    /// Whether the client must gather explicit consent before running the step.
     pub requires_explicit_consent: bool,
+    /// Policy or validation notes explaining the step state.
     pub policy_notes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// Package authoring flow shown to clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackageAuthoringFlow {
+    /// Package identifier the flow describes.
     pub package_id: String,
+    /// Source class for the package.
     pub source_class: PackageSourceClass,
+    /// Source reference when one is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<PackageGitHubSourceReference>,
+    /// Ordered authoring steps.
     pub steps: Vec<PackageAuthoringFlowStep>,
+    /// Optional publication plan for packages ready to publish.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_plan: Option<PackagePublicationPlan>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Request to read a package authoring flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageAuthoringFlowRequest {
+    /// Package identifier to inspect.
     pub package_id: String,
+    /// Whether private or local-only authoring steps should be included.
     pub include_private_steps: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Response containing the package authoring flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageAuthoringFlowResponse {
+    /// Protocol metadata for the response.
     pub metadata: ProtocolMetadata,
+    /// Derived package authoring flow.
     pub flow: PackageAuthoringFlow,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Request to preview a local package remix flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRemixRequest {
+    /// Package identifier to remix.
     pub package_id: String,
+    /// Source class to apply to the remix preview.
     pub source_class: PackageSourceClass,
+    /// Optional source reference for the remix.
     pub source: Option<PackageGitHubSourceReference>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Response containing the remixed package flow preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRemixResponse {
+    /// Protocol metadata for the response.
     pub metadata: ProtocolMetadata,
+    /// Derived remix flow.
     pub flow: PackageAuthoringFlow,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Request to persist package publication intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackagePublicationRequest {
+    /// Package identifier to publish.
     pub package_id: String,
+    /// Requested publication visibility.
     pub visibility: PackagePublicationVisibility,
+    /// Whether registry submission is required for this publication.
     pub requires_registry_submission: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Response containing the refreshed package publication flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackagePublicationResponse {
+    /// Protocol metadata for the response.
     pub metadata: ProtocolMetadata,
+    /// Refreshed package authoring flow.
     pub flow: PackageAuthoringFlow,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Request to persist package registry submission state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRegistrySubmissionRequest {
+    /// Package identifier being submitted.
     pub package_id: String,
+    /// Registry submission state to persist.
     pub state: PackageRegistrySubmissionState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Response containing persisted registry submission state and flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRegistrySubmissionResponse {
+    /// Protocol metadata for the response.
     pub metadata: ProtocolMetadata,
+    /// Package identifier whose submission state changed.
     pub package_id: String,
+    /// Persisted registry submission state.
     pub state: PackageRegistrySubmissionState,
+    /// Refreshed package authoring flow when available.
     pub flow: Option<PackageAuthoringFlow>,
 }
 

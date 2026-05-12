@@ -2683,29 +2683,35 @@ pub struct RemoveExtensionResponse {
     pub record: ExtensionInstallRecord,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// Request to update publication metadata for an installed package.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateExtensionPublicationRequest {
+    /// Installed package identifier.
     pub extension_id: String,
+    /// Publication metadata to persist.
     pub publication: ExtensionPublication,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// Response containing the install record after publication metadata changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateExtensionPublicationResponse {
+    /// Updated package install record.
     pub record: ExtensionInstallRecord,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// Request to update registry submission state for an installed package.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateExtensionRegistrySubmissionRequest {
+    /// Installed package identifier.
     pub extension_id: String,
+    /// Registry submission state to persist.
     pub registry_submission: ExtensionRegistrySubmission,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// Response containing the install record after registry submission changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateExtensionRegistrySubmissionResponse {
+    /// Updated package install record.
     pub record: ExtensionInstallRecord,
 }
 
