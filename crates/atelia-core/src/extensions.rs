@@ -1983,7 +1983,7 @@ impl ExtensionRegistry {
             .get(extension_id)
             .and_then(|records| records.get(&version))
             .and_then(|record| record.source.publication.clone())
-            .ok_or_else(|| {
+            .ok_or({
                 RegistryError::Validation(ExtensionValidationError::MissingField {
                     field: "provenance.publication",
                 })
