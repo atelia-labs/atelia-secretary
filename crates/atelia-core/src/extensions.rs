@@ -1985,16 +1985,6 @@ impl ExtensionRegistry {
             .ok_or_else(|| RegistryError::NotInstalled {
                 extension_id: extension_id.to_string(),
             })?;
-        let existing_publication = self
-            .records
-            .get(extension_id)
-            .and_then(|records| records.get(&version))
-            .and_then(|record| record.source.publication.clone())
-            .ok_or({
-                RegistryError::Validation(ExtensionValidationError::MissingField {
-                    field: "provenance.publication",
-                })
-            })?;
         let record = self
             .records
             .get(extension_id)
@@ -2003,6 +1993,11 @@ impl ExtensionRegistry {
             .ok_or_else(|| RegistryError::NotInstalled {
                 extension_id: extension_id.to_string(),
             })?;
+        let existing_publication = record.source.publication.clone().ok_or({
+            RegistryError::Validation(ExtensionValidationError::MissingField {
+                field: "provenance.publication",
+            })
+        })?;
         let mut manifest = self
             .manifests
             .get(extension_id)
@@ -2012,9 +2007,19 @@ impl ExtensionRegistry {
                 extension_id: extension_id.to_string(),
             })?;
 
+        let existing_registry_identity =
+            trim_optional_string(manifest.provenance.registry_identity.as_deref());
         let registry_identity = trim_optional_string(registry_identity.as_deref());
-        if let Some(registry_identity) = registry_identity.clone() {
-            manifest.provenance.registry_identity = Some(registry_identity);
+        if existing_registry_identity.is_some()
+            && registry_identity.is_some()
+            && existing_registry_identity != registry_identity
+        {
+            return Err(RegistryError::SourceChangeRequiresApproval {
+                extension_id: extension_id.to_string(),
+            });
+        }
+        if existing_registry_identity.is_none() {
+            manifest.provenance.registry_identity = registry_identity.clone();
         }
         manifest.provenance.publication = Some(ExtensionPublication {
             registry_submission,
@@ -2026,20 +2031,13 @@ impl ExtensionRegistry {
 
         let persisted_publication = manifest.provenance.publication.clone();
         let persisted_registry_identity = manifest.provenance.registry_identity.clone();
-        {
-            self.manifests
-                .get_mut(extension_id)
-                .and_then(|records| records.get_mut(&version))
-                .expect("manifest existence checked before registry submission update")
-                .provenance
-                .registry_identity = persisted_registry_identity.clone();
-            self.manifests
-                .get_mut(extension_id)
-                .and_then(|records| records.get_mut(&version))
-                .expect("manifest existence checked before registry submission update")
-                .provenance
-                .publication = persisted_publication.clone();
-        }
+        let manifest = self
+            .manifests
+            .get_mut(extension_id)
+            .and_then(|records| records.get_mut(&version))
+            .expect("manifest existence checked before registry submission update");
+        manifest.provenance.registry_identity = persisted_registry_identity.clone();
+        manifest.provenance.publication = persisted_publication.clone();
 
         let record = self
             .records
@@ -5268,6 +5266,60 @@ mod tests {
                 .and_then(|manifest| manifest.provenance.registry_identity.as_deref()),
             Some("third-party-registry")
         );
+    }
+
+    #[test]
+    fn update_registry_submission_rejects_registry_identity_rebinding() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+        registry
+            .update_publication(
+                "com.example.extension",
+                ExtensionPublication {
+                    visibility: ExtensionPublicationVisibility::PublicSearchable,
+                    registry_submission: ExtensionRegistrySubmission::AwaitingSubmission,
+                },
+            )
+            .unwrap();
+
+        let err = registry
+            .update_registry_submission(
+                "com.example.extension",
+                ExtensionRegistrySubmission::Submitted,
+                Some("other-registry".to_string()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RegistryError::SourceChangeRequiresApproval { extension_id }
+                if extension_id == "com.example.extension"
+        ));
+    }
+
+    #[test]
+    fn update_registry_submission_reports_not_installed_for_missing_active_record() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+        registry.records.clear();
+
+        let err = registry
+            .update_registry_submission(
+                "com.example.extension",
+                ExtensionRegistrySubmission::Submitted,
+                Some("third-party-registry".to_string()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RegistryError::NotInstalled { extension_id }
+                if extension_id == "com.example.extension"
+        ));
     }
 
     #[test]
