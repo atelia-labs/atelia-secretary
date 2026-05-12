@@ -6,7 +6,7 @@ use crate::domain::{
 };
 
 const POLICY_SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_POLICY_VERSION: &str = "policy-stub-v1";
+pub const DEFAULT_POLICY_VERSION: &str = "policy-default-v1";
 pub const REASON_REPOSITORY_BLOCKED: &str = "repository_blocked";
 pub const SCOPE_KIND_REPOSITORY: &str = "repository";
 pub const SCOPE_VALUE_ROOT: &str = ".";
@@ -80,7 +80,7 @@ impl Default for PolicyInput {
     fn default() -> Self {
         Self {
             requester: Actor::System {
-                id: "policy-stub".to_string(),
+                id: "policy-default".to_string(),
             },
             repository_id: RepositoryId::new(),
             requested_capability: "filesystem.read".to_string(),
@@ -215,7 +215,7 @@ impl DefaultPolicyEngine {
             Capability::Unsupported => RuleDecision::blocked(
                 RiskTier::R4,
                 "unsupported_capability_blocked",
-                "The requested capability is not supported by the policy stub.",
+                "The requested capability is not supported by the default policy.",
             ),
         }
     }
@@ -417,6 +417,19 @@ mod tests {
 
     fn decide(input: PolicyInput) -> PolicyDecision {
         DefaultPolicyEngine::new().evaluate(input)
+    }
+
+    #[test]
+    fn default_policy_input_uses_default_policy_identity() {
+        let input = PolicyInput::default();
+
+        assert_eq!(DEFAULT_POLICY_VERSION, input.policy_version);
+        assert_eq!(
+            Actor::System {
+                id: "policy-default".to_string(),
+            },
+            input.requester
+        );
     }
 
     #[test]
