@@ -2029,8 +2029,11 @@ impl ExtensionRegistry {
         manifest.validate(&effective_policy)?;
         self.ensure_not_blocked(&manifest)?;
 
+        manifest.provenance.registry_identity =
+            trim_optional_string(manifest.provenance.registry_identity.as_deref());
         let persisted_publication = manifest.provenance.publication.clone();
         let persisted_registry_identity = manifest.provenance.registry_identity.clone();
+        let persisted_source = ExtensionSourceSnapshot::from_provenance(&manifest.provenance);
         let manifest = self
             .manifests
             .get_mut(extension_id)
@@ -2044,8 +2047,7 @@ impl ExtensionRegistry {
             .get_mut(extension_id)
             .and_then(|records| records.get_mut(&version))
             .expect("record existence checked before registry submission update");
-        record.source.registry_identity = persisted_registry_identity;
-        record.source.publication = persisted_publication;
+        record.source = persisted_source;
         Ok(record.clone())
     }
 
@@ -5297,6 +5299,54 @@ mod tests {
             RegistryError::SourceChangeRequiresApproval { extension_id }
                 if extension_id == "com.example.extension"
         ));
+    }
+
+    #[test]
+    fn update_registry_submission_keeps_source_snapshot_canonical() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+        registry
+            .update_publication(
+                "com.example.extension",
+                ExtensionPublication {
+                    visibility: ExtensionPublicationVisibility::PublicSearchable,
+                    registry_submission: ExtensionRegistrySubmission::AwaitingSubmission,
+                },
+            )
+            .unwrap();
+
+        let active_version = registry
+            .active_versions
+            .get("com.example.extension")
+            .cloned()
+            .expect("active version should exist");
+        let manifest = registry
+            .manifests
+            .get_mut("com.example.extension")
+            .and_then(|versions| versions.get_mut(&active_version))
+            .expect("active manifest should exist");
+        manifest.provenance.registry_identity = Some(" third-party-registry ".to_string());
+
+        let record = registry
+            .update_registry_submission(
+                "com.example.extension",
+                ExtensionRegistrySubmission::Submitted,
+                None,
+            )
+            .unwrap();
+
+        let manifest = registry
+            .manifests
+            .get("com.example.extension")
+            .and_then(|versions| versions.get(&active_version))
+            .expect("active manifest should exist");
+        assert_eq!(
+            record.source,
+            ExtensionSourceSnapshot::from_provenance(&manifest.provenance)
+        );
+        registry.snapshot().validate().unwrap();
     }
 
     #[test]
