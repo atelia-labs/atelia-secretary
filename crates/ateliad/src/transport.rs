@@ -6117,6 +6117,41 @@ mod tests {
             ARTIFACT_V2,
             MANIFEST_V2,
         );
+        let mut accepted_manifest_v1 = manifest_v1.clone();
+        accepted_manifest_v1.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
+        });
+
+        let accepted_install_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/install",
+            serde_json::json!({
+                "manifest": accepted_manifest_v1,
+                "approve_local_unsigned": false,
+                "allow_local_process_runtime": false,
+            }),
+        )
+        .await;
+        assert_eq!(accepted_install_response.status(), StatusCode::BAD_REQUEST);
+        let mut rejected_manifest_v1 = manifest_v1.clone();
+        rejected_manifest_v1.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Rejected,
+        });
+        let rejected_validate_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/validate",
+            serde_json::json!({
+                "manifest": rejected_manifest_v1,
+                "approve_local_unsigned": false,
+                "allow_local_process_runtime": false,
+            }),
+        )
+        .await;
+        assert_eq!(rejected_validate_response.status(), StatusCode::BAD_REQUEST);
 
         let install_response = send_json_request(
             &rpc_server,
@@ -6196,6 +6231,24 @@ mod tests {
             list_after_validate_payload["data"]["extensions"],
             list_before_validate_payload["data"]["extensions"]
         );
+
+        let mut accepted_manifest_v2 = manifest_v2.clone();
+        accepted_manifest_v2.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
+        });
+        let accepted_update_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/update",
+            serde_json::json!({
+                "manifest": accepted_manifest_v2,
+                "approve_local_unsigned": false,
+                "allow_local_process_runtime": false,
+            }),
+        )
+        .await;
+        assert_eq!(accepted_update_response.status(), StatusCode::BAD_REQUEST);
 
         let update_response = send_json_request(
             &rpc_server,

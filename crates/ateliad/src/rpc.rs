@@ -307,6 +307,7 @@ impl SecretaryRpcServer {
         &self,
         request: InstallExtensionRequest,
     ) -> RpcResult<InstallExtensionResponse> {
+        reject_client_writable_registry_verdict(&request.manifest)?;
         let response = self.service.install_extension(request)?;
         Ok(InstallExtensionResponse {
             metadata: self.metadata(),
@@ -319,6 +320,7 @@ impl SecretaryRpcServer {
         &self,
         request: ValidateExtensionManifestRequest,
     ) -> RpcResult<ValidateExtensionResponse> {
+        reject_client_writable_registry_verdict(&request.manifest)?;
         let response = self.service.validate_extension(request)?;
         Ok(ValidateExtensionResponse {
             metadata: self.metadata(),
@@ -331,6 +333,7 @@ impl SecretaryRpcServer {
         &self,
         request: UpdateExtensionRequest,
     ) -> RpcResult<UpdateExtensionResponse> {
+        reject_client_writable_registry_verdict(&request.manifest)?;
         let response = self.service.update_extension(request)?;
         Ok(UpdateExtensionResponse {
             metadata: self.metadata(),
@@ -1490,6 +1493,29 @@ fn watch_events_last_sequence(
             (None, None) => None,
         },
     )
+}
+
+fn reject_client_writable_registry_verdict(
+    manifest: &atelia_core::ExtensionManifest,
+) -> RpcResult<()> {
+    if manifest
+        .provenance
+        .publication
+        .as_ref()
+        .is_some_and(|publication| {
+            matches!(
+                publication.registry_submission,
+                ExtensionRegistrySubmission::Accepted | ExtensionRegistrySubmission::Rejected
+            )
+        })
+    {
+        return Err(RpcError {
+            code: RpcErrorCode::InvalidArgument,
+            reason: "registry accepted and rejected states require registry authority".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn parse_watch_events_limit(limit: Option<usize>) -> RpcResult<usize> {
@@ -5585,6 +5611,83 @@ mod tests {
     }
 
     #[test]
+    fn client_writable_manifests_cannot_claim_registry_verdicts() {
+        const ARTIFACT_V1: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const MANIFEST_V1: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const ARTIFACT_V2: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const MANIFEST_V2: &str =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let server = ready_server();
+        let mut accepted_manifest = extension_manifest(
+            "com.example.review.extension",
+            "1.0.0",
+            ARTIFACT_V1,
+            MANIFEST_V1,
+        );
+        accepted_manifest.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
+        });
+        let mut rejected_manifest = accepted_manifest.clone();
+        rejected_manifest.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Rejected,
+        });
+
+        let rejected_install = server
+            .install_extension(InstallExtensionRequest {
+                manifest: accepted_manifest.clone(),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect_err("client install should not claim accepted registry status");
+        assert_eq!(rejected_install.code, RpcErrorCode::InvalidArgument);
+
+        let rejected_validate = server
+            .validate_extension(ValidateExtensionManifestRequest {
+                manifest: rejected_manifest,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect_err("client validation should not claim rejected registry status");
+        assert_eq!(rejected_validate.code, RpcErrorCode::InvalidArgument);
+
+        let base_manifest = extension_manifest(
+            "com.example.review.extension",
+            "1.0.0",
+            ARTIFACT_V1,
+            MANIFEST_V1,
+        );
+        server
+            .install_extension(InstallExtensionRequest {
+                manifest: base_manifest,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("baseline install should succeed");
+
+        accepted_manifest.version = "2.0.0".to_string();
+        accepted_manifest.provenance.artifact_digest = ARTIFACT_V2.to_string();
+        accepted_manifest.provenance.manifest_digest = MANIFEST_V2.to_string();
+        let rejected_update = server
+            .update_extension(UpdateExtensionRequest {
+                manifest: accepted_manifest,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect_err("client update should not claim accepted registry status");
+        assert_eq!(rejected_update.code, RpcErrorCode::InvalidArgument);
+    }
+
+    #[test]
     fn package_trust_index_round_trip_through_rpc_surface_preserves_provenance() {
         const ACTIVE_ARTIFACT: &str =
             "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
@@ -5599,7 +5702,7 @@ mod tests {
         const SUBMITTED_MANIFEST: &str =
             "sha256:4444444444444444444444444444444444444444444444444444444444444444";
 
-        let server = ready_server();
+        let mut server = ready_server();
         let mut active = extension_manifest(
             "com.example.active",
             "1.0.0",
@@ -5608,7 +5711,7 @@ mod tests {
         );
         active.provenance.publication = Some(atelia_core::ExtensionPublication {
             visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
-            registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Submitted,
         });
 
         let mut blocked = extension_manifest(
@@ -5646,6 +5749,16 @@ mod tests {
                 approve_source_change: false,
             })
             .expect("active install should succeed");
+        server
+            .service_mut()
+            .update_extension_registry_submission(
+                atelia_core::UpdateExtensionRegistrySubmissionRequest {
+                    extension_id: "com.example.active".to_string(),
+                    registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
+                    registry_identity: Some("third-party-registry".to_string()),
+                },
+            )
+            .expect("registry authority should accept the active package");
         server
             .install_extension(InstallExtensionRequest {
                 manifest: blocked,
