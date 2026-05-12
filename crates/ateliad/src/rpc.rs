@@ -396,6 +396,10 @@ impl SecretaryRpcServer {
         let mut flow = package_authoring_flow_from_status(&extension, true)?;
         flow.source_class = request.source_class;
         flow.source = request.source.or(flow.source);
+        if let Some(plan) = flow.publication_plan.as_mut() {
+            plan.source_class = flow.source_class;
+            plan.source = flow.source.clone();
+        }
         mark_package_authoring_step(
             &mut flow,
             PackageAuthoringStage::Remix,
@@ -418,15 +422,29 @@ impl SecretaryRpcServer {
         request: PackagePublicationRequest,
     ) -> RpcResult<PackagePublicationResponse> {
         let publication_visibility = request.visibility;
+        let existing = self.service.extension_status(ExtensionStatusRequest {
+            extension_id: request.package_id.clone(),
+        })?;
+        let existing_registry_submission = existing
+            .record
+            .as_ref()
+            .and_then(|record| record.source.publication.as_ref())
+            .map(|publication| publication.registry_submission);
         self.service
             .update_extension_publication(UpdateExtensionPublicationRequest {
                 extension_id: request.package_id.clone(),
                 publication: ExtensionPublication {
                     visibility: ExtensionPublicationVisibility::from(publication_visibility),
-                    registry_submission: if request.requires_registry_submission {
-                        ExtensionRegistrySubmission::AwaitingSubmission
-                    } else {
-                        ExtensionRegistrySubmission::NotSubmitted
+                    registry_submission: match existing_registry_submission {
+                        Some(
+                            state @ (ExtensionRegistrySubmission::Submitted
+                            | ExtensionRegistrySubmission::Accepted
+                            | ExtensionRegistrySubmission::Rejected),
+                        ) => state,
+                        _ if request.requires_registry_submission => {
+                            ExtensionRegistrySubmission::AwaitingSubmission
+                        }
+                        _ => ExtensionRegistrySubmission::NotSubmitted,
                     },
                 },
             })?;

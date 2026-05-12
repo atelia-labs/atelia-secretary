@@ -2975,6 +2975,21 @@ async fn dispatch_package_remix(
             next_state,
         );
     }
+    if matches!(
+        payload.source_class,
+        Some(rpc::PackageSourceClass::UserSelected)
+    ) && payload.source.is_none()
+    {
+        let rpc_server = state.read().await;
+        let next_state = rpc_next_state(&rpc_server);
+        return make_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "github source is required when source_class is user-selected",
+            false,
+            next_state,
+        );
+    }
 
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
@@ -3077,18 +3092,33 @@ async fn dispatch_package_registry_submission(
         }
     };
     let registry_identity = match payload.registry_identity {
-        Some(registry_identity) if registry_identity.trim().is_empty() => {
-            let rpc_server = state.read().await;
-            let next_state = rpc_next_state(&rpc_server);
-            return make_error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_argument",
-                "registry_identity must not be blank",
-                false,
-                next_state,
-            );
+        Some(registry_identity) => {
+            let trimmed = registry_identity.trim();
+            if trimmed.is_empty() {
+                let rpc_server = state.read().await;
+                let next_state = rpc_next_state(&rpc_server);
+                return make_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "registry_identity must not be blank",
+                    false,
+                    next_state,
+                );
+            }
+            if trimmed != registry_identity {
+                let rpc_server = state.read().await;
+                let next_state = rpc_next_state(&rpc_server);
+                return make_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "registry_identity must not have leading or trailing whitespace",
+                    false,
+                    next_state,
+                );
+            }
+            Some(registry_identity)
         }
-        registry_identity => registry_identity,
+        None => None,
     };
 
     let rpc_server = state.read().await;
@@ -6393,6 +6423,20 @@ mod tests {
             invalid_remix_source_response.status(),
             StatusCode::BAD_REQUEST
         );
+        let invalid_remix_missing_source_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/remix",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "source_class": "user-selected"
+            }),
+        )
+        .await;
+        assert_eq!(
+            invalid_remix_missing_source_response.status(),
+            StatusCode::BAD_REQUEST
+        );
 
         let publication_response = send_json_request(
             &rpc_server,
@@ -6420,6 +6464,38 @@ mod tests {
             .iter()
             .any(|step| step["id"] == "registry_search" && step["state"] == "requires_consent"));
 
+        let github_remix_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/remix",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "source_class": "user-selected",
+                "source": {
+                    "repository": "https://github.com/example/package",
+                    "manifest_path": "atelia.package.yaml"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(github_remix_response.status(), StatusCode::OK);
+        let github_remix_payload = to_bytes(github_remix_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(
+            github_remix_payload["data"]["flow"]["source_class"],
+            "user-selected"
+        );
+        assert_eq!(
+            github_remix_payload["data"]["flow"]["publication_plan"]["source_class"],
+            "user-selected"
+        );
+        assert_eq!(
+            github_remix_payload["data"]["flow"]["publication_plan"]["source"]["repository"],
+            "https://github.com/example/package"
+        );
+
         let blank_registry_identity_response = send_json_request(
             &rpc_server,
             Method::POST,
@@ -6433,6 +6509,21 @@ mod tests {
         .await;
         assert_eq!(
             blank_registry_identity_response.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let padded_registry_identity_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/registry-submission",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "state": "submitted",
+                "registry_identity": " third-party-registry "
+            }),
+        )
+        .await;
+        assert_eq!(
+            padded_registry_identity_response.status(),
             StatusCode::BAD_REQUEST
         );
 
@@ -6520,6 +6611,41 @@ mod tests {
         );
         assert!(
             authoring_flow_after_submission_payload["data"]["flow"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["id"] == "registry_search" && step["state"] == "in_progress")
+        );
+
+        let preserve_submission_publication_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/publication",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "visibility": "unlisted_share",
+                "requires_registry_submission": false
+            }),
+        )
+        .await;
+        assert_eq!(
+            preserve_submission_publication_response.status(),
+            StatusCode::OK
+        );
+        let preserve_submission_publication_payload = to_bytes(
+            preserve_submission_publication_response.into_body(),
+            usize::MAX,
+        )
+        .await
+        .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+        .expect("response bytes");
+        assert_eq!(
+            preserve_submission_publication_payload["data"]["flow"]["publication_plan"]
+                ["requires_registry_submission"],
+            true
+        );
+        assert!(
+            preserve_submission_publication_payload["data"]["flow"]["steps"]
                 .as_array()
                 .unwrap()
                 .iter()
