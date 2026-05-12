@@ -1427,6 +1427,7 @@ impl SecretaryService {
         self.mutate_extension_registry(|registry| registry.remove_extension(request))
     }
 
+    /// Persist package publication metadata through the Secretary service boundary.
     pub fn update_extension_publication(
         &self,
         request: UpdateExtensionPublicationRequest,
@@ -1434,6 +1435,7 @@ impl SecretaryService {
         self.mutate_extension_registry(|registry| registry.update_extension_publication(request))
     }
 
+    /// Persist package registry submission state through the Secretary service boundary.
     pub fn update_extension_registry_submission(
         &self,
         request: UpdateExtensionRegistrySubmissionRequest,
