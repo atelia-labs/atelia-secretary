@@ -2200,6 +2200,11 @@ fn validate_extension_registry_snapshot(
                     ));
                 }
             }
+            if let Some(cycle_entry_version) = detect_rollback_cycle(records, version) {
+                return Err(format!(
+                    "record {extension_id}:{version} has rollback-cycle previous_version chain involving {cycle_entry_version}"
+                ));
+            }
             if manifest.id != *extension_id {
                 return Err(format!(
                     "manifest id {} does not match extension map key {}",
@@ -2287,6 +2292,25 @@ fn validate_extension_registry_snapshot(
     }
 
     Ok(())
+}
+
+fn detect_rollback_cycle(
+    records: &BTreeMap<String, ExtensionInstallRecord>,
+    start_version: &str,
+) -> Option<String> {
+    let mut visited_versions = BTreeSet::new();
+    let mut current_version = start_version;
+
+    while let Some(record) = records.get(current_version) {
+        if !visited_versions.insert(current_version.to_string()) {
+            return Some(current_version.to_string());
+        }
+        current_version = match record.previous_version.as_deref() {
+            Some(previous_version) => previous_version,
+            None => return None,
+        };
+    }
+    None
 }
 
 fn validate_extension_registry_snapshot_manifests(
@@ -4521,6 +4545,42 @@ mod tests {
 
         let err = snapshot.validate().unwrap_err();
         assert!(err.contains("self-referential previous_version"));
+    }
+
+    #[test]
+    fn extension_snapshot_rejects_multi_record_rollback_cycle() {
+        let first = manifest("com.example.extension");
+        let mut second = manifest("com.example.extension");
+        second.version = "1.1.0".to_string();
+        second.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        second.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+
+        let first_version = first.version.clone();
+        let second_version = second.version.clone();
+
+        let snapshot = extension_snapshot(
+            BTreeMap::from([
+                (first_version.clone(), first.clone()),
+                (second_version.clone(), second.clone()),
+            ]),
+            BTreeMap::from([
+                (
+                    first_version.clone(),
+                    extension_record(&first, Some(&second_version)),
+                ),
+                (
+                    second_version.clone(),
+                    extension_record(&second, Some(&first_version)),
+                ),
+            ]),
+        );
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("rollback-cycle"));
+
+        let err = ExtensionRegistry::from_snapshot(snapshot, ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(err.contains("rollback-cycle"));
     }
 
     #[test]
