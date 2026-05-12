@@ -164,8 +164,28 @@ pub struct GetProjectStatusRequest {
     pub repository_id: RepositoryId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ListPackageTrustIndexRequest {}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListPackageTrustIndexRequest {
+    #[serde(default = "ListPackageTrustIndexRequest::default_include_blocked")]
+    pub include_blocked: bool,
+    #[serde(default)]
+    pub discovery_only: bool,
+}
+
+impl ListPackageTrustIndexRequest {
+    fn default_include_blocked() -> bool {
+        true
+    }
+}
+
+impl Default for ListPackageTrustIndexRequest {
+    fn default() -> Self {
+        Self {
+            include_blocked: true,
+            discovery_only: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectStatusSnapshot {
@@ -1341,18 +1361,40 @@ impl SecretaryService {
 
     pub fn list_package_trust_index(
         &self,
-        _request: ListPackageTrustIndexRequest,
+        request: ListPackageTrustIndexRequest,
     ) -> ServiceResult<ListPackageTrustIndexResponse> {
         let response = self.list_extensions(ListExtensionsRequest {
-            include_blocked: true,
+            include_blocked: request.include_blocked,
         })?;
-        Ok(ListPackageTrustIndexResponse {
-            packages: response
-                .extensions
-                .into_iter()
-                .map(PackageTrustIndexEntry::from)
-                .collect(),
-        })
+
+        let mut packages = response
+            .extensions
+            .into_iter()
+            .map(PackageTrustIndexEntry::from)
+            .collect::<Vec<_>>();
+
+        if request.discovery_only {
+            packages.retain(|entry| {
+                if entry.boundary == Some(ExtensionBoundary::LocalDevelopment) {
+                    return false;
+                }
+                if entry.block.is_some() {
+                    return false;
+                }
+                entry
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.publication.as_ref())
+                    .is_some_and(|publication| {
+                        publication.visibility
+                            == atelia_core::ExtensionPublicationVisibility::PublicSearchable
+                            && publication.registry_submission
+                                == atelia_core::ExtensionRegistrySubmission::Accepted
+                    })
+            });
+        }
+
+        Ok(ListPackageTrustIndexResponse { packages })
     }
 
     pub fn rollback_extension(
@@ -2381,6 +2423,183 @@ mod tests {
                 relationship: atelia_core::ExtensionLineageRelationship::Fork,
             })
         );
+    }
+
+    #[test]
+    fn package_trust_index_request_defaults_to_full_index() {
+        let request: ListPackageTrustIndexRequest = serde_json::from_str("{}").unwrap();
+
+        assert!(request.include_blocked);
+        assert!(!request.discovery_only);
+        assert_eq!(request, ListPackageTrustIndexRequest::default());
+    }
+
+    #[test]
+    fn package_trust_index_request_deserializes_filtered_discovery() {
+        let request: ListPackageTrustIndexRequest =
+            serde_json::from_str("{\"include_blocked\":false,\"discovery_only\":true}").unwrap();
+
+        assert!(!request.include_blocked);
+        assert!(request.discovery_only);
+    }
+
+    #[test]
+    fn package_trust_index_discovery_only_filters_discoverable_packages() {
+        let svc = ready_service();
+
+        const PUBLIC_ARTIFACT: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const PUBLIC_MANIFEST: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const SUBMITTED_ARTIFACT: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const SUBMITTED_MANIFEST: &str =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        const PRIVATE_ARTIFACT: &str =
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        const PRIVATE_MANIFEST: &str =
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        const LOCAL_ARTIFACT: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const LOCAL_MANIFEST: &str =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        const BLOCKED_ARTIFACT: &str =
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        const BLOCKED_MANIFEST: &str =
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+
+        let mut discoverable_public = extension_manifest(
+            "com.example.discoverable",
+            "1.0.0",
+            PUBLIC_ARTIFACT,
+            PUBLIC_MANIFEST,
+        );
+        discoverable_public.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
+        });
+
+        let mut submitted_public = extension_manifest(
+            "com.example.submitted",
+            "1.0.0",
+            SUBMITTED_ARTIFACT,
+            SUBMITTED_MANIFEST,
+        );
+        submitted_public.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Submitted,
+        });
+
+        let mut private_remix = extension_manifest(
+            "com.example.private-remix",
+            "1.0.0",
+            PRIVATE_ARTIFACT,
+            PRIVATE_MANIFEST,
+        );
+        private_remix.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PrivateRemix,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::NotSubmitted,
+        });
+
+        let local_development = local_unsigned_extension_manifest(
+            "local.example.local-development",
+            "1.0.0",
+            LOCAL_ARTIFACT,
+            LOCAL_MANIFEST,
+        );
+
+        let mut blocked_public = extension_manifest(
+            "com.example.blocked-searchable",
+            "1.0.0",
+            BLOCKED_ARTIFACT,
+            BLOCKED_MANIFEST,
+        );
+        blocked_public.provenance.publication = Some(atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
+        });
+
+        svc.install_extension(InstallExtensionRequest {
+            manifest: discoverable_public,
+            approve_local_unsigned: false,
+            allow_local_process_runtime: false,
+            approve_source_change: false,
+        })
+        .expect("discoverable public install should succeed");
+        svc.install_extension(InstallExtensionRequest {
+            manifest: submitted_public,
+            approve_local_unsigned: false,
+            allow_local_process_runtime: false,
+            approve_source_change: false,
+        })
+        .expect("submitted public install should succeed");
+        svc.install_extension(InstallExtensionRequest {
+            manifest: private_remix,
+            approve_local_unsigned: false,
+            allow_local_process_runtime: false,
+            approve_source_change: false,
+        })
+        .expect("private remix install should succeed");
+        svc.install_extension(InstallExtensionRequest {
+            manifest: local_development,
+            approve_local_unsigned: true,
+            allow_local_process_runtime: false,
+            approve_source_change: false,
+        })
+        .expect("local development install should succeed");
+        svc.install_extension(InstallExtensionRequest {
+            manifest: blocked_public,
+            approve_local_unsigned: false,
+            allow_local_process_runtime: false,
+            approve_source_change: false,
+        })
+        .expect("blocked searchable install should succeed");
+        svc.apply_blocklist(ApplyBlocklistRequest {
+            entry: atelia_core::BlocklistEntry {
+                key: BlockKey::ExtensionId("com.example.blocked-searchable".to_string()),
+                reason: BlockReason::PolicyViolation,
+                note: Some("blocked for discovery test".to_string()),
+            },
+        })
+        .expect("blocklist should apply");
+
+        let discovery_index = svc
+            .list_package_trust_index(ListPackageTrustIndexRequest {
+                include_blocked: true,
+                discovery_only: true,
+            })
+            .expect("discovery trust index should succeed");
+
+        assert_eq!(discovery_index.packages.len(), 1);
+        let discoverable_entry = discovery_index
+            .packages
+            .iter()
+            .find(|entry| entry.package_id == "com.example.discoverable")
+            .expect("discoverable package should appear in discovery index");
+        assert_eq!(
+            discoverable_entry.source.as_ref().unwrap().publication,
+            Some(atelia_core::ExtensionPublication {
+                visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+                registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
+            })
+        );
+
+        assert!(discovery_index
+            .packages
+            .iter()
+            .all(|entry| entry.package_id != "com.example.private-remix"));
+        assert!(discovery_index
+            .packages
+            .iter()
+            .all(|entry| entry.package_id != "com.example.submitted"));
+        assert!(discovery_index
+            .packages
+            .iter()
+            .all(|entry| entry.package_id != "local.example.local-development"));
+        assert!(discovery_index
+            .packages
+            .iter()
+            .all(|entry| entry.package_id != "com.example.blocked-searchable"));
     }
 
     #[test]

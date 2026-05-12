@@ -2706,15 +2706,18 @@ async fn dispatch_list_package_trust_index(
     state: RpcServerState,
     request: Request<Body>,
 ) -> Response {
-    if let Err(error) = body_or_empty_json::<rpc::ListPackageTrustIndexRequest>(request).await {
-        let rpc_server = state.read().await;
-        let next_state = rpc_next_state(&rpc_server);
-        return error.into_response(next_state);
-    }
+    let payload = match body_or_empty_json::<rpc::ListPackageTrustIndexRequest>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
 
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
-    match rpc_server.list_package_trust_index(rpc::ListPackageTrustIndexRequest {}) {
+    match rpc_server.list_package_trust_index(payload) {
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(
@@ -5853,6 +5856,30 @@ mod tests {
         assert!(trust_index_payload["data"]["packages"][0]
             .get("approved_permissions")
             .is_none());
+
+        let filtered_trust_index_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/package-trust-index:list",
+            serde_json::json!({
+                "include_blocked": false,
+                "discovery_only": true,
+            }),
+        )
+        .await;
+        assert_eq!(filtered_trust_index_response.status(), StatusCode::OK);
+        let filtered_trust_index_payload =
+            to_bytes(filtered_trust_index_response.into_body(), usize::MAX)
+                .await
+                .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+                .expect("response bytes");
+        assert_eq!(
+            filtered_trust_index_payload["data"]["packages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
 
         let execute_response = send_request(
             &rpc_server,
