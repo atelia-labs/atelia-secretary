@@ -5051,6 +5051,19 @@ mod tests {
             .expect("package trust index should succeed");
 
         assert_eq!(index.packages.len(), 3);
+
+        let unblocked_index = server
+            .list_package_trust_index(ListPackageTrustIndexRequest {
+                include_blocked: false,
+                discovery_only: false,
+            })
+            .expect("unblocked package trust index should succeed");
+        assert_eq!(unblocked_index.packages.len(), 2);
+        assert!(unblocked_index
+            .packages
+            .iter()
+            .all(|entry| entry.package_id != "com.example.blocked"));
+
         let blocked_entry = index
             .packages
             .iter()

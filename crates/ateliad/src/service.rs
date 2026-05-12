@@ -2386,6 +2386,18 @@ mod tests {
 
         assert_eq!(index.packages.len(), 2);
 
+        let unblocked_index = svc
+            .list_package_trust_index(ListPackageTrustIndexRequest {
+                include_blocked: false,
+                discovery_only: false,
+            })
+            .expect("unblocked package trust index should succeed");
+        assert_eq!(unblocked_index.packages.len(), 1);
+        assert!(unblocked_index
+            .packages
+            .iter()
+            .all(|entry| entry.package_id != "com.example.blocked"));
+
         let active_entry = index
             .packages
             .iter()
