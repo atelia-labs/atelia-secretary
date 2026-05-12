@@ -6383,6 +6383,37 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
+        let self_accepted_registry_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/registry-submission",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "state": "accepted",
+                "registry_identity": "third-party-registry"
+            }),
+        )
+        .await;
+        assert_eq!(
+            self_accepted_registry_response.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let self_rejected_registry_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/registry-submission",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "state": "rejected",
+                "registry_identity": "third-party-registry"
+            }),
+        )
+        .await;
+        assert_eq!(
+            self_rejected_registry_response.status(),
+            StatusCode::BAD_REQUEST
+        );
+
         let registry_submission_response = send_json_request(
             &rpc_server,
             Method::POST,

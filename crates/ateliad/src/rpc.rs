@@ -441,6 +441,17 @@ impl SecretaryRpcServer {
         &self,
         request: PackageRegistrySubmissionRequest,
     ) -> RpcResult<PackageRegistrySubmissionResponse> {
+        if matches!(
+            request.state,
+            PackageRegistrySubmissionState::Accepted | PackageRegistrySubmissionState::Rejected
+        ) {
+            return Err(RpcError {
+                code: RpcErrorCode::InvalidArgument,
+                reason: "registry accepted and rejected states require registry authority"
+                    .to_string(),
+            });
+        }
+
         self.service.update_extension_registry_submission(
             UpdateExtensionRegistrySubmissionRequest {
                 extension_id: request.package_id.clone(),
