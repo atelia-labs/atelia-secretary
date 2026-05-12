@@ -4938,6 +4938,8 @@ mod tests {
             status: ExtensionInstallStatus::Installed,
             previous_version: None,
             approved_permissions: Vec::new(),
+            approved_local_unsigned: false,
+            approved_local_process_runtime: false,
             rollback_snapshot: None,
         }
     }

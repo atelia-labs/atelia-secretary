@@ -1667,7 +1667,7 @@ impl ExtensionRegistry {
         &self,
         manifest: ExtensionManifest,
         options: InstallOptions,
-    ) -> RegistryResult<ValidatedExtensionManifest> {
+    ) -> RegistryResult<(ValidatedExtensionManifest, ManifestValidationPolicy)> {
         let mut validation_policy = self.validation_policy.clone();
         if let Some(approve_local_unsigned) = options.approve_local_unsigned {
             validation_policy.allow_local_unsigned = approve_local_unsigned;
@@ -1680,7 +1680,7 @@ impl ExtensionRegistry {
         self.ensure_not_blocked(&validated.manifest)?;
         self.ensure_same_version_digest_is_stable(&validated.manifest)?;
         self.ensure_source_change_is_approved(&validated.manifest, options)?;
-        Ok(validated)
+        Ok((validated, validation_policy))
     }
 
     fn install_would_create_rollback_cycle(&self, extension_id: &str, version: &str) -> bool {
@@ -1709,7 +1709,7 @@ impl ExtensionRegistry {
         manifest: ExtensionManifest,
         options: InstallOptions,
     ) -> RegistryResult<ExtensionInstallRecord> {
-        let validated = self.run_validation_checks(manifest, options)?;
+        let (validated, validation_policy) = self.run_validation_checks(manifest, options)?;
 
         if self
             .records
@@ -1766,6 +1766,8 @@ impl ExtensionRegistry {
                 manifest_digest: validated.manifest.provenance.manifest_digest.clone(),
                 artifact_digest: validated.manifest.provenance.artifact_digest.clone(),
             }),
+            approved_local_unsigned: validation_policy.allow_local_unsigned,
+            approved_local_process_runtime: validation_policy.allow_local_process_runtime,
         };
 
         self.manifests
@@ -1788,7 +1790,7 @@ impl ExtensionRegistry {
         manifest: ExtensionManifest,
         options: InstallOptions,
     ) -> RegistryResult<ValidateExtensionManifestResponse> {
-        let validated = self.run_validation_checks(manifest, options)?;
+        let (validated, _) = self.run_validation_checks(manifest, options)?;
 
         Ok(ValidateExtensionManifestResponse {
             manifest: validated.manifest,
@@ -2327,7 +2329,8 @@ fn validate_extension_registry_snapshot_manifests(
                 .ok_or_else(|| {
                     format!("manifest missing for extension {extension_id} version {version}")
                 })?;
-            let validated = manifest.validate(policy).map_err(|error| {
+            let effective_policy = with_record_approvals(policy, record);
+            let validated = manifest.validate(&effective_policy).map_err(|error| {
                 format!("manifest validation failed for extension {extension_id} version {version}: {error}")
             })?;
             if validated.boundary != record.boundary {
@@ -2340,6 +2343,20 @@ fn validate_extension_registry_snapshot_manifests(
     }
 
     Ok(())
+}
+
+fn with_record_approvals(
+    policy: &ManifestValidationPolicy,
+    record: &ExtensionInstallRecord,
+) -> ManifestValidationPolicy {
+    let mut effective = policy.clone();
+    if record.approved_local_unsigned {
+        effective.allow_local_unsigned = true;
+    }
+    if record.approved_local_process_runtime {
+        effective.allow_local_process_runtime = true;
+    }
+    effective
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2798,6 +2815,10 @@ pub struct ExtensionInstallRecord {
     pub status: ExtensionInstallStatus,
     pub previous_version: Option<String>,
     pub approved_permissions: Vec<String>,
+    #[serde(default)]
+    pub approved_local_unsigned: bool,
+    #[serde(default)]
+    pub approved_local_process_runtime: bool,
     pub rollback_snapshot: Option<RollbackSnapshot>,
 }
 
@@ -3239,6 +3260,8 @@ mod tests {
             status: ExtensionInstallStatus::Installed,
             previous_version: previous_version.map(str::to_string),
             approved_permissions: Vec::new(),
+            approved_local_unsigned: false,
+            approved_local_process_runtime: false,
             rollback_snapshot: None,
         }
     }
@@ -3732,6 +3755,65 @@ mod tests {
     }
 
     #[test]
+    fn extension_snapshot_validation_applies_record_local_unsigned_approval() {
+        let mut local = manifest("local.test.unsigned.snapshot");
+        local.provenance.source = ProvenanceSource::Local;
+        local.provenance.registry_identity = None;
+        local.provenance.signature = None;
+        local.provenance.signer = None;
+
+        let snapshot = {
+            let mut manifest_versions = BTreeMap::new();
+            manifest_versions.insert(local.version.clone(), local.clone());
+
+            let mut record_versions = BTreeMap::new();
+            let mut record = extension_record(&local, None);
+            record.boundary = ExtensionBoundary::LocalDevelopment;
+            record.approved_local_unsigned = true;
+            record.approved_local_process_runtime = false;
+            record_versions.insert(local.version.clone(), record);
+
+            ExtensionRegistrySnapshot {
+                manifests: BTreeMap::from([(local.id.clone(), manifest_versions)]),
+                records: BTreeMap::from([(local.id.clone(), record_versions)]),
+                active_versions: BTreeMap::new(),
+                blocklist: Vec::new(),
+            }
+        };
+
+        snapshot
+            .validate_with_policy(&ManifestValidationPolicy::default())
+            .unwrap();
+
+        let unapproved_snapshot = {
+            let mut manifests = BTreeMap::new();
+            manifests.insert(
+                local.id.clone(),
+                BTreeMap::from([(local.version.clone(), local.clone())]),
+            );
+            let mut record_versions = BTreeMap::new();
+            let mut record = extension_record(&local, None);
+            record.boundary = ExtensionBoundary::LocalDevelopment;
+            record.approved_local_unsigned = false;
+            record.approved_local_process_runtime = false;
+            record_versions.insert(local.version.clone(), record);
+
+            ExtensionRegistrySnapshot {
+                manifests,
+                records: BTreeMap::from([(local.id.clone(), record_versions)]),
+                active_versions: BTreeMap::new(),
+                blocklist: Vec::new(),
+            }
+        };
+
+        let err = unapproved_snapshot
+            .validate_with_policy(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(err.contains("manifest validation failed"));
+        assert!(err.contains("local.test.unsigned.snapshot"));
+    }
+
+    #[test]
     fn whitespace_provenance_fields_are_treated_as_missing() {
         let mut local = manifest("local.test.whitespace");
         local.provenance.source = ProvenanceSource::Local;
@@ -3812,12 +3894,14 @@ mod tests {
         let mut process = manifest("local.test.process");
         process.provenance.source = ProvenanceSource::Local;
         process.provenance.registry_identity = None;
+        process.provenance.signature = Some("signature".to_string());
+        process.provenance.signer = Some("signer@example.com".to_string());
         process.entrypoints.runtime = ExtensionRuntime::Process;
         process.entrypoints.wasm = None;
         process.entrypoints.command = Some("cargo run".to_string());
 
         let err = process
-            .validate(&ManifestValidationPolicy::default().with_local_unsigned())
+            .validate(&ManifestValidationPolicy::default())
             .unwrap_err();
         assert!(matches!(
             err,
@@ -3828,12 +3912,70 @@ mod tests {
         ));
 
         process
-            .validate(
-                &ManifestValidationPolicy::default()
-                    .with_local_unsigned()
-                    .with_local_process_runtime(),
-            )
+            .validate(&ManifestValidationPolicy::default().with_local_process_runtime())
             .unwrap();
+    }
+
+    #[test]
+    fn extension_snapshot_validation_applies_record_local_process_approval() {
+        let mut process = manifest("local.test.process.snapshot");
+        process.provenance.source = ProvenanceSource::Local;
+        process.provenance.registry_identity = None;
+        process.provenance.signature = Some("signature".to_string());
+        process.provenance.signer = Some("signer@example.com".to_string());
+        process.entrypoints.runtime = ExtensionRuntime::Process;
+        process.entrypoints.wasm = None;
+        process.entrypoints.command = Some("cargo run".to_string());
+
+        let approved_snapshot = {
+            let mut manifest_versions = BTreeMap::new();
+            manifest_versions.insert(process.version.clone(), process.clone());
+
+            let mut record_versions = BTreeMap::new();
+            let mut record = extension_record(&process, None);
+            record.boundary = ExtensionBoundary::LocalDevelopment;
+            record.approved_local_unsigned = false;
+            record.approved_local_process_runtime = true;
+            record_versions.insert(process.version.clone(), record);
+
+            ExtensionRegistrySnapshot {
+                manifests: BTreeMap::from([(process.id.clone(), manifest_versions)]),
+                records: BTreeMap::from([(process.id.clone(), record_versions)]),
+                active_versions: BTreeMap::new(),
+                blocklist: Vec::new(),
+            }
+        };
+
+        approved_snapshot
+            .validate_with_policy(&ManifestValidationPolicy::default())
+            .unwrap();
+
+        let unapproved_snapshot = {
+            let mut manifests = BTreeMap::new();
+            manifests.insert(
+                process.id.clone(),
+                BTreeMap::from([(process.version.clone(), process.clone())]),
+            );
+            let mut record_versions = BTreeMap::new();
+            let mut record = extension_record(&process, None);
+            record.boundary = ExtensionBoundary::LocalDevelopment;
+            record.approved_local_unsigned = false;
+            record.approved_local_process_runtime = false;
+            record_versions.insert(process.version.clone(), record);
+
+            ExtensionRegistrySnapshot {
+                manifests,
+                records: BTreeMap::from([(process.id.clone(), record_versions)]),
+                active_versions: BTreeMap::new(),
+                blocklist: Vec::new(),
+            }
+        };
+
+        let err = unapproved_snapshot
+            .validate_with_policy(&ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(err.contains("manifest validation failed"));
+        assert!(err.contains("local.test.process.snapshot"));
     }
 
     #[test]

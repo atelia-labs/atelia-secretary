@@ -1986,6 +1986,36 @@ mod tests {
         }
     }
 
+    fn local_unsigned_extension_manifest(
+        id: &str,
+        version: &str,
+        artifact_digest: &str,
+        manifest_digest: &str,
+    ) -> ExtensionManifest {
+        let mut manifest = extension_manifest(id, version, artifact_digest, manifest_digest);
+        manifest.provenance.source = ProvenanceSource::Local;
+        manifest.provenance.registry_identity = None;
+        manifest.provenance.signature = None;
+        manifest.provenance.signer = None;
+        manifest
+    }
+
+    fn local_process_extension_manifest(
+        id: &str,
+        version: &str,
+        artifact_digest: &str,
+        manifest_digest: &str,
+    ) -> ExtensionManifest {
+        let mut manifest =
+            local_unsigned_extension_manifest(id, version, artifact_digest, manifest_digest);
+        manifest.provenance.signature = Some("signature".to_string());
+        manifest.provenance.signer = Some("signer@example.com".to_string());
+        manifest.entrypoints.runtime = ExtensionRuntime::Process;
+        manifest.entrypoints.wasm = None;
+        manifest.entrypoints.command = Some("cargo run".to_string());
+        manifest
+    }
+
     // -- health tests -------------------------------------------------------
 
     #[test]
@@ -2834,6 +2864,84 @@ mod tests {
         assert_eq!(record.version, "1.0.0");
         assert_eq!(record.status, ExtensionInstallStatus::Installed);
 
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn durable_extension_registry_persists_local_unsigned_approval() {
+        let storage_dir = durable_storage_dir("extension-local-unsigned");
+        let service = SecretaryService::new_durable(storage_dir.clone())
+            .expect("durable service should initialize");
+
+        let installed = service
+            .install_extension(InstallExtensionRequest {
+                manifest: local_unsigned_extension_manifest(
+                    "local.example.unsigned",
+                    "1.0.0",
+                    "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                    "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                ),
+                approve_local_unsigned: true,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("local unsigned install should persist");
+        assert_eq!(
+            installed.record.boundary,
+            ExtensionBoundary::LocalDevelopment
+        );
+
+        drop(service);
+
+        let service =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service reload");
+        let status = service
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "local.example.unsigned".to_string(),
+            })
+            .expect("extension should survive durable reload");
+        let record = status.record.expect("record should be present");
+        assert_eq!(record.version, "1.0.0");
+        assert_eq!(record.boundary, ExtensionBoundary::LocalDevelopment);
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn durable_extension_registry_persists_local_process_runtime_approval() {
+        let storage_dir = durable_storage_dir("extension-local-process");
+        let service = SecretaryService::new_durable(storage_dir.clone())
+            .expect("durable service should initialize");
+
+        let installed = service
+            .install_extension(InstallExtensionRequest {
+                manifest: local_process_extension_manifest(
+                    "local.example.process",
+                    "1.0.0",
+                    "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                    "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+                ),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: true,
+                approve_source_change: false,
+            })
+            .expect("local process install should persist");
+        assert_eq!(
+            installed.record.boundary,
+            ExtensionBoundary::LocalDevelopment
+        );
+
+        drop(service);
+
+        let service =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service reload");
+        let status = service
+            .extension_status(ExtensionStatusRequest {
+                extension_id: "local.example.process".to_string(),
+            })
+            .expect("extension should survive durable reload");
+        let record = status.record.expect("record should be present");
+        assert_eq!(record.version, "1.0.0");
+        assert_eq!(record.boundary, ExtensionBoundary::LocalDevelopment);
         let _ = fs::remove_dir_all(storage_dir);
     }
 
