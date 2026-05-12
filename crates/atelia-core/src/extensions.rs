@@ -1916,6 +1916,7 @@ impl ExtensionRegistry {
         Ok(record.clone())
     }
 
+    /// Persist publication metadata for the active package and revalidate it.
     pub fn update_publication(
         &mut self,
         extension_id: &str,
@@ -1966,6 +1967,7 @@ impl ExtensionRegistry {
         Ok(record.clone())
     }
 
+    /// Persist a registry submission state change for the active package.
     pub fn update_registry_submission(
         &mut self,
         extension_id: &str,
@@ -2682,23 +2684,27 @@ pub struct RemoveExtensionResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Request to update publication metadata for an installed package.
 pub struct UpdateExtensionPublicationRequest {
     pub extension_id: String,
     pub publication: ExtensionPublication,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Response containing the install record after publication metadata changes.
 pub struct UpdateExtensionPublicationResponse {
     pub record: ExtensionInstallRecord,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Request to update registry submission state for an installed package.
 pub struct UpdateExtensionRegistrySubmissionRequest {
     pub extension_id: String,
     pub registry_submission: ExtensionRegistrySubmission,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Response containing the install record after registry submission changes.
 pub struct UpdateExtensionRegistrySubmissionResponse {
     pub record: ExtensionInstallRecord,
 }
@@ -2848,6 +2854,7 @@ impl ExtensionRegistryService {
         Ok(record)
     }
 
+    /// Update package publication metadata through the registry service.
     pub fn update_extension_publication(
         &mut self,
         request: UpdateExtensionPublicationRequest,
@@ -2859,6 +2866,7 @@ impl ExtensionRegistryService {
         Ok(record)
     }
 
+    /// Update package registry submission state through the registry service.
     pub fn update_extension_registry_submission(
         &mut self,
         request: UpdateExtensionRegistrySubmissionRequest,

@@ -371,6 +371,7 @@ impl SecretaryRpcServer {
         })
     }
 
+    /// Return the current package authoring flow derived from persisted status.
     pub fn package_authoring_flow(
         &self,
         request: PackageAuthoringFlowRequest,
@@ -384,6 +385,7 @@ impl SecretaryRpcServer {
         })
     }
 
+    /// Build a package remix flow preview for a selected source.
     pub fn remix_package(&self, request: PackageRemixRequest) -> RpcResult<PackageRemixResponse> {
         let extension = self.service.extension_status(ExtensionStatusRequest {
             extension_id: request.package_id,
@@ -407,6 +409,7 @@ impl SecretaryRpcServer {
         })
     }
 
+    /// Persist package publication intent and return the refreshed authoring flow.
     pub fn prepare_package_publication(
         &self,
         request: PackagePublicationRequest,
@@ -433,6 +436,7 @@ impl SecretaryRpcServer {
         })
     }
 
+    /// Persist registry submission state and return the refreshed authoring flow.
     pub fn submit_package_registry_submission(
         &self,
         request: PackageRegistrySubmissionRequest,
@@ -1600,6 +1604,7 @@ pub struct ListPackageTrustIndexResponse {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+/// Source class used by client package authoring flows.
 pub enum PackageSourceClass {
     HostShippedBuiltIn,
     WorkspaceLocal,
@@ -1611,6 +1616,7 @@ pub enum PackageSourceClass {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Ordered stage in the package authoring flow.
 pub enum PackageAuthoringStage {
     Install,
     Inspect,
@@ -1622,6 +1628,7 @@ pub enum PackageAuthoringStage {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// State of a package authoring flow stage.
 pub enum PackageAuthoringStepState {
     Available,
     Blocked,
@@ -1633,6 +1640,7 @@ pub enum PackageAuthoringStepState {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// GitHub action a client may need to complete package publication.
 pub enum PackageGitHubPublicationAction {
     CreateRepository,
     ForkRepository,
@@ -1645,6 +1653,7 @@ pub enum PackageGitHubPublicationAction {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Visibility chosen for package publication.
 pub enum PackagePublicationVisibility {
     PrivateRemix,
     UnlistedShare,
@@ -1654,6 +1663,7 @@ pub enum PackagePublicationVisibility {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Registry submission state exposed through package authoring.
 pub enum PackageRegistrySubmissionState {
     NotSubmitted,
     Submitted,
@@ -1695,6 +1705,7 @@ impl From<ExtensionRegistrySubmission> for PackageRegistrySubmissionState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// GitHub-backed source reference for a package.
 pub struct PackageGitHubSourceReference {
     pub repository: String,
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
@@ -1707,6 +1718,7 @@ pub struct PackageGitHubSourceReference {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Publication plan derived from persisted package provenance.
 pub struct PackagePublicationPlan {
     pub visibility: PackagePublicationVisibility,
     pub source_class: PackageSourceClass,
@@ -1719,6 +1731,7 @@ pub struct PackagePublicationPlan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Single step in a package authoring flow.
 pub struct PackageAuthoringFlowStep {
     pub id: PackageAuthoringStage,
     pub title: String,
@@ -1728,6 +1741,7 @@ pub struct PackageAuthoringFlowStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Package authoring flow shown to clients.
 pub struct PackageAuthoringFlow {
     pub package_id: String,
     pub source_class: PackageSourceClass,
@@ -1739,18 +1753,21 @@ pub struct PackageAuthoringFlow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Request to read a package authoring flow.
 pub struct PackageAuthoringFlowRequest {
     pub package_id: String,
     pub include_private_steps: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Response containing the package authoring flow.
 pub struct PackageAuthoringFlowResponse {
     pub metadata: ProtocolMetadata,
     pub flow: PackageAuthoringFlow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Request to preview a local package remix flow.
 pub struct PackageRemixRequest {
     pub package_id: String,
     pub source_class: PackageSourceClass,
@@ -1758,12 +1775,14 @@ pub struct PackageRemixRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Response containing the remixed package flow preview.
 pub struct PackageRemixResponse {
     pub metadata: ProtocolMetadata,
     pub flow: PackageAuthoringFlow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Request to persist package publication intent.
 pub struct PackagePublicationRequest {
     pub package_id: String,
     pub visibility: PackagePublicationVisibility,
@@ -1771,18 +1790,21 @@ pub struct PackagePublicationRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Response containing the refreshed package publication flow.
 pub struct PackagePublicationResponse {
     pub metadata: ProtocolMetadata,
     pub flow: PackageAuthoringFlow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Request to persist package registry submission state.
 pub struct PackageRegistrySubmissionRequest {
     pub package_id: String,
     pub state: PackageRegistrySubmissionState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Response containing persisted registry submission state and flow.
 pub struct PackageRegistrySubmissionResponse {
     pub metadata: ProtocolMetadata,
     pub package_id: String,
