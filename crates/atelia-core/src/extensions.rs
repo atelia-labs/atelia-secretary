@@ -1683,12 +1683,58 @@ impl ExtensionRegistry {
         Ok(validated)
     }
 
+    fn install_would_create_rollback_cycle(&self, extension_id: &str, version: &str) -> bool {
+        let mut visited_versions = BTreeSet::new();
+        let mut next_version = self.active_versions.get(extension_id);
+        while let Some(current_version) = next_version {
+            if current_version == version {
+                return true;
+            }
+            if !visited_versions.insert(current_version.as_str()) {
+                return false;
+            }
+
+            next_version = self
+                .records
+                .get(extension_id)
+                .and_then(|records| records.get(current_version))
+                .and_then(|record| record.previous_version.as_ref());
+        }
+
+        false
+    }
+
     pub fn install(
         &mut self,
         manifest: ExtensionManifest,
         options: InstallOptions,
     ) -> RegistryResult<ExtensionInstallRecord> {
         let validated = self.run_validation_checks(manifest, options)?;
+
+        if self
+            .records
+            .get(&validated.manifest.id)
+            .and_then(|records| records.get(&validated.manifest.version))
+            .is_some()
+            && self
+                .active_versions
+                .get(&validated.manifest.id)
+                .is_some_and(|active_version| active_version != &validated.manifest.version)
+            && self.install_would_create_rollback_cycle(
+                &validated.manifest.id,
+                &validated.manifest.version,
+            )
+        {
+            return Err(RegistryError::Validation(
+                ExtensionValidationError::InvalidField {
+                    field: "version",
+                    reason: format!(
+                        "version {} is already installed for {} but inactive",
+                        validated.manifest.version, validated.manifest.id
+                    ),
+                },
+            ));
+        }
 
         let previous_version = self
             .active_versions
@@ -4093,6 +4139,147 @@ mod tests {
 
         assert_eq!(reinstalled.version, "1.0.0");
         assert_eq!(reinstalled.previous_version, None);
+        registry.snapshot().validate().unwrap();
+    }
+
+    #[test]
+    fn non_active_version_reinstall_is_rejected() {
+        let mut registry = ExtensionRegistry::in_memory();
+        let mut manifest_v1 = manifest("com.example.extension");
+        manifest_v1.version = "1.0.0".to_string();
+        manifest_v1.provenance.manifest_digest = MANIFEST_DIGEST.to_string();
+        manifest_v1.provenance.artifact_digest = ARTIFACT_DIGEST.to_string();
+        registry
+            .install(manifest_v1, InstallOptions::default())
+            .unwrap();
+
+        let mut manifest_v2 = manifest("com.example.extension");
+        manifest_v2.version = "1.1.0".to_string();
+        manifest_v2.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        manifest_v2.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        registry
+            .install(manifest_v2.clone(), InstallOptions::default())
+            .unwrap();
+
+        let mut manifest_v1_reinstall = manifest("com.example.extension");
+        manifest_v1_reinstall.version = "1.0.0".to_string();
+        manifest_v1_reinstall.provenance.manifest_digest = MANIFEST_DIGEST.to_string();
+        manifest_v1_reinstall.provenance.artifact_digest = ARTIFACT_DIGEST.to_string();
+        let err = registry
+            .install(manifest_v1_reinstall, InstallOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RegistryError::Validation(ExtensionValidationError::InvalidField { field, .. })
+                if field == "version"
+        ));
+        assert_eq!(
+            registry
+                .active_record("com.example.extension")
+                .unwrap()
+                .previous_version
+                .as_deref(),
+            Some("1.0.0")
+        );
+    }
+
+    #[test]
+    fn removed_version_can_be_reinstalled() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let removed = registry.remove("com.example.extension").unwrap();
+        assert_eq!(removed.status, ExtensionInstallStatus::Disabled);
+        assert!(registry.active_record("com.example.extension").is_none());
+
+        let reinstalled = registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+        assert_eq!(reinstalled.version, "1.0.0");
+        assert_eq!(reinstalled.previous_version, None);
+        assert_eq!(
+            registry
+                .active_record("com.example.extension")
+                .unwrap()
+                .status,
+            ExtensionInstallStatus::Installed
+        );
+    }
+
+    #[test]
+    fn removed_version_can_be_reinstalled_after_new_active_version() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let mut manifest_v2 = manifest("com.example.extension");
+        manifest_v2.version = "1.1.0".to_string();
+        manifest_v2.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        manifest_v2.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        registry
+            .install(manifest_v2.clone(), InstallOptions::default())
+            .unwrap();
+        registry.remove("com.example.extension").unwrap();
+        registry
+            .install(manifest_v2, InstallOptions::default())
+            .unwrap();
+
+        let reinstalled = registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+        assert_eq!(reinstalled.version, "1.0.0");
+        assert_eq!(reinstalled.previous_version.as_deref(), Some("1.1.0"));
+        registry.snapshot().validate().unwrap();
+    }
+
+    #[test]
+    fn update_then_rollback_after_rejecting_non_active_reinstall() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let mut manifest_v1 = manifest("com.example.extension");
+        manifest_v1.version = "1.1.0".to_string();
+        manifest_v1.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
+        manifest_v1.provenance.artifact_digest = OTHER_ARTIFACT_DIGEST.to_string();
+        registry
+            .install(manifest_v1.clone(), InstallOptions::default())
+            .unwrap();
+
+        let mut manifest_v2 = manifest("com.example.extension");
+        manifest_v2.version = "1.2.0".to_string();
+        manifest_v2.provenance.manifest_digest = MANIFEST_DIGEST.to_string();
+        manifest_v2.provenance.artifact_digest = ARTIFACT_DIGEST.to_string();
+        let installed = registry
+            .install(manifest_v2.clone(), InstallOptions::default())
+            .unwrap();
+        assert_eq!(installed.previous_version.as_deref(), Some("1.1.0"));
+
+        let err = registry
+            .install(manifest_v1, InstallOptions::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::Validation(ExtensionValidationError::InvalidField { field, .. })
+                if field == "version"
+        ));
+
+        let rolled_back = registry.rollback("com.example.extension").unwrap();
+        assert_eq!(rolled_back.version, "1.1.0");
+        let rolled_back_again = registry.rollback("com.example.extension").unwrap();
+        assert_eq!(rolled_back_again.version, "1.0.0");
+        assert_eq!(
+            registry
+                .active_record("com.example.extension")
+                .unwrap()
+                .version,
+            "1.0.0"
+        );
         registry.snapshot().validate().unwrap();
     }
 
