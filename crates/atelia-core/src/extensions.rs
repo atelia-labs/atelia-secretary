@@ -2305,10 +2305,7 @@ fn detect_rollback_cycle(
         if !visited_versions.insert(current_version.to_string()) {
             return Some(current_version.to_string());
         }
-        current_version = match record.previous_version.as_deref() {
-            Some(previous_version) => previous_version,
-            None => return None,
-        };
+        current_version = record.previous_version.as_deref()?;
     }
     None
 }
