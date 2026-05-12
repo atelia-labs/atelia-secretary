@@ -368,6 +368,8 @@ pub enum ExtensionPublicationVisibility {
 pub enum ExtensionRegistrySubmission {
     /// Not submitted to a registry.
     NotSubmitted,
+    /// Registry submission is required but has not been sent yet.
+    AwaitingSubmission,
     /// Submitted and awaiting registry decision.
     Submitted,
     /// Accepted by registry policy.
@@ -862,7 +864,9 @@ fn validate_publication(
                             .to_string(),
                 });
             }
-            if !has_non_empty_trimmed(manifest.provenance.registry_identity.as_deref()) {
+            if publication.registry_submission != ExtensionRegistrySubmission::AwaitingSubmission
+                && !has_non_empty_trimmed(manifest.provenance.registry_identity.as_deref())
+            {
                 return Err(ExtensionValidationError::ProvenanceRequired {
                     field: "provenance.registry_identity",
                     reason: "public packages must declare registry identity".to_string(),
@@ -5123,6 +5127,140 @@ mod tests {
     }
 
     #[test]
+    fn update_publication_updates_active_manifest_and_record() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let publication = ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: ExtensionRegistrySubmission::AwaitingSubmission,
+        };
+        let record = registry
+            .update_publication("com.example.extension", publication.clone())
+            .unwrap();
+
+        assert_eq!(record.source.publication, Some(publication.clone()));
+        let active_version = registry
+            .active_versions
+            .get("com.example.extension")
+            .expect("active version should exist");
+        assert_eq!(
+            registry
+                .manifests
+                .get("com.example.extension")
+                .and_then(|versions| versions.get(active_version))
+                .and_then(|manifest| manifest.provenance.publication.clone()),
+            Some(publication.clone())
+        );
+        assert_eq!(
+            registry
+                .records
+                .get("com.example.extension")
+                .and_then(|versions| versions.get(active_version))
+                .and_then(|record| record.source.publication.clone()),
+            Some(publication)
+        );
+    }
+
+    #[test]
+    fn update_publication_reports_not_installed_for_missing_active_state() {
+        let mut registry = ExtensionRegistry::in_memory();
+        let publication = ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::UnlistedShare,
+            registry_submission: ExtensionRegistrySubmission::NotSubmitted,
+        };
+
+        let missing_active = registry
+            .update_publication("com.example.extension", publication.clone())
+            .unwrap_err();
+        assert!(matches!(
+            missing_active,
+            RegistryError::NotInstalled { extension_id }
+                if extension_id == "com.example.extension"
+        ));
+
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+        registry.manifests.clear();
+        let missing_manifest = registry
+            .update_publication("com.example.extension", publication.clone())
+            .unwrap_err();
+        assert!(matches!(
+            missing_manifest,
+            RegistryError::NotInstalled { extension_id }
+                if extension_id == "com.example.extension"
+        ));
+
+        registry
+            .manifests
+            .entry("com.example.extension".to_string())
+            .or_default()
+            .insert("1.0.0".to_string(), manifest("com.example.extension"));
+        registry.records.clear();
+        let missing_record = registry
+            .update_publication("com.example.extension", publication)
+            .unwrap_err();
+        assert!(matches!(
+            missing_record,
+            RegistryError::NotInstalled { extension_id }
+                if extension_id == "com.example.extension"
+        ));
+    }
+
+    #[test]
+    fn update_publication_rejects_invalid_or_blocked_publication() {
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(manifest("com.example.extension"), InstallOptions::default())
+            .unwrap();
+
+        let invalid = registry
+            .update_publication(
+                "com.example.extension",
+                ExtensionPublication {
+                    visibility: ExtensionPublicationVisibility::PrivateRemix,
+                    registry_submission: ExtensionRegistrySubmission::Submitted,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            invalid,
+            RegistryError::Validation(ExtensionValidationError::InvalidField {
+                field: "provenance.publication.registry_submission",
+                ..
+            })
+        ));
+
+        registry
+            .add_blocklist_entry(BlocklistEntry {
+                key: BlockKey::ExtensionId("com.example.extension".to_string()),
+                reason: BlockReason::PolicyViolation,
+                note: Some("publication disabled".to_string()),
+            })
+            .unwrap();
+        let blocked = registry
+            .update_publication(
+                "com.example.extension",
+                ExtensionPublication {
+                    visibility: ExtensionPublicationVisibility::UnlistedShare,
+                    registry_submission: ExtensionRegistrySubmission::NotSubmitted,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            blocked,
+            RegistryError::Blocked {
+                extension_id,
+                reason: BlockReason::PolicyViolation,
+                ..
+            } if extension_id == "com.example.extension"
+        ));
+    }
+
+    #[test]
     fn provenance_lineage_and_publication_are_validated_and_preserved() {
         let mut manifest = manifest("com.example.extension");
         manifest.provenance.lineage = Some(ExtensionLineage {
@@ -5285,6 +5423,7 @@ mod tests {
     #[test]
     fn public_searchable_allows_submitted_or_accepted_with_registry_identity() {
         for registry_submission in [
+            ExtensionRegistrySubmission::AwaitingSubmission,
             ExtensionRegistrySubmission::Submitted,
             ExtensionRegistrySubmission::Accepted,
         ] {

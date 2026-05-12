@@ -293,12 +293,14 @@ impl ApiResponse {
     }
 }
 
+/// HTTP payload for requesting a package authoring flow.
 #[derive(Debug, Deserialize)]
 struct PackageAuthoringFlowRequestPayload {
     package_id: Option<String>,
     include_private_steps: Option<bool>,
 }
 
+/// HTTP payload for previewing a package remix flow.
 #[derive(Debug, Deserialize)]
 struct PackageRemixRequestPayload {
     package_id: Option<String>,
@@ -308,6 +310,7 @@ struct PackageRemixRequestPayload {
     source: Option<rpc::PackageGitHubSourceReference>,
 }
 
+/// HTTP payload for preparing package publication.
 #[derive(Debug, Deserialize)]
 struct PackagePublicationRequestPayload {
     package_id: Option<String>,
@@ -316,6 +319,7 @@ struct PackagePublicationRequestPayload {
     requires_registry_submission: bool,
 }
 
+/// HTTP payload for updating package registry submission state.
 #[derive(Debug, Deserialize)]
 struct PackageRegistrySubmissionRequestPayload {
     package_id: Option<String>,
@@ -323,10 +327,12 @@ struct PackageRegistrySubmissionRequestPayload {
     state: Option<rpc::PackageRegistrySubmissionState>,
 }
 
+/// Return the default registry-submission requirement for publication requests.
 fn default_true() -> bool {
     true
 }
 
+/// Resolve the canonical package id from the URL path and optional request body.
 fn package_id_from_path_and_payload(
     path_extension_id: String,
     payload_package_id: Option<String>,
@@ -1647,6 +1653,7 @@ fn serialize_list_package_trust_index_response(
     })
 }
 
+/// Serialize a package authoring-flow RPC response for the HTTP API.
 fn serialize_package_authoring_flow_response(
     response: rpc::PackageAuthoringFlowResponse,
 ) -> serde_json::Value {
@@ -1656,6 +1663,7 @@ fn serialize_package_authoring_flow_response(
     })
 }
 
+/// Serialize a package remix RPC response for the HTTP API.
 fn serialize_package_remix_response(response: rpc::PackageRemixResponse) -> serde_json::Value {
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
@@ -1663,6 +1671,7 @@ fn serialize_package_remix_response(response: rpc::PackageRemixResponse) -> serd
     })
 }
 
+/// Serialize a package publication RPC response for the HTTP API.
 fn serialize_package_publication_response(
     response: rpc::PackagePublicationResponse,
 ) -> serde_json::Value {
@@ -1672,6 +1681,7 @@ fn serialize_package_publication_response(
     })
 }
 
+/// Serialize a package registry-submission RPC response for the HTTP API.
 fn serialize_package_registry_submission_response(
     response: rpc::PackageRegistrySubmissionResponse,
 ) -> serde_json::Value {
@@ -2855,6 +2865,7 @@ async fn dispatch_list_package_trust_index(
     }
 }
 
+/// Dispatch the package authoring-flow HTTP endpoint to the RPC server.
 async fn dispatch_package_authoring_flow(
     state: RpcServerState,
     extension_id: String,
@@ -2903,6 +2914,7 @@ async fn dispatch_package_authoring_flow(
     }
 }
 
+/// Dispatch the package remix preview HTTP endpoint to the RPC server.
 async fn dispatch_package_remix(
     state: RpcServerState,
     extension_id: String,
@@ -2931,6 +2943,33 @@ async fn dispatch_package_remix(
         }
     };
 
+    if payload.source.is_some() && payload.source_class.is_none() {
+        let rpc_server = state.read().await;
+        let next_state = rpc_next_state(&rpc_server);
+        return make_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "source_class is required when source is provided",
+            false,
+            next_state,
+        );
+    }
+    if matches!(
+        payload.source_class,
+        Some(rpc::PackageSourceClass::HostShippedBuiltIn | rpc::PackageSourceClass::WorkspaceLocal)
+    ) && payload.source.is_some()
+    {
+        let rpc_server = state.read().await;
+        let next_state = rpc_next_state(&rpc_server);
+        return make_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "github source cannot be paired with host-shipped or workspace-local source_class",
+            false,
+            next_state,
+        );
+    }
+
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
     match rpc_server.remix_package(rpc::PackageRemixRequest {
@@ -2952,6 +2991,7 @@ async fn dispatch_package_remix(
     }
 }
 
+/// Dispatch the package publication HTTP endpoint to the RPC server.
 async fn dispatch_package_publication(
     state: RpcServerState,
     extension_id: String,
@@ -3001,6 +3041,7 @@ async fn dispatch_package_publication(
     }
 }
 
+/// Dispatch the package registry-submission HTTP endpoint to the RPC server.
 async fn dispatch_package_registry_submission(
     state: RpcServerState,
     extension_id: String,
@@ -6261,6 +6302,24 @@ mod tests {
             .iter()
             .any(|step| step["id"] == "remix" && step["state"] == "complete"));
 
+        let invalid_remix_source_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/extensions/com.example.review.extension/remix",
+            serde_json::json!({
+                "package_id": "com.example.review.extension",
+                "source": {
+                    "repository": "https://github.com/example/package",
+                    "manifest_path": "atelia.package.yaml"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            invalid_remix_source_response.status(),
+            StatusCode::BAD_REQUEST
+        );
+
         let publication_response = send_json_request(
             &rpc_server,
             Method::POST,
@@ -6285,7 +6344,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|step| step["id"] == "registry_search" && step["state"] == "in_progress"));
+            .any(|step| step["id"] == "registry_search" && step["state"] == "requires_consent"));
 
         let registry_submission_response = send_json_request(
             &rpc_server,

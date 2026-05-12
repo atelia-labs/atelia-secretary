@@ -381,7 +381,7 @@ impl SecretaryRpcServer {
         })?;
         Ok(PackageAuthoringFlowResponse {
             metadata: self.metadata(),
-            flow: package_authoring_flow_from_status(&extension, request.include_private_steps),
+            flow: package_authoring_flow_from_status(&extension, request.include_private_steps)?,
         })
     }
 
@@ -390,7 +390,7 @@ impl SecretaryRpcServer {
         let extension = self.service.extension_status(ExtensionStatusRequest {
             extension_id: request.package_id,
         })?;
-        let mut flow = package_authoring_flow_from_status(&extension, true);
+        let mut flow = package_authoring_flow_from_status(&extension, true)?;
         flow.source_class = request.source_class;
         flow.source = request.source.or(flow.source);
         mark_package_authoring_step(
@@ -421,7 +421,7 @@ impl SecretaryRpcServer {
                 publication: ExtensionPublication {
                     visibility: ExtensionPublicationVisibility::from(publication_visibility),
                     registry_submission: if request.requires_registry_submission {
-                        ExtensionRegistrySubmission::Submitted
+                        ExtensionRegistrySubmission::AwaitingSubmission
                     } else {
                         ExtensionRegistrySubmission::NotSubmitted
                     },
@@ -432,7 +432,7 @@ impl SecretaryRpcServer {
         })?;
         Ok(PackagePublicationResponse {
             metadata: self.metadata(),
-            flow: package_authoring_flow_from_status(&extension, true),
+            flow: package_authoring_flow_from_status(&extension, true)?,
         })
     }
 
@@ -465,7 +465,7 @@ impl SecretaryRpcServer {
             metadata: self.metadata(),
             package_id: request.package_id,
             state,
-            flow: Some(package_authoring_flow_from_status(&extension, true)),
+            flow: Some(package_authoring_flow_from_status(&extension, true)?),
         })
     }
 
@@ -1696,6 +1696,8 @@ pub enum PackagePublicationVisibility {
 pub enum PackageRegistrySubmissionState {
     /// Package has not been submitted to the registry.
     NotSubmitted,
+    /// Package needs registry submission but has not been submitted yet.
+    AwaitingSubmission,
     /// Package has been submitted and is awaiting review.
     Submitted,
     /// Package submission has been accepted.
@@ -1705,6 +1707,7 @@ pub enum PackageRegistrySubmissionState {
 }
 
 impl From<PackagePublicationVisibility> for ExtensionPublicationVisibility {
+    /// Convert RPC package publication visibility into core publication visibility.
     fn from(value: PackagePublicationVisibility) -> Self {
         match value {
             PackagePublicationVisibility::PrivateRemix => Self::PrivateRemix,
@@ -1716,9 +1719,11 @@ impl From<PackagePublicationVisibility> for ExtensionPublicationVisibility {
 }
 
 impl From<PackageRegistrySubmissionState> for ExtensionRegistrySubmission {
+    /// Convert RPC registry submission state into core registry submission state.
     fn from(value: PackageRegistrySubmissionState) -> Self {
         match value {
             PackageRegistrySubmissionState::NotSubmitted => Self::NotSubmitted,
+            PackageRegistrySubmissionState::AwaitingSubmission => Self::AwaitingSubmission,
             PackageRegistrySubmissionState::Submitted => Self::Submitted,
             PackageRegistrySubmissionState::Accepted => Self::Accepted,
             PackageRegistrySubmissionState::Rejected => Self::Rejected,
@@ -1727,9 +1732,11 @@ impl From<PackageRegistrySubmissionState> for ExtensionRegistrySubmission {
 }
 
 impl From<ExtensionRegistrySubmission> for PackageRegistrySubmissionState {
+    /// Convert core registry submission state into RPC registry submission state.
     fn from(value: ExtensionRegistrySubmission) -> Self {
         match value {
             ExtensionRegistrySubmission::NotSubmitted => Self::NotSubmitted,
+            ExtensionRegistrySubmission::AwaitingSubmission => Self::AwaitingSubmission,
             ExtensionRegistrySubmission::Submitted => Self::Submitted,
             ExtensionRegistrySubmission::Accepted => Self::Accepted,
             ExtensionRegistrySubmission::Rejected => Self::Rejected,
@@ -2070,11 +2077,11 @@ pub struct PolicyDecision {
 fn package_authoring_flow_from_status(
     status: &atelia_core::ExtensionStatusResponse,
     include_private_steps: bool,
-) -> PackageAuthoringFlow {
-    let record = status
-        .record
-        .as_ref()
-        .expect("extension_status responses include active records");
+) -> RpcResult<PackageAuthoringFlow> {
+    let record = status.record.as_ref().ok_or_else(|| RpcError {
+        code: RpcErrorCode::NotFound,
+        reason: format!("package {} is not installed", status.extension_id),
+    })?;
     let source_class = package_source_class_from_record(record);
     let source = package_source_reference_from_record(record);
     let publication_plan = record
@@ -2157,13 +2164,13 @@ fn package_authoring_flow_from_status(
         });
     }
 
-    PackageAuthoringFlow {
+    Ok(PackageAuthoringFlow {
         package_id: status.extension_id.clone(),
         source_class,
         source,
         steps,
         publication_plan,
-    }
+    })
 }
 
 fn package_authoring_step(
@@ -2200,6 +2207,9 @@ fn package_registry_search_state(
             atelia_core::ExtensionPublicationVisibility::PrivateRemix,
             atelia_core::ExtensionRegistrySubmission::NotSubmitted,
         ) => PackageAuthoringStepState::Complete,
+        (_, atelia_core::ExtensionRegistrySubmission::AwaitingSubmission) => {
+            PackageAuthoringStepState::RequiresConsent
+        }
         (_, atelia_core::ExtensionRegistrySubmission::NotSubmitted) => {
             PackageAuthoringStepState::RequiresConsent
         }
