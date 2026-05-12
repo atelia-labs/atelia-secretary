@@ -1907,6 +1907,25 @@ impl ExtensionRegistry {
             });
         }
 
+        let provider_permission = callee_manifest
+            .permissions
+            .get(required_permission)
+            .ok_or_else(|| RegistryError::ServiceDenied {
+                reason: format!("callee permission metadata missing for {required_permission}"),
+            })?;
+        let caller_permission = caller_manifest
+            .permissions
+            .get(required_permission)
+            .ok_or_else(|| RegistryError::ServiceDenied {
+                reason: format!("caller does not have approved permission {required_permission}"),
+            })?;
+        if caller_permission != provider_permission {
+            return Err(RegistryError::ServiceDenied {
+                reason: "caller permission metadata does not match provider permission metadata"
+                    .to_string(),
+            });
+        }
+
         let caller_version = self
             .active_versions
             .get(&request.caller_extension_id)
@@ -2769,7 +2788,7 @@ mod tests {
         manifest.provenance.manifest_digest = OTHER_MANIFEST_DIGEST.to_string();
         manifest
             .permissions
-            .insert(permission_name.to_string(), permission("consume service"));
+            .insert(permission_name.to_string(), permission("provide service"));
         manifest.services.consumes.push(ExtensionServiceDependency {
             extension_id: callee_id.to_string(),
             service: "review.comments".to_string(),
@@ -3752,6 +3771,90 @@ mod tests {
                 service_consumer(consumer_id, provider_id, "service.review.other"),
                 InstallOptions::default(),
             )
+            .unwrap();
+
+        let err = registry
+            .authorize_service_call(service_call(consumer_id, provider_id))
+            .unwrap_err();
+
+        assert!(matches!(err, RegistryError::ServiceDenied { .. }));
+    }
+
+    #[test]
+    fn service_call_permission_metadata_matching_is_required() {
+        let provider_id = "com.example.provider";
+        let consumer_id = "com.example.consumer";
+        let mut registry = ExtensionRegistry::in_memory();
+        registry
+            .install(
+                service_provider(provider_id, "service.review.comments"),
+                InstallOptions::default(),
+            )
+            .unwrap();
+        registry
+            .install(
+                service_consumer(consumer_id, provider_id, "service.review.comments"),
+                InstallOptions::default(),
+            )
+            .unwrap();
+
+        let grant = registry
+            .authorize_service_call(service_call(consumer_id, provider_id))
+            .unwrap();
+
+        assert_eq!(grant.required_permission, "service.review.comments");
+    }
+
+    #[test]
+    fn service_call_permission_metadata_description_mismatch_is_denied() {
+        let provider_id = "com.example.provider";
+        let consumer_id = "com.example.consumer";
+        let mut registry = ExtensionRegistry::in_memory();
+        let mut consumer = service_consumer(consumer_id, provider_id, "service.review.comments");
+        consumer.permissions.insert(
+            "service.review.comments".to_string(),
+            permission("different description"),
+        );
+
+        registry
+            .install(
+                service_provider(provider_id, "service.review.comments"),
+                InstallOptions::default(),
+            )
+            .unwrap();
+        registry
+            .install(consumer, InstallOptions::default())
+            .unwrap();
+
+        let err = registry
+            .authorize_service_call(service_call(consumer_id, provider_id))
+            .unwrap_err();
+
+        assert!(matches!(err, RegistryError::ServiceDenied { .. }));
+    }
+
+    #[test]
+    fn service_call_permission_metadata_risk_tier_mismatch_is_denied() {
+        let provider_id = "com.example.provider";
+        let consumer_id = "com.example.consumer";
+        let mut registry = ExtensionRegistry::in_memory();
+        let mut consumer = service_consumer(consumer_id, provider_id, "service.review.comments");
+        consumer.permissions.insert(
+            "service.review.comments".to_string(),
+            ExtensionPermission {
+                description: "provide service".to_string(),
+                risk_tier: Some("R1".to_string()),
+            },
+        );
+
+        registry
+            .install(
+                service_provider(provider_id, "service.review.comments"),
+                InstallOptions::default(),
+            )
+            .unwrap();
+        registry
+            .install(consumer, InstallOptions::default())
             .unwrap();
 
         let err = registry
