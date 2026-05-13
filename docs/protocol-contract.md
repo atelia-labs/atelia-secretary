@@ -74,6 +74,7 @@ Required RPC groups:
 | `CheckPolicy` | Preview policy outcome for a requested action |
 | `RenderToolOutput` | Render canonical tool result as TOON, JSON, or text |
 | `ListPackageTrustIndex` | Read the package trust index with provenance and block markers |
+| `PackageInspect` | Inspect one installed package with manifest, permissions, services, source, trust, block, and rollback detail |
 | `ValidateExtension` | Validate an AEP backend package manifest without installing or mutating registry state. Beta RPC name is retained for compatibility. |
 | `InstallExtension` | Install a new AEP backend package manifest. Beta RPC name is retained for compatibility. |
 | `UpdateExtension` | Update an installed AEP backend package manifest |

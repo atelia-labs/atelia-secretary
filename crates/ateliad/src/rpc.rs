@@ -25,13 +25,14 @@ pub use crate::service::{
 use atelia_core::{
     Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState,
     DisableExtensionRequest, EnableExtensionRequest, EventCursor as CoreEventCursor, EventQuery,
-    EventSeverity, EventSubjectType, ExtensionInstallRecord, ExtensionPublication,
-    ExtensionPublicationVisibility, ExtensionRegistrySubmission, ExtensionStatusRequest,
-    InstallExtensionRequest, JobEvent, JobEventKind, JobId, JobKind, JobRecord, JobStatus,
-    ListBlocklistRequest, ListExtensionsRequest, OutputFormat, OversizeOutputPolicy, PathScope,
-    PolicyOutcome, ProjectId, RemoveExtensionRequest, RenderOptions, RepositoryId,
-    RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier, RollbackExtensionRequest,
-    StoreError, ToolInvocationId, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
+    EventSeverity, EventSubjectType, ExtensionBlocklistMatch, ExtensionInstallRecord,
+    ExtensionPublication, ExtensionPublicationVisibility, ExtensionRegistrySubmission,
+    ExtensionServices, ExtensionSourceSnapshot, ExtensionStatusRequest, InstallExtensionRequest,
+    JobEvent, JobEventKind, JobId, JobKind, JobRecord, JobStatus, ListBlocklistRequest,
+    ListExtensionsRequest, OutputFormat, OversizeOutputPolicy, PathScope, PolicyOutcome, ProjectId,
+    RemoveExtensionRequest, RenderOptions, RepositoryId, RepositoryRecord, RepositoryTrustState,
+    ResourceScope, RiskTier, RollbackExtensionRequest, RollbackSnapshot, StoreError,
+    ToolInvocationId, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
     ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity, ToolResultId,
     TruncationMetadata, UpdateExtensionPublicationRequest,
     UpdateExtensionRegistrySubmissionRequest, UpdateExtensionRequest,
@@ -349,6 +350,27 @@ impl SecretaryRpcServer {
         Ok(ExtensionStatusResponse {
             metadata: self.metadata(),
             extension,
+        })
+    }
+
+    /// Returns a single installed-package detail envelope for inspect surfaces.
+    pub fn package_inspect(
+        &self,
+        request: ExtensionStatusRequest,
+    ) -> RpcResult<PackageInspectResponse> {
+        let response = self.service.package_inspect(request)?;
+        Ok(PackageInspectResponse {
+            metadata: self.metadata(),
+            package_id: response.extension.extension_id.clone(),
+            extension: response.extension,
+            manifest: response.manifest,
+            block: response.block,
+            permissions: response.permissions,
+            services: response.services,
+            rollback_available: response.rollback_available,
+            rollback_snapshot: response.rollback_snapshot,
+            source: response.source,
+            trust: response.trust,
         })
     }
 
@@ -1630,6 +1652,33 @@ pub struct UpdateExtensionResponse {
 pub struct ExtensionStatusResponse {
     pub metadata: ProtocolMetadata,
     pub extension: atelia_core::ExtensionStatusResponse,
+}
+
+/// RPC envelope for installed package inspect/detail responses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageInspectResponse {
+    /// Protocol metadata for the response.
+    pub metadata: ProtocolMetadata,
+    /// Stable package identifier.
+    pub package_id: String,
+    /// Current installed-package status and active record.
+    pub extension: atelia_core::ExtensionStatusResponse,
+    /// Manifest snapshot for the active installed version.
+    pub manifest: atelia_core::ExtensionManifest,
+    /// Active blocklist match, when the package is blocked.
+    pub block: Option<ExtensionBlocklistMatch>,
+    /// Approved permissions recorded for the installed package.
+    pub permissions: Vec<String>,
+    /// Service declarations from the active manifest.
+    pub services: ExtensionServices,
+    /// Whether a rollback target is available.
+    pub rollback_available: bool,
+    /// Snapshot of the rollback target, when available.
+    pub rollback_snapshot: Option<RollbackSnapshot>,
+    /// Source and provenance snapshot recorded at install time.
+    pub source: ExtensionSourceSnapshot,
+    /// Publication and registry trust metadata, when available.
+    pub trust: Option<ExtensionPublication>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3395,6 +3444,9 @@ mod tests {
         assert!(response
             .capabilities
             .contains(&"tool_output_settings.v1".to_string()));
+        assert!(response
+            .capabilities
+            .contains(&"package_inspect.v1".to_string()));
         assert!(response
             .capabilities
             .contains(&"package_trust_index.v1".to_string()));
@@ -5623,6 +5675,146 @@ mod tests {
             })
             .expect_err("removed extension should not have active status");
         assert_eq!(missing_after_remove.code, RpcErrorCode::NotFound);
+    }
+
+    /// Verifies the inspect RPC returns manifest, permission, service, trust, and block data.
+    #[test]
+    fn package_inspect_round_trip_includes_manifest_permissions_services_and_trust() {
+        const ARTIFACT_V1: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const MANIFEST_V1: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const ARTIFACT_V2: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const MANIFEST_V2: &str =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let manifest_v1 = extension_manifest(
+            "com.example.inspect.package",
+            "1.0.0",
+            ARTIFACT_V1,
+            MANIFEST_V1,
+        );
+        let mut manifest_v2 = extension_manifest(
+            "com.example.inspect.package",
+            "2.0.0",
+            ARTIFACT_V2,
+            MANIFEST_V2,
+        );
+        manifest_v2.types.push(atelia_core::ExtensionKind::Service);
+        manifest_v2
+            .services
+            .provides
+            .push(atelia_core::ExtensionServiceDefinition {
+                service: "review.comments".to_string(),
+                method: "summarize".to_string(),
+                schema_version: "v1".to_string(),
+                required_permission: "service.review.comments".to_string(),
+            });
+        let expected_services = manifest_v2.services.clone();
+
+        let mut server = ready_server();
+        let install = server
+            .install_extension(InstallExtensionRequest {
+                manifest: manifest_v1,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("install should succeed");
+        assert_eq!(install.record.version, "1.0.0");
+
+        let updated = server
+            .update_extension(UpdateExtensionRequest {
+                manifest: manifest_v2,
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+            })
+            .expect("update should succeed");
+        assert_eq!(updated.record.version, "2.0.0");
+
+        let publication = atelia_core::ExtensionPublication {
+            visibility: atelia_core::ExtensionPublicationVisibility::PublicSearchable,
+            registry_submission: atelia_core::ExtensionRegistrySubmission::Submitted,
+        };
+        server
+            .service_mut()
+            .update_extension_publication(UpdateExtensionPublicationRequest {
+                extension_id: "com.example.inspect.package".to_string(),
+                publication: publication.clone(),
+            })
+            .expect("publication metadata should apply");
+
+        let inspect = server
+            .package_inspect(ExtensionStatusRequest {
+                extension_id: "com.example.inspect.package".to_string(),
+            })
+            .expect("inspect should succeed");
+
+        assert_eq!(inspect.package_id, "com.example.inspect.package");
+        assert_eq!(inspect.manifest.version, "2.0.0");
+        assert_eq!(
+            inspect.permissions,
+            vec!["service.review.comments".to_string()]
+        );
+        assert_eq!(inspect.extension.record.as_ref().unwrap().version, "2.0.0");
+        assert_eq!(inspect.services, expected_services);
+        assert!(inspect.rollback_available);
+        assert_eq!(
+            inspect.rollback_snapshot,
+            Some(atelia_core::RollbackSnapshot {
+                manifest_digest: MANIFEST_V1.to_string(),
+                artifact_digest: ARTIFACT_V1.to_string(),
+            })
+        );
+        assert_eq!(inspect.trust, Some(publication.clone()));
+        assert_eq!(inspect.source.publication, Some(publication));
+        assert!(inspect.block.is_none());
+
+        server
+            .apply_blocklist(ApplyBlocklistRequest {
+                entry: BlocklistEntry {
+                    key: BlockKey::ArtifactDigest(ARTIFACT_V1.to_string()),
+                    reason: BlockReason::UserBlocked,
+                    note: Some("previous version revoked".to_string()),
+                },
+            })
+            .expect("previous version blocklist should apply");
+
+        let previous_blocked_inspect = server
+            .package_inspect(ExtensionStatusRequest {
+                extension_id: "com.example.inspect.package".to_string(),
+            })
+            .expect("inspect should succeed when only rollback target is blocked");
+        assert!(previous_blocked_inspect.block.is_none());
+        assert!(!previous_blocked_inspect.rollback_available);
+        assert!(previous_blocked_inspect.rollback_snapshot.is_none());
+
+        let blocked = server
+            .apply_blocklist(ApplyBlocklistRequest {
+                entry: BlocklistEntry {
+                    key: BlockKey::ExtensionId("com.example.inspect.package".to_string()),
+                    reason: BlockReason::UserBlocked,
+                    note: Some("temporary policy review".to_string()),
+                },
+            })
+            .expect("apply blocklist should succeed");
+        assert_eq!(
+            blocked.entry.key,
+            BlockKey::ExtensionId("com.example.inspect.package".to_string())
+        );
+
+        let blocked_inspect = server
+            .package_inspect(ExtensionStatusRequest {
+                extension_id: "com.example.inspect.package".to_string(),
+            })
+            .expect("inspect should still succeed when blocked");
+        let blocked_reason = blocked_inspect
+            .block
+            .expect("blocked record should expose block");
+        assert_eq!(blocked_reason.reason, BlockReason::UserBlocked);
+        assert_eq!(blocked_inspect.services, expected_services);
     }
 
     #[test]

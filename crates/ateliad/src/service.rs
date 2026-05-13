@@ -10,16 +10,17 @@ use atelia_core::{
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
     CancelJobReceipt, DefaultPolicyEngine, DisableExtensionRequest, DisableExtensionResponse,
     EchoTool, EnableExtensionRequest, EnableExtensionResponse, EventCursor, EventPage, EventQuery,
-    ExtensionBlocklistMatch, ExtensionBoundary, ExtensionInstallStatus, ExtensionRegistry,
-    ExtensionRegistryService, ExtensionSourceSnapshot, ExtensionStatusRequest,
-    ExtensionStatusResponse, FsReadTool, InMemoryStore, InMemoryToolOutputSettingsService,
-    InstallExtensionRequest, InstallExtensionResponse, JobEvent, JobId, JobKind,
-    JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
-    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
-    ManifestValidationPolicy, OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput,
-    PolicyOutcome, RegistryError, RemoveExtensionRequest, RemoveExtensionResponse,
-    RenderedToolOutput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
-    RollbackExtensionRequest, RollbackExtensionResponse, RuntimeError, RuntimeJobReceipt,
+    ExtensionBlocklistMatch, ExtensionBoundary, ExtensionInstallStatus, ExtensionManifest,
+    ExtensionPublication, ExtensionRegistry, ExtensionRegistryService, ExtensionServices,
+    ExtensionSourceSnapshot, ExtensionStatusRequest, ExtensionStatusResponse, FsReadTool,
+    InMemoryStore, InMemoryToolOutputSettingsService, InstallExtensionRequest,
+    InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService, JobPage, JobQuery,
+    JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest, ListBlocklistResponse,
+    ListExtensionsRequest, ListExtensionsResponse, ManifestValidationPolicy, OutputFormat,
+    PathScope, PolicyDecision, PolicyEngine, PolicyInput, PolicyOutcome, RegistryError,
+    RemoveExtensionRequest, RemoveExtensionResponse, RenderedToolOutput, RepositoryId,
+    RepositoryRecord, RepositoryTrustState, ResourceScope, RollbackExtensionRequest,
+    RollbackExtensionResponse, RollbackSnapshot, RuntimeError, RuntimeJobReceipt,
     RuntimeJobRequest, SecretaryStore, StoreError, SubmitJobIdempotencyRecord, ToolInvocationId,
     ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
     ToolOutputSettingsScope, ToolResultId, TruncationMetadata, UpdateExtensionPublicationRequest,
@@ -47,6 +48,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "repertoire.v1",
     "extensions.registry.v1",
     "extensions.authoring.v1",
+    "package_inspect.v1",
     "package_trust_index.v1",
     "tool_output_settings.v1",
     "tool_output_render.v1",
@@ -202,6 +204,29 @@ pub struct ProjectStatusSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListPackageTrustIndexResponse {
     pub packages: Vec<PackageTrustIndexEntry>,
+}
+
+/// Aggregated package detail used by client inspect surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageInspectResponse {
+    /// Current installed-package status and active record.
+    pub extension: ExtensionStatusResponse,
+    /// Manifest snapshot for the active installed version.
+    pub manifest: ExtensionManifest,
+    /// Active blocklist match, when the package is blocked.
+    pub block: Option<ExtensionBlocklistMatch>,
+    /// Approved permissions recorded for the installed package.
+    pub permissions: Vec<String>,
+    /// Service declarations from the active manifest.
+    pub services: ExtensionServices,
+    /// Whether a rollback target is available.
+    pub rollback_available: bool,
+    /// Snapshot of the rollback target, when available.
+    pub rollback_snapshot: Option<RollbackSnapshot>,
+    /// Source and provenance snapshot recorded at install time.
+    pub source: ExtensionSourceSnapshot,
+    /// Publication and registry trust metadata, when available.
+    pub trust: Option<ExtensionPublication>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1352,6 +1377,71 @@ impl SecretaryService {
             .map_err(ServiceError::from)
     }
 
+    /// Returns a single installed-package detail envelope for inspect surfaces.
+    pub fn package_inspect(
+        &self,
+        request: ExtensionStatusRequest,
+    ) -> ServiceResult<PackageInspectResponse> {
+        let registry = self.lock_extension_registry()?;
+        let extension_id = request.extension_id.clone();
+        let extension = registry
+            .extension_status(ExtensionStatusRequest {
+                extension_id: extension_id.clone(),
+            })
+            .map_err(ServiceError::from)?;
+        let record = extension
+            .record
+            .as_ref()
+            .ok_or_else(|| ServiceError::Internal {
+                reason: format!(
+                    "extension {} is missing active record after status lookup",
+                    extension_id
+                ),
+            })?;
+        let snapshot = registry.snapshot();
+        let manifest = snapshot
+            .manifests
+            .get(&extension_id)
+            .and_then(|versions| versions.get(&record.version))
+            .cloned()
+            .ok_or(ServiceError::Store(StoreError::NotFound {
+                collection: "extension_manifests",
+                id: extension_id.clone(),
+            }))?;
+        let rollback_snapshot = record
+            .previous_version
+            .as_ref()
+            .and_then(|previous_version| {
+                snapshot
+                    .manifests
+                    .get(&extension_id)
+                    .and_then(|versions| versions.get(previous_version))
+            })
+            .filter(|previous_manifest| {
+                !snapshot
+                    .blocklist
+                    .iter()
+                    .any(|entry| entry.matches_manifest(previous_manifest))
+            })
+            .map(|previous_manifest| RollbackSnapshot {
+                manifest_digest: previous_manifest.provenance.manifest_digest.clone(),
+                artifact_digest: previous_manifest.provenance.artifact_digest.clone(),
+            });
+        let rollback_available = rollback_snapshot.is_some();
+
+        Ok(PackageInspectResponse {
+            extension: extension.clone(),
+            manifest: manifest.clone(),
+            block: extension.block.clone(),
+            permissions: record.approved_permissions.clone(),
+            services: manifest.services.clone(),
+            rollback_available,
+            rollback_snapshot,
+            source: record.source.clone(),
+            trust: record.source.publication.clone(),
+        })
+    }
+
     pub fn list_extensions(
         &self,
         request: ListExtensionsRequest,
@@ -2146,6 +2236,9 @@ mod tests {
         assert!(health
             .capabilities
             .contains(&"extensions.registry.v1".to_string()));
+        assert!(health
+            .capabilities
+            .contains(&"package_inspect.v1".to_string()));
         assert!(health
             .capabilities
             .contains(&"package_trust_index.v1".to_string()));
@@ -3345,6 +3438,9 @@ mod tests {
         assert!(metadata
             .capabilities
             .contains(&"extensions.registry.v1".to_string()));
+        assert!(metadata
+            .capabilities
+            .contains(&"package_inspect.v1".to_string()));
         assert!(metadata
             .capabilities
             .contains(&"package_trust_index.v1".to_string()));
