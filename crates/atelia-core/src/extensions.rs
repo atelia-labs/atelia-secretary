@@ -2222,7 +2222,8 @@ impl ExtensionRegistry {
                 },
             ));
         }
-        if let Err(reason) = validate_extension_registry_audit_targets(&record, &self.records) {
+        if let Err(reason) = validate_extension_registry_audit_targets(&record, &self.records, true)
+        {
             return Err(RegistryError::Validation(
                 ExtensionValidationError::InvalidField {
                     field: "audit.record",
@@ -2593,7 +2594,10 @@ fn validate_extension_registry_snapshot(
     }
 
     for record in &snapshot.audit_records {
-        validate_extension_registry_audit_targets(record, &snapshot.records)?;
+        // Audit refs capture event-time status. Later lifecycle mutations may
+        // legitimately change the persisted install record status, so snapshot
+        // hydration validates stable identity/digest fields but not status.
+        validate_extension_registry_audit_targets(record, &snapshot.records, false)?;
     }
 
     Ok(())
@@ -2629,6 +2633,81 @@ fn validate_extension_registry_audit_record(
     }
     if let Some(provenance) = &record.provenance {
         validate_extension_registry_audit_provenance(provenance)?;
+    }
+    validate_extension_registry_audit_kind_payload(record)?;
+    Ok(())
+}
+
+fn validate_extension_registry_audit_kind_payload(
+    record: &ExtensionRegistryAuditRecord,
+) -> Result<(), String> {
+    match record.kind {
+        ExtensionRegistryAuditKind::Install => {
+            require_audit_package_id(record)?;
+            require_audit_new_record(record)?;
+            require_audit_provenance(record)?;
+        }
+        ExtensionRegistryAuditKind::Update
+        | ExtensionRegistryAuditKind::Rollback
+        | ExtensionRegistryAuditKind::Disable
+        | ExtensionRegistryAuditKind::Enable
+        | ExtensionRegistryAuditKind::PublicationUpdate
+        | ExtensionRegistryAuditKind::RegistrySubmissionUpdate => {
+            require_audit_package_id(record)?;
+            require_audit_previous_record(record)?;
+            require_audit_new_record(record)?;
+            require_audit_provenance(record)?;
+        }
+        ExtensionRegistryAuditKind::Remove => {
+            require_audit_package_id(record)?;
+            require_audit_previous_record(record)?;
+            require_audit_provenance(record)?;
+        }
+        ExtensionRegistryAuditKind::BlocklistApply => {
+            if record.blocklist_entry.is_none() {
+                return Err("blocklist apply audits must include audit.blocklist_entry".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_audit_package_id(record: &ExtensionRegistryAuditRecord) -> Result<(), String> {
+    if record.package_id.is_none() {
+        return Err(format!(
+            "{:?} audits must include audit.package_id",
+            record.kind
+        ));
+    }
+    Ok(())
+}
+
+fn require_audit_previous_record(record: &ExtensionRegistryAuditRecord) -> Result<(), String> {
+    if record.previous_record.is_none() {
+        return Err(format!(
+            "{:?} audits must include audit.previous_record",
+            record.kind
+        ));
+    }
+    Ok(())
+}
+
+fn require_audit_new_record(record: &ExtensionRegistryAuditRecord) -> Result<(), String> {
+    if record.new_record.is_none() {
+        return Err(format!(
+            "{:?} audits must include audit.new_record",
+            record.kind
+        ));
+    }
+    Ok(())
+}
+
+fn require_audit_provenance(record: &ExtensionRegistryAuditRecord) -> Result<(), String> {
+    if record.provenance.is_none() {
+        return Err(format!(
+            "{:?} audits must include audit.provenance",
+            record.kind
+        ));
     }
     Ok(())
 }
@@ -2681,6 +2760,7 @@ fn validate_extension_registry_audit_provenance(
 fn validate_extension_registry_audit_targets(
     audit_record: &ExtensionRegistryAuditRecord,
     records: &BTreeMap<String, BTreeMap<String, ExtensionInstallRecord>>,
+    enforce_current_status: bool,
 ) -> Result<(), String> {
     if let Some(package_id) = &audit_record.package_id {
         if let Some(previous_record) = &audit_record.previous_record {
@@ -2699,10 +2779,15 @@ fn validate_extension_registry_audit_targets(
         }
     }
     if let Some(previous_record) = &audit_record.previous_record {
-        validate_audit_record_target("audit.previous_record", previous_record, records)?;
+        validate_audit_record_target("audit.previous_record", previous_record, records, false)?;
     }
     if let Some(new_record) = &audit_record.new_record {
-        validate_audit_record_target("audit.new_record", new_record, records)?;
+        validate_audit_record_target(
+            "audit.new_record",
+            new_record,
+            records,
+            enforce_current_status,
+        )?;
     }
     Ok(())
 }
@@ -2725,6 +2810,7 @@ fn validate_audit_record_target(
     field: &'static str,
     record_ref: &ExtensionRegistryAuditRecordRef,
     records: &BTreeMap<String, BTreeMap<String, ExtensionInstallRecord>>,
+    enforce_current_status: bool,
 ) -> Result<(), String> {
     let Some(record_versions) = records.get(&record_ref.package_id) else {
         return Err(format!(
@@ -2747,6 +2833,12 @@ fn validate_audit_record_target(
     if record.artifact_digest != record_ref.artifact_digest {
         return Err(format!(
             "{field} artifact digest does not match persisted record {}:{}",
+            record_ref.package_id, record_ref.version
+        ));
+    }
+    if enforce_current_status && record.status != record_ref.status {
+        return Err(format!(
+            "{field} status does not match persisted record {}:{}",
             record_ref.package_id, record_ref.version
         ));
     }
@@ -3948,6 +4040,8 @@ mod tests {
     }
 
     fn audit_record() -> ExtensionRegistryAuditRecord {
+        let manifest = manifest("com.example.extension");
+        let install_record = extension_record(&manifest, None);
         ExtensionRegistryAuditRecord {
             id: AuditRecordId::new(),
             schema_version: EXTENSION_REGISTRY_AUDIT_SCHEMA_VERSION,
@@ -3961,8 +4055,10 @@ mod tests {
             policy_decision_id: None,
             package_id: Some("com.example.extension".to_string()),
             previous_record: None,
-            new_record: None,
-            provenance: None,
+            new_record: Some(ExtensionRegistryAuditRecordRef::from(&install_record)),
+            provenance: Some(ExtensionRegistryAuditProvenance::from(
+                &install_record.source,
+            )),
             blocklist_entry: None,
         }
     }
@@ -5581,6 +5677,48 @@ mod tests {
 
         let err = snapshot.validate().unwrap_err();
         assert!(err.contains("audit.new_record manifest digest does not match"));
+    }
+
+    #[test]
+    fn append_audit_record_rejects_current_status_mismatch() {
+        let extension = manifest("com.example.extension");
+        let install_record = extension_record(&extension, None);
+        let mut registry = ExtensionRegistry::from_snapshot(
+            extension_snapshot(
+                BTreeMap::from([(extension.version.clone(), extension.clone())]),
+                BTreeMap::from([(extension.version.clone(), install_record.clone())]),
+            ),
+            ManifestValidationPolicy::default(),
+        )
+        .expect("snapshot should hydrate");
+        let mut record = audit_record();
+        let mut record_ref = ExtensionRegistryAuditRecordRef::from(&install_record);
+        record_ref.status = ExtensionInstallStatus::Disabled;
+        record.new_record = Some(record_ref);
+
+        let err = registry.append_audit_record(record).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("audit.new_record status does not match"));
+    }
+
+    #[test]
+    fn extension_snapshot_rejects_audit_kind_missing_required_payload() {
+        let extension = manifest("com.example.extension");
+        let mut snapshot = extension_snapshot(
+            BTreeMap::from([(extension.version.clone(), extension.clone())]),
+            BTreeMap::from([(
+                extension.version.clone(),
+                extension_record(&extension, None),
+            )]),
+        );
+        let mut record = audit_record();
+        record.kind = ExtensionRegistryAuditKind::BlocklistApply;
+        record.blocklist_entry = None;
+        snapshot.audit_records.push(record);
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("blocklist apply audits must include audit.blocklist_entry"));
     }
 
     #[test]
