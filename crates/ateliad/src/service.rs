@@ -1815,6 +1815,7 @@ impl SecretaryService {
             |response| ExtensionRegistryAuditContext {
                 package_id: match &response.entry.key {
                     BlockKey::ExtensionId(package_id) => Some(package_id.clone()),
+                    BlockKey::Version { id, .. } => Some(id.clone()),
                     _ => None,
                 },
                 actor,

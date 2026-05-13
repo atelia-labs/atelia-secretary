@@ -2678,17 +2678,7 @@ fn validate_blocklist_audit_payload(record: &ExtensionRegistryAuditRecord) -> Re
 
     match &entry.key {
         BlockKey::ExtensionId(package_id) => {
-            let Some(audit_package_id) = &record.package_id else {
-                return Err(
-                    "blocklist apply audits for extension ids must include audit.package_id"
-                        .to_string(),
-                );
-            };
-            if audit_package_id != package_id {
-                return Err(format!(
-                    "audit.package_id {audit_package_id} does not match audit.blocklist_entry extension id {package_id}"
-                ));
-            }
+            validate_blocklist_audit_package_id("extension ids", record, package_id)?;
             validate_blocklist_audit_record_ref_package(
                 "audit.previous_record",
                 &record.previous_record,
@@ -2698,6 +2688,21 @@ fn validate_blocklist_audit_payload(record: &ExtensionRegistryAuditRecord) -> Re
                 "audit.new_record",
                 &record.new_record,
                 package_id,
+            )?;
+        }
+        BlockKey::Version { id, version } => {
+            validate_blocklist_audit_package_id("versions", record, id)?;
+            validate_blocklist_audit_record_ref_version(
+                "audit.previous_record",
+                &record.previous_record,
+                id,
+                version,
+            )?;
+            validate_blocklist_audit_record_ref_version(
+                "audit.new_record",
+                &record.new_record,
+                id,
+                version,
             )?;
         }
         BlockKey::VulnerabilityId(_) => {
@@ -2711,6 +2716,24 @@ fn validate_blocklist_audit_payload(record: &ExtensionRegistryAuditRecord) -> Re
     Ok(())
 }
 
+fn validate_blocklist_audit_package_id(
+    key_name: &'static str,
+    record: &ExtensionRegistryAuditRecord,
+    package_id: &str,
+) -> Result<(), String> {
+    let Some(audit_package_id) = &record.package_id else {
+        return Err(format!(
+            "blocklist apply audits for {key_name} must include audit.package_id"
+        ));
+    };
+    if audit_package_id != package_id {
+        return Err(format!(
+            "audit.package_id {audit_package_id} does not match audit.blocklist_entry extension id {package_id}"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_blocklist_audit_record_ref_package(
     field: &'static str,
     record_ref: &Option<ExtensionRegistryAuditRecordRef>,
@@ -2721,6 +2744,24 @@ fn validate_blocklist_audit_record_ref_package(
             return Err(format!(
                 "{field}.package_id {} does not match audit.blocklist_entry extension id {package_id}",
                 record_ref.package_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_blocklist_audit_record_ref_version(
+    field: &'static str,
+    record_ref: &Option<ExtensionRegistryAuditRecordRef>,
+    package_id: &str,
+    version: &str,
+) -> Result<(), String> {
+    validate_blocklist_audit_record_ref_package(field, record_ref, package_id)?;
+    if let Some(record_ref) = record_ref {
+        if record_ref.version != version {
+            return Err(format!(
+                "{field}.version {} does not match audit.blocklist_entry version {version}",
+                record_ref.version
             ));
         }
     }
@@ -5820,6 +5861,32 @@ mod tests {
 
         let err = snapshot.validate().unwrap_err();
         assert!(err.contains("does not match audit.blocklist_entry extension id"));
+    }
+
+    #[test]
+    fn extension_snapshot_rejects_version_blocklist_audit_target_mismatch() {
+        let extension = manifest("com.example.extension");
+        let mut snapshot = extension_snapshot(
+            BTreeMap::from([(extension.version.clone(), extension.clone())]),
+            BTreeMap::from([(
+                extension.version.clone(),
+                extension_record(&extension, None),
+            )]),
+        );
+        let mut record = audit_record();
+        record.kind = ExtensionRegistryAuditKind::BlocklistApply;
+        record.blocklist_entry = Some(BlocklistEntry {
+            key: BlockKey::Version {
+                id: "com.example.extension".to_string(),
+                version: "2.0.0".to_string(),
+            },
+            reason: BlockReason::PolicyViolation,
+            note: None,
+        });
+        snapshot.audit_records.push(record);
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("does not match audit.blocklist_entry version"));
     }
 
     #[test]
