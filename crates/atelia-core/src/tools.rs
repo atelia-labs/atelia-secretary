@@ -490,9 +490,12 @@ fn write_lock_file_name_for_path(path: &Path) -> std::ffi::OsString {
 
 #[cfg(unix)]
 fn write_lock_directory() -> io::Result<PathBuf> {
-    let lock_directory = std::env::temp_dir().join("atelia-secretary").join("locks");
+    let temp_dir = std::env::temp_dir();
+    fs::create_dir_all(&temp_dir)?;
+    let temp_dir = temp_dir.canonicalize()?;
+    let lock_directory = temp_dir.join("atelia-secretary").join("locks");
     fs::create_dir_all(&lock_directory)?;
-    Ok(lock_directory)
+    lock_directory.canonicalize()
 }
 
 #[cfg(unix)]
@@ -3562,9 +3565,11 @@ fn rename_in_parent_dir(
     destination: &std::ffi::OsStr,
     create_new: bool,
 ) -> io::Result<()> {
-    let source = CString::new(source.as_bytes())
+    let source_name = source;
+    let destination_name = destination;
+    let source = CString::new(source_name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
-    let destination_name = CString::new(destination.as_bytes())
+    let destination = CString::new(destination_name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
 
     if create_new {
@@ -3576,7 +3581,7 @@ fn rename_in_parent_dir(
                     parent.as_raw_fd(),
                     source.as_ptr(),
                     parent.as_raw_fd(),
-                    destination_name.as_ptr(),
+                    destination.as_ptr(),
                     libc::RENAME_NOREPLACE,
                 )
             };
@@ -3597,11 +3602,31 @@ fn rename_in_parent_dir(
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            const RENAME_NOFOLLOW_ANY: libc::c_uint = 0x00000010;
+            // SAFETY: `parent` is a live directory file descriptor and both names are valid c-strings.
+            let result = unsafe {
+                libc::renameatx_np(
+                    parent.as_raw_fd(),
+                    source.as_ptr(),
+                    parent.as_raw_fd(),
+                    destination.as_ptr(),
+                    libc::RENAME_EXCL | RENAME_NOFOLLOW_ANY,
+                )
+            };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            return Ok(());
+        }
+
+        #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "create_new writes are supported only with renameat2(RENAME_NOREPLACE)",
+                "create_new writes require renameat2(RENAME_NOREPLACE) or renameatx_np(RENAME_EXCL)",
             ));
         }
     }
@@ -3612,7 +3637,7 @@ fn rename_in_parent_dir(
             parent.as_raw_fd(),
             source.as_ptr(),
             parent.as_raw_fd(),
-            destination_name.as_ptr(),
+            destination.as_ptr(),
         )
     };
 
@@ -3749,9 +3774,11 @@ fn rename_between_parent_dirs(
     destination: &std::ffi::OsStr,
     create_new: bool,
 ) -> io::Result<()> {
-    let source = CString::new(source.as_bytes())
+    let source_name = source;
+    let destination_name = destination;
+    let source = CString::new(source_name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
-    let destination = CString::new(destination.as_bytes())
+    let destination = CString::new(destination_name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
 
     if create_new {
@@ -3784,11 +3811,31 @@ fn rename_between_parent_dirs(
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            const RENAME_NOFOLLOW_ANY: libc::c_uint = 0x00000010;
+            // SAFETY: both directory descriptors are live and both names are valid c-strings.
+            let result = unsafe {
+                libc::renameatx_np(
+                    source_parent.as_raw_fd(),
+                    source.as_ptr(),
+                    destination_parent.as_raw_fd(),
+                    destination.as_ptr(),
+                    libc::RENAME_EXCL | RENAME_NOFOLLOW_ANY,
+                )
+            };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            return Ok(());
+        }
+
+        #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "create_new moves are supported only with renameat2(RENAME_NOREPLACE)",
+                "create_new moves require renameat2(RENAME_NOREPLACE) or renameatx_np(RENAME_EXCL)",
             ));
         }
     }
@@ -5382,10 +5429,13 @@ mod tests {
 
     fn unique_test_dir(name: &str) -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("atelia-tools-test-{}-{}", id, name));
+        let temp_dir = std::env::temp_dir();
+        fs::create_dir_all(&temp_dir).unwrap();
+        let temp_dir = temp_dir.canonicalize().unwrap();
+        let dir = temp_dir.join(format!("atelia-tools-test-{}-{}", id, name));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir
+        dir.canonicalize().unwrap()
     }
 
     fn actor() -> Actor {
@@ -5525,14 +5575,20 @@ mod tests {
     #[test]
     fn canonicalize_rejects_outside_path() {
         let env = TestEnv::new("canon-outside");
+        let outside = unique_test_dir("canon-outside-target");
+        let outside_file = outside.join("secret.txt");
+        fs::write(&outside_file, "secret").unwrap();
+        let outside_name = outside.file_name().unwrap();
+        let relative_outside_file = PathBuf::from("..").join(outside_name).join("secret.txt");
 
-        let result = canonicalize_within_scope(&env.root, Path::new("../../etc/passwd"));
+        let result = canonicalize_within_scope(&env.root, &relative_outside_file);
         assert!(result.is_err());
         match result.unwrap_err() {
             PathResolutionError::OutsideRepositoryScope { .. } => {}
             other => panic!("expected OutsideRepositoryScope, got {:?}", other),
         }
         env.cleanup();
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
@@ -5630,16 +5686,20 @@ mod tests {
     #[test]
     fn fs_list_rejects_out_of_scope() {
         let env = TestEnv::new("list-reject");
+        let outside = unique_test_dir("list-reject-target");
+        let outside_name = outside.file_name().unwrap().to_string_lossy();
+        let outside_request = format!("../{outside_name}");
 
         let tool = FsListTool::new(&env.root);
         let invocation = fake_invocation(tool.tool_id());
-        let request = request_with_path("../../etc");
+        let request = request_with_path(&outside_request);
         let result = tool.execute(&invocation, &request);
 
         assert_eq!(ToolResultStatus::Failed, result.status);
         let error_field = result.fields.iter().find(|f| f.key == "error").unwrap();
         assert!(string_value(&error_field.value).contains("outside repository root"));
         env.cleanup();
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[cfg(unix)]
@@ -6877,49 +6937,48 @@ mod tests {
         env.cleanup();
     }
 
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
     #[test]
-    fn fs_rename_create_new_unsupported_without_renameat2() {
-        let env = TestEnv::new("write-create-rename-unsupported");
+    fn fs_rename_create_new_uses_no_replace_rename_without_renameat2() {
+        let env = TestEnv::new("write-create-rename-noreplace");
         let path = env.root.join("notes.txt");
 
         let parent = open_parent_no_follow(path.parent().unwrap()).unwrap();
         let (temp_name, temp_file) =
             create_temporary_file_in_parent_dir(&parent, path.file_name().unwrap()).unwrap();
+        writeln!(&temp_file, "created").unwrap();
         drop(temp_file);
 
-        let rename_result =
-            rename_in_parent_dir(&parent, &temp_name, path.file_name().unwrap(), true).unwrap_err();
-        assert_eq!(io::ErrorKind::Unsupported, rename_result.kind());
+        rename_in_parent_dir(&parent, &temp_name, path.file_name().unwrap(), true).unwrap();
 
-        unlink_in_parent_dir(&parent, &temp_name).unwrap();
+        assert!(!env.root.join(&temp_name).exists());
+        assert_eq!("created\n", fs::read_to_string(path).unwrap());
         env.cleanup();
     }
 
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
     #[test]
-    fn fs_move_create_new_unsupported_without_renameat2() {
-        let env = TestEnv::new("move-create-rename-unsupported");
+    fn fs_move_create_new_uses_no_replace_rename_without_renameat2() {
+        let env = TestEnv::new("move-create-rename-noreplace");
         env.create_file("from.txt", "source");
         env.create_dir("archive");
 
         let source_parent = open_parent_no_follow(&env.root).unwrap();
         let destination_parent = open_parent_no_follow(&env.root.join("archive")).unwrap();
-        let rename_result = rename_between_parent_dirs(
+        rename_between_parent_dirs(
             &source_parent,
             std::ffi::OsStr::new("from.txt"),
             &destination_parent,
             std::ffi::OsStr::new("from.txt"),
             true,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(io::ErrorKind::Unsupported, rename_result.kind());
+        assert!(!env.root.join("from.txt").exists());
         assert_eq!(
             "source",
-            fs::read_to_string(env.root.join("from.txt")).unwrap()
+            fs::read_to_string(env.root.join("archive/from.txt")).unwrap()
         );
-        assert!(!env.root.join("archive/from.txt").exists());
         env.cleanup();
     }
 
@@ -6940,16 +6999,22 @@ mod tests {
     #[test]
     fn fs_write_rejects_out_of_scope_target() {
         let env = TestEnv::new("write-reject");
+        let outside = unique_test_dir("write-reject-target");
+        let outside_file = outside.join("secret.txt");
+        fs::write(&outside_file, "secret").unwrap();
+        let outside_name = outside.file_name().unwrap().to_string_lossy();
+        let outside_request = format!("../{outside_name}/secret.txt");
 
         let tool = FsWriteTool::new(&env.root, "hello");
         let invocation = fake_invocation(tool.tool_id());
-        let request = request_with_mutation_path("../../etc/passwd");
+        let request = request_with_mutation_path(&outside_request);
         let result = tool.execute(&invocation, &request);
 
         assert_eq!(ToolResultStatus::Failed, result.status);
         let error = result.fields.iter().find(|f| f.key == "error").unwrap();
         assert!(string_value(&error.value).contains("outside repository root"));
         env.cleanup();
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[cfg(unix)]
