@@ -1040,6 +1040,13 @@ fn parse_optional_rpc_actor(payload: Option<ActorPayload>) -> Option<rpc::RpcAct
     payload.map(parse_actor_payload)
 }
 
+fn package_http_request_source(request_source: Option<String>) -> Option<String> {
+    request_source
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| Some("secretary.http".to_string()))
+}
+
 fn parse_job_status(value: Option<String>) -> Result<Option<rpc::RpcJobStatus>, String> {
     let Some(value) = value else {
         return Ok(None);
@@ -2849,9 +2856,7 @@ async fn dispatch_install_extension(state: RpcServerState, request: Request<Body
         allow_local_process_runtime: payload.allow_local_process_runtime,
         approve_source_change: payload.approve_source_change,
         requester,
-        request_source: payload
-            .request_source
-            .or_else(|| Some("secretary.http".to_string())),
+        request_source: package_http_request_source(payload.request_source),
         reason: payload.reason,
     }) {
         Ok(response) => (
@@ -2919,9 +2924,7 @@ async fn dispatch_update_extension(state: RpcServerState, request: Request<Body>
         allow_local_process_runtime: payload.allow_local_process_runtime,
         approve_source_change: payload.approve_source_change,
         requester,
-        request_source: payload
-            .request_source
-            .or_else(|| Some("secretary.http".to_string())),
+        request_source: package_http_request_source(payload.request_source),
         reason: payload.reason,
     }) {
         Ok(response) => (
@@ -3197,9 +3200,7 @@ async fn dispatch_package_publication(
         visibility: payload.visibility,
         requires_registry_submission: payload.requires_registry_submission,
         requester: parse_optional_rpc_actor(payload.requester),
-        request_source: payload
-            .request_source
-            .or_else(|| Some("secretary.http".to_string())),
+        request_source: package_http_request_source(payload.request_source),
         reason: payload.reason,
     }) {
         Ok(response) => (
@@ -3284,9 +3285,7 @@ async fn dispatch_package_registry_submission(
             .unwrap_or(rpc::PackageRegistrySubmissionState::Submitted),
         registry_identity,
         requester: parse_optional_rpc_actor(payload.requester),
-        request_source: payload
-            .request_source
-            .or_else(|| Some("secretary.http".to_string())),
+        request_source: package_http_request_source(payload.request_source),
         reason: payload.reason,
     }) {
         Ok(response) => (
@@ -3424,9 +3423,7 @@ async fn dispatch_rollback_extension(
     match rpc_server.rollback_extension(atelia_core::RollbackExtensionRequest {
         extension_id,
         requester,
-        request_source: payload
-            .request_source
-            .or_else(|| Some("secretary.http".to_string())),
+        request_source: package_http_request_source(payload.request_source),
         reason: payload.reason,
     }) {
         Ok(response) => (
@@ -3465,9 +3462,7 @@ async fn dispatch_disable_extension(
     match rpc_server.disable_extension(atelia_core::DisableExtensionRequest {
         extension_id,
         requester,
-        request_source: payload
-            .request_source
-            .or_else(|| Some("secretary.http".to_string())),
+        request_source: package_http_request_source(payload.request_source),
         reason: payload.reason,
     }) {
         Ok(response) => (
@@ -3506,9 +3501,7 @@ async fn dispatch_enable_extension(
     match rpc_server.enable_extension(atelia_core::EnableExtensionRequest {
         extension_id,
         requester,
-        request_source: payload
-            .request_source
-            .or_else(|| Some("secretary.http".to_string())),
+        request_source: package_http_request_source(payload.request_source),
         reason: payload.reason,
     }) {
         Ok(response) => (
@@ -3547,9 +3540,7 @@ async fn dispatch_remove_extension(
     match rpc_server.remove_extension(atelia_core::RemoveExtensionRequest {
         extension_id,
         requester,
-        request_source: payload
-            .request_source
-            .or_else(|| Some("secretary.http".to_string())),
+        request_source: package_http_request_source(payload.request_source),
         reason: payload.reason,
     }) {
         Ok(response) => (
@@ -3585,9 +3576,7 @@ async fn dispatch_apply_blocklist(state: RpcServerState, request: Request<Body>)
     match rpc_server.apply_blocklist(atelia_core::ApplyBlocklistRequest {
         entry: payload.entry,
         requester,
-        request_source: payload
-            .request_source
-            .or_else(|| Some("secretary.http".to_string())),
+        request_source: package_http_request_source(payload.request_source),
         reason: payload.reason,
     }) {
         Ok(response) => (

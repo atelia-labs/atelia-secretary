@@ -1034,7 +1034,7 @@ impl SecretaryService {
         } = request;
         let requested_limit = requested_limit.unwrap_or(MAX_HISTORY_PAGE);
         let limit = requested_limit.min(MAX_HISTORY_PAGE);
-        let start = list_history_page_start(offset, cursor)?;
+        let start = list_history_page_start(offset, cursor, "tool output settings history")?;
         if limit == 0 {
             return Ok(ListToolOutputSettingsHistoryPage {
                 changes: Vec::new(),
@@ -1827,7 +1827,11 @@ impl SecretaryService {
     ) -> ServiceResult<ListExtensionRegistryAuditRecordsPage> {
         let requested_limit = request.limit.unwrap_or(MAX_HISTORY_PAGE);
         let limit = requested_limit.min(MAX_HISTORY_PAGE);
-        let start = list_history_page_start(request.offset, request.cursor)?;
+        let start = list_history_page_start(
+            request.offset,
+            request.cursor,
+            "extension registry audit history",
+        )?;
         let records = self.lock_extension_registry()?.audit_records();
         let (records, next_page_token) = paginate_records(records, start, limit);
         Ok(ListExtensionRegistryAuditRecordsPage {
@@ -1860,7 +1864,11 @@ fn parse_page_token(page_token: Option<&str>, collection: &'static str) -> Servi
     }
 }
 
-fn list_history_page_start(offset: Option<usize>, cursor: Option<String>) -> ServiceResult<usize> {
+fn list_history_page_start(
+    offset: Option<usize>,
+    cursor: Option<String>,
+    collection: &'static str,
+) -> ServiceResult<usize> {
     let has_offset = offset.is_some();
     let has_cursor = cursor.is_some();
     let cursors_specified = usize::from(has_offset) + usize::from(has_cursor);
@@ -1872,7 +1880,7 @@ fn list_history_page_start(offset: Option<usize>, cursor: Option<String>) -> Ser
     }
 
     if let Some(cursor) = cursor {
-        return parse_page_token(Some(cursor.as_str()), "tool output settings history");
+        return parse_page_token(Some(cursor.as_str()), collection);
     }
 
     if let Some(offset) = offset {

@@ -447,13 +447,20 @@ impl SecretaryRpcServer {
         request: PackagePublicationRequest,
     ) -> RpcResult<PackagePublicationResponse> {
         let publication_visibility = request.visibility;
+        let requires_registry_submission =
+            package_publication_visibility_requires_registry_submission(publication_visibility);
+        if request.requires_registry_submission != requires_registry_submission {
+            return Err(RpcError::invalid_argument(
+                "requires_registry_submission must match the selected visibility",
+            ));
+        }
         let publication_response =
             self.service
                 .update_extension_publication(UpdateExtensionPublicationRequest {
                     extension_id: request.package_id.clone(),
                     publication: ExtensionPublication {
                         visibility: ExtensionPublicationVisibility::from(publication_visibility),
-                        registry_submission: if request.requires_registry_submission {
+                        registry_submission: if requires_registry_submission {
                             ExtensionRegistrySubmission::AwaitingSubmission
                         } else {
                             ExtensionRegistrySubmission::NotSubmitted
@@ -463,9 +470,11 @@ impl SecretaryRpcServer {
                     request_source: request.request_source,
                     reason: request.reason,
                 })?;
-        let extension = self.service.extension_status(ExtensionStatusRequest {
+        let extension = atelia_core::ExtensionStatusResponse {
             extension_id: request.package_id,
-        })?;
+            record: Some(publication_response.record),
+            block: None,
+        };
         Ok(PackagePublicationResponse {
             metadata: self.metadata(),
             flow: package_authoring_flow_from_status(&extension, true)?,
@@ -501,9 +510,11 @@ impl SecretaryRpcServer {
                 reason: request.reason,
             },
         )?;
-        let extension = self.service.extension_status(ExtensionStatusRequest {
+        let extension = atelia_core::ExtensionStatusResponse {
             extension_id: request.package_id.clone(),
-        })?;
+            record: Some(registry_submission_response.record),
+            block: None,
+        };
         let state = extension
             .record
             .as_ref()
@@ -2396,6 +2407,15 @@ fn package_registry_search_state(
             PackageAuthoringStepState::Blocked
         }
     }
+}
+
+fn package_publication_visibility_requires_registry_submission(
+    visibility: PackagePublicationVisibility,
+) -> bool {
+    matches!(
+        visibility,
+        PackagePublicationVisibility::PublicSearchable | PackagePublicationVisibility::Official
+    )
 }
 
 fn package_source_class_from_record(record: &ExtensionInstallRecord) -> PackageSourceClass {
