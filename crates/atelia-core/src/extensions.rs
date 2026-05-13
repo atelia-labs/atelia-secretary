@@ -2705,14 +2705,36 @@ fn validate_blocklist_audit_payload(record: &ExtensionRegistryAuditRecord) -> Re
                 version,
             )?;
         }
+        BlockKey::ArtifactDigest(_)
+        | BlockKey::Signer(_)
+        | BlockKey::Publisher(_)
+        | BlockKey::SourceRepository(_)
+        | BlockKey::PermissionPattern(_) => {
+            reject_unscoped_blocklist_audit_target(record)?;
+        }
         BlockKey::VulnerabilityId(_) => {
             return Err(
                 "blocklist apply audits must not use unsupported vulnerability_id keys".to_string(),
             );
         }
-        _ => {}
     }
 
+    Ok(())
+}
+
+fn reject_unscoped_blocklist_audit_target(
+    record: &ExtensionRegistryAuditRecord,
+) -> Result<(), String> {
+    if record.package_id.is_some()
+        || record.previous_record.is_some()
+        || record.new_record.is_some()
+        || record.provenance.is_some()
+    {
+        return Err(
+            "blocklist apply audits for unscoped blocklist keys must not include package target refs"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -3166,6 +3188,7 @@ impl From<&InstallExtensionRequest> for InstallOptions {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstallExtensionResponse {
     pub record: ExtensionInstallRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_record_id: Option<AuditRecordId>,
 }
 
@@ -3212,6 +3235,7 @@ impl From<&UpdateExtensionRequest> for InstallOptions {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateExtensionResponse {
     pub record: ExtensionInstallRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_record_id: Option<AuditRecordId>,
 }
 
@@ -3266,6 +3290,7 @@ pub struct RollbackExtensionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RollbackExtensionResponse {
     pub record: ExtensionInstallRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_record_id: Option<AuditRecordId>,
 }
 
@@ -3283,6 +3308,7 @@ pub struct DisableExtensionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DisableExtensionResponse {
     pub record: ExtensionInstallRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_record_id: Option<AuditRecordId>,
 }
 
@@ -3300,6 +3326,7 @@ pub struct EnableExtensionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnableExtensionResponse {
     pub record: ExtensionInstallRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_record_id: Option<AuditRecordId>,
 }
 
@@ -3317,6 +3344,7 @@ pub struct RemoveExtensionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoveExtensionResponse {
     pub record: ExtensionInstallRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_record_id: Option<AuditRecordId>,
 }
 
@@ -3340,6 +3368,7 @@ pub struct UpdateExtensionPublicationRequest {
 pub struct UpdateExtensionPublicationResponse {
     /// Updated package install record.
     pub record: ExtensionInstallRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_record_id: Option<AuditRecordId>,
 }
 
@@ -3365,6 +3394,7 @@ pub struct UpdateExtensionRegistrySubmissionRequest {
 pub struct UpdateExtensionRegistrySubmissionResponse {
     /// Updated package install record.
     pub record: ExtensionInstallRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_record_id: Option<AuditRecordId>,
 }
 
@@ -3382,6 +3412,7 @@ pub struct ApplyBlocklistRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApplyBlocklistResponse {
     pub entry: BlocklistEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_record_id: Option<AuditRecordId>,
 }
 
@@ -5887,6 +5918,29 @@ mod tests {
 
         let err = snapshot.validate().unwrap_err();
         assert!(err.contains("does not match audit.blocklist_entry version"));
+    }
+
+    #[test]
+    fn extension_snapshot_rejects_unscoped_blocklist_audit_targets() {
+        let extension = manifest("com.example.extension");
+        let mut snapshot = extension_snapshot(
+            BTreeMap::from([(extension.version.clone(), extension.clone())]),
+            BTreeMap::from([(
+                extension.version.clone(),
+                extension_record(&extension, None),
+            )]),
+        );
+        let mut record = audit_record();
+        record.kind = ExtensionRegistryAuditKind::BlocklistApply;
+        record.blocklist_entry = Some(BlocklistEntry {
+            key: BlockKey::Signer("signer@example.com".to_string()),
+            reason: BlockReason::CompromisedSigner,
+            note: None,
+        });
+        snapshot.audit_records.push(record);
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("unscoped blocklist keys"));
     }
 
     #[test]
