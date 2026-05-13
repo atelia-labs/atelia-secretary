@@ -159,6 +159,13 @@ includes `package_id`, `version`, `status`, `boundary`, `manifest_digest`,
 `artifact_digest`, source snapshot, lineage, publication, and block marker. It
 does not expand into install/update/execute flows or audit/quarantine history.
 
+The same beta transport also exposes `PackageInspect` at
+`POST /v1/packages/{id}/inspect` for client detail surfaces. Unlike
+`ListPackageTrustIndex`, inspect returns one installed package with the active
+manifest, approved permissions, service declarations, source snapshot,
+publication trust, block match, and rollback availability/snapshot. It is still
+read-only: it does not install, update, execute, audit, or quarantine packages.
+
 The current Rust identifiers and RPC names still use `extension` for beta
 compatibility. That is implementation vocabulary, not product positioning.
 

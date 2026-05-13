@@ -82,6 +82,7 @@ enum Route {
     PackageRemix { extension_id: String },
     PackagePublication { extension_id: String },
     PackageRegistrySubmission { extension_id: String },
+    PackageInspect { extension_id: String },
     ExtensionExecution { extension_id: String },
     ExtensionStatus { extension_id: String },
     RollbackExtension { extension_id: String },
@@ -161,6 +162,15 @@ fn route_for_path(path: &str) -> Route {
         .and_then(valid_extension_id)
     {
         return Route::ExtensionStatus {
+            extension_id: extension_id.to_string(),
+        };
+    }
+    if let Some(extension_id) = path
+        .strip_prefix("/v1/packages/")
+        .and_then(|path| path.strip_suffix("/inspect"))
+        .and_then(valid_extension_id)
+    {
+        return Route::PackageInspect {
             extension_id: extension_id.to_string(),
         };
     }
@@ -328,6 +338,11 @@ struct PackageRegistrySubmissionRequestPayload {
     #[serde(default)]
     registry_identity: Option<String>,
 }
+
+/// HTTP payload for routes that intentionally accept no request fields.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyRequestPayload {}
 
 /// Return the default registry-submission requirement for publication requests.
 fn default_true() -> bool {
@@ -1636,6 +1651,23 @@ fn serialize_extension_status_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "extension": response.extension,
+    })
+}
+
+/// Serializes the RPC inspect envelope into the public package inspect JSON shape.
+fn serialize_package_inspect_response(response: rpc::PackageInspectResponse) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "package_id": response.package_id,
+        "extension": response.extension,
+        "manifest": response.manifest,
+        "block": response.block,
+        "permissions": response.permissions,
+        "services": response.services,
+        "rollback_available": response.rollback_available,
+        "rollback_snapshot": response.rollback_snapshot,
+        "source": response.source,
+        "trust": response.trust,
     })
 }
 
@@ -3209,6 +3241,35 @@ async fn dispatch_extension_status(
     }
 }
 
+/// Handles package inspect HTTP requests by delegating to the RPC boundary.
+async fn dispatch_package_inspect(
+    state: RpcServerState,
+    extension_id: String,
+    request: Request<Body>,
+) -> Response {
+    if let Err(error) = body_or_empty_json::<EmptyRequestPayload>(request).await {
+        let rpc_server = state.read().await;
+        let next_state = rpc_next_state(&rpc_server);
+        return error.into_response(next_state);
+    }
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.package_inspect(atelia_core::ExtensionStatusRequest { extension_id }) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_package_inspect_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
 async fn dispatch_rollback_extension(
     state: RpcServerState,
     extension_id: String,
@@ -3917,6 +3978,26 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                     dispatch_extension_status(state, extension_id, request).await
                 }
             }
+            Route::PackageInspect { extension_id } => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_package_inspect(state, extension_id, request).await
+                }
+            }
             Route::RollbackExtension { extension_id } => {
                 if method != Method::POST {
                     let mut response = make_error_response(
@@ -4450,6 +4531,7 @@ mod tests {
         }
     }
 
+    /// Verifies package inspect paths map only at the supported route depth.
     #[test]
     fn route_parser_distinguishes_supported_endpoints() {
         let job_id = JobId::new().as_str().to_string();
@@ -4550,6 +4632,12 @@ mod tests {
             }
         );
         assert_eq!(
+            route_for_path("/v1/packages/com.example.extension/inspect"),
+            Route::PackageInspect {
+                extension_id: "com.example.extension".to_string()
+            }
+        );
+        assert_eq!(
             route_for_path("/v1/packages/com.example.extension/rollback"),
             Route::RollbackExtension {
                 extension_id: "com.example.extension".to_string()
@@ -4578,6 +4666,14 @@ mod tests {
             Route::ExtensionExecution {
                 extension_id: "com.example.extension".to_string()
             }
+        );
+        assert_eq!(
+            route_for_path("/v1/packages/com.example.extension/inspect/settings"),
+            Route::Unsupported
+        );
+        assert_eq!(
+            route_for_path("/v1/packages/com.example.extension/inspect/"),
+            Route::Unsupported
         );
         assert_eq!(
             route_for_path("/v1/packages/com.example.extension/invoke"),
@@ -6301,6 +6397,51 @@ mod tests {
             "2.0.0"
         );
 
+        let inspect_response = send_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/packages/com.example.review.extension/inspect",
+        )
+        .await;
+        assert_eq!(inspect_response.status(), StatusCode::OK);
+        let inspect_payload = to_bytes(inspect_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(
+            inspect_payload["data"]["package_id"],
+            "com.example.review.extension"
+        );
+        assert_eq!(
+            inspect_payload["data"]["extension"]["record"]["version"],
+            "2.0.0"
+        );
+        assert!(inspect_payload["data"]["rollback_available"]
+            .as_bool()
+            .unwrap());
+        assert_eq!(inspect_payload["data"]["manifest"]["version"], "2.0.0");
+        assert_eq!(
+            inspect_payload["data"]["manifest"]["services"],
+            serde_json::json!({
+                "provides": [],
+                "consumes": []
+            })
+        );
+        assert_eq!(
+            inspect_payload["data"]["permissions"],
+            serde_json::json!(["service.review.comments"])
+        );
+        assert!(inspect_payload["data"]["source"].is_object());
+        assert!(inspect_payload["data"]["trust"].is_null());
+        assert_eq!(
+            inspect_payload["data"]["rollback_snapshot"],
+            serde_json::json!({
+                "manifest_digest": MANIFEST_V1,
+                "artifact_digest": ARTIFACT_V1
+            })
+        );
+        assert!(inspect_payload["data"]["block"].is_null());
+
         let rollback_response = send_request(
             &rpc_server,
             Method::POST,
@@ -6724,6 +6865,27 @@ mod tests {
             "blocked"
         );
 
+        let blocked_inspect_response = send_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/packages/com.example.review.extension/inspect",
+        )
+        .await;
+        assert_eq!(blocked_inspect_response.status(), StatusCode::OK);
+        let blocked_inspect_payload = to_bytes(blocked_inspect_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(
+            blocked_inspect_payload["data"]["block"]["reason"],
+            "user_blocked"
+        );
+        assert_eq!(
+            blocked_inspect_payload["data"]["extension"]["record"]["status"],
+            "blocked"
+        );
+        assert_eq!(blocked_inspect_payload["data"]["rollback_available"], false);
+
         let list_response = send_json_request(
             &rpc_server,
             Method::POST,
@@ -6919,8 +7081,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
     /// Verifies the validation route rejects non-POST methods with an Allow header.
+    #[tokio::test]
     async fn extension_validate_route_rejects_get_with_allow_post() {
         let rpc_server = ready_rpc_server();
         let response = send_request(&rpc_server, Method::GET, "/v1/packages/validate").await;
@@ -6937,8 +7099,53 @@ mod tests {
         assert_eq!(payload["error"]["code"], "method_not_allowed");
     }
 
+    /// Verifies the inspect route rejects non-POST methods with an Allow header.
     #[tokio::test]
+    async fn extension_inspect_route_rejects_get_with_allow_post() {
+        let rpc_server = ready_rpc_server();
+        let response = send_request(
+            &rpc_server,
+            Method::GET,
+            "/v1/packages/com.example.review.extension/inspect",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get(header::ALLOW),
+            Some(&header::HeaderValue::from_static("POST"))
+        );
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["error"]["code"], "method_not_allowed");
+    }
+
+    /// Verifies the inspect route rejects unexpected request fields.
+    #[tokio::test]
+    async fn extension_inspect_route_rejects_unexpected_payload() {
+        let rpc_server = ready_rpc_server();
+        let response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/packages/com.example.review.extension/inspect",
+            serde_json::json!({
+                "unexpected": true,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["error"]["code"], "invalid_json");
+    }
+
     /// Verifies invalid HTTP validation requests leave installed extension state unchanged.
+    #[tokio::test]
     async fn extension_validate_route_rejects_invalid_manifest_without_state_change() {
         const ARTIFACT_V1: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

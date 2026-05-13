@@ -3138,7 +3138,8 @@ pub struct BlocklistEntry {
 }
 
 impl BlocklistEntry {
-    fn matches_manifest(&self, manifest: &ExtensionManifest) -> bool {
+    /// Returns whether this blocklist entry applies to the provided manifest.
+    pub fn matches_manifest(&self, manifest: &ExtensionManifest) -> bool {
         match &self.key {
             BlockKey::ExtensionId(id) => manifest.id == *id,
             BlockKey::Version { id, version } => manifest.id == *id && manifest.version == *version,
