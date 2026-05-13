@@ -2666,6 +2666,12 @@ pub struct InstallExtensionRequest {
     /// Explicitly approve a source authority change for an install or update.
     #[serde(default)]
     pub approve_source_change: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Actor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2736,6 +2742,9 @@ impl InstallExtensionRequest {
             approve_local_unsigned: false,
             allow_local_process_runtime: false,
             approve_source_change: false,
+            requester: None,
+            request_source: None,
+            reason: None,
         }
     }
 }
@@ -2778,6 +2787,12 @@ pub struct UpdateExtensionRequest {
     /// Explicitly approve a source authority change for this update.
     #[serde(default)]
     pub approve_source_change: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Actor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl From<UpdateExtensionRequest> for InstallOptions {
@@ -2848,6 +2863,12 @@ pub struct ListExtensionsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RollbackExtensionRequest {
     pub extension_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Actor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2859,6 +2880,12 @@ pub struct RollbackExtensionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DisableExtensionRequest {
     pub extension_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Actor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2870,6 +2897,12 @@ pub struct DisableExtensionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnableExtensionRequest {
     pub extension_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Actor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2881,6 +2914,12 @@ pub struct EnableExtensionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoveExtensionRequest {
     pub extension_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Actor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2896,6 +2935,12 @@ pub struct UpdateExtensionPublicationRequest {
     pub extension_id: String,
     /// Publication metadata to persist.
     pub publication: ExtensionPublication,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Actor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Response containing the install record after publication metadata changes.
@@ -2915,6 +2960,12 @@ pub struct UpdateExtensionRegistrySubmissionRequest {
     pub registry_submission: ExtensionRegistrySubmission,
     /// Registry identity to persist when advancing a registry-backed submission.
     pub registry_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Actor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Response containing the install record after registry submission changes.
@@ -2928,6 +2979,12 @@ pub struct UpdateExtensionRegistrySubmissionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApplyBlocklistRequest {
     pub entry: BlocklistEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Actor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -6010,6 +6067,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .unwrap();
         service
@@ -6018,6 +6078,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .unwrap();
 
@@ -6053,6 +6116,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .unwrap();
 
@@ -6066,12 +6132,18 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .unwrap();
 
         let rolled_back = service
             .rollback_extension(RollbackExtensionRequest {
                 extension_id: "com.example.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .unwrap();
         assert_eq!(rolled_back.record.version, "1.0.0");
@@ -6098,6 +6170,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .unwrap();
 
@@ -6108,6 +6183,9 @@ mod tests {
                     reason: BlockReason::ManifestMismatch,
                     note: Some("policy update".to_string()),
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .unwrap();
 
@@ -6117,6 +6195,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .unwrap_err();
         assert!(matches!(
@@ -6499,6 +6580,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .unwrap();
         service
@@ -6507,6 +6591,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .unwrap();
 
@@ -6517,6 +6604,9 @@ mod tests {
                     reason: BlockReason::PolicyViolation,
                     note: None,
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .unwrap();
 
@@ -6549,6 +6639,9 @@ mod tests {
                     reason: BlockReason::PolicyViolation,
                     note: None,
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .unwrap();
 

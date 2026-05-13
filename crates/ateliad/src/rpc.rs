@@ -10,6 +10,7 @@
 use crate::service::{
     BetaStateHint as ServiceBetaStateHint, CheckPolicyRequest as ServiceCheckPolicyRequest,
     DaemonHealth, DaemonStatus, GetProjectStatusRequest as ServiceGetProjectStatusRequest,
+    ListExtensionRegistryAuditRecordsRequest as ServiceListExtensionRegistryAuditRecordsRequest,
     ListRepertoireRequest as ServiceListRepertoireRequest,
     ListRepositoriesRequest as ServiceListRepositoriesRequest,
     ListToolOutputSettingsHistoryRequest as ServiceListToolOutputSettingsHistoryRequest,
@@ -458,6 +459,9 @@ impl SecretaryRpcServer {
                             ExtensionRegistrySubmission::NotSubmitted
                         },
                     },
+                    requester: request.requester.map(Actor::try_from).transpose()?,
+                    request_source: request.request_source,
+                    reason: request.reason,
                 })?;
         let extension = self.service.extension_status(ExtensionStatusRequest {
             extension_id: request.package_id,
@@ -492,6 +496,9 @@ impl SecretaryRpcServer {
                 extension_id: request.package_id.clone(),
                 registry_submission: ExtensionRegistrySubmission::from(request.state),
                 registry_identity: request.registry_identity,
+                requester: request.requester.map(Actor::try_from).transpose()?,
+                request_source: request.request_source,
+                reason: request.reason,
             },
         )?;
         let extension = self.service.extension_status(ExtensionStatusRequest {
@@ -592,10 +599,19 @@ impl SecretaryRpcServer {
 
     pub fn list_extension_registry_audit_records(
         &self,
+        request: ListExtensionRegistryAuditRecordsRequest,
     ) -> RpcResult<ListExtensionRegistryAuditRecordsResponse> {
+        let page = self.service.list_extension_registry_audit_records(
+            ServiceListExtensionRegistryAuditRecordsRequest {
+                limit: request.limit,
+                offset: request.offset,
+                cursor: request.cursor,
+            },
+        )?;
         Ok(ListExtensionRegistryAuditRecordsResponse {
             metadata: self.metadata(),
-            records: self.service.list_extension_registry_audit_records()?,
+            records: page.records,
+            next_page_token: page.next_page_token,
         })
     }
 
@@ -1976,6 +1992,12 @@ pub struct PackagePublicationRequest {
     pub visibility: PackagePublicationVisibility,
     /// Whether registry submission is required for this publication.
     pub requires_registry_submission: bool,
+    /// Actor requesting the publication mutation.
+    pub requester: Option<RpcActorDto>,
+    /// Request boundary or transport source retained for audit.
+    pub request_source: Option<String>,
+    /// Human-readable audit reason.
+    pub reason: Option<String>,
 }
 
 /// Response containing the refreshed package publication flow.
@@ -1998,6 +2020,12 @@ pub struct PackageRegistrySubmissionRequest {
     pub state: PackageRegistrySubmissionState,
     /// Registry identity to persist when submitting to a registry.
     pub registry_identity: Option<String>,
+    /// Actor requesting the registry-submission mutation.
+    pub requester: Option<RpcActorDto>,
+    /// Request boundary or transport source retained for audit.
+    pub request_source: Option<String>,
+    /// Human-readable audit reason.
+    pub reason: Option<String>,
 }
 
 /// Response containing persisted registry submission state and flow.
@@ -2060,6 +2088,14 @@ pub struct ListBlocklistResponse {
 pub struct ListExtensionRegistryAuditRecordsResponse {
     pub metadata: ProtocolMetadata,
     pub records: Vec<ExtensionRegistryAuditRecord>,
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListExtensionRegistryAuditRecordsRequest {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5599,6 +5635,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("install should succeed");
         assert_eq!(install.record.version, "1.0.0");
@@ -5625,6 +5664,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("update should succeed");
         assert_eq!(updated.metadata.protocol_version, "1.0.0");
@@ -5652,6 +5694,9 @@ mod tests {
         let disabled = server
             .disable_extension(DisableExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("disable should succeed");
         assert_eq!(
@@ -5663,6 +5708,9 @@ mod tests {
         let enabled = server
             .enable_extension(EnableExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("enable should succeed");
         assert_eq!(
@@ -5674,6 +5722,9 @@ mod tests {
         let rolled_back = server
             .rollback_extension(RollbackExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("rollback should succeed");
         assert_eq!(rolled_back.record.version, "1.0.0");
@@ -5686,6 +5737,9 @@ mod tests {
                     reason: BlockReason::UserBlocked,
                     note: Some("policy review".to_string()),
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("apply blocklist should succeed");
         assert!(blocklist_applied.audit_record_id.is_some());
@@ -5709,6 +5763,9 @@ mod tests {
         let removed = server
             .remove_extension(RemoveExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("remove should succeed");
         assert_eq!(
@@ -5725,7 +5782,9 @@ mod tests {
         assert_eq!(missing_after_remove.code, RpcErrorCode::NotFound);
 
         let audit = server
-            .list_extension_registry_audit_records()
+            .list_extension_registry_audit_records(
+                ListExtensionRegistryAuditRecordsRequest::default(),
+            )
             .expect("audit history should list package mutations");
         let kinds = audit
             .records
@@ -5779,7 +5838,10 @@ mod tests {
             MANIFEST_V2
         );
         let blocklist_audit = audit.records.get(5).expect("blocklist audit record");
-        assert!(blocklist_audit.package_id.is_none());
+        assert_eq!(
+            blocklist_audit.package_id.as_deref(),
+            Some("com.example.review.extension")
+        );
         assert!(blocklist_audit.blocklist_entry.is_some());
     }
 
@@ -5826,6 +5888,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("install should succeed");
         assert_eq!(install.record.version, "1.0.0");
@@ -5836,6 +5901,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("update should succeed");
         assert_eq!(updated.record.version, "2.0.0");
@@ -5849,6 +5917,9 @@ mod tests {
             .update_extension_publication(UpdateExtensionPublicationRequest {
                 extension_id: "com.example.inspect.package".to_string(),
                 publication: publication.clone(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("publication metadata should apply");
 
@@ -5885,6 +5956,9 @@ mod tests {
                     reason: BlockReason::UserBlocked,
                     note: Some("previous version revoked".to_string()),
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("previous version blocklist should apply");
 
@@ -5904,6 +5978,9 @@ mod tests {
                     reason: BlockReason::UserBlocked,
                     note: Some("temporary policy review".to_string()),
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("apply blocklist should succeed");
         assert_eq!(
@@ -5957,6 +6034,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect_err("client install should not claim accepted registry status");
         assert_eq!(rejected_install.code, RpcErrorCode::InvalidArgument);
@@ -5983,6 +6063,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("baseline install should succeed");
 
@@ -5995,6 +6078,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect_err("client update should not claim accepted registry status");
         assert_eq!(rejected_update.code, RpcErrorCode::InvalidArgument);
@@ -6060,6 +6146,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("active install should succeed");
         server
@@ -6069,6 +6158,9 @@ mod tests {
                     extension_id: "com.example.active".to_string(),
                     registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
                     registry_identity: Some("third-party-registry".to_string()),
+                    requester: None,
+                    request_source: None,
+                    reason: None,
                 },
             )
             .expect("registry authority should accept the active package");
@@ -6078,6 +6170,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("blocked install should succeed");
         server
@@ -6086,6 +6181,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("submitted install should succeed");
         server
@@ -6095,6 +6193,9 @@ mod tests {
                     reason: BlockReason::PolicyViolation,
                     note: Some("blocked for trust index".to_string()),
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("blocklist should apply");
 
@@ -6189,6 +6290,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("initial install should succeed");
 
@@ -6198,6 +6302,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect_err("source change should require explicit approval");
         assert_eq!(denied.code, RpcErrorCode::Conflict);
@@ -6208,6 +6315,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: true,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("approved source change should succeed");
         assert_eq!(approved.record.version, "2.0.0");

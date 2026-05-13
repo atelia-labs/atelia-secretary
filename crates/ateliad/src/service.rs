@@ -8,27 +8,28 @@ use atelia_core::policy::{REASON_REPOSITORY_BLOCKED, SCOPE_KIND_REPOSITORY, SCOP
 use atelia_core::{
     canonicalize_job_requested_capability, canonicalize_within_scope,
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
-    AuditRecordId, BlocklistEntry, CancelJobReceipt, DefaultPolicyEngine, DisableExtensionRequest,
-    DisableExtensionResponse, EchoTool, EnableExtensionRequest, EnableExtensionResponse,
-    EventCursor, EventPage, EventQuery, ExtensionBlocklistMatch, ExtensionBoundary,
-    ExtensionInstallStatus, ExtensionManifest, ExtensionPublication, ExtensionRegistry,
-    ExtensionRegistryAuditKind, ExtensionRegistryAuditProvenance, ExtensionRegistryAuditRecord,
-    ExtensionRegistryAuditRecordRef, ExtensionRegistryService, ExtensionRegistrySnapshot,
-    ExtensionServices, ExtensionSourceSnapshot, ExtensionStatusRequest, ExtensionStatusResponse,
-    FsReadTool, InMemoryStore, InMemoryToolOutputSettingsService, InstallExtensionRequest,
-    InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService, JobPage, JobQuery,
-    JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest, ListBlocklistResponse,
-    ListExtensionsRequest, ListExtensionsResponse, ManifestValidationPolicy, OutputFormat,
-    PathScope, PolicyDecision, PolicyEngine, PolicyInput, PolicyOutcome, RegistryError,
-    RemoveExtensionRequest, RemoveExtensionResponse, RenderedToolOutput, RepositoryId,
-    RepositoryRecord, RepositoryTrustState, ResourceScope, RollbackExtensionRequest,
-    RollbackExtensionResponse, RollbackSnapshot, RuntimeError, RuntimeJobReceipt,
-    RuntimeJobRequest, SecretaryStore, StoreError, SubmitJobIdempotencyRecord, ToolInvocationId,
-    ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
-    ToolOutputSettingsScope, ToolResultId, TruncationMetadata, UpdateExtensionPublicationRequest,
-    UpdateExtensionPublicationResponse, UpdateExtensionRegistrySubmissionRequest,
-    UpdateExtensionRegistrySubmissionResponse, UpdateExtensionRequest, UpdateExtensionResponse,
-    ValidateExtensionManifestRequest, ValidateExtensionManifestResponse, WatchJobEvent,
+    AuditRecordId, BlockKey, BlocklistEntry, CancelJobReceipt, DefaultPolicyEngine,
+    DisableExtensionRequest, DisableExtensionResponse, EchoTool, EnableExtensionRequest,
+    EnableExtensionResponse, EventCursor, EventPage, EventQuery, ExtensionBlocklistMatch,
+    ExtensionBoundary, ExtensionInstallStatus, ExtensionManifest, ExtensionPublication,
+    ExtensionRegistry, ExtensionRegistryAuditKind, ExtensionRegistryAuditProvenance,
+    ExtensionRegistryAuditRecord, ExtensionRegistryAuditRecordRef, ExtensionRegistryService,
+    ExtensionRegistrySnapshot, ExtensionServices, ExtensionSourceSnapshot, ExtensionStatusRequest,
+    ExtensionStatusResponse, FsReadTool, InMemoryStore, InMemoryToolOutputSettingsService,
+    InstallExtensionRequest, InstallExtensionResponse, JobEvent, JobId, JobKind,
+    JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
+    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
+    ManifestValidationPolicy, OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput,
+    PolicyOutcome, RegistryError, RemoveExtensionRequest, RemoveExtensionResponse,
+    RenderedToolOutput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
+    RollbackExtensionRequest, RollbackExtensionResponse, RollbackSnapshot, RuntimeError,
+    RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError, SubmitJobIdempotencyRecord,
+    ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange,
+    ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId, TruncationMetadata,
+    UpdateExtensionPublicationRequest, UpdateExtensionPublicationResponse,
+    UpdateExtensionRegistrySubmissionRequest, UpdateExtensionRegistrySubmissionResponse,
+    UpdateExtensionRequest, UpdateExtensionResponse, ValidateExtensionManifestRequest,
+    ValidateExtensionManifestResponse, WatchJobEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -482,6 +483,19 @@ pub struct ListToolOutputSettingsHistoryPage {
     pub next_page_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ListExtensionRegistryAuditRecordsRequest {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListExtensionRegistryAuditRecordsPage {
+    pub records: Vec<ExtensionRegistryAuditRecord>,
+    pub next_page_token: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExtensionExecutionRequest {
     pub extension_id: String,
@@ -538,10 +552,28 @@ struct ExtensionRegistryAuditContext {
     blocklist_entry: Option<BlocklistEntry>,
 }
 
-fn package_registry_actor() -> Actor {
+fn default_package_registry_actor() -> Actor {
     Actor::System {
         id: "atelia-secretary".to_string(),
     }
+}
+
+fn package_registry_actor(requester: Option<Actor>) -> Actor {
+    requester.unwrap_or_else(default_package_registry_actor)
+}
+
+fn package_registry_request_source(request_source: Option<String>) -> String {
+    request_source
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "secretary.rpc".to_string())
+}
+
+fn package_registry_reason(reason: Option<String>, default_reason: &str) -> String {
+    reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_reason.to_string())
 }
 
 fn active_extension_record_ref(
@@ -1449,14 +1481,17 @@ impl SecretaryService {
         &self,
         request: InstallExtensionRequest,
     ) -> ServiceResult<InstallExtensionResponse> {
+        let actor = package_registry_actor(request.requester.clone());
+        let request_source = package_registry_request_source(request.request_source.clone());
+        let reason = package_registry_reason(request.reason.clone(), "install package");
         self.mutate_extension_registry_with_audit(
             ExtensionRegistryAuditKind::Install,
-            "secretary.rpc",
-            "install package",
+            request_source,
+            reason,
             |registry| registry.install_extension(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
-                actor: package_registry_actor(),
+                actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
             },
@@ -1478,14 +1513,17 @@ impl SecretaryService {
         &self,
         request: UpdateExtensionRequest,
     ) -> ServiceResult<UpdateExtensionResponse> {
+        let actor = package_registry_actor(request.requester.clone());
+        let request_source = package_registry_request_source(request.request_source.clone());
+        let reason = package_registry_reason(request.reason.clone(), "update package");
         self.mutate_extension_registry_with_audit(
             ExtensionRegistryAuditKind::Update,
-            "secretary.rpc",
-            "update package",
+            request_source,
+            reason,
             |registry| registry.update_extension(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
-                actor: package_registry_actor(),
+                actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
             },
@@ -1618,14 +1656,17 @@ impl SecretaryService {
         &self,
         request: RollbackExtensionRequest,
     ) -> ServiceResult<RollbackExtensionResponse> {
+        let actor = package_registry_actor(request.requester.clone());
+        let request_source = package_registry_request_source(request.request_source.clone());
+        let reason = package_registry_reason(request.reason.clone(), "rollback package");
         self.mutate_extension_registry_with_audit(
             ExtensionRegistryAuditKind::Rollback,
-            "secretary.rpc",
-            "rollback package",
+            request_source,
+            reason,
             |registry| registry.rollback_extension(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
-                actor: package_registry_actor(),
+                actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
             },
@@ -1637,14 +1678,17 @@ impl SecretaryService {
         &self,
         request: DisableExtensionRequest,
     ) -> ServiceResult<DisableExtensionResponse> {
+        let actor = package_registry_actor(request.requester.clone());
+        let request_source = package_registry_request_source(request.request_source.clone());
+        let reason = package_registry_reason(request.reason.clone(), "disable package");
         self.mutate_extension_registry_with_audit(
             ExtensionRegistryAuditKind::Disable,
-            "secretary.rpc",
-            "disable package",
+            request_source,
+            reason,
             |registry| registry.disable_extension(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
-                actor: package_registry_actor(),
+                actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
             },
@@ -1656,14 +1700,17 @@ impl SecretaryService {
         &self,
         request: EnableExtensionRequest,
     ) -> ServiceResult<EnableExtensionResponse> {
+        let actor = package_registry_actor(request.requester.clone());
+        let request_source = package_registry_request_source(request.request_source.clone());
+        let reason = package_registry_reason(request.reason.clone(), "enable package");
         self.mutate_extension_registry_with_audit(
             ExtensionRegistryAuditKind::Enable,
-            "secretary.rpc",
-            "enable package",
+            request_source,
+            reason,
             |registry| registry.enable_extension(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
-                actor: package_registry_actor(),
+                actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
             },
@@ -1675,14 +1722,17 @@ impl SecretaryService {
         &self,
         request: RemoveExtensionRequest,
     ) -> ServiceResult<RemoveExtensionResponse> {
+        let actor = package_registry_actor(request.requester.clone());
+        let request_source = package_registry_request_source(request.request_source.clone());
+        let reason = package_registry_reason(request.reason.clone(), "remove package");
         self.mutate_extension_registry_with_audit(
             ExtensionRegistryAuditKind::Remove,
-            "secretary.rpc",
-            "remove package",
+            request_source,
+            reason,
             |registry| registry.remove_extension(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
-                actor: package_registry_actor(),
+                actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
             },
@@ -1695,14 +1745,17 @@ impl SecretaryService {
         &self,
         request: UpdateExtensionPublicationRequest,
     ) -> ServiceResult<UpdateExtensionPublicationResponse> {
+        let actor = package_registry_actor(request.requester.clone());
+        let request_source = package_registry_request_source(request.request_source.clone());
+        let reason = package_registry_reason(request.reason.clone(), "update package publication");
         self.mutate_extension_registry_with_audit(
             ExtensionRegistryAuditKind::PublicationUpdate,
-            "secretary.rpc",
-            "update package publication",
+            request_source,
+            reason,
             |registry| registry.update_extension_publication(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
-                actor: package_registry_actor(),
+                actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
             },
@@ -1715,14 +1768,18 @@ impl SecretaryService {
         &self,
         request: UpdateExtensionRegistrySubmissionRequest,
     ) -> ServiceResult<UpdateExtensionRegistrySubmissionResponse> {
+        let actor = package_registry_actor(request.requester.clone());
+        let request_source = package_registry_request_source(request.request_source.clone());
+        let reason =
+            package_registry_reason(request.reason.clone(), "update package registry submission");
         self.mutate_extension_registry_with_audit(
             ExtensionRegistryAuditKind::RegistrySubmissionUpdate,
-            "secretary.rpc",
-            "update package registry submission",
+            request_source,
+            reason,
             |registry| registry.update_extension_registry_submission(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
-                actor: package_registry_actor(),
+                actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
             },
@@ -1734,14 +1791,20 @@ impl SecretaryService {
         &self,
         request: ApplyBlocklistRequest,
     ) -> ServiceResult<ApplyBlocklistResponse> {
+        let actor = package_registry_actor(request.requester.clone());
+        let request_source = package_registry_request_source(request.request_source.clone());
+        let reason = package_registry_reason(request.reason.clone(), "apply package blocklist");
         self.mutate_extension_registry_with_audit(
             ExtensionRegistryAuditKind::BlocklistApply,
-            "secretary.rpc",
-            "apply package blocklist",
+            request_source,
+            reason,
             |registry| registry.apply_blocklist(request),
             |response| ExtensionRegistryAuditContext {
-                package_id: None,
-                actor: package_registry_actor(),
+                package_id: match &response.entry.key {
+                    BlockKey::ExtensionId(package_id) => Some(package_id.clone()),
+                    _ => None,
+                },
+                actor,
                 policy_decision_id: None,
                 blocklist_entry: Some(response.entry.clone()),
             },
@@ -1760,8 +1823,17 @@ impl SecretaryService {
 
     pub fn list_extension_registry_audit_records(
         &self,
-    ) -> ServiceResult<Vec<ExtensionRegistryAuditRecord>> {
-        Ok(self.lock_extension_registry()?.audit_records())
+        request: ListExtensionRegistryAuditRecordsRequest,
+    ) -> ServiceResult<ListExtensionRegistryAuditRecordsPage> {
+        let requested_limit = request.limit.unwrap_or(MAX_HISTORY_PAGE);
+        let limit = requested_limit.min(MAX_HISTORY_PAGE);
+        let start = list_history_page_start(request.offset, request.cursor)?;
+        let records = self.lock_extension_registry()?.audit_records();
+        let (records, next_page_token) = paginate_records(records, start, limit);
+        Ok(ListExtensionRegistryAuditRecordsPage {
+            records,
+            next_page_token,
+        })
     }
 
     pub fn execute_extension(
@@ -2513,6 +2585,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("first install should succeed");
         assert_eq!(installed_v1.record.version, "1.0.0");
@@ -2523,6 +2598,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("second install should succeed");
         assert_eq!(installed_v2.record.version, "2.0.0");
@@ -2546,6 +2624,9 @@ mod tests {
         let rolled_back = svc
             .rollback_extension(RollbackExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("rollback should succeed");
         assert_eq!(rolled_back.record.version, "1.0.0");
@@ -2553,6 +2634,9 @@ mod tests {
         let disabled = svc
             .disable_extension(DisableExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("disable should succeed");
         assert_eq!(
@@ -2563,6 +2647,9 @@ mod tests {
         let enabled = svc
             .enable_extension(EnableExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("enable should succeed");
         assert_eq!(
@@ -2577,6 +2664,9 @@ mod tests {
                     reason: BlockReason::UserBlocked,
                     note: Some("disabled for review".to_string()),
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("apply blocklist should succeed");
         assert_eq!(block.entry.reason, BlockReason::UserBlocked);
@@ -2595,6 +2685,9 @@ mod tests {
         let blocked_enable = svc
             .enable_extension(EnableExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect_err("enable should fail while extension is blocklisted");
         assert!(matches!(
@@ -2624,6 +2717,9 @@ mod tests {
         let removed = svc
             .remove_extension(RemoveExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("remove should succeed");
         assert_eq!(
@@ -2688,6 +2784,9 @@ mod tests {
             approve_local_unsigned: false,
             allow_local_process_runtime: false,
             approve_source_change: false,
+            requester: None,
+            request_source: None,
+            reason: None,
         })
         .expect("active install should succeed");
         svc.install_extension(InstallExtensionRequest {
@@ -2695,6 +2794,9 @@ mod tests {
             approve_local_unsigned: false,
             allow_local_process_runtime: false,
             approve_source_change: false,
+            requester: None,
+            request_source: None,
+            reason: None,
         })
         .expect("blocked install should succeed");
         svc.apply_blocklist(ApplyBlocklistRequest {
@@ -2703,6 +2805,9 @@ mod tests {
                 reason: BlockReason::PolicyViolation,
                 note: Some("blocked for trust index".to_string()),
             },
+            requester: None,
+            request_source: None,
+            reason: None,
         })
         .expect("blocklist should apply");
 
@@ -2862,6 +2967,9 @@ mod tests {
             approve_local_unsigned: false,
             allow_local_process_runtime: false,
             approve_source_change: false,
+            requester: None,
+            request_source: None,
+            reason: None,
         })
         .expect("discoverable public install should succeed");
         svc.install_extension(InstallExtensionRequest {
@@ -2869,6 +2977,9 @@ mod tests {
             approve_local_unsigned: false,
             allow_local_process_runtime: false,
             approve_source_change: false,
+            requester: None,
+            request_source: None,
+            reason: None,
         })
         .expect("submitted public install should succeed");
         svc.install_extension(InstallExtensionRequest {
@@ -2876,6 +2987,9 @@ mod tests {
             approve_local_unsigned: false,
             allow_local_process_runtime: false,
             approve_source_change: false,
+            requester: None,
+            request_source: None,
+            reason: None,
         })
         .expect("private remix install should succeed");
         svc.install_extension(InstallExtensionRequest {
@@ -2883,6 +2997,9 @@ mod tests {
             approve_local_unsigned: true,
             allow_local_process_runtime: false,
             approve_source_change: false,
+            requester: None,
+            request_source: None,
+            reason: None,
         })
         .expect("local development install should succeed");
         svc.install_extension(InstallExtensionRequest {
@@ -2890,6 +3007,9 @@ mod tests {
             approve_local_unsigned: false,
             allow_local_process_runtime: false,
             approve_source_change: false,
+            requester: None,
+            request_source: None,
+            reason: None,
         })
         .expect("blocked searchable install should succeed");
         svc.apply_blocklist(ApplyBlocklistRequest {
@@ -2898,6 +3018,9 @@ mod tests {
                 reason: BlockReason::PolicyViolation,
                 note: Some("blocked for discovery test".to_string()),
             },
+            requester: None,
+            request_source: None,
+            reason: None,
         })
         .expect("blocklist should apply");
 
@@ -2963,6 +3086,9 @@ mod tests {
             approve_local_unsigned: false,
             allow_local_process_runtime: false,
             approve_source_change: false,
+            requester: None,
+            request_source: None,
+            reason: None,
         })
         .expect("baseline install should succeed");
 
@@ -3099,6 +3225,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .map(|_| "install_extension"),
             svc.validate_extension(ValidateExtensionManifestRequest {
@@ -3118,6 +3247,9 @@ mod tests {
             .map(|_| "list_extensions"),
             svc.rollback_extension(RollbackExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .map(|_| "rollback_extension"),
             svc.apply_blocklist(ApplyBlocklistRequest {
@@ -3126,6 +3258,9 @@ mod tests {
                     reason: BlockReason::UserBlocked,
                     note: Some("poison check".to_string()),
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .map(|_| "apply_blocklist"),
             svc.list_blocklist(ListBlocklistRequest {})
@@ -3373,6 +3508,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("first install should persist");
         service
@@ -3386,12 +3524,18 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("update should persist");
 
         let rolled_back = service
             .rollback_extension(RollbackExtensionRequest {
                 extension_id: "com.example.restart.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("rollback should persist");
         assert_eq!(rolled_back.record.version, "1.0.0");
@@ -3399,6 +3543,9 @@ mod tests {
         let disabled = service
             .disable_extension(DisableExtensionRequest {
                 extension_id: "com.example.restart.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("disable should persist");
         assert_eq!(disabled.record.status, ExtensionInstallStatus::Disabled);
@@ -3406,6 +3553,9 @@ mod tests {
         service
             .enable_extension(EnableExtensionRequest {
                 extension_id: "com.example.restart.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("enable should persist");
 
@@ -3441,6 +3591,9 @@ mod tests {
                 approve_local_unsigned: true,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("local unsigned install should persist");
         assert_eq!(
@@ -3480,6 +3633,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: true,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("local process install should persist");
         assert_eq!(
@@ -3518,12 +3674,18 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("install should succeed");
 
         let removed = service
             .remove_extension(RemoveExtensionRequest {
                 extension_id: "com.example.removed.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("remove should persist");
         assert_eq!(removed.record.status, ExtensionInstallStatus::Disabled);
@@ -3567,6 +3729,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("install should succeed");
 
@@ -3577,6 +3742,9 @@ mod tests {
                     reason: BlockReason::UserBlocked,
                     note: Some("blocked for restart".to_string()),
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("blocklist should persist");
         assert_eq!(
