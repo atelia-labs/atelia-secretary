@@ -2222,6 +2222,14 @@ impl ExtensionRegistry {
                 },
             ));
         }
+        if let Err(reason) = validate_extension_registry_audit_targets(&record, &self.records) {
+            return Err(RegistryError::Validation(
+                ExtensionValidationError::InvalidField {
+                    field: "audit.record",
+                    reason,
+                },
+            ));
+        }
         self.audit_records.push(record);
         Ok(())
     }
@@ -2584,6 +2592,10 @@ fn validate_extension_registry_snapshot(
         return Err("extension blocklist contains unsupported vulnerability_id key".to_string());
     }
 
+    for record in &snapshot.audit_records {
+        validate_extension_registry_audit_targets(record, &snapshot.records)?;
+    }
+
     Ok(())
 }
 
@@ -2606,7 +2618,174 @@ fn validate_extension_registry_audit_record(
     if !seen_ids.insert(record.id.clone()) {
         return Err(format!("duplicate audit id {}", record.id.as_str()));
     }
+    if let Some(package_id) = &record.package_id {
+        validate_audit_reverse_dns_id("audit.package_id", package_id)?;
+    }
+    if let Some(previous_record) = &record.previous_record {
+        validate_extension_registry_audit_record_ref("audit.previous_record", previous_record)?;
+    }
+    if let Some(new_record) = &record.new_record {
+        validate_extension_registry_audit_record_ref("audit.new_record", new_record)?;
+    }
+    if let Some(provenance) = &record.provenance {
+        validate_extension_registry_audit_provenance(provenance)?;
+    }
     Ok(())
+}
+
+fn validate_extension_registry_audit_record_ref(
+    field: &'static str,
+    record_ref: &ExtensionRegistryAuditRecordRef,
+) -> Result<(), String> {
+    validate_audit_reverse_dns_id(field, &record_ref.package_id)?;
+    validate_audit_semver(field, &record_ref.version)?;
+    validate_audit_digest(field, &record_ref.manifest_digest)?;
+    validate_audit_digest(field, &record_ref.artifact_digest)?;
+    Ok(())
+}
+
+fn validate_extension_registry_audit_provenance(
+    provenance: &ExtensionRegistryAuditProvenance,
+) -> Result<(), String> {
+    validate_audit_optional_trimmed("audit.provenance.repository", &provenance.repository)?;
+    validate_audit_optional_trimmed("audit.provenance.ref", &provenance.source_ref)?;
+    validate_audit_optional_trimmed("audit.provenance.manifest_path", &provenance.manifest_path)?;
+    validate_audit_optional_trimmed("audit.provenance.commit", &provenance.commit)?;
+    validate_audit_optional_trimmed(
+        "audit.provenance.registry_identity",
+        &provenance.registry_identity,
+    )?;
+
+    match provenance.source {
+        ProvenanceSource::Github => {
+            require_audit_optional_value("audit.provenance.repository", &provenance.repository)?;
+            require_audit_optional_value("audit.provenance.ref", &provenance.source_ref)?;
+            require_audit_optional_value(
+                "audit.provenance.manifest_path",
+                &provenance.manifest_path,
+            )?;
+            require_audit_optional_value("audit.provenance.commit", &provenance.commit)?;
+        }
+        ProvenanceSource::Registry => {
+            require_audit_optional_value(
+                "audit.provenance.registry_identity",
+                &provenance.registry_identity,
+            )?;
+        }
+        ProvenanceSource::Local => {}
+    }
+
+    Ok(())
+}
+
+fn validate_extension_registry_audit_targets(
+    audit_record: &ExtensionRegistryAuditRecord,
+    records: &BTreeMap<String, BTreeMap<String, ExtensionInstallRecord>>,
+) -> Result<(), String> {
+    if let Some(package_id) = &audit_record.package_id {
+        if let Some(previous_record) = &audit_record.previous_record {
+            validate_audit_record_package_match(
+                "audit.previous_record.package_id",
+                package_id,
+                previous_record,
+            )?;
+        }
+        if let Some(new_record) = &audit_record.new_record {
+            validate_audit_record_package_match(
+                "audit.new_record.package_id",
+                package_id,
+                new_record,
+            )?;
+        }
+    }
+    if let Some(previous_record) = &audit_record.previous_record {
+        validate_audit_record_target("audit.previous_record", previous_record, records)?;
+    }
+    if let Some(new_record) = &audit_record.new_record {
+        validate_audit_record_target("audit.new_record", new_record, records)?;
+    }
+    Ok(())
+}
+
+fn validate_audit_record_package_match(
+    field: &'static str,
+    package_id: &str,
+    record_ref: &ExtensionRegistryAuditRecordRef,
+) -> Result<(), String> {
+    if record_ref.package_id != package_id {
+        return Err(format!(
+            "{field} {} does not match audit.package_id {package_id}",
+            record_ref.package_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_audit_record_target(
+    field: &'static str,
+    record_ref: &ExtensionRegistryAuditRecordRef,
+    records: &BTreeMap<String, BTreeMap<String, ExtensionInstallRecord>>,
+) -> Result<(), String> {
+    let Some(record_versions) = records.get(&record_ref.package_id) else {
+        return Err(format!(
+            "{field} references unknown package {}",
+            record_ref.package_id
+        ));
+    };
+    let Some(record) = record_versions.get(&record_ref.version) else {
+        return Err(format!(
+            "{field} references unknown version {} for package {}",
+            record_ref.version, record_ref.package_id
+        ));
+    };
+    if record.manifest_digest != record_ref.manifest_digest {
+        return Err(format!(
+            "{field} manifest digest does not match persisted record {}:{}",
+            record_ref.package_id, record_ref.version
+        ));
+    }
+    if record.artifact_digest != record_ref.artifact_digest {
+        return Err(format!(
+            "{field} artifact digest does not match persisted record {}:{}",
+            record_ref.package_id, record_ref.version
+        ));
+    }
+    Ok(())
+}
+
+fn validate_audit_reverse_dns_id(field: &'static str, value: &str) -> Result<(), String> {
+    require_reverse_dns_id(field, value).map_err(|err| err.to_string())
+}
+
+fn validate_audit_semver(field: &'static str, value: &str) -> Result<(), String> {
+    require_semver(field, value).map_err(|err| err.to_string())
+}
+
+fn validate_audit_digest(field: &'static str, value: &str) -> Result<(), String> {
+    require_digest(field, value).map_err(|err| err.to_string())
+}
+
+fn validate_audit_optional_trimmed(
+    field: &'static str,
+    value: &Option<String>,
+) -> Result<(), String> {
+    if let Some(value) = value {
+        if value.trim().is_empty() {
+            return Err(format!("{field} must not be empty"));
+        }
+        if value.trim() != value {
+            return Err(format!("{field} must not contain surrounding whitespace"));
+        }
+    }
+    Ok(())
+}
+
+fn require_audit_optional_value(field: &'static str, value: &Option<String>) -> Result<(), String> {
+    if value.is_some() {
+        Ok(())
+    } else {
+        Err(format!("{field} must not be empty"))
+    }
 }
 
 fn detect_rollback_cycle(
@@ -5361,6 +5540,50 @@ mod tests {
     }
 
     #[test]
+    fn extension_snapshot_rejects_invalid_audit_record_ref() {
+        let extension = manifest("com.example.extension");
+        let install_record = extension_record(&extension, None);
+        let mut snapshot = extension_snapshot(
+            BTreeMap::from([(extension.version.clone(), extension.clone())]),
+            BTreeMap::from([(extension.version.clone(), install_record.clone())]),
+        );
+        let mut record = audit_record();
+        record.new_record = Some(ExtensionRegistryAuditRecordRef {
+            package_id: String::new(),
+            version: install_record.version,
+            manifest_digest: install_record.manifest_digest,
+            artifact_digest: install_record.artifact_digest,
+            status: install_record.status,
+        });
+        snapshot.audit_records.push(record);
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("audit.new_record"));
+    }
+
+    #[test]
+    fn extension_snapshot_rejects_audit_record_ref_digest_mismatch() {
+        let extension = manifest("com.example.extension");
+        let install_record = extension_record(&extension, None);
+        let mut snapshot = extension_snapshot(
+            BTreeMap::from([(extension.version.clone(), extension.clone())]),
+            BTreeMap::from([(extension.version.clone(), install_record.clone())]),
+        );
+        let mut record = audit_record();
+        record.new_record = Some(ExtensionRegistryAuditRecordRef {
+            package_id: install_record.id,
+            version: install_record.version,
+            manifest_digest: OTHER_MANIFEST_DIGEST.to_string(),
+            artifact_digest: install_record.artifact_digest,
+            status: install_record.status,
+        });
+        snapshot.audit_records.push(record);
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("audit.new_record manifest digest does not match"));
+    }
+
+    #[test]
     fn append_audit_record_rejects_invalid_audit_contract() {
         let mut registry = ExtensionRegistry::in_memory();
         let mut record = audit_record();
@@ -5375,6 +5598,25 @@ mod tests {
             })
         ));
         assert!(err.to_string().contains("unsupported audit schema_version"));
+    }
+
+    #[test]
+    fn append_audit_record_rejects_missing_record_ref_target() {
+        let mut registry = ExtensionRegistry::in_memory();
+        let extension = manifest("com.example.extension");
+        let install_record = extension_record(&extension, None);
+        let mut record = audit_record();
+        record.new_record = Some(ExtensionRegistryAuditRecordRef::from(&install_record));
+
+        let err = registry.append_audit_record(record).unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::Validation(ExtensionValidationError::InvalidField {
+                field: "audit.record",
+                ..
+            })
+        ));
+        assert!(err.to_string().contains("references unknown package"));
     }
 
     #[test]
