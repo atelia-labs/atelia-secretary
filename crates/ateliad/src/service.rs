@@ -547,6 +547,7 @@ pub struct LiveEventSubscription {
 
 struct ExtensionRegistryAuditContext {
     package_id: Option<String>,
+    record_version: Option<String>,
     actor: Actor,
     policy_decision_id: Option<atelia_core::PolicyDecisionId>,
     blocklist_entry: Option<BlocklistEntry>,
@@ -601,6 +602,18 @@ fn active_extension_record_ref(
         .map(ExtensionRegistryAuditRecordRef::from)
 }
 
+fn extension_record_ref(
+    snapshot: &ExtensionRegistrySnapshot,
+    package_id: &str,
+    version: &str,
+) -> Option<ExtensionRegistryAuditRecordRef> {
+    snapshot
+        .records
+        .get(package_id)?
+        .get(version)
+        .map(ExtensionRegistryAuditRecordRef::from)
+}
+
 fn active_extension_provenance(
     snapshot: &ExtensionRegistrySnapshot,
     package_id: &str,
@@ -613,6 +626,18 @@ fn active_extension_provenance(
         .map(|record| ExtensionRegistryAuditProvenance::from(&record.source))
 }
 
+fn extension_provenance(
+    snapshot: &ExtensionRegistrySnapshot,
+    package_id: &str,
+    version: &str,
+) -> Option<ExtensionRegistryAuditProvenance> {
+    snapshot
+        .records
+        .get(package_id)?
+        .get(version)
+        .map(|record| ExtensionRegistryAuditProvenance::from(&record.source))
+}
+
 fn extension_registry_audit_record(
     kind: ExtensionRegistryAuditKind,
     request_source: String,
@@ -622,20 +647,30 @@ fn extension_registry_audit_record(
     after: &ExtensionRegistrySnapshot,
 ) -> ExtensionRegistryAuditRecord {
     let package_id = context.package_id.clone();
-    let previous_record = package_id
-        .as_deref()
-        .and_then(|package_id| active_extension_record_ref(before, package_id));
-    let new_record = package_id
-        .as_deref()
-        .and_then(|package_id| active_extension_record_ref(after, package_id));
-    let provenance = package_id
-        .as_deref()
-        .and_then(|package_id| active_extension_provenance(after, package_id))
-        .or_else(|| {
-            package_id
-                .as_deref()
-                .and_then(|package_id| active_extension_provenance(before, package_id))
-        });
+    let record_version = context.record_version.as_deref();
+    let previous_record = package_id.as_deref().and_then(|package_id| {
+        if let Some(version) = record_version {
+            extension_record_ref(before, package_id, version)
+        } else {
+            active_extension_record_ref(before, package_id)
+        }
+    });
+    let new_record = package_id.as_deref().and_then(|package_id| {
+        if let Some(version) = record_version {
+            extension_record_ref(after, package_id, version)
+        } else {
+            active_extension_record_ref(after, package_id)
+        }
+    });
+    let provenance = package_id.as_deref().and_then(|package_id| {
+        if let Some(version) = record_version {
+            extension_provenance(after, package_id, version)
+                .or_else(|| extension_provenance(before, package_id, version))
+        } else {
+            active_extension_provenance(after, package_id)
+                .or_else(|| active_extension_provenance(before, package_id))
+        }
+    });
 
     ExtensionRegistryAuditRecord {
         id: AuditRecordId::new(),
@@ -1504,6 +1539,7 @@ impl SecretaryService {
             |registry| registry.install_extension(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
+                record_version: None,
                 actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
@@ -1536,6 +1572,7 @@ impl SecretaryService {
             |registry| registry.update_extension(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
+                record_version: None,
                 actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
@@ -1679,6 +1716,7 @@ impl SecretaryService {
             |registry| registry.rollback_extension(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
+                record_version: None,
                 actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
@@ -1701,6 +1739,7 @@ impl SecretaryService {
             |registry| registry.disable_extension(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
+                record_version: None,
                 actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
@@ -1723,6 +1762,7 @@ impl SecretaryService {
             |registry| registry.enable_extension(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
+                record_version: None,
                 actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
@@ -1745,6 +1785,7 @@ impl SecretaryService {
             |registry| registry.remove_extension(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
+                record_version: None,
                 actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
@@ -1768,6 +1809,7 @@ impl SecretaryService {
             |registry| registry.update_extension_publication(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
+                record_version: None,
                 actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
@@ -1792,6 +1834,7 @@ impl SecretaryService {
             |registry| registry.update_extension_registry_submission(request),
             |response| ExtensionRegistryAuditContext {
                 package_id: Some(response.record.id.clone()),
+                record_version: None,
                 actor,
                 policy_decision_id: None,
                 blocklist_entry: None,
@@ -1816,6 +1859,10 @@ impl SecretaryService {
                 package_id: match &response.entry.key {
                     BlockKey::ExtensionId(package_id) => Some(package_id.clone()),
                     BlockKey::Version { id, .. } => Some(id.clone()),
+                    _ => None,
+                },
+                record_version: match &response.entry.key {
+                    BlockKey::Version { version, .. } => Some(version.clone()),
                     _ => None,
                 },
                 actor,
@@ -2820,6 +2867,97 @@ mod tests {
         assert_eq!(
             audit_record.reason.chars().count(),
             PACKAGE_REGISTRY_REASON_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn version_blocklist_audits_target_blocked_version() {
+        const ARTIFACT_V1: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const MANIFEST_V1: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const ARTIFACT_V2: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const MANIFEST_V2: &str =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        let svc = ready_service();
+        svc.install_extension(InstallExtensionRequest {
+            manifest: extension_manifest(
+                "com.example.version-blocked",
+                "1.0.0",
+                ARTIFACT_V1,
+                MANIFEST_V1,
+            ),
+            approve_local_unsigned: false,
+            allow_local_process_runtime: false,
+            approve_source_change: false,
+            requester: None,
+            request_source: None,
+            reason: None,
+        })
+        .expect("first install should succeed");
+        svc.install_extension(InstallExtensionRequest {
+            manifest: extension_manifest(
+                "com.example.version-blocked",
+                "2.0.0",
+                ARTIFACT_V2,
+                MANIFEST_V2,
+            ),
+            approve_local_unsigned: false,
+            allow_local_process_runtime: false,
+            approve_source_change: false,
+            requester: None,
+            request_source: None,
+            reason: None,
+        })
+        .expect("second install should succeed");
+
+        let block = svc
+            .apply_blocklist(ApplyBlocklistRequest {
+                entry: atelia_core::BlocklistEntry {
+                    key: BlockKey::Version {
+                        id: "com.example.version-blocked".to_string(),
+                        version: "1.0.0".to_string(),
+                    },
+                    reason: BlockReason::PolicyViolation,
+                    note: None,
+                },
+                requester: None,
+                request_source: None,
+                reason: None,
+            })
+            .expect("version blocklist should audit the targeted version");
+        let audit_record_id = block
+            .audit_record_id
+            .expect("blocklist should return audit record id");
+
+        let audit_page = svc
+            .list_extension_registry_audit_records(ListExtensionRegistryAuditRecordsRequest {
+                limit: Some(10),
+                offset: None,
+                cursor: None,
+            })
+            .expect("audit records should be listed");
+        let audit_record = audit_page
+            .records
+            .into_iter()
+            .find(|record| record.id == audit_record_id)
+            .expect("blocklist audit record should be persisted");
+
+        assert_eq!(
+            audit_record
+                .previous_record
+                .as_ref()
+                .map(|record| record.version.as_str()),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            audit_record
+                .new_record
+                .as_ref()
+                .map(|record| record.version.as_str()),
+            Some("1.0.0")
         );
     }
 
