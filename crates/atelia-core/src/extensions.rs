@@ -2230,6 +2230,19 @@ impl ExtensionRegistry {
         self.audit_records.clone()
     }
 
+    pub fn audit_records_window(
+        &self,
+        start: usize,
+        limit: usize,
+    ) -> Vec<ExtensionRegistryAuditRecord> {
+        self.audit_records
+            .iter()
+            .skip(start)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
     pub fn authorize_service_call(
         &self,
         request: ServiceCallRequest,
@@ -3038,6 +3051,14 @@ impl ExtensionRegistryService {
 
     pub fn audit_records(&self) -> Vec<ExtensionRegistryAuditRecord> {
         self.registry.audit_records.clone()
+    }
+
+    pub fn audit_records_window(
+        &self,
+        start: usize,
+        limit: usize,
+    ) -> Vec<ExtensionRegistryAuditRecord> {
+        self.registry.audit_records_window(start, limit)
     }
 
     pub fn append_audit_record(

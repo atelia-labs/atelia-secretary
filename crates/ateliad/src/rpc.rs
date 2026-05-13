@@ -5837,7 +5837,7 @@ mod tests {
                 .manifest_digest,
             MANIFEST_V1
         );
-        assert_eq!(install_audit.request_source, "secretary.rpc");
+        assert_eq!(install_audit.request_source, "service");
         assert_eq!(install_audit.reason, "install package");
         assert!(install_audit.provenance.is_some());
         let update_audit = audit.records.get(1).expect("update audit record");

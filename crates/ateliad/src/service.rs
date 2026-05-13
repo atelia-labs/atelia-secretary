@@ -566,7 +566,7 @@ fn package_registry_request_source(request_source: Option<String>) -> String {
     request_source
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "secretary.rpc".to_string())
+        .unwrap_or_else(|| "service".to_string())
 }
 
 fn package_registry_reason(reason: Option<String>, default_reason: &str) -> String {
@@ -1832,8 +1832,24 @@ impl SecretaryService {
             request.cursor,
             "extension registry audit history",
         )?;
-        let records = self.lock_extension_registry()?.audit_records();
-        let (records, next_page_token) = paginate_records(records, start, limit);
+        if limit == 0 {
+            return Ok(ListExtensionRegistryAuditRecordsPage {
+                records: Vec::new(),
+                next_page_token: None,
+            });
+        }
+        let mut records = self
+            .lock_extension_registry()?
+            .audit_records_window(start, limit.saturating_add(1));
+        let has_next = records.len() > limit;
+        if has_next {
+            records.truncate(limit);
+        }
+        let next_page_token = if has_next {
+            Some((start + records.len()).to_string())
+        } else {
+            None
+        };
         Ok(ListExtensionRegistryAuditRecordsPage {
             records,
             next_page_token,
