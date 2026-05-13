@@ -8,12 +8,14 @@ use atelia_core::policy::{REASON_REPOSITORY_BLOCKED, SCOPE_KIND_REPOSITORY, SCOP
 use atelia_core::{
     canonicalize_job_requested_capability, canonicalize_within_scope,
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
-    CancelJobReceipt, DefaultPolicyEngine, DisableExtensionRequest, DisableExtensionResponse,
-    EchoTool, EnableExtensionRequest, EnableExtensionResponse, EventCursor, EventPage, EventQuery,
-    ExtensionBlocklistMatch, ExtensionBoundary, ExtensionInstallStatus, ExtensionManifest,
-    ExtensionPublication, ExtensionRegistry, ExtensionRegistryService, ExtensionServices,
-    ExtensionSourceSnapshot, ExtensionStatusRequest, ExtensionStatusResponse, FsReadTool,
-    InMemoryStore, InMemoryToolOutputSettingsService, InstallExtensionRequest,
+    AuditRecordId, BlocklistEntry, CancelJobReceipt, DefaultPolicyEngine, DisableExtensionRequest,
+    DisableExtensionResponse, EchoTool, EnableExtensionRequest, EnableExtensionResponse,
+    EventCursor, EventPage, EventQuery, ExtensionBlocklistMatch, ExtensionBoundary,
+    ExtensionInstallStatus, ExtensionManifest, ExtensionPublication, ExtensionRegistry,
+    ExtensionRegistryAuditKind, ExtensionRegistryAuditProvenance, ExtensionRegistryAuditRecord,
+    ExtensionRegistryAuditRecordRef, ExtensionRegistryService, ExtensionRegistrySnapshot,
+    ExtensionServices, ExtensionSourceSnapshot, ExtensionStatusRequest, ExtensionStatusResponse,
+    FsReadTool, InMemoryStore, InMemoryToolOutputSettingsService, InstallExtensionRequest,
     InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService, JobPage, JobQuery,
     JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest, ListBlocklistResponse,
     ListExtensionsRequest, ListExtensionsResponse, ManifestValidationPolicy, OutputFormat,
@@ -529,6 +531,84 @@ pub struct LiveEventSubscription {
     pub resolved_cursor_sequence: Option<u64>,
 }
 
+struct ExtensionRegistryAuditContext {
+    package_id: Option<String>,
+    actor: Actor,
+    policy_decision_id: Option<atelia_core::PolicyDecisionId>,
+    blocklist_entry: Option<BlocklistEntry>,
+}
+
+fn package_registry_actor() -> Actor {
+    Actor::System {
+        id: "atelia-secretary".to_string(),
+    }
+}
+
+fn active_extension_record_ref(
+    snapshot: &ExtensionRegistrySnapshot,
+    package_id: &str,
+) -> Option<ExtensionRegistryAuditRecordRef> {
+    let active_version = snapshot.active_versions.get(package_id)?;
+    snapshot
+        .records
+        .get(package_id)?
+        .get(active_version)
+        .map(ExtensionRegistryAuditRecordRef::from)
+}
+
+fn active_extension_provenance(
+    snapshot: &ExtensionRegistrySnapshot,
+    package_id: &str,
+) -> Option<ExtensionRegistryAuditProvenance> {
+    let active_version = snapshot.active_versions.get(package_id)?;
+    snapshot
+        .records
+        .get(package_id)?
+        .get(active_version)
+        .map(|record| ExtensionRegistryAuditProvenance::from(&record.source))
+}
+
+fn extension_registry_audit_record(
+    kind: ExtensionRegistryAuditKind,
+    request_source: String,
+    reason: String,
+    context: ExtensionRegistryAuditContext,
+    before: &ExtensionRegistrySnapshot,
+    after: &ExtensionRegistrySnapshot,
+) -> ExtensionRegistryAuditRecord {
+    let package_id = context.package_id.clone();
+    let previous_record = package_id
+        .as_deref()
+        .and_then(|package_id| active_extension_record_ref(before, package_id));
+    let new_record = package_id
+        .as_deref()
+        .and_then(|package_id| active_extension_record_ref(after, package_id));
+    let provenance = package_id
+        .as_deref()
+        .and_then(|package_id| active_extension_provenance(after, package_id))
+        .or_else(|| {
+            package_id
+                .as_deref()
+                .and_then(|package_id| active_extension_provenance(before, package_id))
+        });
+
+    ExtensionRegistryAuditRecord {
+        id: AuditRecordId::new(),
+        schema_version: atelia_core::EXTENSION_REGISTRY_AUDIT_SCHEMA_VERSION,
+        created_at: LedgerTimestamp::now(),
+        kind,
+        actor: context.actor,
+        request_source,
+        reason,
+        policy_decision_id: context.policy_decision_id,
+        package_id,
+        previous_record,
+        new_record,
+        provenance,
+        blocklist_entry: context.blocklist_entry,
+    }
+}
+
 impl SecretaryService {
     /// Create a new service backed by an in-memory store and default policy.
     pub fn new() -> Self {
@@ -584,14 +664,20 @@ impl SecretaryService {
         Ok(())
     }
 
-    fn mutate_extension_registry<R>(
+    fn mutate_extension_registry_with_audit<R>(
         &self,
+        kind: ExtensionRegistryAuditKind,
+        request_source: impl Into<String>,
+        reason: impl Into<String>,
         mutator: impl FnOnce(&mut ExtensionRegistryService) -> Result<R, RegistryError>,
+        audit_context: impl FnOnce(&R) -> ExtensionRegistryAuditContext,
+        attach_audit_record_id: impl FnOnce(&mut R, AuditRecordId),
     ) -> ServiceResult<R> {
         let mut registry = self.lock_extension_registry()?;
+        let before = registry.snapshot();
         let validation_policy = registry.validation_policy();
         let mut draft = ExtensionRegistryService::with_registry(
-            ExtensionRegistry::from_snapshot(registry.snapshot(), validation_policy).map_err(
+            ExtensionRegistry::from_snapshot(before.clone(), validation_policy).map_err(
                 |reason| {
                     ServiceError::Store(atelia_core::StoreError::InvalidRecord {
                         collection: "extension_registry",
@@ -600,8 +686,23 @@ impl SecretaryService {
                 },
             )?,
         );
-        let response = mutator(&mut draft).map_err(ServiceError::from)?;
+        let mut response = mutator(&mut draft).map_err(ServiceError::from)?;
+        let context = audit_context(&response);
+        let after = draft.snapshot();
+        let audit_record = extension_registry_audit_record(
+            kind,
+            request_source.into(),
+            reason.into(),
+            context,
+            &before,
+            &after,
+        );
+        let audit_record_id = audit_record.id.clone();
+        draft
+            .append_audit_record(audit_record)
+            .map_err(ServiceError::from)?;
         self.persist_extension_registry_snapshot(&draft)?;
+        attach_audit_record_id(&mut response, audit_record_id);
         *registry = draft;
         Ok(response)
     }
@@ -1348,7 +1449,19 @@ impl SecretaryService {
         &self,
         request: InstallExtensionRequest,
     ) -> ServiceResult<InstallExtensionResponse> {
-        self.mutate_extension_registry(|registry| registry.install_extension(request))
+        self.mutate_extension_registry_with_audit(
+            ExtensionRegistryAuditKind::Install,
+            "secretary.rpc",
+            "install package",
+            |registry| registry.install_extension(request),
+            |response| ExtensionRegistryAuditContext {
+                package_id: Some(response.record.id.clone()),
+                actor: package_registry_actor(),
+                policy_decision_id: None,
+                blocklist_entry: None,
+            },
+            |response, audit_record_id| response.audit_record_id = Some(audit_record_id),
+        )
     }
 
     /// Validate an extension manifest through the registry without installation side effects.
@@ -1365,7 +1478,19 @@ impl SecretaryService {
         &self,
         request: UpdateExtensionRequest,
     ) -> ServiceResult<UpdateExtensionResponse> {
-        self.mutate_extension_registry(|registry| registry.update_extension(request))
+        self.mutate_extension_registry_with_audit(
+            ExtensionRegistryAuditKind::Update,
+            "secretary.rpc",
+            "update package",
+            |registry| registry.update_extension(request),
+            |response| ExtensionRegistryAuditContext {
+                package_id: Some(response.record.id.clone()),
+                actor: package_registry_actor(),
+                policy_decision_id: None,
+                blocklist_entry: None,
+            },
+            |response, audit_record_id| response.audit_record_id = Some(audit_record_id),
+        )
     }
 
     pub fn extension_status(
@@ -1493,28 +1618,76 @@ impl SecretaryService {
         &self,
         request: RollbackExtensionRequest,
     ) -> ServiceResult<RollbackExtensionResponse> {
-        self.mutate_extension_registry(|registry| registry.rollback_extension(request))
+        self.mutate_extension_registry_with_audit(
+            ExtensionRegistryAuditKind::Rollback,
+            "secretary.rpc",
+            "rollback package",
+            |registry| registry.rollback_extension(request),
+            |response| ExtensionRegistryAuditContext {
+                package_id: Some(response.record.id.clone()),
+                actor: package_registry_actor(),
+                policy_decision_id: None,
+                blocklist_entry: None,
+            },
+            |response, audit_record_id| response.audit_record_id = Some(audit_record_id),
+        )
     }
 
     pub fn disable_extension(
         &self,
         request: DisableExtensionRequest,
     ) -> ServiceResult<DisableExtensionResponse> {
-        self.mutate_extension_registry(|registry| registry.disable_extension(request))
+        self.mutate_extension_registry_with_audit(
+            ExtensionRegistryAuditKind::Disable,
+            "secretary.rpc",
+            "disable package",
+            |registry| registry.disable_extension(request),
+            |response| ExtensionRegistryAuditContext {
+                package_id: Some(response.record.id.clone()),
+                actor: package_registry_actor(),
+                policy_decision_id: None,
+                blocklist_entry: None,
+            },
+            |response, audit_record_id| response.audit_record_id = Some(audit_record_id),
+        )
     }
 
     pub fn enable_extension(
         &self,
         request: EnableExtensionRequest,
     ) -> ServiceResult<EnableExtensionResponse> {
-        self.mutate_extension_registry(|registry| registry.enable_extension(request))
+        self.mutate_extension_registry_with_audit(
+            ExtensionRegistryAuditKind::Enable,
+            "secretary.rpc",
+            "enable package",
+            |registry| registry.enable_extension(request),
+            |response| ExtensionRegistryAuditContext {
+                package_id: Some(response.record.id.clone()),
+                actor: package_registry_actor(),
+                policy_decision_id: None,
+                blocklist_entry: None,
+            },
+            |response, audit_record_id| response.audit_record_id = Some(audit_record_id),
+        )
     }
 
     pub fn remove_extension(
         &self,
         request: RemoveExtensionRequest,
     ) -> ServiceResult<RemoveExtensionResponse> {
-        self.mutate_extension_registry(|registry| registry.remove_extension(request))
+        self.mutate_extension_registry_with_audit(
+            ExtensionRegistryAuditKind::Remove,
+            "secretary.rpc",
+            "remove package",
+            |registry| registry.remove_extension(request),
+            |response| ExtensionRegistryAuditContext {
+                package_id: Some(response.record.id.clone()),
+                actor: package_registry_actor(),
+                policy_decision_id: None,
+                blocklist_entry: None,
+            },
+            |response, audit_record_id| response.audit_record_id = Some(audit_record_id),
+        )
     }
 
     /// Persist package publication metadata through the Secretary service boundary.
@@ -1522,7 +1695,19 @@ impl SecretaryService {
         &self,
         request: UpdateExtensionPublicationRequest,
     ) -> ServiceResult<UpdateExtensionPublicationResponse> {
-        self.mutate_extension_registry(|registry| registry.update_extension_publication(request))
+        self.mutate_extension_registry_with_audit(
+            ExtensionRegistryAuditKind::PublicationUpdate,
+            "secretary.rpc",
+            "update package publication",
+            |registry| registry.update_extension_publication(request),
+            |response| ExtensionRegistryAuditContext {
+                package_id: Some(response.record.id.clone()),
+                actor: package_registry_actor(),
+                policy_decision_id: None,
+                blocklist_entry: None,
+            },
+            |response, audit_record_id| response.audit_record_id = Some(audit_record_id),
+        )
     }
 
     /// Persist package registry submission state through the Secretary service boundary.
@@ -1530,16 +1715,38 @@ impl SecretaryService {
         &self,
         request: UpdateExtensionRegistrySubmissionRequest,
     ) -> ServiceResult<UpdateExtensionRegistrySubmissionResponse> {
-        self.mutate_extension_registry(|registry| {
-            registry.update_extension_registry_submission(request)
-        })
+        self.mutate_extension_registry_with_audit(
+            ExtensionRegistryAuditKind::RegistrySubmissionUpdate,
+            "secretary.rpc",
+            "update package registry submission",
+            |registry| registry.update_extension_registry_submission(request),
+            |response| ExtensionRegistryAuditContext {
+                package_id: Some(response.record.id.clone()),
+                actor: package_registry_actor(),
+                policy_decision_id: None,
+                blocklist_entry: None,
+            },
+            |response, audit_record_id| response.audit_record_id = Some(audit_record_id),
+        )
     }
 
     pub fn apply_blocklist(
         &self,
         request: ApplyBlocklistRequest,
     ) -> ServiceResult<ApplyBlocklistResponse> {
-        self.mutate_extension_registry(|registry| registry.apply_blocklist(request))
+        self.mutate_extension_registry_with_audit(
+            ExtensionRegistryAuditKind::BlocklistApply,
+            "secretary.rpc",
+            "apply package blocklist",
+            |registry| registry.apply_blocklist(request),
+            |response| ExtensionRegistryAuditContext {
+                package_id: None,
+                actor: package_registry_actor(),
+                policy_decision_id: None,
+                blocklist_entry: Some(response.entry.clone()),
+            },
+            |response, audit_record_id| response.audit_record_id = Some(audit_record_id),
+        )
     }
 
     pub fn list_blocklist(
@@ -1549,6 +1756,12 @@ impl SecretaryService {
         self.lock_extension_registry()?
             .list_blocklist(request)
             .map_err(ServiceError::from)
+    }
+
+    pub fn list_extension_registry_audit_records(
+        &self,
+    ) -> ServiceResult<Vec<ExtensionRegistryAuditRecord>> {
+        Ok(self.lock_extension_registry()?.audit_records())
     }
 
     pub fn execute_extension(

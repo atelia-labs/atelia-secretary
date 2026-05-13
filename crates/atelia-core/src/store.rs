@@ -4953,6 +4953,7 @@ mod tests {
             records,
             active_versions: BTreeMap::new(),
             blocklist: Vec::new(),
+            audit_records: Vec::new(),
         }
     }
 

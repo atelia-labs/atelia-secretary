@@ -6,6 +6,7 @@
 //! service provide / consume declarations. It intentionally does not execute
 //! extension code yet.
 
+use crate::{Actor, AuditRecordId, LedgerTimestamp, PolicyDecisionId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -15,6 +16,7 @@ use std::str::FromStr;
 
 pub const EXTENSION_MANIFEST_SCHEMA: &str = "atelia.extension.v1";
 pub const EXTENSION_RPC_PROTOCOL: &str = "atelia-extension-rpc.v1";
+pub const EXTENSION_REGISTRY_AUDIT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtensionManifest {
@@ -1594,7 +1596,97 @@ pub struct ExtensionRegistry {
     records: BTreeMap<String, BTreeMap<String, ExtensionInstallRecord>>,
     active_versions: BTreeMap<String, String>,
     blocklist: Vec<BlocklistEntry>,
+    audit_records: Vec<ExtensionRegistryAuditRecord>,
     validation_policy: ManifestValidationPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionRegistryAuditKind {
+    Install,
+    Update,
+    Rollback,
+    Disable,
+    Enable,
+    Remove,
+    PublicationUpdate,
+    RegistrySubmissionUpdate,
+    BlocklistApply,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionRegistryAuditRecord {
+    pub id: AuditRecordId,
+    pub schema_version: u32,
+    pub created_at: LedgerTimestamp,
+    pub kind: ExtensionRegistryAuditKind,
+    pub actor: Actor,
+    pub request_source: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_decision_id: Option<PolicyDecisionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_record: Option<ExtensionRegistryAuditRecordRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_record: Option<ExtensionRegistryAuditRecordRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ExtensionRegistryAuditProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocklist_entry: Option<BlocklistEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionRegistryAuditRecordRef {
+    pub package_id: String,
+    pub version: String,
+    pub manifest_digest: String,
+    pub artifact_digest: String,
+    pub status: ExtensionInstallStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionRegistryAuditProvenance {
+    pub source: ProvenanceSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<ExtensionPublication>,
+}
+
+impl From<&ExtensionInstallRecord> for ExtensionRegistryAuditRecordRef {
+    fn from(record: &ExtensionInstallRecord) -> Self {
+        Self {
+            package_id: record.id.clone(),
+            version: record.version.clone(),
+            manifest_digest: record.manifest_digest.clone(),
+            artifact_digest: record.artifact_digest.clone(),
+            status: record.status,
+        }
+    }
+}
+
+impl From<&ExtensionSourceSnapshot> for ExtensionRegistryAuditProvenance {
+    fn from(source: &ExtensionSourceSnapshot) -> Self {
+        Self {
+            source: source.source,
+            repository: source.repository.clone(),
+            source_ref: source.source_ref.clone(),
+            manifest_path: source.manifest_path.clone(),
+            commit: source.commit.clone(),
+            registry_identity: source.registry_identity.clone(),
+            publication: source.publication.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1603,6 +1695,8 @@ pub struct ExtensionRegistrySnapshot {
     pub records: BTreeMap<String, BTreeMap<String, ExtensionInstallRecord>>,
     pub active_versions: BTreeMap<String, String>,
     pub blocklist: Vec<BlocklistEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_records: Vec<ExtensionRegistryAuditRecord>,
 }
 
 impl ExtensionRegistrySnapshot {
@@ -1623,6 +1717,7 @@ impl ExtensionRegistry {
             records: BTreeMap::new(),
             active_versions: BTreeMap::new(),
             blocklist: Vec::new(),
+            audit_records: Vec::new(),
             validation_policy,
         }
     }
@@ -1637,6 +1732,7 @@ impl ExtensionRegistry {
             records: snapshot.records,
             active_versions: snapshot.active_versions,
             blocklist: snapshot.blocklist,
+            audit_records: snapshot.audit_records,
             validation_policy,
         })
     }
@@ -1647,6 +1743,7 @@ impl ExtensionRegistry {
             records: self.records.clone(),
             active_versions: self.active_versions.clone(),
             blocklist: self.blocklist.clone(),
+            audit_records: self.audit_records.clone(),
         }
     }
 
@@ -2106,6 +2203,46 @@ impl ExtensionRegistry {
 
     pub fn blocklist_entries(&self) -> Vec<BlocklistEntry> {
         self.blocklist.clone()
+    }
+
+    pub fn append_audit_record(
+        &mut self,
+        record: ExtensionRegistryAuditRecord,
+    ) -> RegistryResult<()> {
+        if record.reason.trim().is_empty() {
+            return Err(RegistryError::Validation(
+                ExtensionValidationError::InvalidField {
+                    field: "audit.reason",
+                    reason: "must not be empty".to_string(),
+                },
+            ));
+        }
+        if record.request_source.trim().is_empty() {
+            return Err(RegistryError::Validation(
+                ExtensionValidationError::InvalidField {
+                    field: "audit.request_source",
+                    reason: "must not be empty".to_string(),
+                },
+            ));
+        }
+        if self
+            .audit_records
+            .iter()
+            .any(|existing| existing.id == record.id)
+        {
+            return Err(RegistryError::Validation(
+                ExtensionValidationError::InvalidField {
+                    field: "audit.id",
+                    reason: "must be unique".to_string(),
+                },
+            ));
+        }
+        self.audit_records.push(record);
+        Ok(())
+    }
+
+    pub fn audit_records(&self) -> Vec<ExtensionRegistryAuditRecord> {
+        self.audit_records.clone()
     }
 
     pub fn authorize_service_call(
@@ -2628,6 +2765,7 @@ impl From<&InstallExtensionRequest> for InstallOptions {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstallExtensionResponse {
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<AuditRecordId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2667,6 +2805,7 @@ impl From<&UpdateExtensionRequest> for InstallOptions {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateExtensionResponse {
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<AuditRecordId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2714,6 +2853,7 @@ pub struct RollbackExtensionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RollbackExtensionResponse {
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<AuditRecordId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2724,6 +2864,7 @@ pub struct DisableExtensionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DisableExtensionResponse {
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<AuditRecordId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2734,6 +2875,7 @@ pub struct EnableExtensionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnableExtensionResponse {
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<AuditRecordId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2744,6 +2886,7 @@ pub struct RemoveExtensionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoveExtensionResponse {
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<AuditRecordId>,
 }
 
 /// Request to update publication metadata for an installed package.
@@ -2760,6 +2903,7 @@ pub struct UpdateExtensionPublicationRequest {
 pub struct UpdateExtensionPublicationResponse {
     /// Updated package install record.
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<AuditRecordId>,
 }
 
 /// Request to update registry submission state for an installed package.
@@ -2778,6 +2922,7 @@ pub struct UpdateExtensionRegistrySubmissionRequest {
 pub struct UpdateExtensionRegistrySubmissionResponse {
     /// Updated package install record.
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<AuditRecordId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2788,6 +2933,7 @@ pub struct ApplyBlocklistRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApplyBlocklistResponse {
     pub entry: BlocklistEntry,
+    pub audit_record_id: Option<AuditRecordId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2821,6 +2967,17 @@ impl ExtensionRegistryService {
         self.registry.validation_policy()
     }
 
+    pub fn audit_records(&self) -> Vec<ExtensionRegistryAuditRecord> {
+        self.registry.audit_records.clone()
+    }
+
+    pub fn append_audit_record(
+        &mut self,
+        record: ExtensionRegistryAuditRecord,
+    ) -> RegistryResult<()> {
+        self.registry.append_audit_record(record)
+    }
+
     pub fn install_extension(
         &mut self,
         request: InstallExtensionRequest,
@@ -2829,7 +2986,10 @@ impl ExtensionRegistryService {
         let record = self
             .registry
             .install(request.manifest, options)
-            .map(|record| InstallExtensionResponse { record })?;
+            .map(|record| InstallExtensionResponse {
+                record,
+                audit_record_id: None,
+            })?;
         Ok(record)
     }
 
@@ -2850,7 +3010,10 @@ impl ExtensionRegistryService {
         let record = self
             .registry
             .install(request.manifest, options)
-            .map(|record| UpdateExtensionResponse { record })?;
+            .map(|record| UpdateExtensionResponse {
+                record,
+                audit_record_id: None,
+            })?;
         Ok(record)
     }
 
@@ -2888,7 +3051,10 @@ impl ExtensionRegistryService {
         let record = self
             .registry
             .rollback(&request.extension_id)
-            .map(|record| RollbackExtensionResponse { record })?;
+            .map(|record| RollbackExtensionResponse {
+                record,
+                audit_record_id: None,
+            })?;
         Ok(record)
     }
 
@@ -2896,10 +3062,12 @@ impl ExtensionRegistryService {
         &mut self,
         request: DisableExtensionRequest,
     ) -> RegistryResult<DisableExtensionResponse> {
-        let record = self
-            .registry
-            .disable(&request.extension_id)
-            .map(|record| DisableExtensionResponse { record })?;
+        let record = self.registry.disable(&request.extension_id).map(|record| {
+            DisableExtensionResponse {
+                record,
+                audit_record_id: None,
+            }
+        })?;
         Ok(record)
     }
 
@@ -2907,10 +3075,13 @@ impl ExtensionRegistryService {
         &mut self,
         request: EnableExtensionRequest,
     ) -> RegistryResult<EnableExtensionResponse> {
-        let record = self
-            .registry
-            .enable(&request.extension_id)
-            .map(|record| EnableExtensionResponse { record })?;
+        let record =
+            self.registry
+                .enable(&request.extension_id)
+                .map(|record| EnableExtensionResponse {
+                    record,
+                    audit_record_id: None,
+                })?;
         Ok(record)
     }
 
@@ -2918,10 +3089,13 @@ impl ExtensionRegistryService {
         &mut self,
         request: RemoveExtensionRequest,
     ) -> RegistryResult<RemoveExtensionResponse> {
-        let record = self
-            .registry
-            .remove(&request.extension_id)
-            .map(|record| RemoveExtensionResponse { record })?;
+        let record =
+            self.registry
+                .remove(&request.extension_id)
+                .map(|record| RemoveExtensionResponse {
+                    record,
+                    audit_record_id: None,
+                })?;
         Ok(record)
     }
 
@@ -2933,7 +3107,10 @@ impl ExtensionRegistryService {
         let record = self
             .registry
             .update_publication(&request.extension_id, request.publication)
-            .map(|record| UpdateExtensionPublicationResponse { record })?;
+            .map(|record| UpdateExtensionPublicationResponse {
+                record,
+                audit_record_id: None,
+            })?;
         Ok(record)
     }
 
@@ -2949,7 +3126,10 @@ impl ExtensionRegistryService {
                 request.registry_submission,
                 request.registry_identity,
             )
-            .map(|record| UpdateExtensionRegistrySubmissionResponse { record })?;
+            .map(|record| UpdateExtensionRegistrySubmissionResponse {
+                record,
+                audit_record_id: None,
+            })?;
         Ok(record)
     }
 
@@ -2959,7 +3139,10 @@ impl ExtensionRegistryService {
     ) -> RegistryResult<ApplyBlocklistResponse> {
         let entry = request.entry;
         self.registry.add_blocklist_entry(entry.clone())?;
-        Ok(ApplyBlocklistResponse { entry })
+        Ok(ApplyBlocklistResponse {
+            entry,
+            audit_record_id: None,
+        })
     }
 
     pub fn list_blocklist(
@@ -3491,6 +3674,7 @@ mod tests {
             records,
             active_versions: BTreeMap::new(),
             blocklist: Vec::new(),
+            audit_records: Vec::new(),
         }
     }
 
@@ -3988,6 +4172,7 @@ mod tests {
                 records: BTreeMap::from([(local.id.clone(), record_versions)]),
                 active_versions: BTreeMap::new(),
                 blocklist: Vec::new(),
+                audit_records: Vec::new(),
             }
         };
 
@@ -4013,6 +4198,7 @@ mod tests {
                 records: BTreeMap::from([(local.id.clone(), record_versions)]),
                 active_versions: BTreeMap::new(),
                 blocklist: Vec::new(),
+                audit_records: Vec::new(),
             }
         };
 
@@ -4153,6 +4339,7 @@ mod tests {
                 records: BTreeMap::from([(process.id.clone(), record_versions)]),
                 active_versions: BTreeMap::new(),
                 blocklist: Vec::new(),
+                audit_records: Vec::new(),
             }
         };
 
@@ -4178,6 +4365,7 @@ mod tests {
                 records: BTreeMap::from([(process.id.clone(), record_versions)]),
                 active_versions: BTreeMap::new(),
                 blocklist: Vec::new(),
+                audit_records: Vec::new(),
             }
         };
 

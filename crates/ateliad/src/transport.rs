@@ -91,6 +91,7 @@ enum Route {
     RemoveExtension { extension_id: String },
     ApplyBlocklist,
     ListBlocklist,
+    ListExtensionRegistryAuditRecords,
     RenderToolOutput,
     ProjectStatus,
     Unsupported,
@@ -238,6 +239,7 @@ fn route_for_path(path: &str) -> Route {
         "/v1/package-trust-index:list" => Route::ListPackageTrustIndex,
         "/v1/packages/blocklist/apply" => Route::ApplyBlocklist,
         "/v1/packages/blocklist/list" => Route::ListBlocklist,
+        "/v1/packages/audit:list" => Route::ListExtensionRegistryAuditRecords,
         "/v1/tool-results:render" => Route::RenderToolOutput,
         "/v1/project-status:get" => Route::ProjectStatus,
         _ => Route::Unsupported,
@@ -1622,6 +1624,7 @@ fn serialize_install_extension_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "record": response.record,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1642,6 +1645,7 @@ fn serialize_update_extension_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "record": response.record,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1712,6 +1716,7 @@ fn serialize_package_publication_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "flow": response.flow,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1724,6 +1729,7 @@ fn serialize_package_registry_submission_response(
         "package_id": response.package_id,
         "state": response.state,
         "flow": response.flow,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1733,6 +1739,7 @@ fn serialize_rollback_extension_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "record": response.record,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1742,6 +1749,7 @@ fn serialize_disable_extension_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "record": response.record,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1751,6 +1759,7 @@ fn serialize_enable_extension_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "record": response.record,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1760,6 +1769,7 @@ fn serialize_remove_extension_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "record": response.record,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1767,6 +1777,7 @@ fn serialize_apply_blocklist_response(response: rpc::ApplyBlocklistResponse) -> 
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "entry": response.entry,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1774,6 +1785,15 @@ fn serialize_list_blocklist_response(response: rpc::ListBlocklistResponse) -> se
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "entries": response.entries,
+    })
+}
+
+fn serialize_list_extension_registry_audit_records_response(
+    response: rpc::ListExtensionRegistryAuditRecordsResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "records": response.records,
     })
 }
 
@@ -3433,6 +3453,33 @@ async fn dispatch_list_blocklist(state: RpcServerState, request: Request<Body>) 
         }
     }
 }
+
+async fn dispatch_list_extension_registry_audit_records(
+    state: RpcServerState,
+    request: Request<Body>,
+) -> Response {
+    if let Err(error) = body_or_empty_json::<EmptyRequestPayload>(request).await {
+        let rpc_server = state.read().await;
+        let next_state = rpc_next_state(&rpc_server);
+        return error.into_response(next_state);
+    }
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.list_extension_registry_audit_records() {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(
+                serialize_list_extension_registry_audit_records_response(response),
+            )),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
 async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Body>) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
@@ -4116,6 +4163,26 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                     response
                 } else {
                     dispatch_list_blocklist(state, request).await
+                }
+            }
+            Route::ListExtensionRegistryAuditRecords => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_list_extension_registry_audit_records(state, request).await
                 }
             }
             Route::ProjectStatus => {
@@ -6602,6 +6669,9 @@ mod tests {
                 .await
                 .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
                 .expect("response bytes");
+        assert!(unlisted_publication_payload["data"]["audit_record_id"]
+            .as_str()
+            .is_some());
         assert_eq!(
             unlisted_publication_payload["data"]["flow"]["publication_plan"]
                 ["requires_registry_submission"],
@@ -6636,6 +6706,9 @@ mod tests {
             .await
             .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
             .expect("response bytes");
+        assert!(publication_payload["data"]["audit_record_id"]
+            .as_str()
+            .is_some());
         assert_eq!(
             publication_payload["data"]["flow"]["publication_plan"]["visibility"],
             "public_searchable"
@@ -6758,6 +6831,9 @@ mod tests {
                 .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
                 .expect("response bytes");
         assert_eq!(registry_submission_payload["data"]["state"], "submitted");
+        assert!(registry_submission_payload["data"]["audit_record_id"]
+            .as_str()
+            .is_some());
         assert_eq!(
             registry_submission_payload["data"]["flow"]["publication_plan"]
                 ["requires_registry_submission"],
@@ -6798,6 +6874,21 @@ mod tests {
                 .iter()
                 .any(|step| step["id"] == "registry_search" && step["state"] == "in_progress")
         );
+
+        let audit_response =
+            send_request(&rpc_server, Method::POST, "/v1/packages/audit:list").await;
+        assert_eq!(audit_response.status(), StatusCode::OK);
+        let audit_payload = to_bytes(audit_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        let audit_records = audit_payload["data"]["records"].as_array().unwrap();
+        assert!(audit_records
+            .iter()
+            .any(|record| record["kind"] == "publication_update"));
+        assert!(audit_records
+            .iter()
+            .any(|record| record["kind"] == "registry_submission_update"));
 
         let preserve_submission_publication_response = send_json_request(
             &rpc_server,
