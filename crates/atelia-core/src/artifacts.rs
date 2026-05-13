@@ -1699,7 +1699,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        env::temp_dir().join(format!("atelia-artifacts-{name}-{unique}"))
+        let temp_dir = env::temp_dir();
+        fs::create_dir_all(&temp_dir).unwrap();
+        let temp_dir = temp_dir.canonicalize().unwrap();
+        temp_dir.join(format!("atelia-artifacts-{name}-{unique}"))
     }
 
     #[cfg(unix)]
