@@ -91,6 +91,7 @@ enum Route {
     RemoveExtension { extension_id: String },
     ApplyBlocklist,
     ListBlocklist,
+    ListExtensionRegistryAuditRecords,
     RenderToolOutput,
     ProjectStatus,
     Unsupported,
@@ -238,6 +239,7 @@ fn route_for_path(path: &str) -> Route {
         "/v1/package-trust-index:list" => Route::ListPackageTrustIndex,
         "/v1/packages/blocklist/apply" => Route::ApplyBlocklist,
         "/v1/packages/blocklist/list" => Route::ListBlocklist,
+        "/v1/packages/audit:list" => Route::ListExtensionRegistryAuditRecords,
         "/v1/tool-results:render" => Route::RenderToolOutput,
         "/v1/project-status:get" => Route::ProjectStatus,
         _ => Route::Unsupported,
@@ -326,6 +328,9 @@ struct PackagePublicationRequestPayload {
     visibility: rpc::PackagePublicationVisibility,
     #[serde(default = "default_true")]
     requires_registry_submission: bool,
+    requester: Option<ActorPayload>,
+    request_source: Option<String>,
+    reason: Option<String>,
 }
 
 /// HTTP payload for updating package registry submission state.
@@ -337,6 +342,60 @@ struct PackageRegistrySubmissionRequestPayload {
     state: Option<rpc::PackageRegistrySubmissionState>,
     #[serde(default)]
     registry_identity: Option<String>,
+    requester: Option<ActorPayload>,
+    request_source: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallExtensionRequestPayload {
+    manifest: atelia_core::ExtensionManifest,
+    #[serde(default)]
+    approve_local_unsigned: bool,
+    #[serde(default)]
+    allow_local_process_runtime: bool,
+    #[serde(default)]
+    approve_source_change: bool,
+    requester: Option<ActorPayload>,
+    request_source: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateExtensionRequestPayload {
+    manifest: atelia_core::ExtensionManifest,
+    #[serde(default)]
+    approve_local_unsigned: bool,
+    #[serde(default)]
+    allow_local_process_runtime: bool,
+    #[serde(default)]
+    approve_source_change: bool,
+    requester: Option<ActorPayload>,
+    request_source: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyBlocklistRequestPayload {
+    entry: atelia_core::BlocklistEntry,
+    requester: Option<ActorPayload>,
+    request_source: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageMutationAuditPayload {
+    requester: Option<ActorPayload>,
+    request_source: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ListPackageAuditRequestPayload {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    cursor: Option<String>,
 }
 
 /// HTTP payload for routes that intentionally accept no request fields.
@@ -968,6 +1027,24 @@ fn parse_actor_payload(payload: ActorPayload) -> rpc::RpcActorDto {
         ActorPayload::Extension { id } => rpc::RpcActorDto::Extension { id },
         ActorPayload::System { id } => rpc::RpcActorDto::System { id },
     }
+}
+
+fn parse_optional_core_actor(payload: Option<ActorPayload>) -> rpc::RpcResult<Option<Actor>> {
+    payload
+        .map(parse_actor_payload)
+        .map(Actor::try_from)
+        .transpose()
+}
+
+fn parse_optional_rpc_actor(payload: Option<ActorPayload>) -> Option<rpc::RpcActorDto> {
+    payload.map(parse_actor_payload)
+}
+
+fn package_http_request_source(request_source: Option<String>) -> Option<String> {
+    request_source
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| Some("secretary.http".to_string()))
 }
 
 fn parse_job_status(value: Option<String>) -> Result<Option<rpc::RpcJobStatus>, String> {
@@ -1622,6 +1699,7 @@ fn serialize_install_extension_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "record": response.record,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1642,6 +1720,7 @@ fn serialize_update_extension_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "record": response.record,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1712,6 +1791,7 @@ fn serialize_package_publication_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "flow": response.flow,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1724,6 +1804,7 @@ fn serialize_package_registry_submission_response(
         "package_id": response.package_id,
         "state": response.state,
         "flow": response.flow,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1733,6 +1814,7 @@ fn serialize_rollback_extension_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "record": response.record,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1742,6 +1824,7 @@ fn serialize_disable_extension_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "record": response.record,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1751,6 +1834,7 @@ fn serialize_enable_extension_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "record": response.record,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1760,6 +1844,7 @@ fn serialize_remove_extension_response(
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "record": response.record,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1767,6 +1852,7 @@ fn serialize_apply_blocklist_response(response: rpc::ApplyBlocklistResponse) -> 
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "entry": response.entry,
+        "audit_record_id": response.audit_record_id,
     })
 }
 
@@ -1774,6 +1860,16 @@ fn serialize_list_blocklist_response(response: rpc::ListBlocklistResponse) -> se
     serde_json::json!({
         "metadata": serialize_protocol_metadata(&response.metadata),
         "entries": response.entries,
+    })
+}
+
+fn serialize_list_extension_registry_audit_records_response(
+    response: rpc::ListExtensionRegistryAuditRecordsResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "records": response.records,
+        "next_page_token": response.next_page_token,
     })
 }
 
@@ -2097,6 +2193,11 @@ fn rpc_error_status(code: rpc::RpcErrorCode) -> (StatusCode, bool) {
         rpc::RpcErrorCode::UnsupportedCapability => (StatusCode::NOT_IMPLEMENTED, true),
         rpc::RpcErrorCode::Internal => (StatusCode::INTERNAL_SERVER_ERROR, false),
     }
+}
+
+fn rpc_error_response(next_state: String, error: rpc::RpcError) -> Response {
+    let (status, recoverable) = rpc_error_status(error.code);
+    make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
 }
 
 enum BodyParseError {
@@ -2734,7 +2835,7 @@ async fn dispatch_list_tool_output_settings_history(
 }
 
 async fn dispatch_install_extension(state: RpcServerState, request: Request<Body>) -> Response {
-    let payload = match body_or_empty_json::<atelia_core::InstallExtensionRequest>(request).await {
+    let payload = match body_or_empty_json::<InstallExtensionRequestPayload>(request).await {
         Ok(payload) => payload,
         Err(error) => {
             let rpc_server = state.read().await;
@@ -2745,7 +2846,19 @@ async fn dispatch_install_extension(state: RpcServerState, request: Request<Body
 
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
-    match rpc_server.install_extension(payload) {
+    let requester = match parse_optional_core_actor(payload.requester) {
+        Ok(requester) => requester,
+        Err(error) => return rpc_error_response(next_state, error),
+    };
+    match rpc_server.install_extension(atelia_core::InstallExtensionRequest {
+        manifest: payload.manifest,
+        approve_local_unsigned: payload.approve_local_unsigned,
+        allow_local_process_runtime: payload.allow_local_process_runtime,
+        approve_source_change: payload.approve_source_change,
+        requester,
+        request_source: package_http_request_source(payload.request_source),
+        reason: payload.reason,
+    }) {
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_install_extension_response(
@@ -2790,7 +2903,7 @@ async fn dispatch_validate_extension(state: RpcServerState, request: Request<Bod
 }
 
 async fn dispatch_update_extension(state: RpcServerState, request: Request<Body>) -> Response {
-    let payload = match body_or_empty_json::<atelia_core::UpdateExtensionRequest>(request).await {
+    let payload = match body_or_empty_json::<UpdateExtensionRequestPayload>(request).await {
         Ok(payload) => payload,
         Err(error) => {
             let rpc_server = state.read().await;
@@ -2801,7 +2914,19 @@ async fn dispatch_update_extension(state: RpcServerState, request: Request<Body>
 
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
-    match rpc_server.update_extension(payload) {
+    let requester = match parse_optional_core_actor(payload.requester) {
+        Ok(requester) => requester,
+        Err(error) => return rpc_error_response(next_state, error),
+    };
+    match rpc_server.update_extension(atelia_core::UpdateExtensionRequest {
+        manifest: payload.manifest,
+        approve_local_unsigned: payload.approve_local_unsigned,
+        allow_local_process_runtime: payload.allow_local_process_runtime,
+        approve_source_change: payload.approve_source_change,
+        requester,
+        request_source: package_http_request_source(payload.request_source),
+        reason: payload.reason,
+    }) {
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_update_extension_response(
@@ -3074,6 +3199,9 @@ async fn dispatch_package_publication(
         package_id,
         visibility: payload.visibility,
         requires_registry_submission: payload.requires_registry_submission,
+        requester: parse_optional_rpc_actor(payload.requester),
+        request_source: package_http_request_source(payload.request_source),
+        reason: payload.reason,
     }) {
         Ok(response) => (
             StatusCode::OK,
@@ -3156,6 +3284,9 @@ async fn dispatch_package_registry_submission(
             .state
             .unwrap_or(rpc::PackageRegistrySubmissionState::Submitted),
         registry_identity,
+        requester: parse_optional_rpc_actor(payload.requester),
+        request_source: package_http_request_source(payload.request_source),
+        reason: payload.reason,
     }) {
         Ok(response) => (
             StatusCode::OK,
@@ -3275,15 +3406,26 @@ async fn dispatch_rollback_extension(
     extension_id: String,
     request: Request<Body>,
 ) -> Response {
-    if let Err(error) = body_or_empty_json::<serde_json::Value>(request).await {
-        let rpc_server = state.read().await;
-        let next_state = rpc_next_state(&rpc_server);
-        return error.into_response(next_state);
-    }
-
+    let payload = match body_or_empty_json::<PackageMutationAuditPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
-    match rpc_server.rollback_extension(atelia_core::RollbackExtensionRequest { extension_id }) {
+    let requester = match parse_optional_core_actor(payload.requester) {
+        Ok(requester) => requester,
+        Err(error) => return rpc_error_response(next_state, error),
+    };
+    match rpc_server.rollback_extension(atelia_core::RollbackExtensionRequest {
+        extension_id,
+        requester,
+        request_source: package_http_request_source(payload.request_source),
+        reason: payload.reason,
+    }) {
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_rollback_extension_response(
@@ -3303,15 +3445,26 @@ async fn dispatch_disable_extension(
     extension_id: String,
     request: Request<Body>,
 ) -> Response {
-    if let Err(error) = body_or_empty_json::<serde_json::Value>(request).await {
-        let rpc_server = state.read().await;
-        let next_state = rpc_next_state(&rpc_server);
-        return error.into_response(next_state);
-    }
-
+    let payload = match body_or_empty_json::<PackageMutationAuditPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
-    match rpc_server.disable_extension(atelia_core::DisableExtensionRequest { extension_id }) {
+    let requester = match parse_optional_core_actor(payload.requester) {
+        Ok(requester) => requester,
+        Err(error) => return rpc_error_response(next_state, error),
+    };
+    match rpc_server.disable_extension(atelia_core::DisableExtensionRequest {
+        extension_id,
+        requester,
+        request_source: package_http_request_source(payload.request_source),
+        reason: payload.reason,
+    }) {
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_disable_extension_response(
@@ -3331,15 +3484,26 @@ async fn dispatch_enable_extension(
     extension_id: String,
     request: Request<Body>,
 ) -> Response {
-    if let Err(error) = body_or_empty_json::<serde_json::Value>(request).await {
-        let rpc_server = state.read().await;
-        let next_state = rpc_next_state(&rpc_server);
-        return error.into_response(next_state);
-    }
-
+    let payload = match body_or_empty_json::<PackageMutationAuditPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
-    match rpc_server.enable_extension(atelia_core::EnableExtensionRequest { extension_id }) {
+    let requester = match parse_optional_core_actor(payload.requester) {
+        Ok(requester) => requester,
+        Err(error) => return rpc_error_response(next_state, error),
+    };
+    match rpc_server.enable_extension(atelia_core::EnableExtensionRequest {
+        extension_id,
+        requester,
+        request_source: package_http_request_source(payload.request_source),
+        reason: payload.reason,
+    }) {
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_enable_extension_response(
@@ -3359,15 +3523,26 @@ async fn dispatch_remove_extension(
     extension_id: String,
     request: Request<Body>,
 ) -> Response {
-    if let Err(error) = body_or_empty_json::<serde_json::Value>(request).await {
-        let rpc_server = state.read().await;
-        let next_state = rpc_next_state(&rpc_server);
-        return error.into_response(next_state);
-    }
-
+    let payload = match body_or_empty_json::<PackageMutationAuditPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
-    match rpc_server.remove_extension(atelia_core::RemoveExtensionRequest { extension_id }) {
+    let requester = match parse_optional_core_actor(payload.requester) {
+        Ok(requester) => requester,
+        Err(error) => return rpc_error_response(next_state, error),
+    };
+    match rpc_server.remove_extension(atelia_core::RemoveExtensionRequest {
+        extension_id,
+        requester,
+        request_source: package_http_request_source(payload.request_source),
+        reason: payload.reason,
+    }) {
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_remove_extension_response(
@@ -3383,7 +3558,7 @@ async fn dispatch_remove_extension(
 }
 
 async fn dispatch_apply_blocklist(state: RpcServerState, request: Request<Body>) -> Response {
-    let payload = match body_or_empty_json::<atelia_core::ApplyBlocklistRequest>(request).await {
+    let payload = match body_or_empty_json::<ApplyBlocklistRequestPayload>(request).await {
         Ok(payload) => payload,
         Err(error) => {
             let rpc_server = state.read().await;
@@ -3394,7 +3569,16 @@ async fn dispatch_apply_blocklist(state: RpcServerState, request: Request<Body>)
 
     let rpc_server = state.read().await;
     let next_state = rpc_next_state(&rpc_server);
-    match rpc_server.apply_blocklist(payload) {
+    let requester = match parse_optional_core_actor(payload.requester) {
+        Ok(requester) => requester,
+        Err(error) => return rpc_error_response(next_state, error),
+    };
+    match rpc_server.apply_blocklist(atelia_core::ApplyBlocklistRequest {
+        entry: payload.entry,
+        requester,
+        request_source: package_http_request_source(payload.request_source),
+        reason: payload.reason,
+    }) {
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_apply_blocklist_response(
@@ -3425,6 +3609,42 @@ async fn dispatch_list_blocklist(state: RpcServerState, request: Request<Body>) 
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_list_blocklist_response(response))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_list_extension_registry_audit_records(
+    state: RpcServerState,
+    request: Request<Body>,
+) -> Response {
+    let payload = match body_or_empty_json::<ListPackageAuditRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.list_extension_registry_audit_records(
+        rpc::ListExtensionRegistryAuditRecordsRequest {
+            limit: payload.limit,
+            offset: payload.offset,
+            cursor: payload.cursor,
+        },
+    ) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(
+                serialize_list_extension_registry_audit_records_response(response),
+            )),
         )
             .into_response(),
         Err(error) => {
@@ -4116,6 +4336,26 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                     response
                 } else {
                     dispatch_list_blocklist(state, request).await
+                }
+            }
+            Route::ListExtensionRegistryAuditRecords => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_list_extension_registry_audit_records(state, request).await
                 }
             }
             Route::ProjectStatus => {
@@ -6602,6 +6842,9 @@ mod tests {
                 .await
                 .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
                 .expect("response bytes");
+        assert!(unlisted_publication_payload["data"]["audit_record_id"]
+            .as_str()
+            .is_some());
         assert_eq!(
             unlisted_publication_payload["data"]["flow"]["publication_plan"]
                 ["requires_registry_submission"],
@@ -6636,6 +6879,9 @@ mod tests {
             .await
             .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
             .expect("response bytes");
+        assert!(publication_payload["data"]["audit_record_id"]
+            .as_str()
+            .is_some());
         assert_eq!(
             publication_payload["data"]["flow"]["publication_plan"]["visibility"],
             "public_searchable"
@@ -6758,6 +7004,9 @@ mod tests {
                 .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
                 .expect("response bytes");
         assert_eq!(registry_submission_payload["data"]["state"], "submitted");
+        assert!(registry_submission_payload["data"]["audit_record_id"]
+            .as_str()
+            .is_some());
         assert_eq!(
             registry_submission_payload["data"]["flow"]["publication_plan"]
                 ["requires_registry_submission"],
@@ -6798,6 +7047,21 @@ mod tests {
                 .iter()
                 .any(|step| step["id"] == "registry_search" && step["state"] == "in_progress")
         );
+
+        let audit_response =
+            send_request(&rpc_server, Method::POST, "/v1/packages/audit:list").await;
+        assert_eq!(audit_response.status(), StatusCode::OK);
+        let audit_payload = to_bytes(audit_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        let audit_records = audit_payload["data"]["records"].as_array().unwrap();
+        assert!(audit_records
+            .iter()
+            .any(|record| record["kind"] == "publication_update"));
+        assert!(audit_records
+            .iter()
+            .any(|record| record["kind"] == "registry_submission_update"));
 
         let preserve_submission_publication_response = send_json_request(
             &rpc_server,

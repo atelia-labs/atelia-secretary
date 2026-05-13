@@ -10,6 +10,7 @@
 use crate::service::{
     BetaStateHint as ServiceBetaStateHint, CheckPolicyRequest as ServiceCheckPolicyRequest,
     DaemonHealth, DaemonStatus, GetProjectStatusRequest as ServiceGetProjectStatusRequest,
+    ListExtensionRegistryAuditRecordsRequest as ServiceListExtensionRegistryAuditRecordsRequest,
     ListRepertoireRequest as ServiceListRepertoireRequest,
     ListRepositoriesRequest as ServiceListRepositoriesRequest,
     ListToolOutputSettingsHistoryRequest as ServiceListToolOutputSettingsHistoryRequest,
@@ -26,15 +27,15 @@ use atelia_core::{
     Actor, ApplyBlocklistRequest, BlocklistEntry, CancelJobReceipt, CancellationState,
     DisableExtensionRequest, EnableExtensionRequest, EventCursor as CoreEventCursor, EventQuery,
     EventSeverity, EventSubjectType, ExtensionBlocklistMatch, ExtensionInstallRecord,
-    ExtensionPublication, ExtensionPublicationVisibility, ExtensionRegistrySubmission,
-    ExtensionServices, ExtensionSourceSnapshot, ExtensionStatusRequest, InstallExtensionRequest,
-    JobEvent, JobEventKind, JobId, JobKind, JobRecord, JobStatus, ListBlocklistRequest,
-    ListExtensionsRequest, OutputFormat, OversizeOutputPolicy, PathScope, PolicyOutcome, ProjectId,
-    RemoveExtensionRequest, RenderOptions, RepositoryId, RepositoryRecord, RepositoryTrustState,
-    ResourceScope, RiskTier, RollbackExtensionRequest, RollbackSnapshot, StoreError,
-    ToolInvocationId, ToolOutputDefaults, ToolOutputGranularity, ToolOutputOverrides,
-    ToolOutputSettingsChange, ToolOutputSettingsScope, ToolOutputVerbosity, ToolResultId,
-    TruncationMetadata, UpdateExtensionPublicationRequest,
+    ExtensionPublication, ExtensionPublicationVisibility, ExtensionRegistryAuditRecord,
+    ExtensionRegistrySubmission, ExtensionServices, ExtensionSourceSnapshot,
+    ExtensionStatusRequest, InstallExtensionRequest, JobEvent, JobEventKind, JobId, JobKind,
+    JobRecord, JobStatus, ListBlocklistRequest, ListExtensionsRequest, OutputFormat,
+    OversizeOutputPolicy, PathScope, PolicyOutcome, ProjectId, RemoveExtensionRequest,
+    RenderOptions, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope, RiskTier,
+    RollbackExtensionRequest, RollbackSnapshot, StoreError, ToolInvocationId, ToolOutputDefaults,
+    ToolOutputGranularity, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsScope,
+    ToolOutputVerbosity, ToolResultId, TruncationMetadata, UpdateExtensionPublicationRequest,
     UpdateExtensionRegistrySubmissionRequest, UpdateExtensionRequest,
     ValidateExtensionManifestRequest, WatchJobEvent,
 };
@@ -313,6 +314,7 @@ impl SecretaryRpcServer {
         Ok(InstallExtensionResponse {
             metadata: self.metadata(),
             record: response.record,
+            audit_record_id: response.audit_record_id.map(|id| id.as_str().to_string()),
         })
     }
 
@@ -339,6 +341,7 @@ impl SecretaryRpcServer {
         Ok(UpdateExtensionResponse {
             metadata: self.metadata(),
             record: response.record,
+            audit_record_id: response.audit_record_id.map(|id| id.as_str().to_string()),
         })
     }
 
@@ -444,24 +447,40 @@ impl SecretaryRpcServer {
         request: PackagePublicationRequest,
     ) -> RpcResult<PackagePublicationResponse> {
         let publication_visibility = request.visibility;
-        self.service
-            .update_extension_publication(UpdateExtensionPublicationRequest {
-                extension_id: request.package_id.clone(),
-                publication: ExtensionPublication {
-                    visibility: ExtensionPublicationVisibility::from(publication_visibility),
-                    registry_submission: if request.requires_registry_submission {
-                        ExtensionRegistrySubmission::AwaitingSubmission
-                    } else {
-                        ExtensionRegistrySubmission::NotSubmitted
+        let requires_registry_submission =
+            package_publication_visibility_requires_registry_submission(publication_visibility);
+        if request.requires_registry_submission != requires_registry_submission {
+            return Err(RpcError::invalid_argument(
+                "requires_registry_submission must match the selected visibility",
+            ));
+        }
+        let publication_response =
+            self.service
+                .update_extension_publication(UpdateExtensionPublicationRequest {
+                    extension_id: request.package_id.clone(),
+                    publication: ExtensionPublication {
+                        visibility: ExtensionPublicationVisibility::from(publication_visibility),
+                        registry_submission: if requires_registry_submission {
+                            ExtensionRegistrySubmission::AwaitingSubmission
+                        } else {
+                            ExtensionRegistrySubmission::NotSubmitted
+                        },
                     },
-                },
-            })?;
-        let extension = self.service.extension_status(ExtensionStatusRequest {
+                    requester: request.requester.map(Actor::try_from).transpose()?,
+                    request_source: request.request_source,
+                    reason: request.reason,
+                })?;
+        let extension = atelia_core::ExtensionStatusResponse {
             extension_id: request.package_id,
-        })?;
+            record: Some(publication_response.record),
+            block: None,
+        };
         Ok(PackagePublicationResponse {
             metadata: self.metadata(),
             flow: package_authoring_flow_from_status(&extension, true)?,
+            audit_record_id: publication_response
+                .audit_record_id
+                .map(|id| id.as_str().to_string()),
         })
     }
 
@@ -481,16 +500,21 @@ impl SecretaryRpcServer {
             });
         }
 
-        self.service.update_extension_registry_submission(
+        let registry_submission_response = self.service.update_extension_registry_submission(
             UpdateExtensionRegistrySubmissionRequest {
                 extension_id: request.package_id.clone(),
                 registry_submission: ExtensionRegistrySubmission::from(request.state),
                 registry_identity: request.registry_identity,
+                requester: request.requester.map(Actor::try_from).transpose()?,
+                request_source: request.request_source,
+                reason: request.reason,
             },
         )?;
-        let extension = self.service.extension_status(ExtensionStatusRequest {
+        let extension = atelia_core::ExtensionStatusResponse {
             extension_id: request.package_id.clone(),
-        })?;
+            record: Some(registry_submission_response.record),
+            block: None,
+        };
         let state = extension
             .record
             .as_ref()
@@ -507,6 +531,9 @@ impl SecretaryRpcServer {
             package_id: request.package_id,
             state,
             flow: Some(package_authoring_flow_from_status(&extension, true)?),
+            audit_record_id: registry_submission_response
+                .audit_record_id
+                .map(|id| id.as_str().to_string()),
         })
     }
 
@@ -518,6 +545,7 @@ impl SecretaryRpcServer {
         Ok(RollbackExtensionResponse {
             metadata: self.metadata(),
             record: response.record,
+            audit_record_id: response.audit_record_id.map(|id| id.as_str().to_string()),
         })
     }
 
@@ -529,6 +557,7 @@ impl SecretaryRpcServer {
         Ok(DisableExtensionResponse {
             metadata: self.metadata(),
             record: response.record,
+            audit_record_id: response.audit_record_id.map(|id| id.as_str().to_string()),
         })
     }
 
@@ -540,6 +569,7 @@ impl SecretaryRpcServer {
         Ok(EnableExtensionResponse {
             metadata: self.metadata(),
             record: response.record,
+            audit_record_id: response.audit_record_id.map(|id| id.as_str().to_string()),
         })
     }
 
@@ -551,6 +581,7 @@ impl SecretaryRpcServer {
         Ok(RemoveExtensionResponse {
             metadata: self.metadata(),
             record: response.record,
+            audit_record_id: response.audit_record_id.map(|id| id.as_str().to_string()),
         })
     }
 
@@ -562,6 +593,7 @@ impl SecretaryRpcServer {
         Ok(ApplyBlocklistResponse {
             metadata: self.metadata(),
             entry: response.entry,
+            audit_record_id: response.audit_record_id.map(|id| id.as_str().to_string()),
         })
     }
 
@@ -573,6 +605,24 @@ impl SecretaryRpcServer {
         Ok(ListBlocklistResponse {
             metadata: self.metadata(),
             entries: response.entries,
+        })
+    }
+
+    pub fn list_extension_registry_audit_records(
+        &self,
+        request: ListExtensionRegistryAuditRecordsRequest,
+    ) -> RpcResult<ListExtensionRegistryAuditRecordsResponse> {
+        let page = self.service.list_extension_registry_audit_records(
+            ServiceListExtensionRegistryAuditRecordsRequest {
+                limit: request.limit,
+                offset: request.offset,
+                cursor: request.cursor,
+            },
+        )?;
+        Ok(ListExtensionRegistryAuditRecordsResponse {
+            metadata: self.metadata(),
+            records: page.records,
+            next_page_token: page.next_page_token,
         })
     }
 
@@ -1629,6 +1679,7 @@ pub struct RpcEventRefs {
 pub struct InstallExtensionResponse {
     pub metadata: ProtocolMetadata,
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1646,6 +1697,7 @@ pub struct ValidateExtensionResponse {
 pub struct UpdateExtensionResponse {
     pub metadata: ProtocolMetadata,
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1951,6 +2003,12 @@ pub struct PackagePublicationRequest {
     pub visibility: PackagePublicationVisibility,
     /// Whether registry submission is required for this publication.
     pub requires_registry_submission: bool,
+    /// Actor requesting the publication mutation.
+    pub requester: Option<RpcActorDto>,
+    /// Request boundary or transport source retained for audit.
+    pub request_source: Option<String>,
+    /// Human-readable audit reason.
+    pub reason: Option<String>,
 }
 
 /// Response containing the refreshed package publication flow.
@@ -1960,6 +2018,8 @@ pub struct PackagePublicationResponse {
     pub metadata: ProtocolMetadata,
     /// Refreshed package authoring flow.
     pub flow: PackageAuthoringFlow,
+    /// Audit record id for the persisted publication mutation.
+    pub audit_record_id: Option<String>,
 }
 
 /// Request to persist package registry submission state.
@@ -1971,6 +2031,12 @@ pub struct PackageRegistrySubmissionRequest {
     pub state: PackageRegistrySubmissionState,
     /// Registry identity to persist when submitting to a registry.
     pub registry_identity: Option<String>,
+    /// Actor requesting the registry-submission mutation.
+    pub requester: Option<RpcActorDto>,
+    /// Request boundary or transport source retained for audit.
+    pub request_source: Option<String>,
+    /// Human-readable audit reason.
+    pub reason: Option<String>,
 }
 
 /// Response containing persisted registry submission state and flow.
@@ -1984,42 +2050,63 @@ pub struct PackageRegistrySubmissionResponse {
     pub state: PackageRegistrySubmissionState,
     /// Refreshed package authoring flow when available.
     pub flow: Option<PackageAuthoringFlow>,
+    /// Audit record id for the persisted registry-submission mutation.
+    pub audit_record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackExtensionResponse {
     pub metadata: ProtocolMetadata,
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisableExtensionResponse {
     pub metadata: ProtocolMetadata,
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnableExtensionResponse {
     pub metadata: ProtocolMetadata,
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoveExtensionResponse {
     pub metadata: ProtocolMetadata,
     pub record: ExtensionInstallRecord,
+    pub audit_record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyBlocklistResponse {
     pub metadata: ProtocolMetadata,
     pub entry: BlocklistEntry,
+    pub audit_record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListBlocklistResponse {
     pub metadata: ProtocolMetadata,
     pub entries: Vec<BlocklistEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListExtensionRegistryAuditRecordsResponse {
+    pub metadata: ProtocolMetadata,
+    pub records: Vec<ExtensionRegistryAuditRecord>,
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListExtensionRegistryAuditRecordsRequest {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2320,6 +2407,15 @@ fn package_registry_search_state(
             PackageAuthoringStepState::Blocked
         }
     }
+}
+
+fn package_publication_visibility_requires_registry_submission(
+    visibility: PackagePublicationVisibility,
+) -> bool {
+    matches!(
+        visibility,
+        PackagePublicationVisibility::PublicSearchable | PackagePublicationVisibility::Official
+    )
 }
 
 fn package_source_class_from_record(record: &ExtensionInstallRecord) -> PackageSourceClass {
@@ -3176,8 +3272,9 @@ mod tests {
     use atelia_core::{
         BlockKey, BlockReason, DegradeBehavior, ExtensionCompatibility, ExtensionEntrypoints,
         ExtensionFailure, ExtensionKind, ExtensionManifest, ExtensionPermission,
-        ExtensionPublisher, ExtensionRealm, ExtensionRuntime, ExtensionServices, ProvenanceSource,
-        RetryPolicy, EXTENSION_MANIFEST_SCHEMA, EXTENSION_RPC_PROTOCOL,
+        ExtensionPublisher, ExtensionRealm, ExtensionRegistryAuditKind, ExtensionRuntime,
+        ExtensionServices, ProvenanceSource, RetryPolicy, EXTENSION_MANIFEST_SCHEMA,
+        EXTENSION_RPC_PROTOCOL,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -5558,9 +5655,13 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("install should succeed");
         assert_eq!(install.record.version, "1.0.0");
+        assert!(install.audit_record_id.is_some());
 
         let validated = server
             .validate_extension(atelia_core::ValidateExtensionManifestRequest {
@@ -5583,10 +5684,14 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("update should succeed");
         assert_eq!(updated.metadata.protocol_version, "1.0.0");
         assert_eq!(updated.record.version, "2.0.0");
+        assert!(updated.audit_record_id.is_some());
 
         let status = server
             .extension_status(ExtensionStatusRequest {
@@ -5609,39 +5714,55 @@ mod tests {
         let disabled = server
             .disable_extension(DisableExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("disable should succeed");
         assert_eq!(
             disabled.record.status,
             atelia_core::ExtensionInstallStatus::Disabled
         );
+        assert!(disabled.audit_record_id.is_some());
 
         let enabled = server
             .enable_extension(EnableExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("enable should succeed");
         assert_eq!(
             enabled.record.status,
             atelia_core::ExtensionInstallStatus::Installed
         );
+        assert!(enabled.audit_record_id.is_some());
 
         let rolled_back = server
             .rollback_extension(RollbackExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("rollback should succeed");
         assert_eq!(rolled_back.record.version, "1.0.0");
+        assert!(rolled_back.audit_record_id.is_some());
 
-        server
+        let blocklist_applied = server
             .apply_blocklist(ApplyBlocklistRequest {
                 entry: BlocklistEntry {
                     key: BlockKey::ExtensionId("com.example.review.extension".to_string()),
                     reason: BlockReason::UserBlocked,
                     note: Some("policy review".to_string()),
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("apply blocklist should succeed");
+        assert!(blocklist_applied.audit_record_id.is_some());
 
         let blocked_status = server
             .extension_status(ExtensionStatusRequest {
@@ -5662,12 +5783,16 @@ mod tests {
         let removed = server
             .remove_extension(RemoveExtensionRequest {
                 extension_id: "com.example.review.extension".to_string(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("remove should succeed");
         assert_eq!(
             removed.record.status,
             atelia_core::ExtensionInstallStatus::Disabled
         );
+        assert!(removed.audit_record_id.is_some());
 
         let missing_after_remove = server
             .extension_status(ExtensionStatusRequest {
@@ -5675,6 +5800,69 @@ mod tests {
             })
             .expect_err("removed extension should not have active status");
         assert_eq!(missing_after_remove.code, RpcErrorCode::NotFound);
+
+        let audit = server
+            .list_extension_registry_audit_records(
+                ListExtensionRegistryAuditRecordsRequest::default(),
+            )
+            .expect("audit history should list package mutations");
+        let kinds = audit
+            .records
+            .iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                ExtensionRegistryAuditKind::Install,
+                ExtensionRegistryAuditKind::Update,
+                ExtensionRegistryAuditKind::Disable,
+                ExtensionRegistryAuditKind::Enable,
+                ExtensionRegistryAuditKind::Rollback,
+                ExtensionRegistryAuditKind::BlocklistApply,
+                ExtensionRegistryAuditKind::Remove,
+            ]
+        );
+        let install_audit = audit.records.first().expect("install audit record");
+        assert_eq!(
+            install_audit.package_id.as_deref(),
+            Some("com.example.review.extension")
+        );
+        assert!(install_audit.previous_record.is_none());
+        assert_eq!(
+            install_audit
+                .new_record
+                .as_ref()
+                .expect("install new record")
+                .manifest_digest,
+            MANIFEST_V1
+        );
+        assert_eq!(install_audit.request_source, "service");
+        assert_eq!(install_audit.reason, "install package");
+        assert!(install_audit.provenance.is_some());
+        let update_audit = audit.records.get(1).expect("update audit record");
+        assert_eq!(
+            update_audit
+                .previous_record
+                .as_ref()
+                .expect("update previous record")
+                .manifest_digest,
+            MANIFEST_V1
+        );
+        assert_eq!(
+            update_audit
+                .new_record
+                .as_ref()
+                .expect("update new record")
+                .manifest_digest,
+            MANIFEST_V2
+        );
+        let blocklist_audit = audit.records.get(5).expect("blocklist audit record");
+        assert_eq!(
+            blocklist_audit.package_id.as_deref(),
+            Some("com.example.review.extension")
+        );
+        assert!(blocklist_audit.blocklist_entry.is_some());
     }
 
     /// Verifies the inspect RPC returns manifest, permission, service, trust, and block data.
@@ -5720,6 +5908,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("install should succeed");
         assert_eq!(install.record.version, "1.0.0");
@@ -5730,6 +5921,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("update should succeed");
         assert_eq!(updated.record.version, "2.0.0");
@@ -5743,6 +5937,9 @@ mod tests {
             .update_extension_publication(UpdateExtensionPublicationRequest {
                 extension_id: "com.example.inspect.package".to_string(),
                 publication: publication.clone(),
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("publication metadata should apply");
 
@@ -5779,6 +5976,9 @@ mod tests {
                     reason: BlockReason::UserBlocked,
                     note: Some("previous version revoked".to_string()),
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("previous version blocklist should apply");
 
@@ -5798,6 +5998,9 @@ mod tests {
                     reason: BlockReason::UserBlocked,
                     note: Some("temporary policy review".to_string()),
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("apply blocklist should succeed");
         assert_eq!(
@@ -5851,6 +6054,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect_err("client install should not claim accepted registry status");
         assert_eq!(rejected_install.code, RpcErrorCode::InvalidArgument);
@@ -5877,6 +6083,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("baseline install should succeed");
 
@@ -5889,6 +6098,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect_err("client update should not claim accepted registry status");
         assert_eq!(rejected_update.code, RpcErrorCode::InvalidArgument);
@@ -5954,6 +6166,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("active install should succeed");
         server
@@ -5963,6 +6178,9 @@ mod tests {
                     extension_id: "com.example.active".to_string(),
                     registry_submission: atelia_core::ExtensionRegistrySubmission::Accepted,
                     registry_identity: Some("third-party-registry".to_string()),
+                    requester: None,
+                    request_source: None,
+                    reason: None,
                 },
             )
             .expect("registry authority should accept the active package");
@@ -5972,6 +6190,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("blocked install should succeed");
         server
@@ -5980,6 +6201,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("submitted install should succeed");
         server
@@ -5989,6 +6213,9 @@ mod tests {
                     reason: BlockReason::PolicyViolation,
                     note: Some("blocked for trust index".to_string()),
                 },
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("blocklist should apply");
 
@@ -6083,6 +6310,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("initial install should succeed");
 
@@ -6092,6 +6322,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: false,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect_err("source change should require explicit approval");
         assert_eq!(denied.code, RpcErrorCode::Conflict);
@@ -6102,6 +6335,9 @@ mod tests {
                 approve_local_unsigned: false,
                 allow_local_process_runtime: false,
                 approve_source_change: true,
+                requester: None,
+                request_source: None,
+                reason: None,
             })
             .expect("approved source change should succeed");
         assert_eq!(approved.record.version, "2.0.0");
