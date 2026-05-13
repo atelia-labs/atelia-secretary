@@ -2209,31 +2209,16 @@ impl ExtensionRegistry {
         &mut self,
         record: ExtensionRegistryAuditRecord,
     ) -> RegistryResult<()> {
-        if record.reason.trim().is_empty() {
-            return Err(RegistryError::Validation(
-                ExtensionValidationError::InvalidField {
-                    field: "audit.reason",
-                    reason: "must not be empty".to_string(),
-                },
-            ));
-        }
-        if record.request_source.trim().is_empty() {
-            return Err(RegistryError::Validation(
-                ExtensionValidationError::InvalidField {
-                    field: "audit.request_source",
-                    reason: "must not be empty".to_string(),
-                },
-            ));
-        }
-        if self
+        let mut seen_ids = self
             .audit_records
             .iter()
-            .any(|existing| existing.id == record.id)
-        {
+            .map(|existing| existing.id.clone())
+            .collect::<BTreeSet<_>>();
+        if let Err(reason) = validate_extension_registry_audit_record(&record, &mut seen_ids) {
             return Err(RegistryError::Validation(
                 ExtensionValidationError::InvalidField {
-                    field: "audit.id",
-                    reason: "must be unique".to_string(),
+                    field: "audit.record",
+                    reason,
                 },
             ));
         }
@@ -2455,6 +2440,11 @@ impl ExtensionRegistry {
 fn validate_extension_registry_snapshot(
     snapshot: &ExtensionRegistrySnapshot,
 ) -> Result<(), String> {
+    let mut audit_ids = BTreeSet::new();
+    for record in &snapshot.audit_records {
+        validate_extension_registry_audit_record(record, &mut audit_ids)?;
+    }
+
     for (extension_id, records) in &snapshot.records {
         for (version, record) in records {
             let manifests = snapshot.manifests.get(extension_id).ok_or_else(|| {
@@ -2581,6 +2571,28 @@ fn validate_extension_registry_snapshot(
         return Err("extension blocklist contains unsupported vulnerability_id key".to_string());
     }
 
+    Ok(())
+}
+
+fn validate_extension_registry_audit_record(
+    record: &ExtensionRegistryAuditRecord,
+    seen_ids: &mut BTreeSet<AuditRecordId>,
+) -> Result<(), String> {
+    if record.schema_version != EXTENSION_REGISTRY_AUDIT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported audit schema_version {}",
+            record.schema_version
+        ));
+    }
+    if record.reason.trim().is_empty() {
+        return Err("audit.reason must not be empty".to_string());
+    }
+    if record.request_source.trim().is_empty() {
+        return Err("audit.request_source must not be empty".to_string());
+    }
+    if !seen_ids.insert(record.id.clone()) {
+        return Err(format!("duplicate audit id {}", record.id.as_str()));
+    }
     Ok(())
 }
 
@@ -3732,6 +3744,26 @@ mod tests {
             active_versions: BTreeMap::new(),
             blocklist: Vec::new(),
             audit_records: Vec::new(),
+        }
+    }
+
+    fn audit_record() -> ExtensionRegistryAuditRecord {
+        ExtensionRegistryAuditRecord {
+            id: AuditRecordId::new(),
+            schema_version: EXTENSION_REGISTRY_AUDIT_SCHEMA_VERSION,
+            created_at: LedgerTimestamp::now(),
+            kind: ExtensionRegistryAuditKind::Install,
+            actor: Actor::System {
+                id: "atelia-secretary".to_string(),
+            },
+            request_source: "secretary.test".to_string(),
+            reason: "test audit".to_string(),
+            policy_decision_id: None,
+            package_id: Some("com.example.extension".to_string()),
+            previous_record: None,
+            new_record: None,
+            provenance: None,
+            blocklist_entry: None,
         }
     }
 
@@ -5262,6 +5294,66 @@ mod tests {
         let err = ExtensionRegistry::from_snapshot(snapshot, ManifestValidationPolicy::default())
             .unwrap_err();
         assert!(err.contains("boundary mismatch"));
+    }
+
+    #[test]
+    fn extension_snapshot_rejects_invalid_audit_record() {
+        let extension = manifest("com.example.extension");
+        let mut snapshot = extension_snapshot(
+            BTreeMap::from([(extension.version.clone(), extension.clone())]),
+            BTreeMap::from([(
+                extension.version.clone(),
+                extension_record(&extension, None),
+            )]),
+        );
+        let mut record = audit_record();
+        record.request_source.clear();
+        snapshot.audit_records.push(record);
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("audit.request_source must not be empty"));
+
+        let err = ExtensionRegistry::from_snapshot(snapshot, ManifestValidationPolicy::default())
+            .unwrap_err();
+        assert!(err.contains("audit.request_source must not be empty"));
+    }
+
+    #[test]
+    fn extension_snapshot_rejects_duplicate_audit_ids() {
+        let extension = manifest("com.example.extension");
+        let mut first = audit_record();
+        let mut second = audit_record();
+        second.id = first.id.clone();
+        first.reason = "first audit".to_string();
+        second.reason = "second audit".to_string();
+        let mut snapshot = extension_snapshot(
+            BTreeMap::from([(extension.version.clone(), extension.clone())]),
+            BTreeMap::from([(
+                extension.version.clone(),
+                extension_record(&extension, None),
+            )]),
+        );
+        snapshot.audit_records = vec![first, second];
+
+        let err = snapshot.validate().unwrap_err();
+        assert!(err.contains("duplicate audit id"));
+    }
+
+    #[test]
+    fn append_audit_record_rejects_invalid_audit_contract() {
+        let mut registry = ExtensionRegistry::in_memory();
+        let mut record = audit_record();
+        record.schema_version = EXTENSION_REGISTRY_AUDIT_SCHEMA_VERSION + 1;
+
+        let err = registry.append_audit_record(record).unwrap_err();
+        assert!(matches!(
+            err,
+            RegistryError::Validation(ExtensionValidationError::InvalidField {
+                field: "audit.record",
+                ..
+            })
+        ));
+        assert!(err.to_string().contains("unsupported audit schema_version"));
     }
 
     #[test]
