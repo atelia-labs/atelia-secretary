@@ -552,6 +552,9 @@ struct ExtensionRegistryAuditContext {
     blocklist_entry: Option<BlocklistEntry>,
 }
 
+const PACKAGE_REGISTRY_REQUEST_SOURCE_MAX_CHARS: usize = 128;
+const PACKAGE_REGISTRY_REASON_MAX_CHARS: usize = 1024;
+
 fn default_package_registry_actor() -> Actor {
     Actor::System {
         id: "atelia-secretary".to_string(),
@@ -562,18 +565,28 @@ fn package_registry_actor(requester: Option<Actor>) -> Actor {
     requester.unwrap_or_else(default_package_registry_actor)
 }
 
+fn truncate_audit_text(value: String, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value
+    } else {
+        value.chars().take(max_chars).collect()
+    }
+}
+
 fn package_registry_request_source(request_source: Option<String>) -> String {
-    request_source
+    let value = request_source
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "service".to_string())
+        .unwrap_or_else(|| "service".to_string());
+    truncate_audit_text(value, PACKAGE_REGISTRY_REQUEST_SOURCE_MAX_CHARS)
 }
 
 fn package_registry_reason(reason: Option<String>, default_reason: &str) -> String {
-    reason
+    let value = reason
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| default_reason.to_string())
+        .unwrap_or_else(|| default_reason.to_string());
+    truncate_audit_text(value, PACKAGE_REGISTRY_REASON_MAX_CHARS)
 }
 
 fn active_extension_record_ref(
@@ -2760,6 +2773,53 @@ mod tests {
             missing_after_remove,
             ServiceError::ExtensionRegistry(RegistryError::NotInstalled { .. })
         ));
+    }
+
+    #[test]
+    fn package_registry_audit_metadata_is_bounded_before_persisting() {
+        let svc = ready_service();
+
+        let installed = svc
+            .install_extension(InstallExtensionRequest {
+                manifest: extension_manifest(
+                    "com.example.bounded-audit",
+                    "1.0.0",
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ),
+                approve_local_unsigned: false,
+                allow_local_process_runtime: false,
+                approve_source_change: false,
+                requester: None,
+                request_source: Some("s".repeat(PACKAGE_REGISTRY_REQUEST_SOURCE_MAX_CHARS + 16)),
+                reason: Some("r".repeat(PACKAGE_REGISTRY_REASON_MAX_CHARS + 16)),
+            })
+            .expect("install should persist bounded audit metadata");
+        let audit_record_id = installed
+            .audit_record_id
+            .expect("install should return audit record id");
+
+        let audit_page = svc
+            .list_extension_registry_audit_records(ListExtensionRegistryAuditRecordsRequest {
+                limit: Some(1),
+                offset: None,
+                cursor: None,
+            })
+            .expect("audit records should be listed");
+        let audit_record = audit_page
+            .records
+            .into_iter()
+            .find(|record| record.id == audit_record_id)
+            .expect("audit record should be persisted");
+
+        assert_eq!(
+            audit_record.request_source.chars().count(),
+            PACKAGE_REGISTRY_REQUEST_SOURCE_MAX_CHARS
+        );
+        assert_eq!(
+            audit_record.reason.chars().count(),
+            PACKAGE_REGISTRY_REASON_MAX_CHARS
+        );
     }
 
     #[test]
