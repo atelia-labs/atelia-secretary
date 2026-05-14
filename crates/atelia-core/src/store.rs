@@ -1062,9 +1062,8 @@ impl SecretaryStore for InMemoryStore {
         let start = page_start(query.page_token.as_deref(), "job_events")?;
         let page_size = query.page_size.unwrap_or(usize::MAX);
         let resolved_cursor_sequence = resolve_event_cursor_sequence(&inner, query.cursor.clone())?;
-        let filtered = collect_filtered_job_events(&inner, &query)?;
+        let (event_refs, next_page_token) = collect_paginated_filtered_job_events(&inner, &query, start, page_size)?;
 
-        let (event_refs, next_page_token) = page_records(filtered.into_iter(), start, page_size);
         let events = event_refs.into_iter().cloned().collect();
 
         Ok(EventPage {
@@ -3024,13 +3023,22 @@ fn page_records<Record>(
     (retained, next_page_token)
 }
 
-fn collect_filtered_job_events<'a>(
+fn collect_paginated_filtered_job_events<'a>(
     inner: &'a InMemoryInner,
     query: &EventQuery,
-) -> StoreResult<Vec<&'a JobEvent>> {
+    start: usize,
+    page_size: usize,
+) -> StoreResult<(Vec<&'a JobEvent>, Option<String>)> {
     let after_sequence = event_cursor_sequence(inner, query.cursor.clone())?;
 
-    let mut filtered = Vec::new();
+    let mut skipped = 0usize;
+    let mut retained = Vec::with_capacity(page_size.min(1024));
+    let mut has_next = false;
+
+    if page_size == 0 {
+        return Ok((retained, None));
+    }
+
     if let Some(start_sequence) = after_sequence.checked_add(1) {
         for (_, id) in inner.job_events_by_sequence.range(start_sequence..) {
             let event = inner
@@ -3042,12 +3050,28 @@ fn collect_filtered_job_events<'a>(
                 })?;
 
             if event_matches_query(inner, event, query)? {
-                filtered.push(event);
+                if skipped < start {
+                    skipped += 1;
+                    continue;
+                }
+
+                if retained.len() == page_size {
+                    has_next = true;
+                    break;
+                }
+
+                retained.push(event);
             }
         }
     }
 
-    Ok(filtered)
+    let next_page_token = if has_next {
+        Some((start + retained.len()).to_string())
+    } else {
+        None
+    };
+
+    Ok((retained, next_page_token))
 }
 
 fn resolve_event_cursor_sequence(
