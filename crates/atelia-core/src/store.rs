@@ -1062,7 +1062,8 @@ impl SecretaryStore for InMemoryStore {
         let start = page_start(query.page_token.as_deref(), "job_events")?;
         let page_size = query.page_size.unwrap_or(usize::MAX);
         let resolved_cursor_sequence = resolve_event_cursor_sequence(&inner, query.cursor.clone())?;
-        let (event_refs, next_page_token) = collect_paginated_filtered_job_events(&inner, &query, start, page_size)?;
+        let (event_refs, next_page_token) =
+            collect_paginated_filtered_job_events(&inner, &query, start, page_size)?;
 
         let events = event_refs.into_iter().cloned().collect();
 
