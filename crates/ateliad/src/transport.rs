@@ -706,8 +706,7 @@ fn local_auth_token_is_strong(token: &str) -> bool {
 
 /// Load an existing generated session token or create one in the storage dir.
 fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String> {
-    std::fs::create_dir_all(storage_dir)
-        .with_context(|| format!("failed to create auth storage dir {storage_dir:?}"))?;
+    create_auth_storage_dir(storage_dir)?;
 
     let token_path = local_auth_token_path(storage_dir);
     match std::fs::symlink_metadata(&token_path) {
@@ -720,6 +719,35 @@ fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String>
             Err(error).with_context(|| format!("failed to read session token file {token_path:?}"))
         }
     }
+}
+
+#[cfg(unix)]
+fn create_auth_storage_dir(storage_dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(storage_dir)
+        .with_context(|| format!("failed to create auth storage dir {storage_dir:?}"))?;
+
+    let metadata = std::fs::metadata(storage_dir)
+        .with_context(|| format!("failed to inspect auth storage dir {storage_dir:?}"))?;
+    let current_euid = unsafe { libc::geteuid() };
+    if metadata.uid() != current_euid {
+        return Err(anyhow!(
+            "auth storage dir {storage_dir:?} must be owned by the current user"
+        ));
+    }
+
+    std::fs::set_permissions(storage_dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to set restrictive permissions on {storage_dir:?}"))
+}
+
+#[cfg(not(unix))]
+fn create_auth_storage_dir(storage_dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(storage_dir)
+        .with_context(|| format!("failed to create auth storage dir {storage_dir:?}"))
 }
 
 /// Read a persisted session token after validating file safety properties.
@@ -5112,6 +5140,51 @@ mod tests {
 
         let resolved_again = resolve_local_auth(&storage_dir).expect("resolve local auth again");
         assert_eq!(resolved_again, LocalAuthConfig::BearerToken { token });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_auth_creates_restrictive_storage_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::remove_var(AUTH_TOKEN_ENV);
+
+        let storage_dir = test_repo_dir("local-auth-fresh-storage").join("auth");
+        assert!(!storage_dir.exists());
+
+        resolve_local_auth(&storage_dir).expect("resolve local auth");
+
+        let mode = fs::metadata(&storage_dir)
+            .expect("auth storage dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_auth_normalizes_existing_storage_dir_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = LocalAuthEnvGuard::lock();
+        std::env::remove_var(AUTH_DISABLED_ENV);
+        std::env::remove_var(AUTH_TOKEN_ENV);
+
+        let storage_dir = test_repo_dir("local-auth-storage-permissions");
+        let permissions = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(&storage_dir, permissions).expect("seed auth storage dir permissions");
+
+        resolve_local_auth(&storage_dir).expect("resolve local auth");
+
+        let mode = fs::metadata(&storage_dir)
+            .expect("auth storage dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[cfg(unix)]
