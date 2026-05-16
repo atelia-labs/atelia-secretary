@@ -4255,6 +4255,71 @@ mod tests {
     }
 
     #[test]
+    fn register_submit_and_project_status_normalize_blank_goal() {
+        let server = ready_server();
+        let root = test_repo_dir("blank-goal-round-trip");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "rpc-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let submitted = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: Some(" \t\n ".to_string()),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("blank goal submit should succeed");
+        assert_eq!(submitted.job.goal, None);
+
+        let fetched = server
+            .get_job(GetJobRequest {
+                job_id: submitted.job.job_id.clone(),
+            })
+            .expect("get job should succeed");
+        assert_eq!(fetched.job.goal, None);
+
+        let jobs = server
+            .list_jobs(ListJobsRequest {
+                repository_id: Some(registered.repository.repository_id.clone()),
+                status: Some(RpcJobStatus::Succeeded),
+                requester: None,
+                page_size: None,
+                page_token: None,
+            })
+            .expect("list jobs should succeed");
+        let listed = jobs
+            .jobs
+            .iter()
+            .find(|job| job.job_id == submitted.job.job_id)
+            .expect("listed blank-goal job");
+        assert_eq!(listed.goal, None);
+
+        let status = server
+            .get_project_status(GetProjectStatusRequest {
+                repository_id: submitted.job.repository_id.clone(),
+            })
+            .expect("project status should succeed");
+        let status_job = status
+            .recent_jobs
+            .iter()
+            .find(|job| job.job_id == submitted.job.job_id)
+            .expect("status job with blank goal");
+        assert_eq!(status_job.goal, None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn register_repository_response_policy_is_not_an_authz_result() {
         let server = ready_server();
         let root = test_repo_dir("register-policy-null");

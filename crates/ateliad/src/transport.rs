@@ -5743,6 +5743,54 @@ mod tests {
         assert_eq!(parsed.goal, None);
     }
 
+    #[tokio::test]
+    async fn job_routes_submit_blank_goal_omits_goal_field() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("job-route-blank-goal");
+        let repository = {
+            let server = rpc_server.read().await;
+            server
+                .register_repository(rpc::RegisterRepositoryRequest {
+                    display_name: "job-route-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed")
+                .repository
+        };
+
+        let submit_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/jobs/submit",
+            serde_json::json!({
+                "repository_id": repository.repository_id,
+                "requester": {
+                    "type": "agent",
+                    "id": "agent:job-route",
+                    "display_name": "Job Route Agent"
+                },
+                "kind": "read",
+                "goal": " \t\n ",
+                "requested_capabilities": [],
+                "idempotency_key": "job-route-blank-goal"
+            }),
+        )
+        .await;
+        assert_eq!(submit_response.status(), StatusCode::OK);
+        let submit_payload = to_bytes(submit_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        let job = submit_payload["data"]["job"]
+            .as_object()
+            .expect("job object should be serialized");
+        assert!(!job.contains_key("goal"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn submit_job_payload_rejects_ambiguous_filesystem_read_scopes() {
         for roots in [
