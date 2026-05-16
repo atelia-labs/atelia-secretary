@@ -1,0 +1,60 @@
+{
+  "schema": "atelia.extension.v1",
+  "id": "ai.atelia.observational-memory",
+  "name": "Observational Memory",
+  "version": "1.0.0",
+  "publisher": {
+    "name": "Atelia Labs",
+    "url": null
+  },
+  "description": "Foundation fixture for the default memory strategy contract; not installable until artifact verification exists.",
+  "types": [
+    "memory_strategy"
+  ],
+  "compatibility": {
+    "atelia_protocol": ">=0.1 <0.3",
+    "atelia_secretary": ">=0.1 <0.2"
+  },
+  "entrypoints": {
+    "realm": "backend",
+    "runtime": "wasm-rust",
+    "command": null,
+    "image": null,
+    "wasm": null,
+    "protocol": "atelia-extension-rpc.v1"
+  },
+  "permissions": {},
+  "services": {
+    "provides": [],
+    "consumes": []
+  },
+  "tool_output": [],
+  "hooks": [],
+  "webhooks": [],
+  "composition": {
+    "attachments": []
+  },
+  "failure": {
+    "degrade": "return_unavailable",
+    "retry_policy": "none"
+  },
+  "provenance": {
+    "source": "registry",
+    "repository": null,
+    "commit": null,
+    "registry_identity": "atelia-official",
+    "publication": {
+      "visibility": "official",
+      "registry_submission": "awaiting_submission"
+    },
+    "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "manifest_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "signature": "official-signature",
+    "signer": "atelia-official"
+  },
+  "bundle": null,
+  "migration": {
+    "from": [],
+    "notes": null
+  }
+}

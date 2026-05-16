@@ -53,6 +53,11 @@ surface.
 - `presentation`: changes human/agent-facing display
 - `integration`: connects external services such as GitHub, Linear, or Slack
 
+Observational Memory reserves the official default `memory_strategy` contract
+for future package execution in this lane. It defines the `messages` and
+`memory` split for schema and policy coverage, but Secretary does not execute
+that compaction flow yet.
+
 Semantic presentation is declared by AEP packages and rendered by presentation
 hosts such as Atelia Mac and Atelia iOS. Secretary preserves the backend audit,
 permission, and provenance facts that those hosts must display.
