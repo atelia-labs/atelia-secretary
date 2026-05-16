@@ -17,6 +17,75 @@ use std::str::FromStr;
 pub const EXTENSION_MANIFEST_SCHEMA: &str = "atelia.extension.v1";
 pub const EXTENSION_RPC_PROTOCOL: &str = "atelia-extension-rpc.v1";
 pub const EXTENSION_REGISTRY_AUDIT_SCHEMA_VERSION: u32 = 1;
+pub const OFFICIAL_OBSERVATIONAL_MEMORY_PACKAGE_ID: &str = "ai.atelia.observational-memory";
+
+/// Build the official default Observational Memory package manifest.
+///
+/// This is the initial `memory_strategy` foundation for the `messages` +
+/// `memory` split used by agent context compaction. It is scoped as an
+/// official `ai.atelia.*` package and does not introduce runtime dispatch.
+pub fn official_observational_memory_manifest() -> ExtensionManifest {
+    ExtensionManifest {
+        schema: EXTENSION_MANIFEST_SCHEMA.to_string(),
+        id: OFFICIAL_OBSERVATIONAL_MEMORY_PACKAGE_ID.to_string(),
+        name: "Observational Memory".to_string(),
+        version: "1.0.0".to_string(),
+        publisher: ExtensionPublisher {
+            name: "Atelia Labs".to_string(),
+            url: None,
+        },
+        description:
+            "Official default memory strategy foundation for recent messages and compressed memory."
+                .to_string(),
+        types: vec![ExtensionKind::MemoryStrategy],
+        compatibility: ExtensionCompatibility {
+            atelia_protocol: ">=0.1 <0.3".to_string(),
+            atelia_secretary: ">=0.1 <0.2".to_string(),
+        },
+        entrypoints: ExtensionEntrypoints {
+            realm: ExtensionRealm::Backend,
+            runtime: ExtensionRuntime::WasmRust,
+            command: None,
+            image: None,
+            wasm: Some("observational-memory.wasm".to_string()),
+            protocol: EXTENSION_RPC_PROTOCOL.to_string(),
+        },
+        permissions: BTreeMap::new(),
+        tools: Vec::new(),
+        services: ExtensionServices::default(),
+        tool_output: Vec::new(),
+        hooks: Vec::new(),
+        webhooks: Vec::new(),
+        composition: ExtensionComposition::default(),
+        failure: ExtensionFailure {
+            degrade: DegradeBehavior::ReturnUnavailable,
+            retry_policy: RetryPolicy::None,
+        },
+        provenance: ExtensionProvenance {
+            source: ProvenanceSource::Registry,
+            repository: None,
+            source_ref: None,
+            manifest_path: None,
+            commit: None,
+            registry_identity: Some("atelia-official".to_string()),
+            lineage: None,
+            publication: Some(ExtensionPublication {
+                visibility: ExtensionPublicationVisibility::Official,
+                registry_submission: ExtensionRegistrySubmission::Accepted,
+            }),
+            artifact_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            manifest_digest:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            signature: Some("official-signature".to_string()),
+            signer: Some("atelia-official".to_string()),
+        },
+        bundle: None,
+        migration: ExtensionMigration::default(),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtensionManifest {
@@ -6771,6 +6840,51 @@ mod tests {
             validated.manifest.provenance.publication,
             manifest.provenance.publication
         );
+    }
+
+    #[test]
+    fn official_observational_memory_manifest_validates_as_official_default_package() {
+        let manifest = official_observational_memory_manifest();
+
+        let validated = manifest
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap();
+
+        assert_eq!(validated.boundary, ExtensionBoundary::Official);
+        assert_eq!(
+            validated.manifest.id,
+            OFFICIAL_OBSERVATIONAL_MEMORY_PACKAGE_ID
+        );
+        assert_eq!(
+            validated.manifest.types,
+            vec![ExtensionKind::MemoryStrategy]
+        );
+        assert_eq!(
+            validated.manifest.provenance.publication,
+            Some(ExtensionPublication {
+                visibility: ExtensionPublicationVisibility::Official,
+                registry_submission: ExtensionRegistrySubmission::Accepted,
+            })
+        );
+    }
+
+    #[test]
+    fn official_observational_memory_manifest_rejects_malformed_tool_shape() {
+        let mut manifest = official_observational_memory_manifest();
+        manifest.tools.push(ExtensionToolDefinition {
+            id: "memory.peek".to_string(),
+            permissions: vec!["memory.peek".to_string()],
+            permissions_required: Vec::new(),
+        });
+
+        let err = manifest
+            .validate(&ManifestValidationPolicy::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ExtensionValidationError::InvalidField { field: "types", .. }
+        ));
     }
 
     #[test]

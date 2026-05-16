@@ -1,4 +1,7 @@
-use atelia_core::extensions::{ExtensionBoundary, ExtensionManifest, ManifestValidationPolicy};
+use atelia_core::extensions::{
+    official_observational_memory_manifest, ExtensionBoundary, ExtensionManifest,
+    ManifestValidationPolicy,
+};
 
 /// Deserialize a manifest fixture into the extension manifest model.
 fn load_manifest_fixture(contents: &str) -> ExtensionManifest {
@@ -46,5 +49,27 @@ fn extension_manifest_compatibility_fixtures_cover_local_process_manifests() {
             .with_local_unsigned()
             .with_local_process_runtime(),
         ExtensionBoundary::LocalDevelopment,
+    );
+}
+
+/// Verify compatibility coverage for the official Observational Memory package fixture.
+#[test]
+fn extension_manifest_compatibility_fixtures_cover_official_observational_memory_package() {
+    let manifest = official_observational_memory_manifest();
+    let serialized = serde_json::to_value(&manifest).expect("official manifest should serialize");
+    let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+        "fixtures/extensions/official_observational_memory.json"
+    ))
+    .expect("fixture manifest should parse as JSON");
+
+    assert_eq!(
+        serialized, fixture,
+        "official memory strategy fixture should match the code-generated manifest"
+    );
+
+    assert_manifest_fixture_roundtrip(
+        include_str!("fixtures/extensions/official_observational_memory.json"),
+        ManifestValidationPolicy::default(),
+        ExtensionBoundary::Official,
     );
 }
