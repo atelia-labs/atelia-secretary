@@ -102,7 +102,9 @@ runtime は state transition を handler 内の ad hoc string としてではな
 
 `SubmitJobRequest.goal` は任意の bounded-job intent / summary です。Secretary は空または未指定の
 goal を受け入れて `None` / absent として保持し、durable な `Goal` lifecycle と OM default
-package policy は別の future product lane に切り出します。
+package policy は別の future product lane に切り出します。この job request が持つのは
+あくまで optional な goal summary であり、first-class な goal lifecycle contract は将来に
+予約されています。
 
 初期 job state:
 
