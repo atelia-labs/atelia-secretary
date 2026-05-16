@@ -6858,9 +6858,12 @@ mod tests {
             })
         );
         assert!(manifest.entrypoints.wasm.is_none());
-        assert!(manifest
-            .validate(&ManifestValidationPolicy::default())
-            .is_err());
+        assert!(matches!(
+            manifest.validate(&ManifestValidationPolicy::default()),
+            Err(ExtensionValidationError::MissingField {
+                field: "entrypoints.wasm"
+            })
+        ));
     }
 
     #[test]
