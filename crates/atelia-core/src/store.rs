@@ -322,7 +322,7 @@ pub struct InMemoryStore {
 #[serde(default)]
 struct InMemoryInner {
     repositories: HashMap<RepositoryId, RepositoryRecord>,
-    jobs: HashMap<JobId, JobRecord>,
+    jobs: BTreeMap<JobId, JobRecord>,
     job_events_by_id: HashMap<JobEventId, JobEvent>,
     job_events_by_sequence: BTreeMap<u64, JobEventId>,
     next_event_sequence: u64,
@@ -747,14 +747,15 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn list_jobs(&self) -> StoreResult<Vec<JobRecord>> {
-        Ok(list_records(&self.lock()?.jobs))
+        Ok(list_records_btree(&self.lock()?.jobs))
     }
 
     fn query_jobs(&self, query: JobQuery) -> StoreResult<JobPage> {
+        // PERF: Avoid full materialization during pagination by streaming the inherently sorted BTreeMap
         let inner = self.lock()?;
         let start = page_start(query.page_token.as_deref(), "jobs")?;
         let page_size = query.page_size.unwrap_or(usize::MAX);
-        let mut filtered = inner
+        let filtered = inner
             .jobs
             .values()
             .filter(|job| {
@@ -776,11 +777,9 @@ impl SecretaryStore for InMemoryStore {
                     .as_ref()
                     .map(|requester| &job.requester == requester)
                     .unwrap_or(true)
-            })
-            .collect::<Vec<_>>();
-        filtered.sort_by(|left, right| left.id.cmp(&right.id));
+            });
 
-        let (job_refs, next_page_token) = page_records(filtered.into_iter(), start, page_size);
+        let (job_refs, next_page_token) = page_records(filtered, start, page_size);
         let jobs = job_refs.into_iter().cloned().collect();
 
         Ok(JobPage {
@@ -790,7 +789,7 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn get_job(&self, id: &JobId) -> StoreResult<JobRecord> {
-        get_record(&self.lock()?.jobs, id, "jobs")
+        get_record_btree(&self.lock()?.jobs, id, "jobs")
     }
 
     fn project_status_snapshot(
@@ -2886,7 +2885,34 @@ where
         })
 }
 
+/// Fetches a record from a BTree-backed collection while keeping callers on the ordered storage path.
+fn get_record_btree<Id, Record>(
+    collection: &BTreeMap<Id, Record>,
+    id: &Id,
+    collection_name: &'static str,
+) -> StoreResult<Record>
+where
+    Id: Ord + std::fmt::Debug,
+    Record: Clone,
+{
+    collection
+        .get(id)
+        .cloned()
+        .ok_or_else(|| StoreError::NotFound {
+            collection: collection_name,
+            id: id_debug(id),
+        })
+}
+
 fn list_records<Id, Record>(collection: &HashMap<Id, Record>) -> Vec<Record>
+where
+    Record: Clone,
+{
+    collection.values().cloned().collect()
+}
+
+/// Lists records in BTree key order so pagination and listing observe stable iteration order.
+fn list_records_btree<Id, Record>(collection: &BTreeMap<Id, Record>) -> Vec<Record>
 where
     Record: Clone,
 {
