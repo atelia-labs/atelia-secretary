@@ -1351,14 +1351,16 @@ impl SecretaryStore for InMemoryStore {
     }
 
     fn list_schema_migrations(&self) -> StoreResult<Vec<SchemaMigrationRecord>> {
-        let mut migrations = list_records(&self.lock()?.schema_migrations);
+        // PERF: Defer cloning until after sorting to avoid heavy allocations and swaps
+        let inner = self.lock()?;
+        let mut migrations: Vec<_> = inner.schema_migrations.values().collect();
         migrations.sort_by(|left, right| {
             left.migration_version
                 .cmp(&right.migration_version)
                 .then_with(|| left.created_at.cmp(&right.created_at))
                 .then_with(|| left.id.cmp(&right.id))
         });
-        Ok(migrations)
+        Ok(migrations.into_iter().cloned().collect())
     }
 
     fn get_schema_migration(&self, id: &SchemaMigrationId) -> StoreResult<SchemaMigrationRecord> {
