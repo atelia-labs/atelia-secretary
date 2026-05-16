@@ -1586,14 +1586,23 @@ fn serialize_job_cancellation(cancellation: &rpc::JobCancellation) -> serde_json
 
 fn serialize_job(job: &rpc::Job) -> serde_json::Value {
     let mut object = serde_json::Map::from_iter([
-        ("job_id".to_string(), serde_json::Value::String(job.job_id.clone())),
+        (
+            "job_id".to_string(),
+            serde_json::Value::String(job.job_id.clone()),
+        ),
         (
             "repository_id".to_string(),
             serde_json::Value::String(job.repository_id.clone()),
         ),
         ("requester".to_string(), serialize_actor(&job.requester)),
-        ("kind".to_string(), serde_json::Value::String(job.kind.clone())),
-        ("status".to_string(), serde_json::Value::String(job.status.clone())),
+        (
+            "kind".to_string(),
+            serde_json::Value::String(job.kind.clone()),
+        ),
+        (
+            "status".to_string(),
+            serde_json::Value::String(job.status.clone()),
+        ),
         (
             "policy_summary".to_string(),
             serde_json::to_value(job.policy_summary.as_ref().map(serialize_policy_summary))

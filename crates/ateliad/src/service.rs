@@ -1165,8 +1165,11 @@ impl SecretaryService {
             }
             None => None,
         };
-        let request_signature =
-            submit_job_request_signature(&request, normalized_goal.as_deref(), &requested_capabilities);
+        let request_signature = submit_job_request_signature(
+            &request,
+            normalized_goal.as_deref(),
+            &requested_capabilities,
+        );
         let tool_output_defaults = self.get_tool_output_defaults(
             ToolOutputSettingsScope::repository(repository.id.clone())
                 .for_tool(tool_kind.tool_id()),
