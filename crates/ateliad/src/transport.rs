@@ -706,8 +706,21 @@ fn local_auth_token_is_strong(token: &str) -> bool {
 
 /// Load an existing generated session token or create one in the storage dir.
 fn load_or_create_session_token(storage_dir: &std::path::Path) -> Result<String> {
-    std::fs::create_dir_all(storage_dir)
-        .with_context(|| format!("failed to create auth storage dir {storage_dir:?}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(storage_dir)
+            .with_context(|| format!("failed to create auth storage dir {storage_dir:?}"))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(storage_dir)
+            .with_context(|| format!("failed to create auth storage dir {storage_dir:?}"))?;
+    }
 
     let token_path = local_auth_token_path(storage_dir);
     match std::fs::symlink_metadata(&token_path) {
