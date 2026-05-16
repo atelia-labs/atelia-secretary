@@ -127,7 +127,8 @@ as ad hoc strings in handlers.
 `SubmitJobRequest.goal` is an optional bounded-job intent/summary. Secretary
 accepts empty or missing goal values and stores them as absent/`None`; durable
 `Goal` lifecycle work and OM default package policy belong to separate future
-product lanes.
+product lanes. This job request still only carries an optional goal summary;
+a first-class goal lifecycle contract is reserved for later.
 
 Initial job states:
 

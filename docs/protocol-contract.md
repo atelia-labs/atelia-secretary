@@ -164,7 +164,9 @@ policy and idempotency, but they are not echoed on `Job` yet.
 
 `SubmitJobRequest.goal` is optional. Secretary accepts empty or missing goal
 values, stores them as absent/`None`, and keeps the durable `Goal` lifecycle
-and OM default package policy in separate future product lanes.
+and OM default package policy in separate future product lanes. This job
+request still only carries an optional goal summary; a first-class goal
+lifecycle contract is reserved for later.
 
 `SubmitJob` must not execute work immediately before policy has been evaluated.
 The first observable effect is a persisted `job` and `job_event`.
