@@ -15,7 +15,8 @@ use atelia_core::{
     ExtensionRegistry, ExtensionRegistryAuditKind, ExtensionRegistryAuditProvenance,
     ExtensionRegistryAuditRecord, ExtensionRegistryAuditRecordRef, ExtensionRegistryService,
     ExtensionRegistrySnapshot, ExtensionServices, ExtensionSourceSnapshot, ExtensionStatusRequest,
-    ExtensionStatusResponse, FsDeleteTool, FsListTool, FsReadTool, FsStatTool,
+    ExtensionStatusResponse, FsDeleteTool, FsDiffTool, FsListTool, FsReadTool, FsSearchTool,
+    FsStatTool,
     InMemoryStore, InMemoryToolOutputSettingsService,
     InstallExtensionRequest, InstallExtensionResponse, JobEvent, JobId, JobKind,
     JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
@@ -69,9 +70,17 @@ const SECRETARY_FS_DELETE_TOOL_DESCRIPTION: &str = "Delete one file from an allo
 const SECRETARY_FS_LIST_TOOL_ID: &str = "fs.list";
 const SECRETARY_FS_LIST_TOOL_NAME: &str = "Filesystem List";
 const SECRETARY_FS_LIST_TOOL_DESCRIPTION: &str = "List directory entries within an allowed scope.";
+const SECRETARY_FS_SEARCH_TOOL_ID: &str = "fs.search";
+const SECRETARY_FS_SEARCH_TOOL_NAME: &str = "Filesystem Search";
+const SECRETARY_FS_SEARCH_TOOL_DESCRIPTION: &str =
+    "Search file contents for a literal pattern within an allowed repository scope.";
 const SECRETARY_FS_READ_TOOL_ID: &str = "fs.read";
 const SECRETARY_FS_READ_TOOL_NAME: &str = "Filesystem Read";
 const SECRETARY_FS_READ_TOOL_DESCRIPTION: &str = "Read a file from an allowed repository scope.";
+const SECRETARY_FS_DIFF_TOOL_ID: &str = "fs.diff";
+const SECRETARY_FS_DIFF_TOOL_NAME: &str = "Filesystem Diff";
+const SECRETARY_FS_DIFF_TOOL_DESCRIPTION: &str =
+    "Compare a bounded diff between two files in the repository.";
 const SECRETARY_FS_STAT_TOOL_ID: &str = "fs.stat";
 const SECRETARY_FS_STAT_TOOL_NAME: &str = "Filesystem Stat";
 const SECRETARY_FS_STAT_TOOL_DESCRIPTION: &str = "Read metadata for a file or directory.";
@@ -83,6 +92,8 @@ const SECRETARY_FS_READ_CAPABILITY: &str = "filesystem.read";
 const SECRETARY_FS_LIST_CAPABILITY: &str = "filesystem.list";
 const SECRETARY_FS_STAT_CAPABILITY: &str = "filesystem.stat";
 const SECRETARY_FS_DELETE_CAPABILITY: &str = "filesystem.delete";
+const SECRETARY_FS_SEARCH_CAPABILITY: &str = "filesystem.search";
+const SECRETARY_FS_DIFF_CAPABILITY: &str = "filesystem.diff";
 const SECRETARY_CAPABILITY_DISCOVERY: &str = "capability.discovery";
 
 fn daemon_capabilities() -> Vec<String> {
@@ -376,8 +387,39 @@ pub struct SubmitJobRequest {
     pub goal: Option<String>,
     pub resource_scope: Option<ResourceScope>,
     pub requested_capabilities: Vec<String>,
+    pub tool_args: Option<SubmitJobToolArgs>,
     /// Optional caller-provided key used to deduplicate successful retries.
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
+pub struct SubmitJobToolArgs {
+    pub pattern: Option<String>,
+    pub max: Option<u64>,
+    pub comparison_path: Option<String>,
+    pub max_bytes: Option<u64>,
+    pub max_chars: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct SubmitJobToolArgsSearch {
+    pattern: String,
+    max_results: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct SubmitJobToolArgsDiff {
+    comparison_path: String,
+    max_bytes: Option<usize>,
+    max_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+enum SubmitJobToolArgsSpec {
+    Search(SubmitJobToolArgsSearch),
+    Diff(SubmitJobToolArgsDiff),
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,6 +429,8 @@ enum SubmitJobToolKind {
     FsList,
     FsStat,
     FsDelete,
+    FsSearch,
+    FsDiff,
 }
 
 impl SubmitJobToolKind {
@@ -397,6 +441,8 @@ impl SubmitJobToolKind {
             Self::FsList => SECRETARY_FS_LIST_TOOL_ID,
             Self::FsStat => SECRETARY_FS_STAT_TOOL_ID,
             Self::FsDelete => SECRETARY_FS_DELETE_TOOL_ID,
+            Self::FsSearch => SECRETARY_FS_SEARCH_TOOL_ID,
+            Self::FsDiff => SECRETARY_FS_DIFF_TOOL_ID,
         }
     }
 }
@@ -1171,6 +1217,8 @@ impl SecretaryService {
         let tool_kind = resolve_submit_job_tool_kind(&request, &requested_capabilities)?;
         let repository = self.get_repository(&request.repository_id)?;
         let normalized_goal = normalize_submit_job_goal(request.goal.clone());
+        let resolved_tool_args =
+            resolve_submit_job_tool_args(&tool_kind, request.tool_args.clone())?;
 
         let normalized_idempotency_key = match request.idempotency_key.as_ref() {
             Some(idempotency_key) => {
@@ -1204,8 +1252,17 @@ impl SecretaryService {
                 | SubmitJobToolKind::FsList
                 | SubmitJobToolKind::FsStat
                 | SubmitJobToolKind::FsDelete
+                | SubmitJobToolKind::FsSearch
+                | SubmitJobToolKind::FsDiff
         ) {
             validate_filesystem_path_scope(&repository, &resource_scope)?;
+        }
+        if let SubmitJobToolArgsSpec::Diff(diff) = &resolved_tool_args {
+            validate_secondary_filesystem_path_scope(
+                &repository,
+                &resource_scope,
+                &diff.comparison_path,
+            )?;
         }
 
         let runtime_request = RuntimeJobRequest::new(
@@ -1290,7 +1347,7 @@ impl SecretaryService {
                     });
                 }
 
-                let receipt = match tool_kind {
+                    let receipt = match tool_kind {
                     SubmitJobToolKind::Echo => {
                         self.lifecycle.runtime().run_tool_job_with_finalizer(
                             runtime_request.clone(),
@@ -1336,6 +1393,54 @@ impl SecretaryService {
                     }
                     SubmitJobToolKind::FsDelete => {
                         let tool = FsDeleteTool::new(&repository.root_path);
+                        self.lifecycle.runtime().run_tool_job_with_finalizer(
+                            runtime_request.clone(),
+                            &tool,
+                            Some(make_submit_job_finalizer(
+                                idempotency_key.to_string(),
+                                request_signature.clone(),
+                            )),
+                        )?
+                    }
+                    SubmitJobToolKind::FsSearch => {
+                        let search = match &resolved_tool_args {
+                            SubmitJobToolArgsSpec::Search(args) => args,
+                            _ => {
+                                return Err(ServiceError::InvalidArgument {
+                                    reason: "internal tool_args resolution lost for fs.search".to_string(),
+                                });
+                            }
+                        };
+                        let mut tool = FsSearchTool::new(&repository.root_path, &search.pattern);
+                        if let Some(max) = search.max_results {
+                            tool = tool.with_max_results(max);
+                        }
+                        self.lifecycle.runtime().run_tool_job_with_finalizer(
+                            runtime_request.clone(),
+                            &tool,
+                            Some(make_submit_job_finalizer(
+                                idempotency_key.to_string(),
+                                request_signature.clone(),
+                            )),
+                        )?
+                    }
+                    SubmitJobToolKind::FsDiff => {
+                        let diff = match &resolved_tool_args {
+                            SubmitJobToolArgsSpec::Diff(args) => args,
+                            _ => {
+                                return Err(ServiceError::InvalidArgument {
+                                    reason: "internal tool_args resolution lost for fs.diff".to_string(),
+                                });
+                            }
+                        };
+                        let mut tool =
+                            FsDiffTool::new(&repository.root_path, &diff.comparison_path);
+                        if let Some(max_bytes) = diff.max_bytes {
+                            tool = tool.with_max_bytes(max_bytes);
+                        }
+                        if let Some(max_chars) = diff.max_chars {
+                            tool = tool.with_max_chars(max_chars);
+                        }
                         self.lifecycle.runtime().run_tool_job_with_finalizer(
                             runtime_request.clone(),
                             &tool,
@@ -1420,6 +1525,51 @@ impl SecretaryService {
                 }
                 SubmitJobToolKind::FsDelete => {
                     let tool = FsDeleteTool::new(&repository.root_path);
+                    self.lifecycle.runtime().run_tool_job_with_finalizer(
+                        runtime_request,
+                        &tool,
+                        None::<
+                            fn(&RuntimeJobReceipt) -> Option<(String, SubmitJobIdempotencyRecord)>,
+                        >,
+                    )?
+                }
+                SubmitJobToolKind::FsSearch => {
+                    let search = match resolved_tool_args {
+                        SubmitJobToolArgsSpec::Search(ref args) => args,
+                        _ => {
+                            return Err(ServiceError::InvalidArgument {
+                                reason: "internal tool_args resolution lost for fs.search".to_string(),
+                            })
+                        }
+                    };
+                    let mut tool = FsSearchTool::new(&repository.root_path, &search.pattern);
+                    if let Some(max) = search.max_results {
+                        tool = tool.with_max_results(max);
+                    }
+                    self.lifecycle.runtime().run_tool_job_with_finalizer(
+                        runtime_request,
+                        &tool,
+                        None::<
+                            fn(&RuntimeJobReceipt) -> Option<(String, SubmitJobIdempotencyRecord)>,
+                        >,
+                    )?
+                }
+                SubmitJobToolKind::FsDiff => {
+                    let diff = match resolved_tool_args {
+                        SubmitJobToolArgsSpec::Diff(ref args) => args,
+                        _ => {
+                            return Err(ServiceError::InvalidArgument {
+                                reason: "internal tool_args resolution lost for fs.diff".to_string(),
+                            })
+                        }
+                    };
+                    let mut tool = FsDiffTool::new(&repository.root_path, &diff.comparison_path);
+                    if let Some(max_bytes) = diff.max_bytes {
+                        tool = tool.with_max_bytes(max_bytes);
+                    }
+                    if let Some(max_chars) = diff.max_chars {
+                        tool = tool.with_max_chars(max_chars);
+                    }
                     self.lifecycle.runtime().run_tool_job_with_finalizer(
                         runtime_request,
                         &tool,
@@ -2130,6 +2280,24 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
             0,
         ),
         entry(
+            SECRETARY_FS_DIFF_TOOL_ID,
+            SECRETARY_FS_DIFF_TOOL_NAME,
+            SECRETARY_FS_DIFF_TOOL_DESCRIPTION,
+            "R1",
+            "idempotent",
+            false,
+            0,
+        ),
+        entry(
+            SECRETARY_FS_SEARCH_TOOL_ID,
+            SECRETARY_FS_SEARCH_TOOL_NAME,
+            SECRETARY_FS_SEARCH_TOOL_DESCRIPTION,
+            "R1",
+            "idempotent",
+            false,
+            0,
+        ),
+        entry(
             SECRETARY_FS_LIST_TOOL_ID,
             SECRETARY_FS_LIST_TOOL_NAME,
             SECRETARY_FS_LIST_TOOL_DESCRIPTION,
@@ -2309,6 +2477,10 @@ fn canonicalize_submit_requested_capability(name: &str) -> Option<&'static str> 
             "fs.stat" => Some(SECRETARY_FS_STAT_CAPABILITY),
             SECRETARY_FS_DELETE_CAPABILITY => Some(SECRETARY_FS_DELETE_CAPABILITY),
             "fs.delete" => Some(SECRETARY_FS_DELETE_CAPABILITY),
+            SECRETARY_FS_SEARCH_CAPABILITY => Some(SECRETARY_FS_SEARCH_CAPABILITY),
+            "fs.search" => Some(SECRETARY_FS_SEARCH_CAPABILITY),
+            SECRETARY_FS_DIFF_CAPABILITY => Some(SECRETARY_FS_DIFF_CAPABILITY),
+            "fs.diff" => Some(SECRETARY_FS_DIFF_CAPABILITY),
             _ => None,
         }
     })
@@ -2320,13 +2492,15 @@ fn resolve_submit_job_tool_kind(
 ) -> ServiceResult<SubmitJobToolKind> {
     match requested_capabilities {
         [capability] if capability == SECRETARY_CAPABILITY_DISCOVERY => Ok(SubmitJobToolKind::Echo),
-        [capability]
+            [capability]
             if matches!(
                 capability.as_str(),
                 SECRETARY_FS_READ_CAPABILITY
                     | SECRETARY_FS_LIST_CAPABILITY
                     | SECRETARY_FS_STAT_CAPABILITY
                     | SECRETARY_FS_DELETE_CAPABILITY
+                    | SECRETARY_FS_SEARCH_CAPABILITY
+                    | SECRETARY_FS_DIFF_CAPABILITY
             ) =>
         {
             let resource_scope =
@@ -2367,6 +2541,8 @@ fn resolve_submit_job_tool_kind(
                 SECRETARY_FS_LIST_CAPABILITY => Ok(SubmitJobToolKind::FsList),
                 SECRETARY_FS_STAT_CAPABILITY => Ok(SubmitJobToolKind::FsStat),
                 SECRETARY_FS_DELETE_CAPABILITY => Ok(SubmitJobToolKind::FsDelete),
+                SECRETARY_FS_SEARCH_CAPABILITY => Ok(SubmitJobToolKind::FsSearch),
+                SECRETARY_FS_DIFF_CAPABILITY => Ok(SubmitJobToolKind::FsDiff),
                 _ => Ok(SubmitJobToolKind::FsRead),
             }
         }
@@ -2418,6 +2594,121 @@ fn validate_filesystem_path_scope(
     }
 }
 
+fn validate_secondary_filesystem_path_scope(
+    repository: &RepositoryRecord,
+    primary_scope: &ResourceScope,
+    comparison_path: &str,
+) -> ServiceResult<()> {
+    let root = Path::new(&repository.root_path);
+    let requested = canonicalize_within_scope(root, Path::new(comparison_path)).map_err(|err| {
+        ServiceError::InvalidArgument {
+            reason: format!("comparison path is outside repository scope: {err}"),
+        }
+    })?;
+
+    if requested.canonical == requested.root {
+        return Err(ServiceError::InvalidArgument {
+            reason: "comparison path must be concrete".to_string(),
+        });
+    }
+
+    let _ = canonicalize_within_scope(root, Path::new(&primary_scope.value)).map_err(|err| {
+        ServiceError::InvalidArgument {
+            reason: format!("primary path is outside repository scope: {err}"),
+        }
+    })?;
+
+    let allowed = repository
+        .allowed_path_scope
+        .allowed_paths
+        .iter()
+        .any(|allowed_path| {
+            canonicalize_within_scope(root, Path::new(allowed_path))
+                .map(|allowed| requested.canonical.starts_with(&allowed.canonical))
+                .unwrap_or(false)
+        });
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(ServiceError::InvalidArgument {
+            reason: "comparison path is outside allowed_path_scope".to_string(),
+        })
+    }
+}
+
+fn resolve_submit_job_tool_args(
+    tool_kind: &SubmitJobToolKind,
+    tool_args: Option<SubmitJobToolArgs>,
+) -> ServiceResult<SubmitJobToolArgsSpec> {
+    let missing_tool_args = || ServiceError::InvalidArgument {
+        reason: "tool_args is required for this capability".to_string(),
+    };
+
+    match tool_kind {
+        SubmitJobToolKind::FsSearch => {
+            let args = tool_args.ok_or_else(missing_tool_args)?;
+            let pattern = args.pattern.ok_or_else(|| ServiceError::InvalidArgument {
+                reason: "search requires non-empty pattern in tool_args".to_string(),
+            })?;
+            if pattern.trim().is_empty() {
+                return Err(ServiceError::InvalidArgument {
+                    reason: "search requires non-empty pattern in tool_args".to_string(),
+                });
+            }
+
+            let max_results = args.max.map(|max| {
+                usize::try_from(max).map_err(|_| ServiceError::InvalidArgument {
+                    reason: "search max must fit in usize".to_string(),
+                })
+            })
+            .transpose()?;
+
+            Ok(SubmitJobToolArgsSpec::Search(SubmitJobToolArgsSearch {
+                pattern,
+                max_results,
+            }))
+        }
+        SubmitJobToolKind::FsDiff => {
+            let args = tool_args.ok_or_else(missing_tool_args)?;
+            let comparison_path = args
+                .comparison_path
+                .ok_or_else(|| ServiceError::InvalidArgument {
+                    reason: "diff requires non-empty comparison_path in tool_args".to_string(),
+                })?;
+            if comparison_path.trim().is_empty() {
+                return Err(ServiceError::InvalidArgument {
+                    reason: "diff requires non-empty comparison_path in tool_args".to_string(),
+                });
+            }
+
+            let max_bytes = args.max_bytes.map(|max_bytes| {
+                usize::try_from(max_bytes).map_err(|_| ServiceError::InvalidArgument {
+                    reason: "max_bytes must fit in usize".to_string(),
+                })
+            })
+            .transpose()?;
+            let max_chars = args.max_chars.map(|max_chars| {
+                usize::try_from(max_chars).map_err(|_| ServiceError::InvalidArgument {
+                    reason: "max_chars must fit in usize".to_string(),
+                })
+            })
+            .transpose()?;
+
+            Ok(SubmitJobToolArgsSpec::Diff(SubmitJobToolArgsDiff {
+                comparison_path,
+                max_bytes,
+                max_chars,
+            }))
+        }
+        _ if tool_args.is_some() => Err(ServiceError::InvalidArgument {
+            reason: "tool_args are only supported for filesystem.search and filesystem.diff"
+                .to_string(),
+        }),
+        _ => Ok(SubmitJobToolArgsSpec::None),
+    }
+}
+
 fn normalize_submit_job_goal(goal: Option<String>) -> Option<String> {
     goal.and_then(|goal| {
         let trimmed = goal.trim().to_string();
@@ -2443,6 +2734,7 @@ fn submit_job_request_signature(
         goal: Option<&'a str>,
         resource_scope: &'a ResourceScope,
         requested_capabilities: &'a [String],
+        tool_args: &'a Option<SubmitJobToolArgs>,
     }
 
     let resource_scope = request
@@ -2460,6 +2752,7 @@ fn submit_job_request_signature(
         goal: normalized_goal,
         resource_scope: &resource_scope,
         requested_capabilities,
+        tool_args: &request.tool_args,
     })
     .expect("serialize canonical submit_job request signature")
 }
@@ -3678,6 +3971,7 @@ mod tests {
                 goal: Some("persist me".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("restart-key".to_string()),
             })
             .expect("job submission should succeed");
@@ -3714,6 +4008,7 @@ mod tests {
                 goal: Some("persist me".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("restart-key".to_string()),
             })
             .expect("idempotent replay should return the stored receipt");
@@ -3769,6 +4064,7 @@ mod tests {
                 goal: Some("first goal".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("restart-key".to_string()),
             })
             .expect("job submission should succeed");
@@ -3784,6 +4080,7 @@ mod tests {
                 goal: Some("different goal".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("restart-key".to_string()),
             })
             .unwrap_err();
@@ -3817,6 +4114,7 @@ mod tests {
                 goal: Some("blocked request".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("blocked-key".to_string()),
             })
             .expect("blocked submit should still return a receipt");
@@ -3849,6 +4147,7 @@ mod tests {
                 goal: Some("blocked request".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("blocked-key".to_string()),
             })
             .expect("blocked submit should execute again after restart");
@@ -4225,7 +4524,15 @@ mod tests {
 
         assert_eq!(
             repertoire_tool_ids(&repertoire.entries),
-            vec!["fs.delete", "fs.list", "fs.read", "fs.stat", "secretary.echo"]
+            vec![
+                "fs.delete",
+                "fs.diff",
+                "fs.list",
+                "fs.read",
+                "fs.search",
+                "fs.stat",
+                "secretary.echo"
+            ]
         );
         let delete = repertoire
             .entries
@@ -4279,6 +4586,30 @@ mod tests {
         assert_eq!(echo.risk_tier, "R0");
         assert!(!echo.cancellable);
         assert_eq!(echo.timeout_ms, 0);
+        let diff = repertoire
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "fs.diff")
+            .expect("fs.diff repertoire entry");
+        assert_eq!(diff.name, "Filesystem Diff");
+        assert_eq!(diff.risk_tier, "R1");
+        assert_eq!(diff.provider_kind, "builtin");
+        assert_eq!(diff.provider_id, "atelia-secretary");
+        assert_eq!(diff.default_result_format, "toon");
+        assert!(!diff.cancellable);
+        assert_eq!(diff.timeout_ms, 0);
+        let search = repertoire
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "fs.search")
+            .expect("fs.search repertoire entry");
+        assert_eq!(search.name, "Filesystem Search");
+        assert_eq!(search.risk_tier, "R1");
+        assert_eq!(search.provider_kind, "builtin");
+        assert_eq!(search.provider_id, "atelia-secretary");
+        assert_eq!(search.default_result_format, "toon");
+        assert!(!search.cancellable);
+        assert_eq!(search.timeout_ms, 0);
         let stat = repertoire
             .entries
             .iter()
@@ -4298,7 +4629,13 @@ mod tests {
             .all(|entry| {
                 matches!(
                     entry.tool_id.as_str(),
-                    "fs.delete" | "fs.list" | "fs.read" | "fs.stat" | "secretary.echo"
+                    "fs.delete"
+                        | "fs.diff"
+                        | "fs.list"
+                        | "fs.read"
+                        | "fs.search"
+                        | "fs.stat"
+                        | "secretary.echo"
                 )
             }));
     }
@@ -5086,6 +5423,7 @@ mod tests {
                 goal: Some("summarize current repository status".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit should succeed");
@@ -5143,6 +5481,7 @@ mod tests {
                 goal: Some("summarize repository a".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit a should succeed");
@@ -5157,6 +5496,7 @@ mod tests {
                 goal: Some("summarize repository b".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit b should succeed");
@@ -5473,6 +5813,7 @@ mod tests {
                 goal: Some(long_goal.clone()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("job submission should succeed");
@@ -5560,6 +5901,7 @@ mod tests {
                 goal: Some("render tool output".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("job submission should succeed");
@@ -5973,6 +6315,7 @@ mod tests {
                 goal: Some("summarize status".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit should succeed");
@@ -6019,6 +6362,7 @@ mod tests {
             goal: Some("first".to_string()),
             resource_scope: None,
             requested_capabilities: Vec::new(),
+            tool_args: None,
             idempotency_key: None,
         })
         .expect("submit should succeed");
@@ -6029,6 +6373,7 @@ mod tests {
             goal: Some("second".to_string()),
             resource_scope: None,
             requested_capabilities: Vec::new(),
+            tool_args: None,
             idempotency_key: None,
         })
         .expect("submit should succeed");
@@ -6094,6 +6439,7 @@ mod tests {
                 goal: Some("summarize the runtime output".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit should succeed");
@@ -6136,6 +6482,7 @@ mod tests {
                 goal: Some(" ".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("empty goal should be accepted");
@@ -6175,6 +6522,7 @@ mod tests {
                 goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-123".to_string()),
             })
             .unwrap_err();
@@ -6208,6 +6556,7 @@ mod tests {
                 goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: vec!["policy.check".to_string()],
+                tool_args: None,
                 idempotency_key: Some("request-123".to_string()),
             })
             .expect("submit should succeed");
@@ -6223,6 +6572,7 @@ mod tests {
                 goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: vec!["capability.discovery".to_string()],
+                tool_args: None,
                 idempotency_key: Some("request-123".to_string()),
             })
             .expect("normalized alias should replay the same job");
@@ -6257,6 +6607,7 @@ mod tests {
                     value: "README.md".to_string(),
                 }),
                 requested_capabilities: vec!["filesystem.read".to_string()],
+                tool_args: None,
                 idempotency_key: Some("read-job-key".to_string()),
             })
             .expect("real read dispatch should succeed");
@@ -6314,6 +6665,7 @@ mod tests {
                     value: "notes".to_string(),
                 }),
                 requested_capabilities: vec!["filesystem.list".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("list dispatch should succeed");
@@ -6344,6 +6696,181 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_dispatches_filesystem_search_tool() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-search-dispatch");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "search-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("note.txt"), "alpha\nneedle\n").unwrap();
+        fs::write(root.join("other.txt"), "beta\nNEEDLE\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("search repository notes".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "note.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.search".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("needle".to_string()),
+                    max: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .expect("search dispatch should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.search"
+        );
+        assert_eq!(
+            receipt.policy_decision.requested_capability,
+            "filesystem.search"
+        );
+        let tool_result = receipt.tool_result.expect("tool result should exist");
+        assert_eq!(
+            tool_result.schema_ref.as_deref(),
+            Some("tool_result.fs.search.v1")
+        );
+        assert!(
+            tool_result
+                .fields
+                .iter()
+                .any(|field| field.key == "matches" && matches!(&field.value, atelia_core::StructuredValue::StringList(_)))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_search_outside_allowed_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-search-allowed-scope");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "search-scope-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: Some(PathScope {
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_paths: vec!["notes".to_string()],
+                }),
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes").join("note.txt"), "alpha\nneedle\n").unwrap();
+        fs::write(root.join("outside.txt"), "outside\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("search disallowed path".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "outside.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.search".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("needle".to_string()),
+                    max: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_diff_tool() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-diff-dispatch");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "diff-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("left.txt"), "alpha\n").unwrap();
+        fs::write(root.join("right.txt"), "alpha\nbeta\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("diff two files".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "left.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.diff".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    comparison_path: Some("right.txt".to_string()),
+                    max_bytes: Some(128),
+                    max_chars: Some(128),
+                }),
+                idempotency_key: None,
+            })
+            .expect("diff dispatch should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.diff"
+        );
+        assert_eq!(
+            receipt.policy_decision.requested_capability,
+            "filesystem.diff"
+        );
+        let tool_result = receipt.tool_result.expect("tool result should exist");
+        assert_eq!(
+            tool_result.schema_ref.as_deref(),
+            Some("tool_result.fs.diff.v1")
+        );
+        assert!(
+            tool_result.fields.iter().any(|field| {
+                field.key == "diff"
+                    && matches!(&field.value, atelia_core::StructuredValue::String(_))
+            })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn submit_job_dispatches_filesystem_stat_tool() {
         let svc = ready_service();
         let root = test_repo_dir("filesystem-stat-dispatch");
@@ -6369,6 +6896,7 @@ mod tests {
                     value: "note.txt".to_string(),
                 }),
                 requested_capabilities: vec!["fs.stat".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("stat dispatch should succeed");
@@ -6420,6 +6948,7 @@ mod tests {
                     value: "to-delete.txt".to_string(),
                 }),
                 requested_capabilities: vec!["filesystem.delete".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("delete dispatch should succeed");
@@ -6479,6 +7008,7 @@ mod tests {
                     value: "docs/guide.md".to_string(),
                 }),
                 requested_capabilities: vec!["filesystem.read".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("read inside allowed scope should succeed");
@@ -6502,6 +7032,7 @@ mod tests {
                     value: "README.md".to_string(),
                 }),
                 requested_capabilities: vec!["filesystem.read".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .unwrap_err();
@@ -6539,6 +7070,7 @@ mod tests {
                     value: "README.md".to_string(),
                 }),
                 requested_capabilities: vec!["filesystem.delete".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .unwrap_err();
@@ -6548,6 +7080,132 @@ mod tests {
             root.join("README.md").exists(),
             "root file should still exist after rejection"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_search_without_pattern() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-search-missing-arg");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "search-arg-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("note.txt"), "alpha\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("search without pattern".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "note.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.search".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_diff_without_comparison_path() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-diff-missing-arg");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "diff-arg-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("left.txt"), "alpha\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("diff without path".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "left.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.diff".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_diff_comparison_path_outside_allowed_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-diff-allowed-scope");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "diff-scope-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: Some(PathScope {
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_paths: vec!["docs".to_string()],
+                }),
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("docs").join("left.txt"), "alpha\n").unwrap();
+        fs::write(root.join("outside.txt"), "outside\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("diff scoped".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "docs/left.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.diff".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    comparison_path: Some("outside.txt".to_string()),
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6573,6 +7231,7 @@ mod tests {
                 goal: Some("read repository notes".to_string()),
                 resource_scope: None,
                 requested_capabilities: vec!["filesystem.read".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .unwrap_err();
@@ -6613,6 +7272,7 @@ mod tests {
                         value: value.to_string(),
                     }),
                     requested_capabilities: vec!["filesystem.read".to_string()],
+                    tool_args: None,
                     idempotency_key: None,
                 })
                 .unwrap_err();
@@ -6648,6 +7308,7 @@ mod tests {
             goal: Some("summarize".to_string()),
             resource_scope: None,
             requested_capabilities: Vec::new(),
+            tool_args: None,
             idempotency_key: Some("request-123".to_string()),
         };
         let first_normalized_goal = normalize_submit_job_goal(first_request.goal.clone());
@@ -6668,6 +7329,7 @@ mod tests {
             goal: Some("summarize".to_string()),
             resource_scope: None,
             requested_capabilities: vec!["capability.discovery".to_string()],
+            tool_args: None,
             idempotency_key: Some("request-123".to_string()),
         };
         let second_normalized_goal = normalize_submit_job_goal(second_request.goal.clone());
@@ -6708,6 +7370,7 @@ mod tests {
                 goal: Some("  summarize  ".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-123".to_string()),
             })
             .expect("first submit should succeed");
@@ -6722,6 +7385,7 @@ mod tests {
                 goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-123".to_string()),
             })
             .expect("trimmed goal should replay the same job");
@@ -6752,6 +7416,7 @@ mod tests {
             goal: Some("   ".to_string()),
             resource_scope: None,
             requested_capabilities: Vec::new(),
+            tool_args: None,
             idempotency_key: Some("request-blank".to_string()),
         };
         let first_normalized_goal = normalize_submit_job_goal(first_request.goal.clone());
@@ -6772,6 +7437,7 @@ mod tests {
             goal: None,
             resource_scope: None,
             requested_capabilities: Vec::new(),
+            tool_args: None,
             idempotency_key: Some("request-blank".to_string()),
         };
         let second_normalized_goal = normalize_submit_job_goal(second_request.goal.clone());
@@ -6818,6 +7484,7 @@ mod tests {
                     value: "binary.bin".to_string(),
                 }),
                 requested_capabilities: vec!["filesystem.read".to_string()],
+                tool_args: None,
                 idempotency_key: Some("request-123".to_string()),
             })
             .expect("first submit should return a failed receipt");
@@ -6835,6 +7502,7 @@ mod tests {
                     value: "binary.bin".to_string(),
                 }),
                 requested_capabilities: vec!["filesystem.read".to_string()],
+                tool_args: None,
                 idempotency_key: Some("request-123".to_string()),
             })
             .expect("failed job should not be replayed from the in-memory cache");
@@ -6872,6 +7540,7 @@ mod tests {
                 value: "branch=main;capabilities=capability.discovery".to_string(),
             }),
             requested_capabilities: vec!["capability.discovery".to_string()],
+            tool_args: None,
             idempotency_key: None,
         };
         let request_two = SubmitJobRequest {
@@ -6884,6 +7553,7 @@ mod tests {
                 value: "branch=main".to_string(),
             }),
             requested_capabilities: vec!["capability.discovery".to_string()],
+            tool_args: None,
             idempotency_key: None,
         };
 
@@ -6901,6 +7571,73 @@ mod tests {
         );
 
         assert_ne!(signature_one, signature_two);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_request_signature_includes_tool_args() {
+        let svc = ready_service();
+        let root = test_repo_dir("submit-job-signature-tool-args");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "signature-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let base_request = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id,
+            kind: JobKind::Read,
+            goal: Some("search".to_string()),
+            resource_scope: Some(ResourceScope {
+                kind: "path".to_string(),
+                value: "note.txt".to_string(),
+            }),
+            requested_capabilities: vec!["filesystem.search".to_string()],
+            tool_args: Some(SubmitJobToolArgs {
+                pattern: Some("needle".to_string()),
+                max: None,
+                comparison_path: None,
+                max_bytes: None,
+                max_chars: None,
+            }),
+            idempotency_key: None,
+        };
+        let normalized = normalize_submit_job_goal(base_request.goal.clone());
+        let request_signature_one = submit_job_request_signature(
+            &base_request,
+            normalized.as_deref(),
+            &normalize_requested_capabilities(&base_request.requested_capabilities)
+                .expect("capabilities should normalize"),
+        );
+
+        let comparison_request = SubmitJobRequest {
+            goal: Some("search".to_string()),
+            resource_scope: Some(ResourceScope {
+                kind: "path".to_string(),
+                value: "note.txt".to_string(),
+            }),
+            tool_args: Some(SubmitJobToolArgs {
+                pattern: Some("other".to_string()),
+                max: None,
+                comparison_path: None,
+                max_bytes: None,
+                max_chars: None,
+            }),
+            ..base_request
+        };
+        let normalized = normalize_submit_job_goal(comparison_request.goal.clone());
+        let request_signature_two = submit_job_request_signature(
+            &comparison_request,
+            normalized.as_deref(),
+            &normalize_requested_capabilities(&comparison_request.requested_capabilities)
+                .expect("capabilities should normalize"),
+        );
+        assert_ne!(request_signature_one, request_signature_two);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6926,6 +7663,7 @@ mod tests {
                 goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .unwrap_err();
@@ -6956,6 +7694,7 @@ mod tests {
                 goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-123".to_string()),
             })
             .expect("first submit should succeed");
@@ -6968,6 +7707,7 @@ mod tests {
                 goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-123".to_string()),
             })
             .expect("replayed submit should return same job");
@@ -6999,6 +7739,7 @@ mod tests {
                 goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-0".to_string()),
             })
             .expect("first submit should succeed");
@@ -7012,6 +7753,7 @@ mod tests {
                     goal: Some("summarize".to_string()),
                     resource_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: Some(format!("request-{index}")),
                 })
                 .expect("unique submit should succeed");
@@ -7031,6 +7773,7 @@ mod tests {
                 goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-0".to_string()),
             })
             .expect("replayed submit should still succeed after cache eviction");
@@ -7065,6 +7808,7 @@ mod tests {
                     goal: Some("summarize".to_string()),
                     resource_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: Some("shared-key".to_string()),
                 })
             }));
@@ -7122,6 +7866,7 @@ mod tests {
                 goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-123".to_string()),
             })
             .expect("first submit should succeed");
@@ -7134,6 +7879,7 @@ mod tests {
                 goal: Some("different summary".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-123".to_string()),
             })
             .unwrap_err();
@@ -7164,6 +7910,7 @@ mod tests {
                 goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("   ".to_string()),
             })
             .unwrap_err();
@@ -7198,6 +7945,7 @@ mod tests {
             goal: Some("from-first".to_string()),
             resource_scope: None,
             requested_capabilities: Vec::new(),
+            tool_args: None,
             idempotency_key: None,
         })
         .expect("first submit should succeed");
@@ -7208,6 +7956,7 @@ mod tests {
             goal: Some("from-second".to_string()),
             resource_scope: None,
             requested_capabilities: Vec::new(),
+            tool_args: None,
             idempotency_key: None,
         })
         .expect("second submit should succeed");

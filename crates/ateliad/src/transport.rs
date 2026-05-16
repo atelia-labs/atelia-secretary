@@ -461,7 +461,17 @@ struct SubmitJobRequestPayload {
     goal: Option<String>,
     path_scope: Option<PathScopePayload>,
     requested_capabilities: Option<Vec<String>>,
+    tool_args: Option<SubmitJobToolArgsPayload>,
     idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitJobToolArgsPayload {
+    pattern: Option<String>,
+    max: Option<u64>,
+    comparison_path: Option<String>,
+    max_bytes: Option<u64>,
+    max_chars: Option<u64>,
 }
 
 fn requests_filesystem_path_operation(capabilities: &[String]) -> bool {
@@ -474,7 +484,8 @@ fn requests_filesystem_path_operation(capabilities: &[String]) -> bool {
         matches!(
             normalized.as_str(),
             "filesystem.read" | "filesystem.list" | "filesystem.stat" | "filesystem.delete" | "fs.read"
-                | "fs.list" | "fs.stat" | "fs.delete"
+                | "fs.list" | "fs.stat" | "fs.delete" | "filesystem.search" | "filesystem.diff"
+                | "fs.search" | "fs.diff"
         )
     })
 }
@@ -1106,6 +1117,13 @@ fn parse_submit_job_payload(
         .path_scope
         .map(parse_path_scope_payload)
         .transpose()?;
+    let tool_args = payload.tool_args.map(|payload| rpc::SubmitJobToolArgs {
+        pattern: payload.pattern,
+        max: payload.max,
+        comparison_path: payload.comparison_path,
+        max_bytes: payload.max_bytes,
+        max_chars: payload.max_chars,
+    });
 
     if requests_filesystem_path_operation(&requested_capabilities) {
         let roots = path_scope
@@ -1130,6 +1148,7 @@ fn parse_submit_job_payload(
         goal: payload.goal,
         path_scope,
         requested_capabilities,
+        tool_args,
         idempotency_key: payload.idempotency_key,
     })
 }
@@ -5800,6 +5819,7 @@ mod tests {
                 exclude_patterns: None,
             }),
             requested_capabilities: Some(vec!["filesystem.read".to_string()]),
+            tool_args: None,
             idempotency_key: None,
         })
         .expect_err("filesystem.read should reject empty path_scope");
@@ -5828,10 +5848,14 @@ mod tests {
             "filesystem.list",
             "filesystem.stat",
             "filesystem.delete",
+            "filesystem.search",
+            "filesystem.diff",
             "fs.read",
             "fs.list",
             "fs.stat",
             "fs.delete",
+            "fs.search",
+            "fs.diff",
         ] {
             let parsed = parse_submit_job_payload(SubmitJobRequestPayload {
                 repository_id: RepositoryId::new().as_str().to_string(),
@@ -5848,6 +5872,7 @@ mod tests {
                     exclude_patterns: None,
                 }),
                 requested_capabilities: Some(vec![capability.to_string()]),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("filesystem capability payload should parse");
@@ -5926,6 +5951,7 @@ mod tests {
                     exclude_patterns: None,
                 }),
                 requested_capabilities: Some(vec!["filesystem.read".to_string()]),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect_err("filesystem.read should reject ambiguous path_scope roots");
@@ -6170,6 +6196,7 @@ mod tests {
                     goal: Some("first".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: None,
                 })
                 .expect("first submit should succeed");
@@ -6184,6 +6211,7 @@ mod tests {
                     goal: Some("between".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: None,
                 })
                 .expect("other repo submit should succeed");
@@ -6198,6 +6226,7 @@ mod tests {
                     goal: Some("second".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: None,
                 })
                 .expect("second submit should succeed");
@@ -6353,6 +6382,7 @@ mod tests {
                     goal: Some("first".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: Some("events-list-first".to_string()),
                 })
                 .expect("first submit should succeed")
@@ -6373,6 +6403,7 @@ mod tests {
                     goal: Some("second".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: Some("events-list-second".to_string()),
                 })
                 .expect("second submit should succeed")
@@ -7729,6 +7760,7 @@ mod tests {
                     goal: Some("render tool output".to_string()),
                     resource_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: None,
                 })
                 .expect("job submission should succeed");
@@ -7895,7 +7927,15 @@ mod tests {
             .collect();
         assert_eq!(
             tool_ids,
-            vec!["fs.delete", "fs.list", "fs.read", "fs.stat", "secretary.echo"]
+            vec![
+                "fs.delete",
+                "fs.diff",
+                "fs.list",
+                "fs.read",
+                "fs.search",
+                "fs.stat",
+                "secretary.echo"
+            ]
         );
         assert_eq!(entries[0]["timeout_ms"].as_u64(), Some(0));
         assert_eq!(entries[1]["timeout_ms"].as_u64(), Some(0));

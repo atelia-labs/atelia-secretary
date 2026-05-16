@@ -15,6 +15,7 @@ use crate::service::{
     ListRepositoriesRequest as ServiceListRepositoriesRequest,
     ListToolOutputSettingsHistoryRequest as ServiceListToolOutputSettingsHistoryRequest,
     ProtocolMetadata as ServiceProtocolMetadata,
+    SubmitJobToolArgs as ServiceSubmitJobToolArgs,
     RegisterRepositoryRequest as ServiceRegisterRepositoryRequest,
     RenderToolOutputRequest as ServiceRenderToolOutputRequest, SecretaryService, ServiceError,
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
@@ -180,6 +181,13 @@ impl SecretaryRpcServer {
             goal: request.goal,
             resource_scope: path_scope,
             requested_capabilities: request.requested_capabilities,
+            tool_args: request.tool_args.map(|args| ServiceSubmitJobToolArgs {
+                pattern: args.pattern,
+                max: args.max,
+                comparison_path: args.comparison_path,
+                max_bytes: args.max_bytes,
+                max_chars: args.max_chars,
+            }),
             idempotency_key: request.idempotency_key,
         })?;
 
@@ -1455,7 +1463,17 @@ pub struct SubmitJobRequest {
     pub goal: Option<String>,
     pub path_scope: Option<RpcPathScope>,
     pub requested_capabilities: Vec<String>,
+    pub tool_args: Option<SubmitJobToolArgs>,
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitJobToolArgs {
+    pub pattern: Option<String>,
+    pub max: Option<u64>,
+    pub comparison_path: Option<String>,
+    pub max_bytes: Option<u64>,
+    pub max_chars: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3476,6 +3494,7 @@ mod tests {
                 goal: Some("persist rpc state".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("job submission should succeed");
@@ -3575,7 +3594,15 @@ mod tests {
             .collect();
         assert_eq!(
             tool_ids,
-            vec!["fs.delete", "fs.list", "fs.read", "fs.stat", "secretary.echo"]
+            vec![
+                "fs.delete",
+                "fs.diff",
+                "fs.list",
+                "fs.read",
+                "fs.search",
+                "fs.stat",
+                "secretary.echo"
+            ]
         );
         let read = response
             .entries
@@ -3597,7 +3624,13 @@ mod tests {
         assert!(response.entries.iter().all(|entry| {
             matches!(
                 entry.tool_id.as_str(),
-                "fs.delete" | "fs.list" | "fs.read" | "fs.stat" | "secretary.echo"
+                "fs.delete"
+                    | "fs.diff"
+                    | "fs.list"
+                    | "fs.read"
+                    | "fs.search"
+                    | "fs.stat"
+                    | "secretary.echo"
             )
         }));
     }
@@ -3687,6 +3720,7 @@ mod tests {
                 goal: Some(long_goal.clone()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("job submission should succeed");
@@ -3774,6 +3808,7 @@ mod tests {
                 goal: Some("render tool output".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("job submission should succeed");
@@ -4161,6 +4196,7 @@ mod tests {
                 goal: Some("summarize repository state".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit job should succeed");
@@ -4190,6 +4226,7 @@ mod tests {
                 goal: None,
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit job without goal should succeed");
@@ -4281,6 +4318,7 @@ mod tests {
                 goal: Some(" \t\n ".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("blank goal submit should succeed");
@@ -4374,6 +4412,7 @@ mod tests {
                 goal: Some("first".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("first submit should succeed");
@@ -4385,6 +4424,7 @@ mod tests {
                 goal: Some("between".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("other repo submit should succeed");
@@ -4396,6 +4436,7 @@ mod tests {
                 goal: Some("second".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("second submit should succeed");
@@ -4527,6 +4568,7 @@ mod tests {
                 goal: Some("first repo job".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("first repository job should submit");
@@ -4539,6 +4581,7 @@ mod tests {
                 goal: Some("second repo job".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("second repository job should submit");
@@ -4618,6 +4661,7 @@ mod tests {
                 goal: Some("watch live job".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit should succeed");
@@ -4741,6 +4785,7 @@ mod tests {
                 goal: Some("watch live anchor".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit should succeed");
@@ -5137,6 +5182,7 @@ mod tests {
                 goal: Some("one".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit job should succeed");
@@ -5148,6 +5194,7 @@ mod tests {
                 goal: Some("two".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit job should succeed");
@@ -5265,6 +5312,7 @@ mod tests {
                 goal: Some("finish immediately".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit job should succeed");
@@ -5293,6 +5341,7 @@ mod tests {
                 goal: Some("test".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .unwrap_err();
@@ -5338,6 +5387,7 @@ mod tests {
                     exclude_patterns: Vec::new(),
                 }),
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .unwrap_err();
@@ -5367,6 +5417,7 @@ mod tests {
                 goal: Some("first".to_string()),
                 path_scope: None,
                 requested_capabilities: vec!["policy.check".to_string()],
+                tool_args: None,
                 idempotency_key: Some("request-key".to_string()),
             })
             .expect("submit should succeed");
@@ -5382,6 +5433,7 @@ mod tests {
                 goal: Some("first".to_string()),
                 path_scope: None,
                 requested_capabilities: vec!["capability.discovery".to_string()],
+                tool_args: None,
                 idempotency_key: Some("request-key".to_string()),
             })
             .expect("replay should return same job");
@@ -5395,6 +5447,7 @@ mod tests {
                 goal: Some("second".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-key-2".to_string()),
             })
             .expect("submit job should succeed");
@@ -5405,6 +5458,7 @@ mod tests {
                 kind: "read".to_string(),
                 goal: Some("second".to_string()),
                 path_scope: None,
+                tool_args: None,
                 idempotency_key: Some("request-key-2".to_string()),
                 requested_capabilities: Vec::new(),
             })
@@ -5419,6 +5473,7 @@ mod tests {
                 goal: Some("conflicting goal".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-key".to_string()),
             })
             .unwrap_err();
@@ -5448,6 +5503,7 @@ mod tests {
                 goal: Some("unsupported".to_string()),
                 path_scope: None,
                 requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .unwrap_err();
@@ -5482,6 +5538,7 @@ mod tests {
                     exclude_patterns: Vec::new(),
                 }),
                 requested_capabilities: vec!["filesystem.read".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("filesystem.read should dispatch through RPC path_scope");
@@ -5518,6 +5575,7 @@ mod tests {
                     exclude_patterns: Vec::new(),
                 }),
                 requested_capabilities: vec!["fs.list".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("filesystem.list should dispatch through RPC path_scope");
