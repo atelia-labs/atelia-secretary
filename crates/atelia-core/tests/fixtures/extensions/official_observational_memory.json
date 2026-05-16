@@ -7,7 +7,7 @@
     "name": "Atelia Labs",
     "url": null
   },
-  "description": "Official default memory strategy foundation for recent messages and compressed memory.",
+  "description": "Foundation fixture for the default memory strategy contract; not installable until artifact verification exists.",
   "types": [
     "memory_strategy"
   ],
@@ -20,7 +20,7 @@
     "runtime": "wasm-rust",
     "command": null,
     "image": null,
-    "wasm": "observational-memory.wasm",
+    "wasm": null,
     "protocol": "atelia-extension-rpc.v1"
   },
   "permissions": {},
@@ -45,7 +45,7 @@
     "registry_identity": "atelia-official",
     "publication": {
       "visibility": "official",
-      "registry_submission": "accepted"
+      "registry_submission": "awaiting_submission"
     },
     "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "manifest_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",

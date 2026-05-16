@@ -19,11 +19,13 @@ pub const EXTENSION_RPC_PROTOCOL: &str = "atelia-extension-rpc.v1";
 pub const EXTENSION_REGISTRY_AUDIT_SCHEMA_VERSION: u32 = 1;
 pub const OFFICIAL_OBSERVATIONAL_MEMORY_PACKAGE_ID: &str = "ai.atelia.observational-memory";
 
-/// Build the official default Observational Memory package manifest.
+/// Build the Observational Memory foundation fixture.
 ///
-/// This is the initial `memory_strategy` foundation for the `messages` +
-/// `memory` split used by agent context compaction. It is scoped as an
-/// official `ai.atelia.*` package and does not introduce runtime dispatch.
+/// This reserves the default `memory_strategy` contract for the future
+/// `messages` + `memory` package split without making it installable yet. It
+/// remains an official `ai.atelia.*` manifest shape for schema and taxonomy
+/// coverage, but it is not accepted for production use until artifact
+/// verification exists.
 pub fn official_observational_memory_manifest() -> ExtensionManifest {
     ExtensionManifest {
         schema: EXTENSION_MANIFEST_SCHEMA.to_string(),
@@ -35,7 +37,7 @@ pub fn official_observational_memory_manifest() -> ExtensionManifest {
             url: None,
         },
         description:
-            "Official default memory strategy foundation for recent messages and compressed memory."
+            "Foundation fixture for the default memory strategy contract; not installable until artifact verification exists."
                 .to_string(),
         types: vec![ExtensionKind::MemoryStrategy],
         compatibility: ExtensionCompatibility {
@@ -47,7 +49,7 @@ pub fn official_observational_memory_manifest() -> ExtensionManifest {
             runtime: ExtensionRuntime::WasmRust,
             command: None,
             image: None,
-            wasm: Some("observational-memory.wasm".to_string()),
+            wasm: None,
             protocol: EXTENSION_RPC_PROTOCOL.to_string(),
         },
         permissions: BTreeMap::new(),
@@ -71,7 +73,7 @@ pub fn official_observational_memory_manifest() -> ExtensionManifest {
             lineage: None,
             publication: Some(ExtensionPublication {
                 visibility: ExtensionPublicationVisibility::Official,
-                registry_submission: ExtensionRegistrySubmission::Accepted,
+                registry_submission: ExtensionRegistrySubmission::AwaitingSubmission,
             }),
             artifact_digest:
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -6843,34 +6845,32 @@ mod tests {
     }
 
     #[test]
-    fn official_observational_memory_manifest_validates_as_official_default_package() {
+    fn official_observational_memory_manifest_remains_a_non_installable_foundation_fixture() {
         let manifest = official_observational_memory_manifest();
 
-        let validated = manifest
-            .validate(&ManifestValidationPolicy::default())
-            .unwrap();
-
-        assert_eq!(validated.boundary, ExtensionBoundary::Official);
+        assert_eq!(manifest.id, OFFICIAL_OBSERVATIONAL_MEMORY_PACKAGE_ID);
+        assert_eq!(manifest.types, vec![ExtensionKind::MemoryStrategy]);
         assert_eq!(
-            validated.manifest.id,
-            OFFICIAL_OBSERVATIONAL_MEMORY_PACKAGE_ID
-        );
-        assert_eq!(
-            validated.manifest.types,
-            vec![ExtensionKind::MemoryStrategy]
-        );
-        assert_eq!(
-            validated.manifest.provenance.publication,
+            manifest.provenance.publication,
             Some(ExtensionPublication {
                 visibility: ExtensionPublicationVisibility::Official,
-                registry_submission: ExtensionRegistrySubmission::Accepted,
+                registry_submission: ExtensionRegistrySubmission::AwaitingSubmission,
             })
         );
+        assert!(manifest.entrypoints.wasm.is_none());
+        assert!(manifest
+            .validate(&ManifestValidationPolicy::default())
+            .is_err());
     }
 
     #[test]
     fn official_observational_memory_manifest_rejects_malformed_tool_shape() {
         let mut manifest = official_observational_memory_manifest();
+        manifest.entrypoints.wasm = Some("observational-memory.wasm".to_string());
+        manifest.provenance.publication = Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::Official,
+            registry_submission: ExtensionRegistrySubmission::Accepted,
+        });
         manifest.tools.push(ExtensionToolDefinition {
             id: "memory.peek".to_string(),
             permissions: vec!["memory.peek".to_string()],

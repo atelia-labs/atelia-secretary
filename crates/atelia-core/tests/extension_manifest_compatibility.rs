@@ -1,6 +1,7 @@
 use atelia_core::extensions::{
     official_observational_memory_manifest, ExtensionBoundary, ExtensionManifest,
-    ManifestValidationPolicy,
+    ExtensionPublication, ExtensionPublicationVisibility, ExtensionRegistrySubmission,
+    ExtensionValidationError, ManifestValidationPolicy,
 };
 
 /// Deserialize a manifest fixture into the extension manifest model.
@@ -52,9 +53,10 @@ fn extension_manifest_compatibility_fixtures_cover_local_process_manifests() {
     );
 }
 
-/// Verify compatibility coverage for the official Observational Memory package fixture.
+/// Verify compatibility coverage for the official Observational Memory foundation fixture.
 #[test]
-fn extension_manifest_compatibility_fixtures_cover_official_observational_memory_package() {
+fn extension_manifest_compatibility_fixtures_cover_official_observational_memory_foundation_fixture(
+) {
     let manifest = official_observational_memory_manifest();
     let serialized = serde_json::to_value(&manifest).expect("official manifest should serialize");
     let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
@@ -64,12 +66,26 @@ fn extension_manifest_compatibility_fixtures_cover_official_observational_memory
 
     assert_eq!(
         serialized, fixture,
-        "official memory strategy fixture should match the code-generated manifest"
+        "official memory strategy foundation fixture should match the code-generated manifest"
     );
 
-    assert_manifest_fixture_roundtrip(
-        include_str!("fixtures/extensions/official_observational_memory.json"),
-        ManifestValidationPolicy::default(),
-        ExtensionBoundary::Official,
+    assert_eq!(manifest.id, "ai.atelia.observational-memory");
+    assert_eq!(
+        manifest.types,
+        vec![atelia_core::extensions::ExtensionKind::MemoryStrategy]
     );
+    assert_eq!(
+        manifest.provenance.publication,
+        Some(ExtensionPublication {
+            visibility: ExtensionPublicationVisibility::Official,
+            registry_submission: ExtensionRegistrySubmission::AwaitingSubmission,
+        })
+    );
+    assert!(manifest.entrypoints.wasm.is_none());
+    assert!(matches!(
+        manifest.validate(&ManifestValidationPolicy::default()),
+        Err(ExtensionValidationError::MissingField {
+            field: "entrypoints.wasm"
+        })
+    ));
 }
