@@ -9,3 +9,7 @@
 ## 2026-05-15 - Defer struct cloning during memory store sorting
 **Learning:** Found another instance of the performance anti-pattern described in a previous journal entry. The `list_schema_migrations` function in `InMemoryStore` (`crates/atelia-core/src/store.rs`) was cloning the entire HashMap of `SchemaMigrationRecord` structs before performing a multi-level sort. This eagerly allocates memory and causes heavy struct swapping during sort instead of light reference swaps.
 **Action:** Defer struct cloning in collections before sorting by iterating `.values()`, sorting a collection of references (`Vec<&T>`), and only cloning using `.cloned().collect()` at the end.
+
+## 2024-05-18 - Avoid full materialization during JobQuery pagination
+**Learning:** In the core store `query_jobs`, pulling all filtered jobs into memory using `.collect::<Vec<_>>()` and then sorting using `.sort_by()` defeated the purpose of pagination. If there are tens of thousands of jobs, retrieving page 1 size 10 still eagerly clones all 10,000 matches into an allocated vector before picking out the first 10.
+**Action:** By converting `InMemoryInner.jobs` from a `HashMap` to a `BTreeMap`, iterators implicitly sort by `JobId`. We can lazily process filters via iterators and pass the stream to `page_records` directly, stopping iteration gracefully after extracting the 10 needed items.
