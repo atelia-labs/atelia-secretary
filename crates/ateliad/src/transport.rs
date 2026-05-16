@@ -464,13 +464,18 @@ struct SubmitJobRequestPayload {
     idempotency_key: Option<String>,
 }
 
-fn requests_filesystem_read(capabilities: &[String]) -> bool {
+fn requests_filesystem_path_operation(capabilities: &[String]) -> bool {
     capabilities.iter().any(|capability| {
-        capability
+        let normalized = capability
             .trim()
             .to_ascii_lowercase()
-            .replace(['_', '-', ':', '/'], ".")
-            == "filesystem.read"
+            .replace(['_', '-', ':', '/'], ".");
+
+        matches!(
+            normalized.as_str(),
+            "filesystem.read" | "filesystem.list" | "filesystem.stat" | "filesystem.delete" | "fs.read"
+                | "fs.list" | "fs.stat" | "fs.delete"
+        )
     })
 }
 
@@ -1102,17 +1107,17 @@ fn parse_submit_job_payload(
         .map(parse_path_scope_payload)
         .transpose()?;
 
-    if requests_filesystem_read(&requested_capabilities) {
+    if requests_filesystem_path_operation(&requested_capabilities) {
         let roots = path_scope
             .as_ref()
             .map(|scope| scope.roots.as_slice())
             .ok_or_else(|| {
-                "filesystem.read requires path_scope.roots to contain exactly one concrete path"
+                "filesystem operation requires path_scope.roots to contain exactly one concrete path"
                     .to_string()
             })?;
         if roots.len() != 1 || roots[0].trim().is_empty() || roots[0].trim() == "." {
             return Err(
-                "filesystem.read requires path_scope.roots to contain exactly one concrete path"
+                "filesystem operation requires path_scope.roots to contain exactly one concrete path"
                     .to_string(),
             );
         }
@@ -5799,7 +5804,7 @@ mod tests {
         })
         .expect_err("filesystem.read should reject empty path_scope");
 
-        assert!(err.contains("filesystem.read requires path_scope.roots"));
+        assert!(err.contains("filesystem operation requires path_scope.roots"));
     }
 
     #[test]
@@ -5814,6 +5819,42 @@ mod tests {
         let parsed = parse_submit_job_payload(payload).expect("missing goal should be accepted");
 
         assert_eq!(parsed.goal, None);
+    }
+
+    #[test]
+    fn submit_job_payload_accepts_supported_filesystem_caps_with_explicit_path_scope() {
+        for capability in [
+            "filesystem.read",
+            "filesystem.list",
+            "filesystem.stat",
+            "filesystem.delete",
+            "fs.read",
+            "fs.list",
+            "fs.stat",
+            "fs.delete",
+        ] {
+            let parsed = parse_submit_job_payload(SubmitJobRequestPayload {
+                repository_id: RepositoryId::new().as_str().to_string(),
+                requester: ActorPayload::Agent {
+                    id: "agent:transport".to_string(),
+                    display_name: None,
+                },
+                kind: "read".to_string(),
+                goal: Some("read over HTTP".to_string()),
+                path_scope: Some(PathScopePayload {
+                    kind: Some("explicit_paths".to_string()),
+                    roots: Some(vec!["notes".to_string()]),
+                    include_patterns: None,
+                    exclude_patterns: None,
+                }),
+                requested_capabilities: Some(vec![capability.to_string()]),
+                idempotency_key: None,
+            })
+            .expect("filesystem capability payload should parse");
+
+            assert_eq!(parsed.path_scope.as_ref().expect("path scope").roots[0], "notes");
+            assert_eq!(parsed.requested_capabilities, vec![capability.to_string()]);
+        }
     }
 
     #[tokio::test]
@@ -5890,7 +5931,7 @@ mod tests {
             .expect_err("filesystem.read should reject ambiguous path_scope roots");
 
             assert!(err.contains(
-                "filesystem.read requires path_scope.roots to contain exactly one concrete path"
+                "filesystem operation requires path_scope.roots to contain exactly one concrete path"
             ));
         }
     }
@@ -7852,7 +7893,10 @@ mod tests {
             .iter()
             .map(|entry| entry["tool_id"].as_str().expect("tool id"))
             .collect();
-        assert_eq!(tool_ids, vec!["fs.read", "secretary.echo"]);
+        assert_eq!(
+            tool_ids,
+            vec!["fs.delete", "fs.list", "fs.read", "fs.stat", "secretary.echo"]
+        );
         assert_eq!(entries[0]["timeout_ms"].as_u64(), Some(0));
         assert_eq!(entries[1]["timeout_ms"].as_u64(), Some(0));
     }

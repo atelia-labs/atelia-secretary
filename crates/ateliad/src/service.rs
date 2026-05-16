@@ -15,7 +15,8 @@ use atelia_core::{
     ExtensionRegistry, ExtensionRegistryAuditKind, ExtensionRegistryAuditProvenance,
     ExtensionRegistryAuditRecord, ExtensionRegistryAuditRecordRef, ExtensionRegistryService,
     ExtensionRegistrySnapshot, ExtensionServices, ExtensionSourceSnapshot, ExtensionStatusRequest,
-    ExtensionStatusResponse, FsReadTool, InMemoryStore, InMemoryToolOutputSettingsService,
+    ExtensionStatusResponse, FsDeleteTool, FsListTool, FsReadTool, FsStatTool,
+    InMemoryStore, InMemoryToolOutputSettingsService,
     InstallExtensionRequest, InstallExtensionResponse, JobEvent, JobId, JobKind,
     JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
     ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
@@ -62,14 +63,26 @@ const SECRETARY_ECHO_TOOL_ID: &str = "secretary.echo";
 const SECRETARY_ECHO_TOOL_NAME: &str = "Secretary Echo";
 const SECRETARY_ECHO_TOOL_DESCRIPTION: &str =
     "Echo input for daemon smoke tests and context probes.";
+const SECRETARY_FS_DELETE_TOOL_ID: &str = "fs.delete";
+const SECRETARY_FS_DELETE_TOOL_NAME: &str = "Filesystem Delete";
+const SECRETARY_FS_DELETE_TOOL_DESCRIPTION: &str = "Delete one file from an allowed repository path.";
+const SECRETARY_FS_LIST_TOOL_ID: &str = "fs.list";
+const SECRETARY_FS_LIST_TOOL_NAME: &str = "Filesystem List";
+const SECRETARY_FS_LIST_TOOL_DESCRIPTION: &str = "List directory entries within an allowed scope.";
 const SECRETARY_FS_READ_TOOL_ID: &str = "fs.read";
 const SECRETARY_FS_READ_TOOL_NAME: &str = "Filesystem Read";
 const SECRETARY_FS_READ_TOOL_DESCRIPTION: &str = "Read a file from an allowed repository scope.";
+const SECRETARY_FS_STAT_TOOL_ID: &str = "fs.stat";
+const SECRETARY_FS_STAT_TOOL_NAME: &str = "Filesystem Stat";
+const SECRETARY_FS_STAT_TOOL_DESCRIPTION: &str = "Read metadata for a file or directory.";
 const SECRETARY_TOOL_PROVIDER_KIND: &str = "builtin";
 const SECRETARY_TOOL_PROVIDER_ID: &str = "atelia-secretary";
 const SECRETARY_TOON_FORMAT: &str = "toon";
 const SECRETARY_JSON_FORMAT: &str = "json";
 const SECRETARY_FS_READ_CAPABILITY: &str = "filesystem.read";
+const SECRETARY_FS_LIST_CAPABILITY: &str = "filesystem.list";
+const SECRETARY_FS_STAT_CAPABILITY: &str = "filesystem.stat";
+const SECRETARY_FS_DELETE_CAPABILITY: &str = "filesystem.delete";
 const SECRETARY_CAPABILITY_DISCOVERY: &str = "capability.discovery";
 
 fn daemon_capabilities() -> Vec<String> {
@@ -371,6 +384,9 @@ pub struct SubmitJobRequest {
 enum SubmitJobToolKind {
     Echo,
     FsRead,
+    FsList,
+    FsStat,
+    FsDelete,
 }
 
 impl SubmitJobToolKind {
@@ -378,6 +394,9 @@ impl SubmitJobToolKind {
         match self {
             Self::Echo => SECRETARY_ECHO_TOOL_ID,
             Self::FsRead => SECRETARY_FS_READ_TOOL_ID,
+            Self::FsList => SECRETARY_FS_LIST_TOOL_ID,
+            Self::FsStat => SECRETARY_FS_STAT_TOOL_ID,
+            Self::FsDelete => SECRETARY_FS_DELETE_TOOL_ID,
         }
     }
 }
@@ -1144,7 +1163,7 @@ impl SecretaryService {
     }
 
     /// Submit a supported daemon job, dispatching the echo tool by default
-    /// and `fs.read` when the request asks for a filesystem read.
+    /// and an approved filesystem tool when requested.
     #[allow(dead_code)]
     pub fn submit_job(&self, request: SubmitJobRequest) -> ServiceResult<RuntimeJobReceipt> {
         let requested_capabilities =
@@ -1179,8 +1198,14 @@ impl SecretaryService {
             kind: "repository".to_string(),
             value: ".".to_string(),
         });
-        if matches!(tool_kind, SubmitJobToolKind::FsRead) {
-            validate_filesystem_read_scope(&repository, &resource_scope)?;
+        if matches!(
+            tool_kind,
+            SubmitJobToolKind::FsRead
+                | SubmitJobToolKind::FsList
+                | SubmitJobToolKind::FsStat
+                | SubmitJobToolKind::FsDelete
+        ) {
+            validate_filesystem_path_scope(&repository, &resource_scope)?;
         }
 
         let runtime_request = RuntimeJobRequest::new(
@@ -1287,6 +1312,39 @@ impl SecretaryService {
                             )),
                         )?
                     }
+                    SubmitJobToolKind::FsList => {
+                        let tool = FsListTool::new(&repository.root_path);
+                        self.lifecycle.runtime().run_tool_job_with_finalizer(
+                            runtime_request.clone(),
+                            &tool,
+                            Some(make_submit_job_finalizer(
+                                idempotency_key.to_string(),
+                                request_signature.clone(),
+                            )),
+                        )?
+                    }
+                    SubmitJobToolKind::FsStat => {
+                        let tool = FsStatTool::new(&repository.root_path);
+                        self.lifecycle.runtime().run_tool_job_with_finalizer(
+                            runtime_request.clone(),
+                            &tool,
+                            Some(make_submit_job_finalizer(
+                                idempotency_key.to_string(),
+                                request_signature.clone(),
+                            )),
+                        )?
+                    }
+                    SubmitJobToolKind::FsDelete => {
+                        let tool = FsDeleteTool::new(&repository.root_path);
+                        self.lifecycle.runtime().run_tool_job_with_finalizer(
+                            runtime_request.clone(),
+                            &tool,
+                            Some(make_submit_job_finalizer(
+                                idempotency_key.to_string(),
+                                request_signature.clone(),
+                            )),
+                        )?
+                    }
                 };
                 if receipt.job.status == JobStatus::Succeeded {
                     let mut cache = self.idempotent_submissions.lock().map_err(|err| {
@@ -1332,6 +1390,36 @@ impl SecretaryService {
                 )?,
                 SubmitJobToolKind::FsRead => {
                     let tool = FsReadTool::new(&repository.root_path);
+                    self.lifecycle.runtime().run_tool_job_with_finalizer(
+                        runtime_request,
+                        &tool,
+                        None::<
+                            fn(&RuntimeJobReceipt) -> Option<(String, SubmitJobIdempotencyRecord)>,
+                        >,
+                    )?
+                }
+                SubmitJobToolKind::FsList => {
+                    let tool = FsListTool::new(&repository.root_path);
+                    self.lifecycle.runtime().run_tool_job_with_finalizer(
+                        runtime_request,
+                        &tool,
+                        None::<
+                            fn(&RuntimeJobReceipt) -> Option<(String, SubmitJobIdempotencyRecord)>,
+                        >,
+                    )?
+                }
+                SubmitJobToolKind::FsStat => {
+                    let tool = FsStatTool::new(&repository.root_path);
+                    self.lifecycle.runtime().run_tool_job_with_finalizer(
+                        runtime_request,
+                        &tool,
+                        None::<
+                            fn(&RuntimeJobReceipt) -> Option<(String, SubmitJobIdempotencyRecord)>,
+                        >,
+                    )?
+                }
+                SubmitJobToolKind::FsDelete => {
+                    let tool = FsDeleteTool::new(&repository.root_path);
                     self.lifecycle.runtime().run_tool_job_with_finalizer(
                         runtime_request,
                         &tool,
@@ -2033,9 +2121,36 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
 
     let mut entries = vec![
         entry(
+            SECRETARY_FS_DELETE_TOOL_ID,
+            SECRETARY_FS_DELETE_TOOL_NAME,
+            SECRETARY_FS_DELETE_TOOL_DESCRIPTION,
+            "R2",
+            "not idempotent",
+            false,
+            0,
+        ),
+        entry(
+            SECRETARY_FS_LIST_TOOL_ID,
+            SECRETARY_FS_LIST_TOOL_NAME,
+            SECRETARY_FS_LIST_TOOL_DESCRIPTION,
+            "R1",
+            "idempotent",
+            false,
+            0,
+        ),
+        entry(
             SECRETARY_FS_READ_TOOL_ID,
             SECRETARY_FS_READ_TOOL_NAME,
             SECRETARY_FS_READ_TOOL_DESCRIPTION,
+            "R1",
+            "idempotent",
+            false,
+            0,
+        ),
+        entry(
+            SECRETARY_FS_STAT_TOOL_ID,
+            SECRETARY_FS_STAT_TOOL_NAME,
+            SECRETARY_FS_STAT_TOOL_DESCRIPTION,
             "R1",
             "idempotent",
             false,
@@ -2187,6 +2302,12 @@ fn canonicalize_submit_requested_capability(name: &str) -> Option<&'static str> 
 
         match normalized.as_str() {
             SECRETARY_FS_READ_CAPABILITY => Some(SECRETARY_FS_READ_CAPABILITY),
+            SECRETARY_FS_LIST_CAPABILITY => Some(SECRETARY_FS_LIST_CAPABILITY),
+            "fs.list" => Some(SECRETARY_FS_LIST_CAPABILITY),
+            SECRETARY_FS_STAT_CAPABILITY => Some(SECRETARY_FS_STAT_CAPABILITY),
+            "fs.stat" => Some(SECRETARY_FS_STAT_CAPABILITY),
+            SECRETARY_FS_DELETE_CAPABILITY => Some(SECRETARY_FS_DELETE_CAPABILITY),
+            "fs.delete" => Some(SECRETARY_FS_DELETE_CAPABILITY),
             _ => None,
         }
     })
@@ -2198,13 +2319,24 @@ fn resolve_submit_job_tool_kind(
 ) -> ServiceResult<SubmitJobToolKind> {
     match requested_capabilities {
         [capability] if capability == SECRETARY_CAPABILITY_DISCOVERY => Ok(SubmitJobToolKind::Echo),
-        [capability] if capability == SECRETARY_FS_READ_CAPABILITY => {
+        [capability]
+            if matches!(
+                capability.as_str(),
+                SECRETARY_FS_READ_CAPABILITY
+                    | SECRETARY_FS_LIST_CAPABILITY
+                    | SECRETARY_FS_STAT_CAPABILITY
+                    | SECRETARY_FS_DELETE_CAPABILITY
+            ) =>
+        {
             let resource_scope =
                 request
                     .resource_scope
                     .as_ref()
                     .ok_or_else(|| ServiceError::InvalidArgument {
-                        reason: "filesystem.read requires a path_scope/resource_scope".to_string(),
+                        reason: format!(
+                            "{capability} requires a path_scope/resource_scope"
+                        )
+                        .to_string(),
                     })?;
 
             if !matches!(
@@ -2212,18 +2344,30 @@ fn resolve_submit_job_tool_kind(
                 "repository" | "explicit_paths" | "read_only" | "path"
             ) {
                 return Err(ServiceError::InvalidArgument {
-                    reason: "filesystem.read requires resource_scope.kind to be repository, explicit_paths, read_only, or path".to_string(),
+                    reason: format!(
+                        "{capability} requires resource_scope.kind to be repository, explicit_paths, read_only, or path"
+                    ),
                 });
             }
 
-            if matches!(resource_scope.value.trim(), "" | ".") {
+            if matches!(resource_scope.value.trim(), "" | ".")
+                && matches!(
+                    capability.as_str(),
+                    SECRETARY_FS_READ_CAPABILITY | SECRETARY_FS_DELETE_CAPABILITY
+                )
+            {
                 return Err(ServiceError::InvalidArgument {
-                    reason: "filesystem.read requires a concrete path_scope/resource_scope root"
+                    reason: format!("{capability} requires a concrete path_scope/resource_scope root")
                         .to_string(),
                 });
             }
 
-            Ok(SubmitJobToolKind::FsRead)
+            match capability.as_str() {
+                SECRETARY_FS_LIST_CAPABILITY => Ok(SubmitJobToolKind::FsList),
+                SECRETARY_FS_STAT_CAPABILITY => Ok(SubmitJobToolKind::FsStat),
+                SECRETARY_FS_DELETE_CAPABILITY => Ok(SubmitJobToolKind::FsDelete),
+                _ => Ok(SubmitJobToolKind::FsRead),
+            }
         }
         [capability] => Err(ServiceError::InvalidArgument {
             reason: format!("requested_capabilities contains unsupported capability: {capability}"),
@@ -2235,7 +2379,7 @@ fn resolve_submit_job_tool_kind(
     }
 }
 
-fn validate_filesystem_read_scope(
+fn validate_filesystem_path_scope(
     repository: &RepositoryRecord,
     resource_scope: &ResourceScope,
 ) -> ServiceResult<()> {
@@ -2243,13 +2387,13 @@ fn validate_filesystem_read_scope(
     let requested =
         canonicalize_within_scope(root, Path::new(&resource_scope.value)).map_err(|err| {
             ServiceError::InvalidArgument {
-                reason: format!("filesystem.read path is outside repository scope: {err}"),
+                reason: format!("filesystem path is outside repository scope: {err}"),
             }
         })?;
 
     if requested.canonical == requested.root {
         return Err(ServiceError::InvalidArgument {
-            reason: "filesystem.read requires a concrete path_scope/resource_scope root"
+            reason: "filesystem operation requires a concrete path_scope/resource_scope path"
                 .to_string(),
         });
     }
@@ -2268,7 +2412,7 @@ fn validate_filesystem_read_scope(
         Ok(())
     } else {
         Err(ServiceError::InvalidArgument {
-            reason: "filesystem.read path is outside allowed_path_scope".to_string(),
+            reason: "filesystem operation path is outside allowed_path_scope".to_string(),
         })
     }
 }
@@ -4080,8 +4224,36 @@ mod tests {
 
         assert_eq!(
             repertoire_tool_ids(&repertoire.entries),
-            vec!["fs.read", "secretary.echo"]
+            vec!["fs.delete", "fs.list", "fs.read", "fs.stat", "secretary.echo"]
         );
+        let delete = repertoire
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "fs.delete")
+            .expect("fs.delete repertoire entry");
+        assert_eq!(delete.name, "Filesystem Delete");
+        assert_eq!(delete.risk_tier, "R2");
+        assert_eq!(delete.provider_kind, "builtin");
+        assert_eq!(delete.provider_id, "atelia-secretary");
+        assert_eq!(delete.default_result_format, "toon");
+        assert!(!delete.cancellable);
+        assert_eq!(
+            delete.supported_result_formats,
+            vec!["toon".to_string(), "json".to_string()]
+        );
+        assert_eq!(delete.timeout_ms, 0);
+        let list = repertoire
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "fs.list")
+            .expect("fs.list repertoire entry");
+        assert_eq!(list.name, "Filesystem List");
+        assert_eq!(list.risk_tier, "R1");
+        assert_eq!(list.provider_kind, "builtin");
+        assert_eq!(list.provider_id, "atelia-secretary");
+        assert_eq!(list.default_result_format, "toon");
+        assert!(!list.cancellable);
+        assert_eq!(list.timeout_ms, 0);
         let read = repertoire
             .entries
             .iter()
@@ -4106,10 +4278,28 @@ mod tests {
         assert_eq!(echo.risk_tier, "R0");
         assert!(!echo.cancellable);
         assert_eq!(echo.timeout_ms, 0);
+        let stat = repertoire
+            .entries
+            .iter()
+            .find(|entry| entry.tool_id == "fs.stat")
+            .expect("fs.stat repertoire entry");
+        assert_eq!(stat.name, "Filesystem Stat");
+        assert_eq!(stat.risk_tier, "R1");
+        assert_eq!(stat.provider_kind, "builtin");
+        assert_eq!(stat.provider_id, "atelia-secretary");
+        assert_eq!(stat.default_result_format, "toon");
+        assert!(!stat.cancellable);
+        assert_eq!(stat.timeout_ms, 0);
+
         assert!(repertoire
             .entries
             .iter()
-            .all(|entry| { matches!(entry.tool_id.as_str(), "fs.read" | "secretary.echo") }));
+            .all(|entry| {
+                matches!(
+                    entry.tool_id.as_str(),
+                    "fs.delete" | "fs.list" | "fs.read" | "fs.stat" | "secretary.echo"
+                )
+            }));
     }
 
     // -- register / list round trip -----------------------------------------
@@ -6092,6 +6282,168 @@ mod tests {
             field.key == "content"
                 && matches!(&field.value, atelia_core::StructuredValue::String(value) if value == "alpha\nbeta")
         }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_list_tool() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-list-dispatch");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "list-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes").join("a.txt"), "alpha\n").unwrap();
+        fs::write(root.join("notes").join("b.txt"), "beta\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("list directory".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "notes".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.list".to_string()],
+                idempotency_key: None,
+            })
+            .expect("list dispatch should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.list"
+        );
+        assert_eq!(
+            receipt.policy_decision.requested_capability,
+            "filesystem.list"
+        );
+        let tool_result = receipt.tool_result.expect("tool result should exist");
+        assert_eq!(
+            tool_result.schema_ref.as_deref(),
+            Some("tool_result.fs.list.v1")
+        );
+        assert!(tool_result
+            .fields
+            .iter()
+            .any(|field| field.key == "entries"
+                && matches!(&field.value, atelia_core::StructuredValue::StringList(values) if values.contains(&"a.txt".to_string()) && values.contains(&"b.txt".to_string()))));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_stat_tool() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-stat-dispatch");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "stat-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("note.txt"), "hello\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("stat file".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "note.txt".to_string(),
+                }),
+                requested_capabilities: vec!["fs.stat".to_string()],
+                idempotency_key: None,
+            })
+            .expect("stat dispatch should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.stat"
+        );
+        let tool_result = receipt.tool_result.expect("tool result should exist");
+        assert_eq!(
+            tool_result.schema_ref.as_deref(),
+            Some("tool_result.fs.stat.v1")
+        );
+        assert!(tool_result
+            .fields
+            .iter()
+            .any(|field| field.key == "file_type"
+                && matches!(&field.value, atelia_core::StructuredValue::String(value) if value == "file")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_delete_tool() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-delete-dispatch");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "delete-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("to-delete.txt"), "temporary\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("delete file".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "to-delete.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.delete".to_string()],
+                idempotency_key: None,
+            })
+            .expect("delete dispatch should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.delete"
+        );
+        assert_eq!(
+            receipt.policy_decision.requested_capability,
+            "filesystem.delete"
+        );
+        assert!(
+            !root.join("to-delete.txt").exists(),
+            "file should be removed by delete tool"
+        );
+        let tool_result = receipt.tool_result.expect("tool result should exist");
+        assert_eq!(
+            tool_result.schema_ref.as_deref(),
+            Some("tool_result.fs.delete.v1")
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -3573,7 +3573,10 @@ mod tests {
             .iter()
             .map(|entry| entry.tool_id.as_str())
             .collect();
-        assert_eq!(tool_ids, vec!["fs.read", "secretary.echo"]);
+        assert_eq!(
+            tool_ids,
+            vec!["fs.delete", "fs.list", "fs.read", "fs.stat", "secretary.echo"]
+        );
         let read = response
             .entries
             .iter()
@@ -3591,10 +3594,12 @@ mod tests {
         assert_eq!(echo.risk_tier, "R0");
         assert!(!echo.cancellable);
         assert_eq!(echo.timeout_ms, 0);
-        assert!(response
-            .entries
-            .iter()
-            .all(|entry| { matches!(entry.tool_id.as_str(), "fs.read" | "secretary.echo") }));
+        assert!(response.entries.iter().all(|entry| {
+            matches!(
+                entry.tool_id.as_str(),
+                "fs.delete" | "fs.list" | "fs.read" | "fs.stat" | "secretary.echo"
+            )
+        }));
     }
 
     #[test]
@@ -5482,6 +5487,42 @@ mod tests {
             .expect("filesystem.read should dispatch through RPC path_scope");
 
         assert_eq!(response.policy.requested_capability, "filesystem.read");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_list_with_explicit_path_scope() {
+        let server = ready_server();
+        let root = test_repo_dir("filesystem-list-rpc-dispatch");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes").join("a.txt"), "alpha\n").unwrap();
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "list-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let response = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id,
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: Some("list directory".to_string()),
+                path_scope: Some(RpcPathScope {
+                    kind: RpcPathScopeKind::ExplicitPaths,
+                    roots: vec!["notes".to_string()],
+                    include_patterns: Vec::new(),
+                    exclude_patterns: Vec::new(),
+                }),
+                requested_capabilities: vec!["fs.list".to_string()],
+                idempotency_key: None,
+            })
+            .expect("filesystem.list should dispatch through RPC path_scope");
+
+        assert_eq!(response.policy.requested_capability, "filesystem.list");
         let _ = fs::remove_dir_all(root);
     }
 
