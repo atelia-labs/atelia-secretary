@@ -2885,6 +2885,7 @@ where
         })
 }
 
+/// Fetches a record from a BTree-backed collection while keeping callers on the ordered storage path.
 fn get_record_btree<Id, Record>(
     collection: &BTreeMap<Id, Record>,
     id: &Id,
@@ -2910,6 +2911,7 @@ where
     collection.values().cloned().collect()
 }
 
+/// Lists records in BTree key order so pagination and listing observe stable iteration order.
 fn list_records_btree<Id, Record>(collection: &BTreeMap<Id, Record>) -> Vec<Record>
 where
     Record: Clone,
