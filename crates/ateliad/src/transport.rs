@@ -483,9 +483,18 @@ fn requests_filesystem_path_operation(capabilities: &[String]) -> bool {
 
         matches!(
             normalized.as_str(),
-            "filesystem.read" | "filesystem.list" | "filesystem.stat" | "filesystem.delete" | "fs.read"
-                | "fs.list" | "fs.stat" | "fs.delete" | "filesystem.search" | "filesystem.diff"
-                | "fs.search" | "fs.diff"
+            "filesystem.read"
+                | "filesystem.list"
+                | "filesystem.stat"
+                | "filesystem.delete"
+                | "fs.read"
+                | "fs.list"
+                | "fs.stat"
+                | "fs.delete"
+                | "filesystem.search"
+                | "filesystem.diff"
+                | "fs.search"
+                | "fs.diff"
         )
     })
 }
@@ -5877,7 +5886,10 @@ mod tests {
             })
             .expect("filesystem capability payload should parse");
 
-            assert_eq!(parsed.path_scope.as_ref().expect("path scope").roots[0], "notes");
+            assert_eq!(
+                parsed.path_scope.as_ref().expect("path scope").roots[0],
+                "notes"
+            );
             assert_eq!(parsed.requested_capabilities, vec![capability.to_string()]);
         }
     }

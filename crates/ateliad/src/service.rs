@@ -16,22 +16,20 @@ use atelia_core::{
     ExtensionRegistryAuditRecord, ExtensionRegistryAuditRecordRef, ExtensionRegistryService,
     ExtensionRegistrySnapshot, ExtensionServices, ExtensionSourceSnapshot, ExtensionStatusRequest,
     ExtensionStatusResponse, FsDeleteTool, FsDiffTool, FsListTool, FsReadTool, FsSearchTool,
-    FsStatTool,
-    InMemoryStore, InMemoryToolOutputSettingsService,
-    InstallExtensionRequest, InstallExtensionResponse, JobEvent, JobId, JobKind,
-    JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
-    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
-    ManifestValidationPolicy, OutputFormat, PathScope, PolicyDecision, PolicyEngine, PolicyInput,
-    PolicyOutcome, RegistryError, RemoveExtensionRequest, RemoveExtensionResponse,
-    RenderedToolOutput, RepositoryId, RepositoryRecord, RepositoryTrustState, ResourceScope,
-    RollbackExtensionRequest, RollbackExtensionResponse, RollbackSnapshot, RuntimeError,
-    RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore, StoreError, SubmitJobIdempotencyRecord,
-    ToolInvocationId, ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange,
-    ToolOutputSettingsError, ToolOutputSettingsScope, ToolResultId, TruncationMetadata,
-    UpdateExtensionPublicationRequest, UpdateExtensionPublicationResponse,
-    UpdateExtensionRegistrySubmissionRequest, UpdateExtensionRegistrySubmissionResponse,
-    UpdateExtensionRequest, UpdateExtensionResponse, ValidateExtensionManifestRequest,
-    ValidateExtensionManifestResponse, WatchJobEvent,
+    FsStatTool, InMemoryStore, InMemoryToolOutputSettingsService, InstallExtensionRequest,
+    InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService, JobPage, JobQuery,
+    JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest, ListBlocklistResponse,
+    ListExtensionsRequest, ListExtensionsResponse, ManifestValidationPolicy, OutputFormat,
+    PathScope, PolicyDecision, PolicyEngine, PolicyInput, PolicyOutcome, RegistryError,
+    RemoveExtensionRequest, RemoveExtensionResponse, RenderedToolOutput, RepositoryId,
+    RepositoryRecord, RepositoryTrustState, ResourceScope, RollbackExtensionRequest,
+    RollbackExtensionResponse, RollbackSnapshot, RuntimeError, RuntimeJobReceipt,
+    RuntimeJobRequest, SecretaryStore, StoreError, SubmitJobIdempotencyRecord, ToolInvocationId,
+    ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
+    ToolOutputSettingsScope, ToolResultId, TruncationMetadata, UpdateExtensionPublicationRequest,
+    UpdateExtensionPublicationResponse, UpdateExtensionRegistrySubmissionRequest,
+    UpdateExtensionRegistrySubmissionResponse, UpdateExtensionRequest, UpdateExtensionResponse,
+    ValidateExtensionManifestRequest, ValidateExtensionManifestResponse, WatchJobEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -66,7 +64,8 @@ const SECRETARY_ECHO_TOOL_DESCRIPTION: &str =
     "Echo input for daemon smoke tests and context probes.";
 const SECRETARY_FS_DELETE_TOOL_ID: &str = "fs.delete";
 const SECRETARY_FS_DELETE_TOOL_NAME: &str = "Filesystem Delete";
-const SECRETARY_FS_DELETE_TOOL_DESCRIPTION: &str = "Delete one file from an allowed repository path.";
+const SECRETARY_FS_DELETE_TOOL_DESCRIPTION: &str =
+    "Delete one file from an allowed repository path.";
 const SECRETARY_FS_LIST_TOOL_ID: &str = "fs.list";
 const SECRETARY_FS_LIST_TOOL_NAME: &str = "Filesystem List";
 const SECRETARY_FS_LIST_TOOL_DESCRIPTION: &str = "List directory entries within an allowed scope.";
@@ -1347,7 +1346,7 @@ impl SecretaryService {
                     });
                 }
 
-                    let receipt = match tool_kind {
+                let receipt = match tool_kind {
                     SubmitJobToolKind::Echo => {
                         self.lifecycle.runtime().run_tool_job_with_finalizer(
                             runtime_request.clone(),
@@ -1407,7 +1406,8 @@ impl SecretaryService {
                             SubmitJobToolArgsSpec::Search(args) => args,
                             _ => {
                                 return Err(ServiceError::InvalidArgument {
-                                    reason: "internal tool_args resolution lost for fs.search".to_string(),
+                                    reason: "internal tool_args resolution lost for fs.search"
+                                        .to_string(),
                                 });
                             }
                         };
@@ -1429,7 +1429,8 @@ impl SecretaryService {
                             SubmitJobToolArgsSpec::Diff(args) => args,
                             _ => {
                                 return Err(ServiceError::InvalidArgument {
-                                    reason: "internal tool_args resolution lost for fs.diff".to_string(),
+                                    reason: "internal tool_args resolution lost for fs.diff"
+                                        .to_string(),
                                 });
                             }
                         };
@@ -1538,7 +1539,8 @@ impl SecretaryService {
                         SubmitJobToolArgsSpec::Search(ref args) => args,
                         _ => {
                             return Err(ServiceError::InvalidArgument {
-                                reason: "internal tool_args resolution lost for fs.search".to_string(),
+                                reason: "internal tool_args resolution lost for fs.search"
+                                    .to_string(),
                             })
                         }
                     };
@@ -1559,7 +1561,8 @@ impl SecretaryService {
                         SubmitJobToolArgsSpec::Diff(ref args) => args,
                         _ => {
                             return Err(ServiceError::InvalidArgument {
-                                reason: "internal tool_args resolution lost for fs.diff".to_string(),
+                                reason: "internal tool_args resolution lost for fs.diff"
+                                    .to_string(),
                             })
                         }
                     };
@@ -2492,7 +2495,7 @@ fn resolve_submit_job_tool_kind(
 ) -> ServiceResult<SubmitJobToolKind> {
     match requested_capabilities {
         [capability] if capability == SECRETARY_CAPABILITY_DISCOVERY => Ok(SubmitJobToolKind::Echo),
-            [capability]
+        [capability]
             if matches!(
                 capability.as_str(),
                 SECRETARY_FS_READ_CAPABILITY
@@ -2508,10 +2511,8 @@ fn resolve_submit_job_tool_kind(
                     .resource_scope
                     .as_ref()
                     .ok_or_else(|| ServiceError::InvalidArgument {
-                        reason: format!(
-                            "{capability} requires a path_scope/resource_scope"
-                        )
-                        .to_string(),
+                        reason: format!("{capability} requires a path_scope/resource_scope")
+                            .to_string(),
                     })?;
 
             if !matches!(
@@ -2532,8 +2533,10 @@ fn resolve_submit_job_tool_kind(
                 )
             {
                 return Err(ServiceError::InvalidArgument {
-                    reason: format!("{capability} requires a concrete path_scope/resource_scope root")
-                        .to_string(),
+                    reason: format!(
+                        "{capability} requires a concrete path_scope/resource_scope root"
+                    )
+                    .to_string(),
                 });
             }
 
@@ -2657,12 +2660,14 @@ fn resolve_submit_job_tool_args(
                 });
             }
 
-            let max_results = args.max.map(|max| {
-                usize::try_from(max).map_err(|_| ServiceError::InvalidArgument {
-                    reason: "search max must fit in usize".to_string(),
+            let max_results = args
+                .max
+                .map(|max| {
+                    usize::try_from(max).map_err(|_| ServiceError::InvalidArgument {
+                        reason: "search max must fit in usize".to_string(),
+                    })
                 })
-            })
-            .transpose()?;
+                .transpose()?;
 
             Ok(SubmitJobToolArgsSpec::Search(SubmitJobToolArgsSearch {
                 pattern,
@@ -2671,29 +2676,33 @@ fn resolve_submit_job_tool_args(
         }
         SubmitJobToolKind::FsDiff => {
             let args = tool_args.ok_or_else(missing_tool_args)?;
-            let comparison_path = args
-                .comparison_path
-                .ok_or_else(|| ServiceError::InvalidArgument {
-                    reason: "diff requires non-empty comparison_path in tool_args".to_string(),
-                })?;
+            let comparison_path =
+                args.comparison_path
+                    .ok_or_else(|| ServiceError::InvalidArgument {
+                        reason: "diff requires non-empty comparison_path in tool_args".to_string(),
+                    })?;
             if comparison_path.trim().is_empty() {
                 return Err(ServiceError::InvalidArgument {
                     reason: "diff requires non-empty comparison_path in tool_args".to_string(),
                 });
             }
 
-            let max_bytes = args.max_bytes.map(|max_bytes| {
-                usize::try_from(max_bytes).map_err(|_| ServiceError::InvalidArgument {
-                    reason: "max_bytes must fit in usize".to_string(),
+            let max_bytes = args
+                .max_bytes
+                .map(|max_bytes| {
+                    usize::try_from(max_bytes).map_err(|_| ServiceError::InvalidArgument {
+                        reason: "max_bytes must fit in usize".to_string(),
+                    })
                 })
-            })
-            .transpose()?;
-            let max_chars = args.max_chars.map(|max_chars| {
-                usize::try_from(max_chars).map_err(|_| ServiceError::InvalidArgument {
-                    reason: "max_chars must fit in usize".to_string(),
+                .transpose()?;
+            let max_chars = args
+                .max_chars
+                .map(|max_chars| {
+                    usize::try_from(max_chars).map_err(|_| ServiceError::InvalidArgument {
+                        reason: "max_chars must fit in usize".to_string(),
+                    })
                 })
-            })
-            .transpose()?;
+                .transpose()?;
 
             Ok(SubmitJobToolArgsSpec::Diff(SubmitJobToolArgsDiff {
                 comparison_path,
@@ -4623,21 +4632,18 @@ mod tests {
         assert!(!stat.cancellable);
         assert_eq!(stat.timeout_ms, 0);
 
-        assert!(repertoire
-            .entries
-            .iter()
-            .all(|entry| {
-                matches!(
-                    entry.tool_id.as_str(),
-                    "fs.delete"
-                        | "fs.diff"
-                        | "fs.list"
-                        | "fs.read"
-                        | "fs.search"
-                        | "fs.stat"
-                        | "secretary.echo"
-                )
-            }));
+        assert!(repertoire.entries.iter().all(|entry| {
+            matches!(
+                entry.tool_id.as_str(),
+                "fs.delete"
+                    | "fs.diff"
+                    | "fs.list"
+                    | "fs.read"
+                    | "fs.search"
+                    | "fs.stat"
+                    | "secretary.echo"
+            )
+        }));
     }
 
     // -- register / list round trip -----------------------------------------
@@ -6750,12 +6756,8 @@ mod tests {
             tool_result.schema_ref.as_deref(),
             Some("tool_result.fs.search.v1")
         );
-        assert!(
-            tool_result
-                .fields
-                .iter()
-                .any(|field| field.key == "matches" && matches!(&field.value, atelia_core::StructuredValue::StringList(_)))
-        );
+        assert!(tool_result.fields.iter().any(|field| field.key == "matches"
+            && matches!(&field.value, atelia_core::StructuredValue::StringList(_))));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6861,12 +6863,9 @@ mod tests {
             tool_result.schema_ref.as_deref(),
             Some("tool_result.fs.diff.v1")
         );
-        assert!(
-            tool_result.fields.iter().any(|field| {
-                field.key == "diff"
-                    && matches!(&field.value, atelia_core::StructuredValue::String(_))
-            })
-        );
+        assert!(tool_result.fields.iter().any(|field| {
+            field.key == "diff" && matches!(&field.value, atelia_core::StructuredValue::String(_))
+        }));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -15,10 +15,10 @@ use crate::service::{
     ListRepositoriesRequest as ServiceListRepositoriesRequest,
     ListToolOutputSettingsHistoryRequest as ServiceListToolOutputSettingsHistoryRequest,
     ProtocolMetadata as ServiceProtocolMetadata,
-    SubmitJobToolArgs as ServiceSubmitJobToolArgs,
     RegisterRepositoryRequest as ServiceRegisterRepositoryRequest,
     RenderToolOutputRequest as ServiceRenderToolOutputRequest, SecretaryService, ServiceError,
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
+    SubmitJobToolArgs as ServiceSubmitJobToolArgs,
 };
 pub use crate::service::{
     ExtensionExecutionRequest, ExtensionExecutionResponse, ListPackageTrustIndexRequest,
