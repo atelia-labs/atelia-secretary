@@ -14,12 +14,6 @@ macro_rules! opaque_id {
         #[serde(transparent)]
         pub struct $name(String);
 
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{}", self.0)
-            }
-        }
-
         impl $name {
             pub fn new() -> Self {
                 Self(format!("{}{}", $prefix, Uuid::new_v4()))

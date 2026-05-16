@@ -2892,7 +2892,7 @@ fn get_record_btree<Id, Record>(
     collection_name: &'static str,
 ) -> StoreResult<Record>
 where
-    Id: Ord + std::fmt::Debug + std::fmt::Display,
+    Id: Ord + std::fmt::Debug,
     Record: Clone,
 {
     collection
