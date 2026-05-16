@@ -85,7 +85,7 @@ job record は次を含みます。
 - requester
 - repository id
 - kind
-- goal
+- goal（任意。bounded-job intent がなければ absent / `None`）
 - status
 - policy summary
 - cancellation state

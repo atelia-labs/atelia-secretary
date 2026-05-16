@@ -360,7 +360,7 @@ pub struct SubmitJobRequest {
     pub requester: Actor,
     pub repository_id: RepositoryId,
     pub kind: JobKind,
-    pub goal: String,
+    pub goal: Option<String>,
     pub resource_scope: Option<ResourceScope>,
     pub requested_capabilities: Vec<String>,
     /// Optional caller-provided key used to deduplicate successful retries.
@@ -1147,17 +1147,11 @@ impl SecretaryService {
     /// and `fs.read` when the request asks for a filesystem read.
     #[allow(dead_code)]
     pub fn submit_job(&self, request: SubmitJobRequest) -> ServiceResult<RuntimeJobReceipt> {
-        if request.goal.trim().is_empty() {
-            return Err(ServiceError::InvalidArgument {
-                reason: "goal must not be empty".to_string(),
-            });
-        }
-        let normalized_goal = request.goal.trim().to_string();
-
         let requested_capabilities =
             normalize_requested_capabilities(&request.requested_capabilities)?;
         let tool_kind = resolve_submit_job_tool_kind(&request, &requested_capabilities)?;
         let repository = self.get_repository(&request.repository_id)?;
+        let normalized_goal = normalize_submit_job_goal(request.goal.clone());
 
         let normalized_idempotency_key = match request.idempotency_key.as_ref() {
             Some(idempotency_key) => {
@@ -1172,7 +1166,7 @@ impl SecretaryService {
             None => None,
         };
         let request_signature =
-            submit_job_request_signature(&request, &normalized_goal, &requested_capabilities);
+            submit_job_request_signature(&request, normalized_goal.as_deref(), &requested_capabilities);
         let tool_output_defaults = self.get_tool_output_defaults(
             ToolOutputSettingsScope::repository(repository.id.clone())
                 .for_tool(tool_kind.tool_id()),
@@ -1190,7 +1184,7 @@ impl SecretaryService {
             request.requester,
             request.repository_id,
             request.kind,
-            normalized_goal,
+            normalized_goal.clone(),
         )
         .with_requested_capabilities(requested_capabilities)
         .with_tool_output_defaults(tool_output_defaults)
@@ -2276,10 +2270,21 @@ fn validate_filesystem_read_scope(
     }
 }
 
+fn normalize_submit_job_goal(goal: Option<String>) -> Option<String> {
+    goal.and_then(|goal| {
+        let trimmed = goal.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
 /// Build the canonical request signature used to compare idempotent submit-job retries.
 fn submit_job_request_signature(
     request: &SubmitJobRequest,
-    normalized_goal: &str,
+    normalized_goal: Option<&str>,
     requested_capabilities: &[String],
 ) -> String {
     #[derive(Serialize)]
@@ -2287,7 +2292,7 @@ fn submit_job_request_signature(
         actor: &'a Actor,
         repository_id: &'a str,
         kind: &'a JobKind,
-        goal: &'a str,
+        goal: Option<&'a str>,
         resource_scope: &'a ResourceScope,
         requested_capabilities: &'a [String],
     }
@@ -3522,7 +3527,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "persist me".to_string(),
+                goal: Some("persist me".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("restart-key".to_string()),
@@ -3558,7 +3563,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "persist me".to_string(),
+                goal: Some("persist me".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("restart-key".to_string()),
@@ -3613,7 +3618,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "first goal".to_string(),
+                goal: Some("first goal".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("restart-key".to_string()),
@@ -3628,7 +3633,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "different goal".to_string(),
+                goal: Some("different goal".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("restart-key".to_string()),
@@ -3661,7 +3666,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "blocked request".to_string(),
+                goal: Some("blocked request".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("blocked-key".to_string()),
@@ -3693,7 +3698,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "blocked request".to_string(),
+                goal: Some("blocked request".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("blocked-key".to_string()),
@@ -4884,7 +4889,7 @@ mod tests {
                 },
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "summarize current repository status".to_string(),
+                goal: Some("summarize current repository status".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -4941,7 +4946,7 @@ mod tests {
                 },
                 repository_id: repository_a.id.clone(),
                 kind: JobKind::Read,
-                goal: "summarize repository a".to_string(),
+                goal: Some("summarize repository a".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -4955,7 +4960,7 @@ mod tests {
                 },
                 repository_id: repository_b.id.clone(),
                 kind: JobKind::Read,
-                goal: "summarize repository b".to_string(),
+                goal: Some("summarize repository b".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -5271,7 +5276,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: long_goal.clone(),
+                goal: Some(long_goal.clone()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -5358,7 +5363,7 @@ mod tests {
                 requester: actor(),
                 repository_id: canonical_repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "render tool output".to_string(),
+                goal: Some("render tool output".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -5771,7 +5776,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "summarize status".to_string(),
+                goal: Some("summarize status".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -5817,7 +5822,7 @@ mod tests {
             requester: actor(),
             repository_id: repository_id.clone(),
             kind: JobKind::Read,
-            goal: "first".to_string(),
+            goal: Some("first".to_string()),
             resource_scope: None,
             requested_capabilities: Vec::new(),
             idempotency_key: None,
@@ -5827,7 +5832,7 @@ mod tests {
             requester: actor(),
             repository_id: repository_id.clone(),
             kind: JobKind::Read,
-            goal: "second".to_string(),
+            goal: Some("second".to_string()),
             resource_scope: None,
             requested_capabilities: Vec::new(),
             idempotency_key: None,
@@ -5892,7 +5897,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: "summarize the runtime output".to_string(),
+                goal: Some("summarize the runtime output".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -5916,21 +5921,33 @@ mod tests {
     }
 
     #[test]
-    fn submit_job_rejects_empty_goal() {
+    fn submit_job_accepts_empty_goal_and_records_none() {
         let svc = ready_service();
-        let err = svc
+        let root = test_repo_dir("empty-goal-submit");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let receipt = svc
             .submit_job(SubmitJobRequest {
                 requester: actor(),
-                repository_id: RepositoryId::new(),
+                repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: " ".to_string(),
+                goal: Some(" ".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
             })
-            .unwrap_err();
+            .expect("empty goal should be accepted");
 
-        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert_eq!(receipt.job.goal, None);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5961,7 +5978,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: "summarize".to_string(),
+                goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-123".to_string()),
@@ -5994,7 +6011,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "summarize".to_string(),
+                goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: vec!["policy.check".to_string()],
                 idempotency_key: Some("request-123".to_string()),
@@ -6009,7 +6026,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: "summarize".to_string(),
+                goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: vec!["capability.discovery".to_string()],
                 idempotency_key: Some("request-123".to_string()),
@@ -6040,7 +6057,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: "read repository notes".to_string(),
+                goal: Some("read repository notes".to_string()),
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "README.md".to_string(),
@@ -6100,7 +6117,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "read scoped notes".to_string(),
+                goal: Some("read scoped notes".to_string()),
                 resource_scope: Some(ResourceScope {
                     kind: "explicit_paths".to_string(),
                     value: "docs/guide.md".to_string(),
@@ -6123,7 +6140,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: "read root notes".to_string(),
+                goal: Some("read root notes".to_string()),
                 resource_scope: Some(ResourceScope {
                     kind: "explicit_paths".to_string(),
                     value: "README.md".to_string(),
@@ -6155,7 +6172,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: "read repository notes".to_string(),
+                goal: Some("read repository notes".to_string()),
                 resource_scope: None,
                 requested_capabilities: vec!["filesystem.read".to_string()],
                 idempotency_key: None,
@@ -6192,7 +6209,7 @@ mod tests {
                     requester: actor(),
                     repository_id: repository.id.clone(),
                     kind: JobKind::Read,
-                    goal: "read repository root".to_string(),
+                    goal: Some("read repository root".to_string()),
                     resource_scope: Some(ResourceScope {
                         kind: "repository".to_string(),
                         value: value.to_string(),
@@ -6230,15 +6247,20 @@ mod tests {
             requester: actor(),
             repository_id: repository.id.clone(),
             kind: JobKind::Read,
-            goal: "summarize".to_string(),
+            goal: Some("summarize".to_string()),
             resource_scope: None,
             requested_capabilities: Vec::new(),
             idempotency_key: Some("request-123".to_string()),
         };
-        let first_normalized_goal = first_request.goal.trim().to_string();
+        let first_normalized_goal = first_request
+            .goal
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
         let first_signature = submit_job_request_signature(
             &first_request,
-            &first_normalized_goal,
+            Some(&first_normalized_goal),
             &normalize_requested_capabilities(&first_request.requested_capabilities)
                 .expect("first capability normalization should succeed"),
         );
@@ -6250,15 +6272,20 @@ mod tests {
             requester: actor(),
             repository_id: repository.id,
             kind: JobKind::Read,
-            goal: "summarize".to_string(),
+            goal: Some("summarize".to_string()),
             resource_scope: None,
             requested_capabilities: vec!["capability.discovery".to_string()],
             idempotency_key: Some("request-123".to_string()),
         };
-        let second_normalized_goal = second_request.goal.trim().to_string();
+        let second_normalized_goal = second_request
+            .goal
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
         let second_signature = submit_job_request_signature(
             &second_request,
-            &second_normalized_goal,
+            Some(&second_normalized_goal),
             &normalize_requested_capabilities(&second_request.requested_capabilities)
                 .expect("second capability normalization should succeed"),
         );
@@ -6290,21 +6317,21 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "  summarize  ".to_string(),
+                goal: Some("  summarize  ".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-123".to_string()),
             })
             .expect("first submit should succeed");
 
-        assert_eq!(first.job.goal, "summarize");
+        assert_eq!(first.job.goal, Some("summarize".to_string()));
 
         let second = svc
             .submit_job(SubmitJobRequest {
                 requester: actor(),
                 repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: "summarize".to_string(),
+                goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-123".to_string()),
@@ -6312,7 +6339,7 @@ mod tests {
             .expect("trimmed goal should replay the same job");
 
         assert_eq!(second.job.id, first.job.id);
-        assert_eq!(second.job.goal, "summarize");
+        assert_eq!(second.job.goal, Some("summarize".to_string()));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6336,7 +6363,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "inspect".to_string(),
+                goal: Some("inspect".to_string()),
                 resource_scope: Some(ResourceScope {
                     kind: "repository".to_string(),
                     value: "binary.bin".to_string(),
@@ -6353,7 +6380,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: "inspect".to_string(),
+                goal: Some("inspect".to_string()),
                 resource_scope: Some(ResourceScope {
                     kind: "repository".to_string(),
                     value: "binary.bin".to_string(),
@@ -6390,7 +6417,7 @@ mod tests {
             requester: actor(),
             repository_id: repository.id.clone(),
             kind: JobKind::Read,
-            goal: "summarize;resource_scope=repository:.".to_string(),
+            goal: Some("summarize;resource_scope=repository:.".to_string()),
             resource_scope: Some(ResourceScope {
                 kind: "repository".to_string(),
                 value: "branch=main;capabilities=capability.discovery".to_string(),
@@ -6402,7 +6429,7 @@ mod tests {
             requester: actor(),
             repository_id: repository.id,
             kind: JobKind::Read,
-            goal: "summarize".to_string(),
+            goal: Some("summarize".to_string()),
             resource_scope: Some(ResourceScope {
                 kind: "repository".to_string(),
                 value: "branch=main".to_string(),
@@ -6411,16 +6438,26 @@ mod tests {
             idempotency_key: None,
         };
 
-        let request_one_normalized_goal = request_one.goal.trim().to_string();
-        let request_two_normalized_goal = request_two.goal.trim().to_string();
+        let request_one_normalized_goal = request_one
+            .goal
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let request_two_normalized_goal = request_two
+            .goal
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
         let signature_one = submit_job_request_signature(
             &request_one,
-            &request_one_normalized_goal,
+            Some(&request_one_normalized_goal),
             &normalized_capabilities,
         );
         let signature_two = submit_job_request_signature(
             &request_two,
-            &request_two_normalized_goal,
+            Some(&request_two_normalized_goal),
             &normalized_capabilities,
         );
 
@@ -6447,7 +6484,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: "summarize".to_string(),
+                goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: vec!["filesystem.write".to_string()],
                 idempotency_key: None,
@@ -6477,7 +6514,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "summarize".to_string(),
+                goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-123".to_string()),
@@ -6489,7 +6526,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: "summarize".to_string(),
+                goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-123".to_string()),
@@ -6520,7 +6557,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "summarize".to_string(),
+                goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-0".to_string()),
@@ -6533,13 +6570,13 @@ mod tests {
                     requester: actor(),
                     repository_id: repository.id.clone(),
                     kind: JobKind::Read,
-                    goal: "summarize".to_string(),
+                    goal: Some("summarize".to_string()),
                     resource_scope: None,
                     requested_capabilities: Vec::new(),
                     idempotency_key: Some(format!("request-{index}")),
                 })
                 .expect("unique submit should succeed");
-            assert_eq!(receipt.job.goal, "summarize");
+            assert_eq!(receipt.job.goal, Some("summarize".to_string()));
         }
 
         assert_eq!(
@@ -6552,7 +6589,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: "summarize".to_string(),
+                goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-0".to_string()),
@@ -6586,7 +6623,7 @@ mod tests {
                     requester: actor(),
                     repository_id,
                     kind: JobKind::Read,
-                    goal: "summarize".to_string(),
+                    goal: Some("summarize".to_string()),
                     resource_scope: None,
                     requested_capabilities: Vec::new(),
                     idempotency_key: Some("shared-key".to_string()),
@@ -6643,7 +6680,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "summarize".to_string(),
+                goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-123".to_string()),
@@ -6655,7 +6692,7 @@ mod tests {
                 requester: actor_two(),
                 repository_id: first.job.repository_id,
                 kind: JobKind::Read,
-                goal: "different summary".to_string(),
+                goal: Some("different summary".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-123".to_string()),
@@ -6685,7 +6722,7 @@ mod tests {
                 requester: actor(),
                 repository_id: repository.id,
                 kind: JobKind::Read,
-                goal: "summarize".to_string(),
+                goal: Some("summarize".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("   ".to_string()),
@@ -6719,7 +6756,7 @@ mod tests {
             requester: actor(),
             repository_id: repository_id.clone(),
             kind: JobKind::Read,
-            goal: "from-first".to_string(),
+            goal: Some("from-first".to_string()),
             resource_scope: None,
             requested_capabilities: Vec::new(),
             idempotency_key: None,
@@ -6729,7 +6766,7 @@ mod tests {
             requester: actor_two(),
             repository_id: repository_id.clone(),
             kind: JobKind::Read,
-            goal: "from-second".to_string(),
+            goal: Some("from-second".to_string()),
             resource_scope: None,
             requested_capabilities: Vec::new(),
             idempotency_key: None,

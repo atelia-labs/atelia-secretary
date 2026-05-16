@@ -89,7 +89,7 @@ daemon は明示的な domain record を永続化します。storage は simple 
 | Record | Purpose | Notes |
 | --- | --- | --- |
 | repository | registered workspace root と trust setting | display name、root path、allowed path scope、created/updated timestamps を含む |
-| job | user または agent が要求した仕事 | kind、goal、repository id、status、requester、created/started/completed timestamps を含む |
+| job | user または agent が要求した仕事 | kind、任意の goal、repository id、status、requester、created/started/completed timestamps を含む |
 | job_event | observable job lifecycle event | append-only。streaming と replay を支える |
 | policy_decision | allow / audit / approval / block の結果 | risk tier、reason、policy version、requested capability を含む |
 | tool_invocation | built-in または package-provided tool call | tool id、input digest、permission、status、output ref を含む |
@@ -99,6 +99,10 @@ daemon は明示的な domain record を永続化します。storage は simple 
 ## State Machines
 
 runtime は state transition を handler 内の ad hoc string としてではなく、明示的な model として扱います。
+
+`SubmitJobRequest.goal` は任意の bounded-job intent / summary です。Secretary は空または未指定の
+goal を受け入れて `None` / absent として保持し、durable な `Goal` lifecycle と OM default
+package policy は別の future product lane に切り出します。
 
 初期 job state:
 

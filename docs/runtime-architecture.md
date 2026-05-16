@@ -112,7 +112,7 @@ part of the architecture.
 | Record | Purpose | Notes |
 | --- | --- | --- |
 | repository | registered workspace root and trust settings | includes display name, root path, allowed path scope, timestamps |
-| job | user or agent requested work | includes kind, goal, repository id, status, requester, created/started/completed timestamps |
+| job | user or agent requested work | includes kind, optional goal, repository id, status, requester, created/started/completed timestamps |
 | job_event | observable job lifecycle event | append-only; supports streaming and replay |
 | policy_decision | allow / audit / approval / block result | includes risk tier, reason, policy version, requested capability |
 | tool_invocation | one built-in or package-provided tool call | includes tool id, input digest, permission, status, output ref |
@@ -123,6 +123,11 @@ part of the architecture.
 
 The runtime should model state transitions explicitly rather than encoding them
 as ad hoc strings in handlers.
+
+`SubmitJobRequest.goal` is an optional bounded-job intent/summary. Secretary
+accepts empty or missing goal values and stores them as absent/`None`; durable
+`Goal` lifecycle work and OM default package policy belong to separate future
+product lanes.
 
 Initial job states:
 

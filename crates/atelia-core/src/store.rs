@@ -6157,7 +6157,7 @@ mod tests {
             "requester",
         );
         assert_rejects_change(|job| job.kind = JobKind::Maintenance, "kind");
-        assert_rejects_change(|job| job.goal = "different goal".to_string(), "goal");
+        assert_rejects_change(|job| job.goal = Some("different goal".to_string()), "goal");
     }
 
     #[test]
@@ -8872,7 +8872,12 @@ mod tests {
             .unwrap();
         let mut invalid_inner = store.lock().unwrap().clone();
         let mut invalid_receipt = receipt.clone();
-        invalid_receipt.job.goal.push_str(" mismatch");
+        invalid_receipt
+            .job
+            .goal
+            .as_mut()
+            .expect("goal should exist in invalid receipt")
+            .push_str(" mismatch");
         invalid_inner.idempotent_submit_jobs.insert(
             "ledger-key".to_string(),
             SubmitJobIdempotencyRecord {

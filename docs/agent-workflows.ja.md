@@ -33,7 +33,7 @@ Goal: stale protocol reference がないか docs を inspect する。
 
 Calls:
 
-1. `SubmitJob(kind: documentation_review, repository_id, goal)`
+1. `SubmitJob(kind: documentation_review, repository_id, 任意の goal)`
 2. daemon records `job: queued`
 3. `CheckPolicy(capability: filesystem.read, scope: docs)`
 4. policy returns `allowed` or `audited`
@@ -54,7 +54,7 @@ Goal: design document を更新する。
 
 Calls:
 
-1. `SubmitJob(kind: docs_patch, repository_id, goal)`
+1. `SubmitJob(kind: docs_patch, repository_id, 任意の goal)`
 2. `CheckPolicy(capability: filesystem.write, scope: docs/runtime-architecture.md)`
 3. policy returns `audited`
 4. tool invocation: `fs.patch`
@@ -94,7 +94,7 @@ Goal: broad mutation または external side effect を実行したい。
 
 Calls:
 
-1. `SubmitJob(kind: approval_gated, goal, repository_id)`
+1. `SubmitJob(kind: approval_gated, repository_id, 任意の goal)`
 2. daemon が `job` と initial `job_event` を persist する
 3. `CheckPolicy(capability: repository.merge or external.call)`
 4. policy returns `needs_approval`

@@ -99,7 +99,7 @@ Job records include:
 - requester
 - repository id
 - kind
-- goal
+- goal (optional; absent/`None` when no bounded-job intent was supplied)
 - status
 - policy summary
 - cancellation state

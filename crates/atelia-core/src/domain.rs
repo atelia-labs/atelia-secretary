@@ -325,7 +325,7 @@ pub struct JobRecord {
     pub requester: Actor,
     pub repository_id: RepositoryId,
     pub kind: JobKind,
-    pub goal: String,
+    pub goal: Option<String>,
     pub status: JobStatus,
     pub policy_summary: Option<PolicySummary>,
     pub cancellation_state: CancellationState,
@@ -333,12 +333,40 @@ pub struct JobRecord {
     pub redactions: Vec<RedactionMarker>,
 }
 
+pub trait IntoOptionalDomainGoal {
+    fn into_optional_goal(self) -> Option<String>;
+}
+
+impl IntoOptionalDomainGoal for Option<String> {
+    fn into_optional_goal(self) -> Option<String> {
+        self
+    }
+}
+
+impl IntoOptionalDomainGoal for String {
+    fn into_optional_goal(self) -> Option<String> {
+        Some(self)
+    }
+}
+
+impl IntoOptionalDomainGoal for &str {
+    fn into_optional_goal(self) -> Option<String> {
+        Some(self.to_string())
+    }
+}
+
+impl IntoOptionalDomainGoal for Option<&str> {
+    fn into_optional_goal(self) -> Option<String> {
+        self.map(str::to_string)
+    }
+}
+
 impl JobRecord {
     pub fn new(
         requester: Actor,
         repository_id: RepositoryId,
         kind: JobKind,
-        goal: impl Into<String>,
+        goal: impl IntoOptionalDomainGoal,
         created_at: LedgerTimestamp,
     ) -> Self {
         Self {
@@ -351,7 +379,7 @@ impl JobRecord {
             requester,
             repository_id,
             kind,
-            goal: goal.into(),
+            goal: goal.into_optional_goal(),
             status: JobStatus::Queued,
             policy_summary: None,
             cancellation_state: CancellationState::NotRequested,
