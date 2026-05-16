@@ -325,7 +325,7 @@ pub struct JobRecord {
     pub requester: Actor,
     pub repository_id: RepositoryId,
     pub kind: JobKind,
-    pub goal: String,
+    pub goal: Option<String>,
     pub status: JobStatus,
     pub policy_summary: Option<PolicySummary>,
     pub cancellation_state: CancellationState,
@@ -333,12 +333,51 @@ pub struct JobRecord {
     pub redactions: Vec<RedactionMarker>,
 }
 
+pub trait IntoOptionalDomainGoal {
+    fn into_optional_goal(self) -> Option<String>;
+}
+
+fn normalize_optional_domain_goal(goal: Option<String>) -> Option<String> {
+    goal.and_then(|goal| {
+        let trimmed = goal.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+impl IntoOptionalDomainGoal for Option<String> {
+    fn into_optional_goal(self) -> Option<String> {
+        normalize_optional_domain_goal(self)
+    }
+}
+
+impl IntoOptionalDomainGoal for String {
+    fn into_optional_goal(self) -> Option<String> {
+        normalize_optional_domain_goal(Some(self))
+    }
+}
+
+impl IntoOptionalDomainGoal for &str {
+    fn into_optional_goal(self) -> Option<String> {
+        normalize_optional_domain_goal(Some(self.to_string()))
+    }
+}
+
+impl IntoOptionalDomainGoal for Option<&str> {
+    fn into_optional_goal(self) -> Option<String> {
+        normalize_optional_domain_goal(self.map(str::to_string))
+    }
+}
+
 impl JobRecord {
     pub fn new(
         requester: Actor,
         repository_id: RepositoryId,
         kind: JobKind,
-        goal: impl Into<String>,
+        goal: impl IntoOptionalDomainGoal,
         created_at: LedgerTimestamp,
     ) -> Self {
         Self {
@@ -351,7 +390,7 @@ impl JobRecord {
             requester,
             repository_id,
             kind,
-            goal: goal.into(),
+            goal: goal.into_optional_goal(),
             status: JobStatus::Queued,
             policy_summary: None,
             cancellation_state: CancellationState::NotRequested,
@@ -1219,6 +1258,18 @@ mod tests {
         assert_eq!(
             "R3",
             RiskTier::R3.serialize(StringRoundTripSerializer).unwrap()
+        );
+    }
+
+    #[test]
+    fn optional_domain_goals_trim_and_drop_blank_inputs() {
+        assert_eq!(None, None::<String>.into_optional_goal());
+        assert_eq!(None, String::from("   ").into_optional_goal());
+        assert_eq!(None, " \t ".into_optional_goal());
+        assert_eq!(None, Some(" \n ").into_optional_goal());
+        assert_eq!(
+            Some("summarize".to_string()),
+            "  summarize  ".into_optional_goal()
         );
     }
 

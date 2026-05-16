@@ -35,7 +35,7 @@ Goal: inspect docs for stale protocol references.
 
 Calls:
 
-1. `SubmitJob(kind: documentation_review, repository_id, goal)`
+1. `SubmitJob(kind: documentation_review, repository_id, optional goal)`
 2. daemon records `job: queued`
 3. `CheckPolicy(capability: filesystem.read, scope: docs)`
 4. policy returns `allowed` or `audited`
@@ -56,7 +56,7 @@ Goal: update a design document.
 
 Calls:
 
-1. `SubmitJob(kind: docs_patch, repository_id, goal)`
+1. `SubmitJob(kind: docs_patch, repository_id, optional goal)`
 2. `CheckPolicy(capability: filesystem.write, scope: docs/runtime-architecture.md)`
 3. policy returns `audited`
 4. tool invocation: `fs.patch`
@@ -96,7 +96,7 @@ Goal: run a broad mutation or external side effect.
 
 Calls:
 
-1. `SubmitJob(kind: approval_gated, goal, repository_id)`
+1. `SubmitJob(kind: approval_gated, repository_id, optional goal)`
 2. daemon persists `job` and initial `job_event`
 3. `CheckPolicy(capability: repository.merge or external.call)`
 4. policy returns `needs_approval`

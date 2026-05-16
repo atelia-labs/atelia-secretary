@@ -1452,7 +1452,7 @@ pub struct SubmitJobRequest {
     pub repository_id: String,
     pub requester: RpcActorDto,
     pub kind: String,
-    pub goal: String,
+    pub goal: Option<String>,
     pub path_scope: Option<RpcPathScope>,
     pub requested_capabilities: Vec<String>,
     pub idempotency_key: Option<String>,
@@ -2175,7 +2175,7 @@ pub struct Job {
     pub repository_id: String,
     pub requester: RpcActorDto,
     pub kind: String,
-    pub goal: String,
+    pub goal: Option<String>,
     pub status: String,
     pub policy_summary: Option<PolicySummary>,
     pub created_at_unix_ms: i64,
@@ -3473,7 +3473,7 @@ mod tests {
                 repository_id: repository.repository_id.clone(),
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "persist rpc state".to_string(),
+                goal: Some("persist rpc state".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -3679,7 +3679,7 @@ mod tests {
                 requester: actor_record(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: long_goal.clone(),
+                goal: Some(long_goal.clone()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -3766,7 +3766,7 @@ mod tests {
                 requester: actor_record(),
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
-                goal: "render tool output".to_string(),
+                goal: Some("render tool output".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -4153,7 +4153,7 @@ mod tests {
                 repository_id: registered.repository.repository_id.clone(),
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "summarize repository state".to_string(),
+                goal: Some("summarize repository state".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -4161,6 +4161,10 @@ mod tests {
             .expect("submit job should succeed");
         assert_eq!(submitted.job.status, "succeeded");
         assert_eq!(submitted.policy.outcome, "allowed");
+        assert_eq!(
+            submitted.job.goal.as_deref(),
+            Some("summarize repository state")
+        );
 
         let fetched = server
             .get_job(GetJobRequest {
@@ -4168,6 +4172,23 @@ mod tests {
             })
             .expect("get job should succeed");
         assert_eq!(fetched.job.job_id, submitted.job.job_id);
+        assert_eq!(
+            fetched.job.goal.as_deref(),
+            Some("summarize repository state")
+        );
+
+        let submitted_without_goal = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: None,
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("submit job without goal should succeed");
+        assert_eq!(submitted_without_goal.job.goal, None);
 
         let jobs = server
             .list_jobs(ListJobsRequest {
@@ -4178,8 +4199,22 @@ mod tests {
                 page_token: None,
             })
             .expect("list jobs should succeed");
-        assert_eq!(jobs.jobs.len(), 1);
-        assert_eq!(jobs.jobs[0].job_id, submitted.job.job_id);
+        assert_eq!(jobs.jobs.len(), 2);
+        let listed_with_goal = jobs
+            .jobs
+            .iter()
+            .find(|job| job.job_id == submitted.job.job_id)
+            .expect("listed job with goal");
+        assert_eq!(
+            listed_with_goal.goal.as_deref(),
+            Some("summarize repository state")
+        );
+        let listed_without_goal = jobs
+            .jobs
+            .iter()
+            .find(|job| job.job_id == submitted_without_goal.job.job_id)
+            .expect("listed job without goal");
+        assert_eq!(listed_without_goal.goal, None);
 
         let status = server
             .get_project_status(GetProjectStatusRequest {
@@ -4190,9 +4225,23 @@ mod tests {
             status.repository.repository_id,
             registered.repository.repository_id
         );
-        assert_eq!(status.recent_jobs.len(), 1);
-        assert_eq!(status.recent_jobs[0].job_id, submitted.job.job_id);
-        assert_eq!(status.recent_policy_decisions.len(), 1);
+        assert_eq!(status.recent_jobs.len(), 2);
+        let status_with_goal = status
+            .recent_jobs
+            .iter()
+            .find(|job| job.job_id == submitted.job.job_id)
+            .expect("status job with goal");
+        assert_eq!(
+            status_with_goal.goal.as_deref(),
+            Some("summarize repository state")
+        );
+        let status_without_goal = status
+            .recent_jobs
+            .iter()
+            .find(|job| job.job_id == submitted_without_goal.job.job_id)
+            .expect("status job without goal");
+        assert_eq!(status_without_goal.goal, None);
+        assert_eq!(status.recent_policy_decisions.len(), 2);
         assert!(
             status
                 .latest_cursor
@@ -4201,6 +4250,71 @@ mod tests {
                 .sequence
                 > 0
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn register_submit_and_project_status_normalize_blank_goal() {
+        let server = ready_server();
+        let root = test_repo_dir("blank-goal-round-trip");
+
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "rpc-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let submitted = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: Some(" \t\n ".to_string()),
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("blank goal submit should succeed");
+        assert_eq!(submitted.job.goal, None);
+
+        let fetched = server
+            .get_job(GetJobRequest {
+                job_id: submitted.job.job_id.clone(),
+            })
+            .expect("get job should succeed");
+        assert_eq!(fetched.job.goal, None);
+
+        let jobs = server
+            .list_jobs(ListJobsRequest {
+                repository_id: Some(registered.repository.repository_id.clone()),
+                status: Some(RpcJobStatus::Succeeded),
+                requester: None,
+                page_size: None,
+                page_token: None,
+            })
+            .expect("list jobs should succeed");
+        let listed = jobs
+            .jobs
+            .iter()
+            .find(|job| job.job_id == submitted.job.job_id)
+            .expect("listed blank-goal job");
+        assert_eq!(listed.goal, None);
+
+        let status = server
+            .get_project_status(GetProjectStatusRequest {
+                repository_id: submitted.job.repository_id.clone(),
+            })
+            .expect("project status should succeed");
+        let status_job = status
+            .recent_jobs
+            .iter()
+            .find(|job| job.job_id == submitted.job.job_id)
+            .expect("status job with blank goal");
+        assert_eq!(status_job.goal, None);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4252,7 +4366,7 @@ mod tests {
                 repository_id: registered.repository.repository_id.clone(),
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "first".to_string(),
+                goal: Some("first".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -4263,7 +4377,7 @@ mod tests {
                 repository_id: other_registered.repository.repository_id.clone(),
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "between".to_string(),
+                goal: Some("between".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -4274,7 +4388,7 @@ mod tests {
                 repository_id: registered.repository.repository_id.clone(),
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "second".to_string(),
+                goal: Some("second".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -4405,7 +4519,7 @@ mod tests {
                 repository_id: first_repository.repository_id.clone(),
                 requester: actor_record().into(),
                 kind: "read".to_string(),
-                goal: "first repo job".to_string(),
+                goal: Some("first repo job".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -4417,7 +4531,7 @@ mod tests {
                 repository_id: second_repository.repository_id.clone(),
                 requester: actor_record().into(),
                 kind: "read".to_string(),
-                goal: "second repo job".to_string(),
+                goal: Some("second repo job".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -4496,7 +4610,7 @@ mod tests {
                 repository_id: registered.repository.repository_id.clone(),
                 requester: actor_record().into(),
                 kind: "read".to_string(),
-                goal: "watch live job".to_string(),
+                goal: Some("watch live job".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -4619,7 +4733,7 @@ mod tests {
                 repository_id: registered.repository.repository_id.clone(),
                 requester: actor_record().into(),
                 kind: "read".to_string(),
-                goal: "watch live anchor".to_string(),
+                goal: Some("watch live anchor".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -5015,7 +5129,7 @@ mod tests {
                 repository_id: registered.repository.repository_id.clone(),
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "one".to_string(),
+                goal: Some("one".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -5026,7 +5140,7 @@ mod tests {
                 repository_id: registered.repository.repository_id.clone(),
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "two".to_string(),
+                goal: Some("two".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -5143,7 +5257,7 @@ mod tests {
                 repository_id: registered.repository.repository_id,
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "finish immediately".to_string(),
+                goal: Some("finish immediately".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -5171,7 +5285,7 @@ mod tests {
                 repository_id: "not-a-repo-id".to_string(),
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "test".to_string(),
+                goal: Some("test".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: None,
@@ -5211,7 +5325,7 @@ mod tests {
                 repository_id: registered.repository.repository_id,
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "ignored".to_string(),
+                goal: Some("ignored".to_string()),
                 path_scope: Some(RpcPathScope {
                     kind: RpcPathScopeKind::Repository,
                     roots: vec![".".to_string()],
@@ -5245,7 +5359,7 @@ mod tests {
                 repository_id: registered.repository.repository_id.clone(),
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "first".to_string(),
+                goal: Some("first".to_string()),
                 path_scope: None,
                 requested_capabilities: vec!["policy.check".to_string()],
                 idempotency_key: Some("request-key".to_string()),
@@ -5260,7 +5374,7 @@ mod tests {
                 repository_id: registered.repository.repository_id.clone(),
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "first".to_string(),
+                goal: Some("first".to_string()),
                 path_scope: None,
                 requested_capabilities: vec!["capability.discovery".to_string()],
                 idempotency_key: Some("request-key".to_string()),
@@ -5273,7 +5387,7 @@ mod tests {
                 repository_id: registered.repository.repository_id.clone(),
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "second".to_string(),
+                goal: Some("second".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-key-2".to_string()),
@@ -5284,7 +5398,7 @@ mod tests {
                 repository_id: registered.repository.repository_id.clone(),
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "second".to_string(),
+                goal: Some("second".to_string()),
                 path_scope: None,
                 idempotency_key: Some("request-key-2".to_string()),
                 requested_capabilities: Vec::new(),
@@ -5297,7 +5411,7 @@ mod tests {
                 repository_id: registered.repository.repository_id,
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "conflicting goal".to_string(),
+                goal: Some("conflicting goal".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
                 idempotency_key: Some("request-key".to_string()),
@@ -5326,7 +5440,7 @@ mod tests {
                 repository_id: registered.repository.repository_id,
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "unsupported".to_string(),
+                goal: Some("unsupported".to_string()),
                 path_scope: None,
                 requested_capabilities: vec!["filesystem.write".to_string()],
                 idempotency_key: None,
@@ -5355,7 +5469,7 @@ mod tests {
                 repository_id: registered.repository.repository_id,
                 requester: actor(),
                 kind: "read".to_string(),
-                goal: "read repository notes".to_string(),
+                goal: Some("read repository notes".to_string()),
                 path_scope: Some(RpcPathScope {
                     kind: RpcPathScopeKind::ExplicitPaths,
                     roots: vec!["README.md".to_string()],

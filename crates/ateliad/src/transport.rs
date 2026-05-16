@@ -457,7 +457,8 @@ struct SubmitJobRequestPayload {
     repository_id: String,
     requester: ActorPayload,
     kind: String,
-    goal: String,
+    #[serde(default)]
+    goal: Option<String>,
     path_scope: Option<PathScopePayload>,
     requested_capabilities: Option<Vec<String>>,
     idempotency_key: Option<String>,
@@ -1584,20 +1585,54 @@ fn serialize_job_cancellation(cancellation: &rpc::JobCancellation) -> serde_json
 }
 
 fn serialize_job(job: &rpc::Job) -> serde_json::Value {
-    serde_json::json!({
-        "job_id": job.job_id,
-        "repository_id": job.repository_id,
-        "requester": serialize_actor(&job.requester),
-        "kind": job.kind,
-        "goal": job.goal,
-        "status": job.status,
-        "policy_summary": job.policy_summary.as_ref().map(serialize_policy_summary),
-        "created_at_unix_ms": job.created_at_unix_ms,
-        "started_at_unix_ms": job.started_at_unix_ms,
-        "completed_at_unix_ms": job.completed_at_unix_ms,
-        "latest_event_id": job.latest_event_id,
-        "cancellation": serialize_job_cancellation(&job.cancellation),
-    })
+    let mut object = serde_json::Map::from_iter([
+        (
+            "job_id".to_string(),
+            serde_json::Value::String(job.job_id.clone()),
+        ),
+        (
+            "repository_id".to_string(),
+            serde_json::Value::String(job.repository_id.clone()),
+        ),
+        ("requester".to_string(), serialize_actor(&job.requester)),
+        (
+            "kind".to_string(),
+            serde_json::Value::String(job.kind.clone()),
+        ),
+        (
+            "status".to_string(),
+            serde_json::Value::String(job.status.clone()),
+        ),
+        (
+            "policy_summary".to_string(),
+            serde_json::to_value(job.policy_summary.as_ref().map(serialize_policy_summary))
+                .expect("serialize policy summary"),
+        ),
+        (
+            "created_at_unix_ms".to_string(),
+            serde_json::Value::from(job.created_at_unix_ms),
+        ),
+        (
+            "started_at_unix_ms".to_string(),
+            serde_json::to_value(job.started_at_unix_ms).expect("serialize started_at_unix_ms"),
+        ),
+        (
+            "completed_at_unix_ms".to_string(),
+            serde_json::to_value(job.completed_at_unix_ms).expect("serialize completed_at_unix_ms"),
+        ),
+        (
+            "latest_event_id".to_string(),
+            serde_json::to_value(&job.latest_event_id).expect("serialize latest_event_id"),
+        ),
+        (
+            "cancellation".to_string(),
+            serialize_job_cancellation(&job.cancellation),
+        ),
+    ]);
+    if let Some(goal) = &job.goal {
+        object.insert("goal".to_string(), serde_json::Value::String(goal.clone()));
+    }
+    serde_json::Value::Object(object)
 }
 
 fn serialize_policy_decision(decision: &rpc::PolicyDecision) -> serde_json::Value {
@@ -5679,7 +5714,7 @@ mod tests {
                 display_name: None,
             },
             kind: "read".to_string(),
-            goal: "read over HTTP".to_string(),
+            goal: Some("read over HTTP".to_string()),
             path_scope: Some(PathScopePayload {
                 kind: None,
                 roots: None,
@@ -5695,6 +5730,68 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_payload_accepts_missing_goal() {
+        let repository_id = RepositoryId::new();
+        let payload: SubmitJobRequestPayload = serde_json::from_str(&format!(
+            r#"{{"repository_id":"{}","requester":{{"type":"agent","id":"agent:transport","display_name":null}},"kind":"read"}}"#,
+            repository_id.as_str()
+        ))
+        .expect("payload should deserialize without a goal key");
+
+        let parsed = parse_submit_job_payload(payload).expect("missing goal should be accepted");
+
+        assert_eq!(parsed.goal, None);
+    }
+
+    #[tokio::test]
+    async fn job_routes_submit_blank_goal_omits_goal_field() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("job-route-blank-goal");
+        let repository = {
+            let server = rpc_server.read().await;
+            server
+                .register_repository(rpc::RegisterRepositoryRequest {
+                    display_name: "job-route-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed")
+                .repository
+        };
+
+        let submit_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/jobs/submit",
+            serde_json::json!({
+                "repository_id": repository.repository_id,
+                "requester": {
+                    "type": "agent",
+                    "id": "agent:job-route",
+                    "display_name": "Job Route Agent"
+                },
+                "kind": "read",
+                "goal": " \t\n ",
+                "requested_capabilities": [],
+                "idempotency_key": "job-route-blank-goal"
+            }),
+        )
+        .await;
+        assert_eq!(submit_response.status(), StatusCode::OK);
+        let submit_payload = to_bytes(submit_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        let job = submit_payload["data"]["job"]
+            .as_object()
+            .expect("job object should be serialized");
+        assert!(!job.contains_key("goal"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn submit_job_payload_rejects_ambiguous_filesystem_read_scopes() {
         for roots in [
             vec![".".to_string()],
@@ -5707,7 +5804,7 @@ mod tests {
                     display_name: None,
                 },
                 kind: "read".to_string(),
-                goal: "read over HTTP".to_string(),
+                goal: Some("read over HTTP".to_string()),
                 path_scope: Some(PathScopePayload {
                     kind: Some("repository".to_string()),
                     roots: Some(roots),
@@ -5956,7 +6053,7 @@ mod tests {
                         display_name: Some("Event Route Agent".to_string()),
                     },
                     kind: "read".to_string(),
-                    goal: "first".to_string(),
+                    goal: Some("first".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
                     idempotency_key: None,
@@ -5970,7 +6067,7 @@ mod tests {
                         display_name: Some("Event Route Agent".to_string()),
                     },
                     kind: "read".to_string(),
-                    goal: "between".to_string(),
+                    goal: Some("between".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
                     idempotency_key: None,
@@ -5984,7 +6081,7 @@ mod tests {
                         display_name: Some("Event Route Agent".to_string()),
                     },
                     kind: "read".to_string(),
-                    goal: "second".to_string(),
+                    goal: Some("second".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
                     idempotency_key: None,
@@ -6139,7 +6236,7 @@ mod tests {
                         display_name: Some("Events List Agent".to_string()),
                     },
                     kind: "read".to_string(),
-                    goal: "first".to_string(),
+                    goal: Some("first".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
                     idempotency_key: Some("events-list-first".to_string()),
@@ -6159,7 +6256,7 @@ mod tests {
                         display_name: Some("Events List Agent".to_string()),
                     },
                     kind: "read".to_string(),
-                    goal: "second".to_string(),
+                    goal: Some("second".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
                     idempotency_key: Some("events-list-second".to_string()),
@@ -7515,7 +7612,7 @@ mod tests {
                     },
                     repository_id: repository.id.clone(),
                     kind: atelia_core::JobKind::Read,
-                    goal: "render tool output".to_string(),
+                    goal: Some("render tool output".to_string()),
                     resource_scope: None,
                     requested_capabilities: Vec::new(),
                     idempotency_key: None,

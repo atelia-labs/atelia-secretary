@@ -34,7 +34,7 @@ pub struct RuntimeJobRequest {
     pub requester: Actor,
     pub repository_id: RepositoryId,
     pub kind: JobKind,
-    pub goal: String,
+    pub goal: Option<String>,
     pub resource_scope: ResourceScope,
     pub requested_capabilities: Vec<String>,
     pub approval_available: bool,
@@ -43,18 +43,57 @@ pub struct RuntimeJobRequest {
     pub artifact_spillover: Option<RuntimeArtifactSpillover>,
 }
 
+pub trait IntoOptionalRuntimeGoal {
+    fn into_optional_goal(self) -> Option<String>;
+}
+
+fn normalize_optional_runtime_goal(goal: Option<String>) -> Option<String> {
+    goal.and_then(|goal| {
+        let trimmed = goal.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+impl IntoOptionalRuntimeGoal for Option<String> {
+    fn into_optional_goal(self) -> Option<String> {
+        normalize_optional_runtime_goal(self)
+    }
+}
+
+impl IntoOptionalRuntimeGoal for String {
+    fn into_optional_goal(self) -> Option<String> {
+        normalize_optional_runtime_goal(Some(self))
+    }
+}
+
+impl IntoOptionalRuntimeGoal for &str {
+    fn into_optional_goal(self) -> Option<String> {
+        normalize_optional_runtime_goal(Some(self.to_string()))
+    }
+}
+
+impl IntoOptionalRuntimeGoal for Option<&str> {
+    fn into_optional_goal(self) -> Option<String> {
+        normalize_optional_runtime_goal(self.map(str::to_string))
+    }
+}
+
 impl RuntimeJobRequest {
     pub fn new(
         requester: Actor,
         repository_id: RepositoryId,
         kind: JobKind,
-        goal: impl Into<String>,
+        goal: impl IntoOptionalRuntimeGoal,
     ) -> Self {
         Self {
             requester,
             repository_id,
             kind,
-            goal: goal.into(),
+            goal: goal.into_optional_goal(),
             resource_scope: ResourceScope {
                 kind: "repository".to_string(),
                 value: ".".to_string(),
@@ -125,6 +164,17 @@ impl RuntimeArtifactSpillover {
             options: ToolResultSpilloverOptions::new(max_inline_bytes),
         }
     }
+}
+
+fn display_goal(goal: Option<&str>) -> std::borrow::Cow<'_, str> {
+    match goal.map(str::trim).filter(|goal| !goal.is_empty()) {
+        Some(goal) => std::borrow::Cow::Borrowed(goal),
+        None => std::borrow::Cow::Borrowed("<unset>"),
+    }
+}
+
+fn summarize_goal(goal: Option<&str>) -> String {
+    format!("goal={}", display_goal(goal))
 }
 
 /// Complete runtime outcome for a submitted job, including the ordered ledger events.
@@ -222,10 +272,29 @@ impl RuntimeTool for EchoTool {
     }
 
     fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-        format!("goal={}", request.goal)
+        summarize_goal(request.goal.as_deref())
     }
 
     fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
+        let goal = request
+            .goal
+            .as_deref()
+            .map(str::trim)
+            .filter(|goal| !goal.is_empty());
+        let mut fields = vec![ToolResultField {
+            key: "summary".to_string(),
+            value: StructuredValue::String(format!("echoed goal: {}", display_goal(goal))),
+        }];
+        if let Some(goal) = goal {
+            fields.push(ToolResultField {
+                key: "goal".to_string(),
+                value: StructuredValue::String(goal.to_string()),
+            });
+        }
+        fields.push(ToolResultField {
+            key: "policy.state".to_string(),
+            value: StructuredValue::String("recorded_before_execution".to_string()),
+        });
         ToolResult {
             id: ToolResultId::new(),
             schema_version: RUNTIME_SCHEMA_VERSION,
@@ -234,20 +303,7 @@ impl RuntimeTool for EchoTool {
             tool_id: invocation.tool_id.clone(),
             status: ToolResultStatus::Succeeded,
             schema_ref: Some("tool_result.secretary.echo.v1".to_string()),
-            fields: vec![
-                ToolResultField {
-                    key: "summary".to_string(),
-                    value: StructuredValue::String(format!("echoed goal: {}", request.goal)),
-                },
-                ToolResultField {
-                    key: "goal".to_string(),
-                    value: StructuredValue::String(request.goal.clone()),
-                },
-                ToolResultField {
-                    key: "policy.state".to_string(),
-                    value: StructuredValue::String("recorded_before_execution".to_string()),
-                },
-            ],
+            fields,
             evidence_refs: Vec::new(),
             output_refs: Vec::new(),
             truncation: None,
@@ -1297,7 +1353,7 @@ mod tests {
         }
 
         fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-            format!("goal={}", request.goal)
+            summarize_goal(request.goal.as_deref())
         }
 
         fn execute(&self, invocation: &ToolInvocation, _request: &RuntimeJobRequest) -> ToolResult {
@@ -1335,7 +1391,7 @@ mod tests {
         }
 
         fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-            format!("goal={}", request.goal)
+            summarize_goal(request.goal.as_deref())
         }
 
         fn execute(&self, invocation: &ToolInvocation, _request: &RuntimeJobRequest) -> ToolResult {
@@ -1373,7 +1429,7 @@ mod tests {
         }
 
         fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-            format!("goal={}", request.goal)
+            summarize_goal(request.goal.as_deref())
         }
 
         fn execute(&self, invocation: &ToolInvocation, _request: &RuntimeJobRequest) -> ToolResult {
@@ -1413,7 +1469,7 @@ mod tests {
         }
 
         fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-            format!("goal={}", request.goal)
+            summarize_goal(request.goal.as_deref())
         }
 
         fn execute(&self, invocation: &ToolInvocation, _request: &RuntimeJobRequest) -> ToolResult {
@@ -1456,7 +1512,7 @@ mod tests {
         }
 
         fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-            format!("goal={}", request.goal)
+            summarize_goal(request.goal.as_deref())
         }
 
         fn execute(&self, invocation: &ToolInvocation, _request: &RuntimeJobRequest) -> ToolResult {
@@ -1499,7 +1555,7 @@ mod tests {
         }
 
         fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-            format!("goal={}", request.goal)
+            summarize_goal(request.goal.as_deref())
         }
 
         fn execute(&self, invocation: &ToolInvocation, _request: &RuntimeJobRequest) -> ToolResult {
@@ -1564,6 +1620,14 @@ mod tests {
             .replay_job_events(EventCursor::Beginning, None)
             .unwrap();
         assert_eq!(receipt.events, replayed);
+    }
+
+    #[test]
+    fn runtime_request_normalizes_blank_goals_to_none() {
+        let request =
+            RuntimeJobRequest::new(actor(), repository().id, JobKind::Read, String::from("   "));
+
+        assert_eq!(None, request.goal);
     }
 
     #[test]
@@ -1681,7 +1745,7 @@ mod tests {
             }
 
             fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-                format!("goal={}", request.goal)
+                summarize_goal(request.goal.as_deref())
             }
 
             fn execute(
@@ -2331,7 +2395,7 @@ mod tests {
             }
 
             fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-                format!("goal={}", request.goal)
+                summarize_goal(request.goal.as_deref())
             }
 
             fn execute(
@@ -2339,6 +2403,21 @@ mod tests {
                 invocation: &ToolInvocation,
                 request: &RuntimeJobRequest,
             ) -> ToolResult {
+                let goal = request
+                    .goal
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|goal| !goal.is_empty());
+                let mut fields = vec![ToolResultField {
+                    key: "summary".to_string(),
+                    value: StructuredValue::String(format!("echoed goal: {}", display_goal(goal))),
+                }];
+                if let Some(goal) = goal {
+                    fields.push(ToolResultField {
+                        key: "goal".to_string(),
+                        value: StructuredValue::String(goal.to_string()),
+                    });
+                }
                 ToolResult {
                     id: ToolResultId::new(),
                     schema_version: RUNTIME_SCHEMA_VERSION,
@@ -2347,19 +2426,7 @@ mod tests {
                     tool_id: invocation.tool_id.clone(),
                     status: ToolResultStatus::Succeeded,
                     schema_ref: Some("tool_result.secretary.alias_capability.v1".to_string()),
-                    fields: vec![
-                        ToolResultField {
-                            key: "summary".to_string(),
-                            value: StructuredValue::String(format!(
-                                "echoed goal: {}",
-                                request.goal
-                            )),
-                        },
-                        ToolResultField {
-                            key: "goal".to_string(),
-                            value: StructuredValue::String(request.goal.clone()),
-                        },
-                    ],
+                    fields,
                     evidence_refs: Vec::new(),
                     output_refs: Vec::new(),
                     truncation: None,
@@ -2449,7 +2516,7 @@ mod tests {
             }
 
             fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-                format!("goal={}", request.goal)
+                summarize_goal(request.goal.as_deref())
             }
 
             fn execute(
