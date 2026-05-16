@@ -3,4 +3,4 @@
 **Action:** When filtering, sorting, and paginating large collections of data inside `InMemoryStore`, defer cloning by operating entirely on references. Collect the filtered references into a `Vec`, sort/truncate, and only map `.cloned()` immediately before collecting the final result.
 ## 2024-05-18 - Avoid full materialization during pagination
 **Learning:** In the core store `query_job_events`, using `collect_filtered_job_events` retrieves all events that match a filter, meaning potentially thousands of records are pulled into memory at once just to page through a small subset using `page_records`.
-**Action:** When filtering with an eventual limit (like a paginated endpoint), always track skipped items and page size limits inline during iteration to bail early and avoid full materialization.
+**Action:** When filtering with an eventual limit (like a paginated endpoint), track skipped items and stop retaining once the current page reaches a finite `page_size`. If `page_size` is omitted, keep the filtered stream unbounded instead of capping retained records.

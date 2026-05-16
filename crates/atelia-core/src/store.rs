@@ -7440,6 +7440,67 @@ mod tests {
     }
 
     #[test]
+    fn query_job_events_pages_filtered_results_stably() {
+        let store = InMemoryStore::new();
+        let repository = repository_record();
+
+        store.create_repository(repository.clone()).unwrap();
+
+        let mut first_matching_event = job_event(repository.id.clone());
+        first_matching_event.severity = EventSeverity::Warning;
+        let first_matching_event = store.append_job_event(first_matching_event).unwrap();
+
+        let noise_event = store
+            .append_job_event(job_event(repository.id.clone()))
+            .unwrap();
+
+        let mut second_matching_event = job_event(repository.id.clone());
+        second_matching_event.severity = EventSeverity::Warning;
+        let second_matching_event = store.append_job_event(second_matching_event).unwrap();
+
+        let mut third_matching_event = job_event(repository.id.clone());
+        third_matching_event.severity = EventSeverity::Warning;
+        let third_matching_event = store.append_job_event(third_matching_event).unwrap();
+
+        let first_page = store
+            .query_job_events(EventQuery {
+                repository_id: Some(repository.id.clone()),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: Vec::new(),
+                min_severity: Some(EventSeverity::Warning),
+                page_size: Some(2),
+                page_token: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            first_page.events,
+            vec![first_matching_event.clone(), second_matching_event.clone()]
+        );
+        assert!(!first_page
+            .events
+            .iter()
+            .any(|event| event.id == noise_event.id));
+        assert_eq!(first_page.next_page_token.as_deref(), Some("2"));
+
+        let second_page = store
+            .query_job_events(EventQuery {
+                repository_id: Some(repository.id),
+                cursor: EventCursor::Beginning,
+                subject_ids: Vec::new(),
+                job_ids: Vec::new(),
+                min_severity: Some(EventSeverity::Warning),
+                page_size: Some(2),
+                page_token: first_page.next_page_token,
+            })
+            .unwrap();
+
+        assert_eq!(second_page.events, vec![third_matching_event]);
+        assert_eq!(second_page.next_page_token, None);
+    }
+
+    #[test]
     fn query_job_events_infers_repository_from_subject_when_ref_is_omitted() {
         let store = InMemoryStore::new();
         let repository = repository_record();
