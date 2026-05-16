@@ -2304,6 +2304,7 @@ fn canonicalize_submit_requested_capability(name: &str) -> Option<&'static str> 
             SECRETARY_FS_READ_CAPABILITY => Some(SECRETARY_FS_READ_CAPABILITY),
             SECRETARY_FS_LIST_CAPABILITY => Some(SECRETARY_FS_LIST_CAPABILITY),
             "fs.list" => Some(SECRETARY_FS_LIST_CAPABILITY),
+            "fs.read" => Some(SECRETARY_FS_READ_CAPABILITY),
             SECRETARY_FS_STAT_CAPABILITY => Some(SECRETARY_FS_STAT_CAPABILITY),
             "fs.stat" => Some(SECRETARY_FS_STAT_CAPABILITY),
             SECRETARY_FS_DELETE_CAPABILITY => Some(SECRETARY_FS_DELETE_CAPABILITY),
@@ -6412,7 +6413,7 @@ mod tests {
             .submit_job(SubmitJobRequest {
                 requester: actor(),
                 repository_id: repository.id,
-                kind: JobKind::Read,
+                kind: JobKind::Mutate,
                 goal: Some("delete file".to_string()),
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
@@ -6505,6 +6506,48 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_delete_outside_allowed_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-delete-allowed-scope");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("README.md"), "root\n").unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "delete-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: Some(PathScope {
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_paths: vec!["docs".to_string()],
+                }),
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("delete root notes".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "README.md".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.delete".to_string()],
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            root.join("README.md").exists(),
+            "root file should still exist after rejection"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
