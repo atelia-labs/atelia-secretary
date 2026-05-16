@@ -4161,6 +4161,10 @@ mod tests {
             .expect("submit job should succeed");
         assert_eq!(submitted.job.status, "succeeded");
         assert_eq!(submitted.policy.outcome, "allowed");
+        assert_eq!(
+            submitted.job.goal.as_deref(),
+            Some("summarize repository state")
+        );
 
         let fetched = server
             .get_job(GetJobRequest {
@@ -4168,6 +4172,23 @@ mod tests {
             })
             .expect("get job should succeed");
         assert_eq!(fetched.job.job_id, submitted.job.job_id);
+        assert_eq!(
+            fetched.job.goal.as_deref(),
+            Some("summarize repository state")
+        );
+
+        let submitted_without_goal = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id.clone(),
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: None,
+                path_scope: None,
+                requested_capabilities: Vec::new(),
+                idempotency_key: None,
+            })
+            .expect("submit job without goal should succeed");
+        assert_eq!(submitted_without_goal.job.goal, None);
 
         let jobs = server
             .list_jobs(ListJobsRequest {
@@ -4178,8 +4199,22 @@ mod tests {
                 page_token: None,
             })
             .expect("list jobs should succeed");
-        assert_eq!(jobs.jobs.len(), 1);
-        assert_eq!(jobs.jobs[0].job_id, submitted.job.job_id);
+        assert_eq!(jobs.jobs.len(), 2);
+        let listed_with_goal = jobs
+            .jobs
+            .iter()
+            .find(|job| job.job_id == submitted.job.job_id)
+            .expect("listed job with goal");
+        assert_eq!(
+            listed_with_goal.goal.as_deref(),
+            Some("summarize repository state")
+        );
+        let listed_without_goal = jobs
+            .jobs
+            .iter()
+            .find(|job| job.job_id == submitted_without_goal.job.job_id)
+            .expect("listed job without goal");
+        assert_eq!(listed_without_goal.goal, None);
 
         let status = server
             .get_project_status(GetProjectStatusRequest {
@@ -4190,9 +4225,23 @@ mod tests {
             status.repository.repository_id,
             registered.repository.repository_id
         );
-        assert_eq!(status.recent_jobs.len(), 1);
-        assert_eq!(status.recent_jobs[0].job_id, submitted.job.job_id);
-        assert_eq!(status.recent_policy_decisions.len(), 1);
+        assert_eq!(status.recent_jobs.len(), 2);
+        let status_with_goal = status
+            .recent_jobs
+            .iter()
+            .find(|job| job.job_id == submitted.job.job_id)
+            .expect("status job with goal");
+        assert_eq!(
+            status_with_goal.goal.as_deref(),
+            Some("summarize repository state")
+        );
+        let status_without_goal = status
+            .recent_jobs
+            .iter()
+            .find(|job| job.job_id == submitted_without_goal.job.job_id)
+            .expect("status job without goal");
+        assert_eq!(status_without_goal.goal, None);
+        assert_eq!(status.recent_policy_decisions.len(), 2);
         assert!(
             status
                 .latest_cursor

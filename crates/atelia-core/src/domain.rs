@@ -337,27 +337,38 @@ pub trait IntoOptionalDomainGoal {
     fn into_optional_goal(self) -> Option<String>;
 }
 
+fn normalize_optional_domain_goal(goal: Option<String>) -> Option<String> {
+    goal.and_then(|goal| {
+        let trimmed = goal.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 impl IntoOptionalDomainGoal for Option<String> {
     fn into_optional_goal(self) -> Option<String> {
-        self
+        normalize_optional_domain_goal(self)
     }
 }
 
 impl IntoOptionalDomainGoal for String {
     fn into_optional_goal(self) -> Option<String> {
-        Some(self)
+        normalize_optional_domain_goal(Some(self))
     }
 }
 
 impl IntoOptionalDomainGoal for &str {
     fn into_optional_goal(self) -> Option<String> {
-        Some(self.to_string())
+        normalize_optional_domain_goal(Some(self.to_string()))
     }
 }
 
 impl IntoOptionalDomainGoal for Option<&str> {
     fn into_optional_goal(self) -> Option<String> {
-        self.map(str::to_string)
+        normalize_optional_domain_goal(self.map(str::to_string))
     }
 }
 
@@ -1247,6 +1258,18 @@ mod tests {
         assert_eq!(
             "R3",
             RiskTier::R3.serialize(StringRoundTripSerializer).unwrap()
+        );
+    }
+
+    #[test]
+    fn optional_domain_goals_trim_and_drop_blank_inputs() {
+        assert_eq!(None, None::<String>.into_optional_goal());
+        assert_eq!(None, String::from("   ").into_optional_goal());
+        assert_eq!(None, " \t ".into_optional_goal());
+        assert_eq!(None, Some(" \n ").into_optional_goal());
+        assert_eq!(
+            Some("summarize".to_string()),
+            "  summarize  ".into_optional_goal()
         );
     }
 

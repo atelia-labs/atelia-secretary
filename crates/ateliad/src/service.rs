@@ -6255,15 +6255,10 @@ mod tests {
             requested_capabilities: Vec::new(),
             idempotency_key: Some("request-123".to_string()),
         };
-        let first_normalized_goal = first_request
-            .goal
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .to_string();
+        let first_normalized_goal = normalize_submit_job_goal(first_request.goal.clone());
         let first_signature = submit_job_request_signature(
             &first_request,
-            Some(&first_normalized_goal),
+            first_normalized_goal.as_deref(),
             &normalize_requested_capabilities(&first_request.requested_capabilities)
                 .expect("first capability normalization should succeed"),
         );
@@ -6280,15 +6275,10 @@ mod tests {
             requested_capabilities: vec!["capability.discovery".to_string()],
             idempotency_key: Some("request-123".to_string()),
         };
-        let second_normalized_goal = second_request
-            .goal
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .to_string();
+        let second_normalized_goal = normalize_submit_job_goal(second_request.goal.clone());
         let second_signature = submit_job_request_signature(
             &second_request,
-            Some(&second_normalized_goal),
+            second_normalized_goal.as_deref(),
             &normalize_requested_capabilities(&second_request.requested_capabilities)
                 .expect("second capability normalization should succeed"),
         );
@@ -6343,6 +6333,67 @@ mod tests {
 
         assert_eq!(second.job.id, first.job.id);
         assert_eq!(second.job.goal, Some("summarize".to_string()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_treats_blank_goal_like_absent_goal_for_idempotency() {
+        let svc = ready_service();
+        let root = test_repo_dir("blank-goal-idempotency");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "job-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let first_request = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id.clone(),
+            kind: JobKind::Read,
+            goal: Some("   ".to_string()),
+            resource_scope: None,
+            requested_capabilities: Vec::new(),
+            idempotency_key: Some("request-blank".to_string()),
+        };
+        let first_normalized_goal = normalize_submit_job_goal(first_request.goal.clone());
+        let first_signature = submit_job_request_signature(
+            &first_request,
+            first_normalized_goal.as_deref(),
+            &normalize_requested_capabilities(&first_request.requested_capabilities)
+                .expect("first capability normalization should succeed"),
+        );
+        let first = svc
+            .submit_job(first_request)
+            .expect("blank goal submit should succeed");
+
+        let second_request = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id,
+            kind: JobKind::Read,
+            goal: None,
+            resource_scope: None,
+            requested_capabilities: Vec::new(),
+            idempotency_key: Some("request-blank".to_string()),
+        };
+        let second_normalized_goal = normalize_submit_job_goal(second_request.goal.clone());
+        let second_signature = submit_job_request_signature(
+            &second_request,
+            second_normalized_goal.as_deref(),
+            &normalize_requested_capabilities(&second_request.requested_capabilities)
+                .expect("second capability normalization should succeed"),
+        );
+        let second = svc
+            .submit_job(second_request)
+            .expect("absent goal should replay the blank-goal submission");
+
+        assert_eq!(first.job.id, second.job.id);
+        assert_eq!(first.job.goal, None);
+        assert_eq!(second.job.goal, None);
+        assert_eq!(first_signature, second_signature);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6441,26 +6492,16 @@ mod tests {
             idempotency_key: None,
         };
 
-        let request_one_normalized_goal = request_one
-            .goal
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .to_string();
-        let request_two_normalized_goal = request_two
-            .goal
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .to_string();
+        let request_one_normalized_goal = normalize_submit_job_goal(request_one.goal.clone());
+        let request_two_normalized_goal = normalize_submit_job_goal(request_two.goal.clone());
         let signature_one = submit_job_request_signature(
             &request_one,
-            Some(&request_one_normalized_goal),
+            request_one_normalized_goal.as_deref(),
             &normalized_capabilities,
         );
         let signature_two = submit_job_request_signature(
             &request_two,
-            Some(&request_two_normalized_goal),
+            request_two_normalized_goal.as_deref(),
             &normalized_capabilities,
         );
 

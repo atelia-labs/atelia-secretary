@@ -5731,19 +5731,14 @@ mod tests {
 
     #[test]
     fn submit_job_payload_accepts_missing_goal() {
-        let parsed = parse_submit_job_payload(SubmitJobRequestPayload {
-            repository_id: RepositoryId::new().as_str().to_string(),
-            requester: ActorPayload::Agent {
-                id: "agent:transport".to_string(),
-                display_name: None,
-            },
-            kind: "read".to_string(),
-            goal: None,
-            path_scope: None,
-            requested_capabilities: None,
-            idempotency_key: None,
-        })
-        .expect("missing goal should be accepted");
+        let repository_id = RepositoryId::new();
+        let payload: SubmitJobRequestPayload = serde_json::from_str(&format!(
+            r#"{{"repository_id":"{}","requester":{{"type":"agent","id":"agent:transport","display_name":null}},"kind":"read"}}"#,
+            repository_id.as_str()
+        ))
+        .expect("payload should deserialize without a goal key");
+
+        let parsed = parse_submit_job_payload(payload).expect("missing goal should be accepted");
 
         assert_eq!(parsed.goal, None);
     }

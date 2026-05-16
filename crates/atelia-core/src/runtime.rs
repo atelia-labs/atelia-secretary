@@ -47,27 +47,38 @@ pub trait IntoOptionalRuntimeGoal {
     fn into_optional_goal(self) -> Option<String>;
 }
 
+fn normalize_optional_runtime_goal(goal: Option<String>) -> Option<String> {
+    goal.and_then(|goal| {
+        let trimmed = goal.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 impl IntoOptionalRuntimeGoal for Option<String> {
     fn into_optional_goal(self) -> Option<String> {
-        self
+        normalize_optional_runtime_goal(self)
     }
 }
 
 impl IntoOptionalRuntimeGoal for String {
     fn into_optional_goal(self) -> Option<String> {
-        Some(self)
+        normalize_optional_runtime_goal(Some(self))
     }
 }
 
 impl IntoOptionalRuntimeGoal for &str {
     fn into_optional_goal(self) -> Option<String> {
-        Some(self.to_string())
+        normalize_optional_runtime_goal(Some(self.to_string()))
     }
 }
 
 impl IntoOptionalRuntimeGoal for Option<&str> {
     fn into_optional_goal(self) -> Option<String> {
-        self.map(str::to_string)
+        normalize_optional_runtime_goal(self.map(str::to_string))
     }
 }
 
@@ -1609,6 +1620,14 @@ mod tests {
             .replay_job_events(EventCursor::Beginning, None)
             .unwrap();
         assert_eq!(receipt.events, replayed);
+    }
+
+    #[test]
+    fn runtime_request_normalizes_blank_goals_to_none() {
+        let request =
+            RuntimeJobRequest::new(actor(), repository().id, JobKind::Read, String::from("   "));
+
+        assert_eq!(None, request.goal);
     }
 
     #[test]
