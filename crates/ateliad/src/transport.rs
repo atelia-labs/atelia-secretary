@@ -510,6 +510,20 @@ fn requests_filesystem_path_operation(capabilities: &[String]) -> bool {
     })
 }
 
+fn requests_filesystem_concrete_path_operation(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|capability| {
+        let normalized = capability
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['_', '-', ':', '/'], ".");
+
+        matches!(
+            normalized.as_str(),
+            "filesystem.read" | "fs.read" | "filesystem.delete" | "fs.delete"
+        )
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct ListJobsRequestPayload {
     repository_id: Option<String>,
@@ -1169,11 +1183,19 @@ fn parse_submit_job_payload(
                 "filesystem operation requires path_scope.roots to contain exactly one concrete path"
                     .to_string()
             })?;
-        if roots.len() != 1 || roots[0].trim().is_empty() || roots[0].trim() == "." {
+        if roots.len() != 1 || roots[0].trim().is_empty() {
             return Err(
-                "filesystem operation requires path_scope.roots to contain exactly one concrete path"
-                    .to_string(),
-            );
+                    "filesystem operation requires path_scope.roots to contain exactly one concrete path"
+                        .to_string(),
+                );
+        }
+        if requests_filesystem_concrete_path_operation(&requested_capabilities)
+            && roots[0].trim() == "."
+        {
+            return Err(
+                    "filesystem operation requires path_scope.roots to contain exactly one concrete path"
+                        .to_string(),
+                );
         }
     }
 
@@ -5992,6 +6014,67 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_payload_accepts_root_filesystem_list_scope() {
+        let parsed = parse_submit_job_payload(SubmitJobRequestPayload {
+            repository_id: RepositoryId::new().as_str().to_string(),
+            requester: ActorPayload::Agent {
+                id: "agent:transport".to_string(),
+                display_name: None,
+            },
+            kind: "read".to_string(),
+            goal: Some("list repository root".to_string()),
+            path_scope: Some(PathScopePayload {
+                kind: Some("repository".to_string()),
+                roots: Some(vec![".".to_string()]),
+                include_patterns: None,
+                exclude_patterns: None,
+            }),
+            requested_capabilities: Some(vec!["filesystem.list".to_string()]),
+            tool_args: None,
+            idempotency_key: None,
+        })
+        .expect("filesystem.list should allow repository root scope");
+
+        assert_eq!(
+            parsed.path_scope.as_ref().expect("path_scope").roots,
+            vec![".".to_string()]
+        );
+        assert_eq!(
+            parsed.requested_capabilities,
+            vec!["filesystem.list".to_string()]
+        );
+    }
+
+    #[test]
+    fn submit_job_payload_accepts_root_filesystem_stat_scope() {
+        let parsed = parse_submit_job_payload(SubmitJobRequestPayload {
+            repository_id: RepositoryId::new().as_str().to_string(),
+            requester: ActorPayload::Agent {
+                id: "agent:transport".to_string(),
+                display_name: None,
+            },
+            kind: "read".to_string(),
+            goal: Some("stat repository root".to_string()),
+            path_scope: Some(PathScopePayload {
+                kind: Some("repository".to_string()),
+                roots: Some(vec![".".to_string()]),
+                include_patterns: None,
+                exclude_patterns: None,
+            }),
+            requested_capabilities: Some(vec!["fs.stat".to_string()]),
+            tool_args: None,
+            idempotency_key: None,
+        })
+        .expect("filesystem.stat should allow repository root scope");
+
+        assert_eq!(
+            parsed.path_scope.as_ref().expect("path_scope").roots,
+            vec![".".to_string()]
+        );
+        assert_eq!(parsed.requested_capabilities, vec!["fs.stat".to_string()]);
+    }
+
+    #[test]
     fn submit_job_payload_accepts_missing_goal() {
         let repository_id = RepositoryId::new();
         let payload: SubmitJobRequestPayload = serde_json::from_str(&format!(
@@ -6093,6 +6176,113 @@ mod tests {
             .as_object()
             .expect("job object should be serialized");
         assert!(!job.contains_key("goal"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn job_routes_submit_accepts_root_filesystem_list_scope() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("job-route-list-root");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes").join("a.txt"), "alpha\n").unwrap();
+        let repository = {
+            let server = rpc_server.read().await;
+            server
+                .register_repository(rpc::RegisterRepositoryRequest {
+                    display_name: "list-route-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed")
+                .repository
+        };
+
+        let response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/jobs/submit",
+            serde_json::json!({
+                "repository_id": repository.repository_id,
+                "requester": {
+                    "type": "agent",
+                    "id": "agent:job-route-list",
+                    "display_name": "Job Route Agent"
+                },
+                "kind": "read",
+                "goal": "list repository root",
+                "path_scope": {
+                    "kind": "repository",
+                    "roots": ["."],
+                },
+                "requested_capabilities": ["filesystem.list"],
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], Value::String("ok".to_string()));
+        assert_eq!(
+            payload["data"]["policy"]["requested_capability"],
+            "filesystem.list"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn job_routes_submit_accepts_root_filesystem_stat_scope() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("job-route-stat-root");
+        fs::write(root.join("note.txt"), "hello\n").unwrap();
+        let repository = {
+            let server = rpc_server.read().await;
+            server
+                .register_repository(rpc::RegisterRepositoryRequest {
+                    display_name: "stat-route-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed")
+                .repository
+        };
+
+        let response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/jobs/submit",
+            serde_json::json!({
+                "repository_id": repository.repository_id,
+                "requester": {
+                    "type": "agent",
+                    "id": "agent:job-route-stat",
+                    "display_name": "Job Route Agent"
+                },
+                "kind": "read",
+                "goal": "stat repository root",
+                "path_scope": {
+                    "kind": "repository",
+                    "roots": ["."],
+                },
+                "requested_capabilities": ["fs.stat"],
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], Value::String("ok".to_string()));
+        assert_eq!(
+            payload["data"]["policy"]["requested_capability"],
+            "filesystem.stat"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

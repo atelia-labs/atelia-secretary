@@ -1254,7 +1254,14 @@ impl SecretaryService {
                 | SubmitJobToolKind::FsSearch
                 | SubmitJobToolKind::FsDiff
         ) {
-            validate_filesystem_path_scope(&repository, &resource_scope)?;
+            validate_filesystem_path_scope(
+                &repository,
+                &resource_scope,
+                matches!(
+                    tool_kind,
+                    SubmitJobToolKind::FsRead | SubmitJobToolKind::FsDelete
+                ),
+            )?;
         }
         if let SubmitJobToolArgsSpec::Diff(diff) = &resolved_tool_args {
             validate_secondary_filesystem_path_scope(
@@ -2540,19 +2547,6 @@ fn resolve_submit_job_tool_kind(
                 });
             }
 
-            if matches!(resource_scope.value.trim(), "" | ".")
-                && matches!(
-                    capability.as_str(),
-                    SECRETARY_FS_READ_CAPABILITY | SECRETARY_FS_DELETE_CAPABILITY
-                )
-            {
-                return Err(ServiceError::InvalidArgument {
-                    reason: format!(
-                        "{capability} requires a concrete path_scope/resource_scope root"
-                    ),
-                });
-            }
-
             match capability.as_str() {
                 SECRETARY_FS_LIST_CAPABILITY => Ok(SubmitJobToolKind::FsList),
                 SECRETARY_FS_STAT_CAPABILITY => Ok(SubmitJobToolKind::FsStat),
@@ -2575,6 +2569,7 @@ fn resolve_submit_job_tool_kind(
 fn validate_filesystem_path_scope(
     repository: &RepositoryRecord,
     resource_scope: &ResourceScope,
+    require_concrete_path: bool,
 ) -> ServiceResult<()> {
     let root = Path::new(&repository.root_path);
     let requested =
@@ -2584,7 +2579,7 @@ fn validate_filesystem_path_scope(
             }
         })?;
 
-    if requested.canonical == requested.root {
+    if require_concrete_path && requested.canonical == requested.root {
         return Err(ServiceError::InvalidArgument {
             reason: "filesystem operation requires a concrete path_scope/resource_scope path"
                 .to_string(),
@@ -6732,6 +6727,59 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_allows_filesystem_list_repository_root_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-list-root-scope");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "list-root-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes").join("a.txt"), "alpha\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("list repository root".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "repository".to_string(),
+                    value: ".".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.list".to_string()],
+                tool_args: None,
+                idempotency_key: None,
+            })
+            .expect("list root scope should dispatch");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.list"
+        );
+        let tool_result = receipt.tool_result.expect("tool result should exist");
+        assert_eq!(
+            tool_result.schema_ref.as_deref(),
+            Some("tool_result.fs.list.v1")
+        );
+        assert!(tool_result
+            .fields
+            .iter()
+            .any(|field| field.key == "entries"
+                && matches!(&field.value, atelia_core::StructuredValue::StringList(values) if values.contains(&"notes".to_string()))));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn submit_job_dispatches_filesystem_search_tool() {
         let svc = ready_service();
         let root = test_repo_dir("filesystem-search-dispatch");
@@ -6948,6 +6996,58 @@ mod tests {
             .iter()
             .any(|field| field.key == "file_type"
                 && matches!(&field.value, atelia_core::StructuredValue::String(value) if value == "file")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_allows_filesystem_stat_repository_root_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-stat-root-scope");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "stat-root-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("note.txt"), "hello\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("stat repository root".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "repository".to_string(),
+                    value: ".".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.stat".to_string()],
+                tool_args: None,
+                idempotency_key: None,
+            })
+            .expect("stat root scope should dispatch");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.stat"
+        );
+        let tool_result = receipt.tool_result.expect("tool result should exist");
+        assert_eq!(
+            tool_result.schema_ref.as_deref(),
+            Some("tool_result.fs.stat.v1")
+        );
+        assert!(tool_result
+            .fields
+            .iter()
+            .any(|field| field.key == "file_type"
+                && matches!(&field.value, atelia_core::StructuredValue::String(value) if value == "directory")));
         let _ = fs::remove_dir_all(root);
     }
 
