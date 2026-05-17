@@ -1270,7 +1270,9 @@ impl SecretaryService {
                     &resource_scope,
                     matches!(
                         tool_kind,
-                        SubmitJobToolKind::FsRead | SubmitJobToolKind::FsDelete
+                        SubmitJobToolKind::FsRead
+                            | SubmitJobToolKind::FsDelete
+                            | SubmitJobToolKind::FsDiff
                     ),
                 )?;
             }
@@ -7768,6 +7770,47 @@ mod tests {
                     pattern: None,
                     max: None,
                     comparison_path: Some("outside.txt".to_string()),
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_diff_repository_root_scope_before_tool_execution() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-diff-root-scope");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "diff-root-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("right.txt"), "alpha\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("diff root scope".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "repository".to_string(),
+                    value: ".".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.diff".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    comparison_path: Some("right.txt".to_string()),
                     max_bytes: None,
                     max_chars: None,
                 }),

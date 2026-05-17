@@ -468,6 +468,7 @@ struct SubmitJobRequestPayload {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SubmitJobToolArgsPayload {
     pattern: Option<String>,
     max: Option<u64>,
@@ -6114,6 +6115,21 @@ mod tests {
         let parsed = parse_submit_job_payload(payload).expect("missing goal should be accepted");
 
         assert_eq!(parsed.goal, None);
+    }
+
+    #[test]
+    fn submit_job_payload_rejects_unknown_tool_args_fields() {
+        let repository_id = RepositoryId::new();
+        let err = serde_json::from_str::<SubmitJobRequestPayload>(&format!(
+            r#"{{"repository_id":"{}","requester":{{"type":"agent","id":"agent:transport","display_name":null}},"kind":"read","tool_args":{{"pattern":"needle","unexpected":true}}}}"#,
+            repository_id.as_str()
+        ))
+        .expect_err("unknown tool_args fields should be rejected");
+
+        assert!(
+            err.to_string().contains("unknown field `unexpected`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
