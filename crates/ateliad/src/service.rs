@@ -6811,6 +6811,46 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_rejects_filesystem_list_outside_allowed_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-list-allowed-scope");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("README.md"), "root\n").unwrap();
+        fs::write(root.join("notes").join("note.txt"), "alpha\n").unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "list-scope-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: Some(PathScope {
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_paths: vec!["notes".to_string()],
+                }),
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("list outside allowed path".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "README.md".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.list".to_string()],
+                tool_args: None,
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn submit_job_dispatches_filesystem_search_tool() {
         let svc = ready_service();
         let root = test_repo_dir("filesystem-search-dispatch");
@@ -7147,6 +7187,46 @@ mod tests {
             .iter()
             .any(|field| field.key == "file_type"
                 && matches!(&field.value, atelia_core::StructuredValue::String(value) if value == "directory")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_stat_outside_allowed_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-stat-allowed-scope");
+        fs::write(root.join("outside.txt"), "outside\n").unwrap();
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes").join("note.txt"), "hello\n").unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "stat-scope-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: Some(PathScope {
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_paths: vec!["notes".to_string()],
+                }),
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("stat outside allowed path".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "outside.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.stat".to_string()],
+                tool_args: None,
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
         let _ = fs::remove_dir_all(root);
     }
 
