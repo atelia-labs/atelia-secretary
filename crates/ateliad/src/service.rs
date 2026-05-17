@@ -8511,6 +8511,60 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_request_signature_preserves_raw_message_identity() {
+        let svc = ready_service();
+        let root = test_repo_dir("submit-job-signature-raw-message");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "signature-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let base_request = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id,
+            kind: JobKind::Read,
+            goal: None,
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
+            resource_scope: None,
+            requested_capabilities: Vec::new(),
+            tool_args: None,
+            idempotency_key: None,
+        };
+        let signature_for = |message: Option<&str>| {
+            let request = SubmitJobRequest {
+                message: message.map(str::to_string),
+                ..base_request.clone()
+            };
+            submit_job_request_signature(
+                &request,
+                normalize_submit_job_goal(request.goal.clone()).as_deref(),
+                &normalize_requested_capabilities(&request.requested_capabilities)
+                    .expect("capabilities should normalize"),
+            )
+        };
+
+        let absent = signature_for(None);
+        let empty = signature_for(Some(""));
+        let one_space = signature_for(Some(" "));
+        let two_spaces = signature_for(Some("  "));
+
+        assert_ne!(absent, empty);
+        assert_ne!(empty, one_space);
+        assert_ne!(one_space, two_spaces);
+        assert_ne!(absent, one_space);
+        assert_ne!(absent, two_spaces);
+        assert_ne!(empty, two_spaces);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn submit_job_message_does_not_become_goal() {
         let svc = ready_service();
         let root = test_repo_dir("submit-job-message-not-goal");
