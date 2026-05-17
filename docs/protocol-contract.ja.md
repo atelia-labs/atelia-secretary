@@ -76,7 +76,7 @@ Beta RPC group:
 | --- | --- |
 | `ListRepertoire` | beta repertoire projection を inspect する |
 
-最初の beta server surface は意図的に小さく、現時点ではこの beta slice で dispatch 可能な built-in Secretary tool だけ、すなわち `fs.read` と `secretary.echo` を beta repertoire entry として projection します。より広い built-in は将来の slice または runtime-backed slice に存在し得ますが、dispatch が存在するまでは `ListRepertoire` では claim しません。package-backed の repertoire entry は次の slice です。
+最初の beta server surface は意図的に小さく、この beta slice で dispatch 可能な built-in Secretary tool を、すなわち `fs.delete`、`fs.diff`、`fs.list`、`fs.read`、`fs.search`、`fs.stat`、`secretary.echo` を beta repertoire entry として projection します。`fs.delete` は R2、他は R1。より広い built-in は将来の slice または runtime-backed slice に存在し得ますが、dispatch が存在するまでは `ListRepertoire` では claim しません。package-backed の repertoire entry は次の slice です。
 
 beta slice では package management API は operator-facing です。RPC name は現在の beta wire surface として `Extension*` を維持しますが、docs と新しい product language では AEP backend package management として扱い、公開 package storefront として扱いません。package execution の RPC は beta では未対応です。endpoint が存在する場合でも、invoke されたら unsupported-capability を返さなければなりません。
 

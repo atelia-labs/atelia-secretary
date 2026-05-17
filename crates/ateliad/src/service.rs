@@ -1418,7 +1418,9 @@ impl SecretaryService {
                                 });
                             }
                         };
-                        let mut tool = FsSearchTool::new(&repository.root_path, &search.pattern);
+                        let allowed_roots = allowed_search_roots_for_repository(&repository)?;
+                        let mut tool = FsSearchTool::new(&repository.root_path, &search.pattern)
+                            .with_allowed_roots(&allowed_roots);
                         if let Some(max) = search.max_results {
                             tool = tool.with_max_results(max);
                         }
@@ -1551,7 +1553,9 @@ impl SecretaryService {
                             })
                         }
                     };
-                    let mut tool = FsSearchTool::new(&repository.root_path, &search.pattern);
+                    let allowed_roots = allowed_search_roots_for_repository(&repository)?;
+                    let mut tool = FsSearchTool::new(&repository.root_path, &search.pattern)
+                        .with_allowed_roots(&allowed_roots);
                     if let Some(max) = search.max_results {
                         tool = tool.with_max_results(max);
                     }
@@ -2603,6 +2607,33 @@ fn validate_filesystem_path_scope(
             reason: "filesystem operation path is outside allowed_path_scope".to_string(),
         })
     }
+}
+
+fn allowed_search_roots_for_repository(
+    repository: &RepositoryRecord,
+) -> ServiceResult<Vec<PathBuf>> {
+    let root = Path::new(&repository.root_path);
+    let mut allowed_roots = repository
+        .allowed_path_scope
+        .allowed_paths
+        .iter()
+        .map(|path| {
+            canonicalize_within_scope(root, Path::new(path)).map(|resolved| resolved.canonical)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| ServiceError::Internal {
+            reason: format!("allowed path scope is invalid during submit_job: {err}"),
+        })?;
+
+    if allowed_roots.is_empty() {
+        allowed_roots.push(root.canonicalize().map_err(|err| ServiceError::Internal {
+            reason: format!("repository root is no longer valid: {err}"),
+        })?);
+    }
+
+    allowed_roots.sort();
+    allowed_roots.dedup();
+    Ok(allowed_roots)
 }
 
 fn validate_secondary_filesystem_path_scope(
@@ -6883,6 +6914,74 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_job_search_does_not_follow_scoped_symlink_to_outside_path() {
+        use std::os::unix::fs::symlink;
+
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-search-scoped-symlink");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("private.txt"), "outside secret\n").unwrap();
+        fs::write(root.join("docs").join("notes.txt"), "inside notes\n").unwrap();
+        symlink(root.join("private.txt"), root.join("docs").join("link")).unwrap();
+
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "search-symlink-scope-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: Some(PathScope {
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_paths: vec!["docs".to_string()],
+                }),
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id.clone(),
+                kind: JobKind::Read,
+                goal: Some("search scoped with symlink".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "repository".to_string(),
+                    value: "docs".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.search".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("outside".to_string()),
+                    max: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .expect("scoped search should succeed");
+
+        let tool_result = receipt
+            .tool_result
+            .as_ref()
+            .expect("tool result should exist");
+        let match_count = tool_result
+            .fields
+            .iter()
+            .find(|field| field.key == "match_count")
+            .and_then(|field| match &field.value {
+                atelia_core::StructuredValue::Integer(value) => Some(*value),
+                _ => None,
+            })
+            .unwrap_or(0);
+        assert_eq!(match_count, 0);
+        assert!(tool_result.fields.iter().all(|field| {
+            !matches!(&field.value, atelia_core::StructuredValue::StringList(matches) if matches.iter().any(|entry| entry.contains("private.txt")))
+        }));
+
         let _ = fs::remove_dir_all(root);
     }
 

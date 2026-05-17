@@ -1554,6 +1554,7 @@ pub struct FsSearchTool {
     pattern: String,
     max_results: usize,
     max_file_bytes: u64,
+    allowed_roots: Vec<PathBuf>,
 }
 
 impl FsSearchTool {
@@ -1563,6 +1564,7 @@ impl FsSearchTool {
             pattern: pattern.into(),
             max_results: DEFAULT_SEARCH_MAX_RESULTS,
             max_file_bytes: DEFAULT_SEARCH_MAX_FILE_BYTES,
+            allowed_roots: Vec::new(),
         }
     }
 
@@ -1573,6 +1575,20 @@ impl FsSearchTool {
 
     pub fn with_max_file_bytes(mut self, max: u64) -> Self {
         self.max_file_bytes = max;
+        self
+    }
+
+    pub fn with_allowed_roots<I, P>(mut self, allowed_roots: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.allowed_roots = allowed_roots
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        self.allowed_roots.sort();
+        self.allowed_roots.dedup();
         self
     }
 }
@@ -1623,8 +1639,25 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
         let mut truncated = false;
         let mut total_bytes: u64 = 0;
         let mut retained_bytes: u64 = 0;
+        let allowed_roots = if self.allowed_roots.is_empty() {
+            vec![canonical.root.clone()]
+        } else {
+            self.allowed_roots.clone()
+        };
 
         if canonical.canonical.is_file() {
+            if !is_within_allowed_roots(&canonical.canonical, &allowed_roots) {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "search failed: path rejected".to_string(),
+                    format!(
+                        "{}: path outside allowed search scope",
+                        canonical.display_path()
+                    ),
+                );
+            }
+
             let metadata = match fs::metadata(&canonical.canonical) {
                 Ok(metadata) => metadata,
                 Err(err) => {
@@ -1662,6 +1695,7 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
             if let Err(err) = search_recursive(
                 &canonical.canonical,
                 &canonical.root,
+                &allowed_roots,
                 &self.pattern,
                 self.max_results,
                 self.max_file_bytes,
@@ -2969,6 +3003,7 @@ impl crate::runtime::RuntimeTool for ProcRunTool {
 fn search_recursive(
     dir: &Path,
     root: &Path,
+    allowed_roots: &[PathBuf],
     pattern: &str,
     max_results: usize,
     max_file_bytes: u64,
@@ -2994,6 +3029,10 @@ fn search_recursive(
             continue;
         }
 
+        if !is_within_allowed_roots(&canonical, allowed_roots) {
+            continue;
+        }
+
         let metadata = fs::metadata(&canonical)?;
         if metadata.is_dir() {
             if !visited_dirs.insert(canonical.clone()) {
@@ -3002,6 +3041,7 @@ fn search_recursive(
             search_recursive(
                 &canonical,
                 root,
+                allowed_roots,
                 pattern,
                 max_results,
                 max_file_bytes,
@@ -3045,6 +3085,10 @@ fn search_recursive(
         }
     }
     Ok(())
+}
+
+fn is_within_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots.iter().any(|root| path.starts_with(root))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

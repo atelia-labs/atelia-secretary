@@ -1184,18 +1184,12 @@ fn parse_submit_job_payload(
                     .to_string()
             })?;
         if roots.len() != 1 || roots[0].trim().is_empty() {
-            return Err(
-                    "filesystem operation requires path_scope.roots to contain exactly one concrete path"
-                        .to_string(),
-                );
+            return Err("filesystem operation requires path_scope.roots to contain exactly one concrete path".to_string());
         }
         if requests_filesystem_concrete_path_operation(&requested_capabilities)
             && roots[0].trim() == "."
         {
-            return Err(
-                    "filesystem operation requires path_scope.roots to contain exactly one concrete path"
-                        .to_string(),
-                );
+            return Err("filesystem operation requires path_scope.roots to contain exactly one concrete path".to_string());
         }
     }
 

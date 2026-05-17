@@ -106,13 +106,17 @@ Secretary built-in は意図的に小さくします。すべての built-in too
 
 現行 beta で shipped されている built-ins:
 
-- `secretary.echo`
-- `fs.read`
+- `fs.delete` (R2)
+- `fs.diff` (R1)
+- `fs.list` (R1)
+- `fs.read` (R1)
+- `fs.search` (R1)
+- `fs.stat` (R1)
+- `secretary.echo` (R0)
 
-その他の built-in は future または non-shipped slice に存在しうるが、現行の beta repertoire projection が
-公開するのは上記の tool のみで、dispatch が揃うまでは含めません。
+この beta は、現行の ListRepertoire 計算投影で上記の built-in のみを dispatch として公開します。
 
-注: この例では `fs.search` を future または non-shipped built-in の illustrative schema として使っています。現行の shipped beta built-ins は `secretary.echo` と `fs.read` です。
+注: この文書は tool definition の schema 形を定義します。tool が実行可能であるかは別の段階で決まります。
 
 future または non-shipped built-ins:
 
