@@ -5585,6 +5585,118 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_tool_args_are_mapped_across_rpc_boundary_for_search_bounds() {
+        let mut server = ready_server();
+        let root = test_repo_dir("rpc-search-tool-args");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(
+            root.join("notes").join("note.txt"),
+            "needle line one\nnope\nneedle line two\nneedle line three\n",
+        )
+        .unwrap();
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "search-rpc-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let response = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id,
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: Some("search with bounded max".to_string()),
+                path_scope: Some(RpcPathScope {
+                    kind: RpcPathScopeKind::ExplicitPaths,
+                    roots: vec!["notes".to_string()],
+                    include_patterns: Vec::new(),
+                    exclude_patterns: Vec::new(),
+                }),
+                requested_capabilities: vec!["filesystem.search".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("needle".to_string()),
+                    max: Some(1),
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .expect("rpc search submit should succeed");
+
+        let events = server
+            .list_events(ListEventsRequest {
+                repository_id: Some(response.job.repository_id.clone()),
+                cursor: Some(EventCursorRequest::Beginning),
+                subject_ids: Vec::new(),
+                job_ids: vec![response.job.job_id.clone()],
+                min_severity: None,
+                page_size: Some(32),
+                page_token: None,
+            })
+            .expect("events should be listable by job id");
+        let tool_result_event = events
+            .events
+            .iter()
+            .find(|event| event.kind == "tool_result_recorded")
+            .expect("tool_result_recorded event should exist");
+        let tool_result_id = tool_result_event
+            .refs
+            .tool_result_id
+            .as_deref()
+            .expect("tool result id should be present")
+            .to_string();
+
+        let rendered = server
+            .service_mut()
+            .render_tool_output(ServiceRenderToolOutputRequest {
+                tool_result_id: ToolResultId::try_from_string(tool_result_id.clone())
+                    .expect("tool result id should be parseable"),
+                repository_id: None,
+                format: atelia_core::OutputFormat::Json,
+            })
+            .expect("tool output should render");
+
+        let rendered_json: serde_json::Value = serde_json::from_str(&rendered.rendered_output.body)
+            .expect("tool output should be json");
+
+        let fields = rendered_json["fields"]
+            .as_array()
+            .expect("rendered output should include fields");
+        let summary = fields
+            .iter()
+            .find_map(|field| {
+                if field["key"].as_str() == Some("summary") {
+                    field["value"]["string"].as_str()
+                } else {
+                    None
+                }
+            })
+            .expect("search result summary should be present");
+        let pattern = fields
+            .iter()
+            .find_map(|field| {
+                if field["key"].as_str() == Some("pattern") {
+                    field["value"]["string"].as_str()
+                } else {
+                    None
+                }
+            })
+            .expect("search result pattern should be present");
+        let truncation_reason = rendered_json["truncation"]["reason"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(summary.contains("1 match"));
+        assert_eq!(pattern, "needle");
+        assert!(truncation_reason.contains("truncated at 1 matches"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn duplicate_repository_maps_to_conflict() {
         let server = ready_server();
         let root = test_repo_dir("duplicate-conflict");

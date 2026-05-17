@@ -2515,6 +2515,12 @@ fn resolve_submit_job_tool_kind(
                             .to_string(),
                     })?;
 
+            if capability == SECRETARY_FS_DELETE_CAPABILITY && request.kind != JobKind::Mutate {
+                return Err(ServiceError::InvalidArgument {
+                    reason: "filesystem.delete requires job kind mutate".to_string(),
+                });
+            }
+
             if !matches!(
                 resource_scope.kind.trim(),
                 "repository" | "explicit_paths" | "read_only" | "path"
@@ -2651,6 +2657,15 @@ fn resolve_submit_job_tool_args(
     match tool_kind {
         SubmitJobToolKind::FsSearch => {
             let args = tool_args.ok_or_else(missing_tool_args)?;
+            if args.comparison_path.is_some()
+                || args.max_bytes.is_some()
+                || args.max_chars.is_some()
+            {
+                return Err(ServiceError::InvalidArgument {
+                    reason: "search tool_args only supports pattern and max".to_string(),
+                });
+            }
+
             let pattern = args.pattern.ok_or_else(|| ServiceError::InvalidArgument {
                 reason: "search requires non-empty pattern in tool_args".to_string(),
             })?;
@@ -2676,6 +2691,14 @@ fn resolve_submit_job_tool_args(
         }
         SubmitJobToolKind::FsDiff => {
             let args = tool_args.ok_or_else(missing_tool_args)?;
+            if args.pattern.is_some() || args.max.is_some() {
+                return Err(ServiceError::InvalidArgument {
+                    reason:
+                        "diff tool_args only supports comparison_path, max_bytes, and max_chars"
+                            .to_string(),
+                });
+            }
+
             let comparison_path =
                 args.comparison_path
                     .ok_or_else(|| ServiceError::InvalidArgument {
@@ -6977,6 +7000,45 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_rejects_filesystem_delete_without_mutate_kind() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-delete-mutate-kind");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "delete-kind-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("protected.txt"), "contents\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("delete with read kind".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "protected.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.delete".to_string()],
+                tool_args: None,
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            root.join("protected.txt").exists(),
+            "read-typed delete should not remove the file"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn submit_job_rejects_filesystem_read_outside_allowed_scope() {
         let svc = ready_service();
         let root = test_repo_dir("filesystem-read-allowed-scope");
@@ -7123,6 +7185,86 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_rejects_filesystem_search_with_unexpected_args() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-search-unexpected-args");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "search-unexpected-arg-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("note.txt"), "alpha\nneedle\nneedle\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("search with comparison_path".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "note.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.search".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("needle".to_string()),
+                    max: Some(1),
+                    comparison_path: Some("note.txt".to_string()),
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_search_with_unexpected_bounds() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-search-unexpected-bounds");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "search-unexpected-bounds-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("note.txt"), "alpha\nneedle\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("search with bounds".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "note.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.search".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("needle".to_string()),
+                    max: None,
+                    comparison_path: None,
+                    max_bytes: Some(1),
+                    max_chars: Some(64),
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn submit_job_rejects_filesystem_diff_without_comparison_path() {
         let svc = ready_service();
         let root = test_repo_dir("filesystem-diff-missing-arg");
@@ -7158,6 +7300,48 @@ mod tests {
                 idempotency_key: None,
             })
             .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_diff_with_unexpected_args() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-diff-unexpected-args");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "diff-unexpected-arg-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("left.txt"), "alpha\n").unwrap();
+        fs::write(root.join("right.txt"), "alpha\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("diff with pattern".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "left.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.diff".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("alpha".to_string()),
+                    max: Some(1),
+                    comparison_path: Some("right.txt".to_string()),
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
         let _ = fs::remove_dir_all(root);
     }
