@@ -170,6 +170,12 @@ and OM default package policy in separate future product lanes. This job
 request still only carries an optional goal summary; a first-class goal
 lifecycle contract is reserved for later.
 
+`SubmitJobRequest.message` is an optional free-form requester message and is
+not a fallback for `goal`. Secretary may preserve it for request validation and
+idempotency semantics, but does not echo the raw message on `Job` or default
+analytics records. `model_route_key` and `permission_mode_route_key` are
+optional routing hints preserved with the same request-signature semantics.
+
 `SubmitJob` must not execute work immediately before policy has been evaluated.
 The first observable effect is a persisted `job` and `job_event`.
 Successful submissions may be replayed by `idempotency_key`, including after a
