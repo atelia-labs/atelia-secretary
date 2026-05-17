@@ -135,6 +135,27 @@ policy は、この PR とは別の future product lane です。この job requ
 `SubmitJob` は policy evaluation 前に work を execute してはいけません。最初の observable effect は persisted `job` と `job_event` です。
 成功した submission は `idempotency_key` で replay でき、durable restart 後も有効です。failed submission は現在 replay result として cache されません。
 
+`SubmitJobRequest.tool_args` は capability ごとに以下の形が必須です。
+
+- `filesystem.search` / `fs.search`（読み取り）
+  - 必須: `pattern`（文字列・空文字不可）
+  - 任意: `max`（u64）
+  - 非対応: `comparison_path`、`max_bytes`、`max_chars`
+- `filesystem.diff` / `fs.diff`（読み取り）
+  - 必須: `comparison_path`（文字列・空文字不可）
+  - 任意: `max_bytes`（u64）、`max_chars`（u64）
+  - 非対応: `pattern`、`max`
+- その他の capability: `tool_args` は省略のみ許可されます。
+
+例:
+
+```json
+{ "tool_args": { "pattern": "needle", "max": 10 } }
+{ "tool_args": { "comparison_path": "right.txt", "max_bytes": 4096, "max_chars": 120 } }
+```
+
+非対応フィールドを含む `SubmitJob` は、実行前に却下されます。
+
 ### Event
 
 `Event` は次を含みます。

@@ -1245,32 +1245,6 @@ impl SecretaryService {
             kind: "repository".to_string(),
             value: ".".to_string(),
         });
-        if matches!(
-            tool_kind,
-            SubmitJobToolKind::FsRead
-                | SubmitJobToolKind::FsList
-                | SubmitJobToolKind::FsStat
-                | SubmitJobToolKind::FsDelete
-                | SubmitJobToolKind::FsSearch
-                | SubmitJobToolKind::FsDiff
-        ) {
-            validate_filesystem_path_scope(
-                &repository,
-                &resource_scope,
-                matches!(
-                    tool_kind,
-                    SubmitJobToolKind::FsRead | SubmitJobToolKind::FsDelete
-                ),
-            )?;
-        }
-        if let SubmitJobToolArgsSpec::Diff(diff) = &resolved_tool_args {
-            validate_secondary_filesystem_path_scope(
-                &repository,
-                &resource_scope,
-                &diff.comparison_path,
-            )?;
-        }
-
         let runtime_request = RuntimeJobRequest::new(
             request.requester,
             request.repository_id,
@@ -1279,7 +1253,36 @@ impl SecretaryService {
         )
         .with_requested_capabilities(requested_capabilities)
         .with_tool_output_defaults(tool_output_defaults)
-        .with_resource_scope(resource_scope.kind, resource_scope.value);
+        .with_resource_scope(resource_scope.kind.clone(), resource_scope.value.clone());
+
+        let validate_filesystem_scope = || -> ServiceResult<()> {
+            if matches!(
+                tool_kind,
+                SubmitJobToolKind::FsRead
+                    | SubmitJobToolKind::FsList
+                    | SubmitJobToolKind::FsStat
+                    | SubmitJobToolKind::FsDelete
+                    | SubmitJobToolKind::FsSearch
+                    | SubmitJobToolKind::FsDiff
+            ) {
+                validate_filesystem_path_scope(
+                    &repository,
+                    &resource_scope,
+                    matches!(
+                        tool_kind,
+                        SubmitJobToolKind::FsRead | SubmitJobToolKind::FsDelete
+                    ),
+                )?;
+            }
+            if let SubmitJobToolArgsSpec::Diff(diff) = &resolved_tool_args {
+                validate_secondary_filesystem_path_scope(
+                    &repository,
+                    &resource_scope,
+                    &diff.comparison_path,
+                )?;
+            }
+            Ok(())
+        };
 
         let receipt = if let Some(idempotency_key) = normalized_idempotency_key.as_deref() {
             let key_lock = {
@@ -1352,6 +1355,8 @@ impl SecretaryService {
                                 .to_string(),
                     });
                 }
+
+                validate_filesystem_scope()?;
 
                 let receipt = match tool_kind {
                     SubmitJobToolKind::Echo => {
@@ -1497,6 +1502,8 @@ impl SecretaryService {
 
             receipt_result?
         } else {
+            validate_filesystem_scope()?;
+
             match tool_kind {
                 SubmitJobToolKind::Echo => self.lifecycle.runtime().run_tool_job_with_finalizer(
                     runtime_request,
@@ -4102,6 +4109,61 @@ mod tests {
         assert!(replayed
             .iter()
             .any(|event| event.refs.job_id == Some(job_id.clone())));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn durable_service_replays_successful_filesystem_delete_after_restart() {
+        let storage_dir = durable_storage_dir("delete-restart");
+        let first_service =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service");
+        let root = test_repo_dir("durable-delete-restart");
+        let repository = first_service
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "durable-delete-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("repository registration should succeed");
+        fs::write(root.join("to-delete.txt"), "delete me\n").unwrap();
+        let request = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id.clone(),
+            kind: JobKind::Mutate,
+            goal: Some("delete after restart".to_string()),
+            resource_scope: Some(ResourceScope {
+                kind: "path".to_string(),
+                value: "to-delete.txt".to_string(),
+            }),
+            requested_capabilities: vec!["filesystem.delete".to_string()],
+            tool_args: None,
+            idempotency_key: Some("durable-delete-key".to_string()),
+        };
+
+        let first = first_service
+            .submit_job(request.clone())
+            .expect("initial delete should succeed");
+        assert_eq!(first.job.status, JobStatus::Succeeded);
+        assert!(!root.join("to-delete.txt").exists());
+        drop(first_service);
+
+        let second_service =
+            SecretaryService::new_durable(storage_dir.clone()).expect("durable service reload");
+        let replayed = second_service
+            .submit_job(request)
+            .expect("durable replay should reuse succeeded idempotent receipt");
+        assert_eq!(replayed.job.id, first.job.id);
+        assert_eq!(replayed.job.status, JobStatus::Succeeded);
+        assert!(!root.join("to-delete.txt").exists());
+
+        let jobs = second_service
+            .list_jobs(None, None, None, None, None)
+            .expect("jobs should exist after restart");
+        assert_eq!(jobs.jobs.len(), 1);
+
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(storage_dir);
     }
@@ -8221,6 +8283,52 @@ mod tests {
             .expect("replayed submit should return same job");
 
         assert_eq!(second.job.id, first.job.id);
+        assert!(svc.idempotent_submission_locks.lock().unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_replays_successful_filesystem_delete_without_revalidation() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-delete-replay");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "delete-replay-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        let target = root.join("to-delete.txt");
+        fs::write(&target, "delete me\n").unwrap();
+
+        let request = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id.clone(),
+            kind: JobKind::Mutate,
+            goal: Some("delete temp file".to_string()),
+            resource_scope: Some(ResourceScope {
+                kind: "path".to_string(),
+                value: "to-delete.txt".to_string(),
+            }),
+            requested_capabilities: vec!["filesystem.delete".to_string()],
+            tool_args: None,
+            idempotency_key: Some("delete-replay-key".to_string()),
+        };
+
+        let first = svc
+            .submit_job(request.clone())
+            .expect("initial delete should succeed");
+        assert_eq!(first.job.status, JobStatus::Succeeded);
+        assert!(!target.exists());
+
+        let replayed = svc
+            .submit_job(request)
+            .expect("replayed delete should skip missing-file validation");
+        assert_eq!(replayed.job.id, first.job.id);
+        assert_eq!(replayed.job.status, JobStatus::Succeeded);
+        assert!(!target.exists());
         assert!(svc.idempotent_submission_locks.lock().unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
     }

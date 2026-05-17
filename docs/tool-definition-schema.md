@@ -84,7 +84,11 @@ Rules:
 - destructive fields require explicit booleans and policy checks
 - free-form strings declare max length and redaction class
 
-Example:
+Example (**non-wire / non-normative; retained for early tool-definition drafting**):
+
+`fs.search.input.v1` in this document does not yet represent the `SubmitJob` HTTP wire shape.
+SubmitJob uses `pattern` / `max` for `fs.search` arguments and `comparison_path` for
+`fs.diff`.
 
 ```yaml
 schema: fs.search.input.v1

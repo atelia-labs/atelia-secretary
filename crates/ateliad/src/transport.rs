@@ -519,7 +519,12 @@ fn requests_filesystem_concrete_path_operation(capabilities: &[String]) -> bool 
 
         matches!(
             normalized.as_str(),
-            "filesystem.read" | "fs.read" | "filesystem.delete" | "fs.delete"
+            "filesystem.read"
+                | "fs.read"
+                | "filesystem.delete"
+                | "fs.delete"
+                | "filesystem.diff"
+                | "fs.diff"
         )
     })
 }
@@ -6066,6 +6071,35 @@ mod tests {
             vec![".".to_string()]
         );
         assert_eq!(parsed.requested_capabilities, vec!["fs.stat".to_string()]);
+    }
+
+    #[test]
+    fn submit_job_payload_rejects_root_filesystem_diff_scope() {
+        for capability in ["filesystem.diff", "fs.diff"] {
+            let err = parse_submit_job_payload(SubmitJobRequestPayload {
+                repository_id: RepositoryId::new().as_str().to_string(),
+                requester: ActorPayload::Agent {
+                    id: "agent:transport".to_string(),
+                    display_name: None,
+                },
+                kind: "read".to_string(),
+                goal: Some("reject diff root".to_string()),
+                path_scope: Some(PathScopePayload {
+                    kind: Some("repository".to_string()),
+                    roots: Some(vec![".".to_string()]),
+                    include_patterns: None,
+                    exclude_patterns: None,
+                }),
+                requested_capabilities: Some(vec![capability.to_string()]),
+                tool_args: None,
+                idempotency_key: None,
+            })
+            .expect_err("filesystem.diff should reject repository root scope");
+
+            assert!(err.contains(
+                "filesystem operation requires path_scope.roots to contain exactly one concrete path"
+            ));
+        }
     }
 
     #[test]

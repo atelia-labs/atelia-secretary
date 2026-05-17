@@ -77,7 +77,10 @@ Rules:
 - destructive field は explicit boolean と policy check を要求する
 - free-form string は max length と redaction class を宣言する
 
-Example:
+Example (**非 wire / 非規範**。`tool definition` 初期仕様検討用です）:
+
+この文書の `fs.search.input.v1` は、現時点での `SubmitJob` HTTP wire 形とは一致しません。
+`SubmitJob` の `fs.search` 引数は `pattern` / `max`、`fs.diff` 引数は `comparison_path` を使います。
 
 ```yaml
 schema: fs.search.input.v1
