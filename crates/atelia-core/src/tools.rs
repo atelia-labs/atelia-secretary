@@ -3029,12 +3029,12 @@ fn search_recursive(
             continue;
         }
 
-        if !is_within_allowed_roots(&canonical, allowed_roots) {
-            continue;
-        }
-
         let metadata = fs::metadata(&canonical)?;
         if metadata.is_dir() {
+            if !is_within_or_ancestor_of_allowed_root(&canonical, allowed_roots) {
+                continue;
+            }
+
             if !visited_dirs.insert(canonical.clone()) {
                 continue;
             }
@@ -3054,6 +3054,10 @@ fn search_recursive(
                 visited_dirs,
             )?;
         } else if metadata.is_file() {
+            if !is_within_allowed_roots(&canonical, allowed_roots) {
+                continue;
+            }
+
             if metadata.len() > max_file_bytes {
                 *files_skipped += 1;
                 continue;
@@ -3089,6 +3093,12 @@ fn search_recursive(
 
 fn is_within_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> bool {
     allowed_roots.iter().any(|root| path.starts_with(root))
+}
+
+fn is_within_or_ancestor_of_allowed_root(path: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots
+        .iter()
+        .any(|root| path.starts_with(root) || root.starts_with(path))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6574,6 +6584,39 @@ mod tests {
                 assert_eq!(2, list.len());
                 assert!(list[0].contains("a.txt:1"));
                 assert!(list[1].contains("a.txt:3"));
+            }
+            other => panic!("expected StringList, got {:?}", other),
+        }
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_search_reaches_nested_allowed_root_from_ancestor() {
+        let env = TestEnv::new("search-nested-allowed-root");
+        env.create_file("src/allowed/hit.txt", "MATCH inside allowed root");
+        env.create_file("src/denied/sibling.txt", "MATCH outside allowed root");
+
+        let allowed_root = env.root.join("src/allowed").canonicalize().unwrap();
+        let tool = FsSearchTool::new(&env.root, "MATCH").with_allowed_roots([allowed_root]);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+
+        let count = result
+            .fields
+            .iter()
+            .find(|f| f.key == "match_count")
+            .unwrap();
+        assert_eq!(StructuredValue::Integer(1), count.value);
+
+        let matches_field = result.fields.iter().find(|f| f.key == "matches").unwrap();
+        match &matches_field.value {
+            StructuredValue::StringList(list) => {
+                assert_eq!(1, list.len());
+                assert!(list[0].contains("src/allowed/hit.txt:1"));
+                assert!(!list[0].contains("src/denied/sibling.txt"));
             }
             other => panic!("expected StringList, got {:?}", other),
         }
