@@ -384,6 +384,9 @@ pub struct SubmitJobRequest {
     pub repository_id: RepositoryId,
     pub kind: JobKind,
     pub goal: Option<String>,
+    pub message: Option<String>,
+    pub model_route_key: Option<String>,
+    pub permission_mode_route_key: Option<String>,
     pub resource_scope: Option<ResourceScope>,
     pub requested_capabilities: Vec<String>,
     pub tool_args: Option<SubmitJobToolArgs>,
@@ -2806,6 +2809,9 @@ fn submit_job_request_signature(
         repository_id: &'a str,
         kind: &'a JobKind,
         goal: Option<&'a str>,
+        message: &'a Option<String>,
+        model_route_key: &'a Option<String>,
+        permission_mode_route_key: &'a Option<String>,
         resource_scope: &'a ResourceScope,
         requested_capabilities: &'a [String],
         tool_args: &'a Option<SubmitJobToolArgs>,
@@ -2824,6 +2830,9 @@ fn submit_job_request_signature(
         repository_id: request.repository_id.as_str(),
         kind: &request.kind,
         goal: normalized_goal,
+        message: &request.message,
+        model_route_key: &request.model_route_key,
+        permission_mode_route_key: &request.permission_mode_route_key,
         resource_scope: &resource_scope,
         requested_capabilities,
         tool_args: &request.tool_args,
@@ -4043,6 +4052,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("persist me".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -4080,6 +4092,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("persist me".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -4136,6 +4151,9 @@ mod tests {
             repository_id: repository.id.clone(),
             kind: JobKind::Mutate,
             goal: Some("delete after restart".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: Some(ResourceScope {
                 kind: "path".to_string(),
                 value: "to-delete.txt".to_string(),
@@ -4191,6 +4209,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("first goal".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -4207,6 +4228,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("different goal".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -4241,6 +4265,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("blocked request".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -4274,6 +4301,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("blocked request".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -5547,6 +5577,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("summarize current repository status".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -5605,6 +5638,9 @@ mod tests {
                 repository_id: repository_a.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("summarize repository a".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -5620,6 +5656,9 @@ mod tests {
                 repository_id: repository_b.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("summarize repository b".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -5937,6 +5976,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some(long_goal.clone()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -6025,6 +6067,9 @@ mod tests {
                 repository_id: canonical_repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("render tool output".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -6439,6 +6484,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("summarize status".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -6486,6 +6534,9 @@ mod tests {
             repository_id: repository_id.clone(),
             kind: JobKind::Read,
             goal: Some("first".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: None,
             requested_capabilities: Vec::new(),
             tool_args: None,
@@ -6497,6 +6548,9 @@ mod tests {
             repository_id: repository_id.clone(),
             kind: JobKind::Read,
             goal: Some("second".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: None,
             requested_capabilities: Vec::new(),
             tool_args: None,
@@ -6563,6 +6617,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("summarize the runtime output".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -6606,6 +6663,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some(" ".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -6646,6 +6706,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("summarize".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -6680,6 +6743,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("summarize".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: vec!["policy.check".to_string()],
                 tool_args: None,
@@ -6696,6 +6762,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("summarize".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: vec!["capability.discovery".to_string()],
                 tool_args: None,
@@ -6728,6 +6797,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("read repository notes".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "README.md".to_string(),
@@ -6786,6 +6858,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("list directory".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "notes".to_string(),
@@ -6843,6 +6918,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("list repository root".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "repository".to_string(),
                     value: ".".to_string(),
@@ -6900,6 +6978,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("list outside allowed path".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "README.md".to_string(),
@@ -6936,6 +7017,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("search repository notes".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "note.txt".to_string(),
@@ -7001,6 +7085,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("search disallowed path".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "outside.txt".to_string(),
@@ -7052,6 +7139,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("search scoped with symlink".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "repository".to_string(),
                     value: "docs".to_string(),
@@ -7111,6 +7201,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("diff two files".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "left.txt".to_string(),
@@ -7171,6 +7264,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("stat file".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "note.txt".to_string(),
@@ -7223,6 +7319,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("stat repository root".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "repository".to_string(),
                     value: ".".to_string(),
@@ -7280,6 +7379,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("stat outside allowed path".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "outside.txt".to_string(),
@@ -7315,6 +7417,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Mutate,
                 goal: Some("delete file".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "to-delete.txt".to_string(),
@@ -7370,6 +7475,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("delete with read kind".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "protected.txt".to_string(),
@@ -7409,6 +7517,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Mutate,
                 goal: Some("delete with read-only scope".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "read_only".to_string(),
                     value: "protected.txt".to_string(),
@@ -7453,6 +7564,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("read scoped notes".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "explicit_paths".to_string(),
                     value: "docs/guide.md".to_string(),
@@ -7477,6 +7591,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("read root notes".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "explicit_paths".to_string(),
                     value: "README.md".to_string(),
@@ -7515,6 +7632,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Mutate,
                 goal: Some("delete root notes".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "README.md".to_string(),
@@ -7554,6 +7674,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("search without pattern".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "note.txt".to_string(),
@@ -7594,6 +7717,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("search with comparison_path".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "note.txt".to_string(),
@@ -7634,6 +7760,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("search with bounds".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "note.txt".to_string(),
@@ -7674,6 +7803,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("diff without path".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "left.txt".to_string(),
@@ -7715,6 +7847,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("diff with pattern".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "left.txt".to_string(),
@@ -7761,6 +7896,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("diff scoped".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "docs/left.txt".to_string(),
@@ -7802,6 +7940,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("diff root scope".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "repository".to_string(),
                     value: ".".to_string(),
@@ -7842,6 +7983,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("read repository notes".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: vec!["filesystem.read".to_string()],
                 tool_args: None,
@@ -7880,6 +8024,9 @@ mod tests {
                     repository_id: repository.id.clone(),
                     kind: JobKind::Read,
                     goal: Some("read repository root".to_string()),
+                    message: None,
+                    model_route_key: None,
+                    permission_mode_route_key: None,
                     resource_scope: Some(ResourceScope {
                         kind: "repository".to_string(),
                         value: value.to_string(),
@@ -7919,6 +8066,9 @@ mod tests {
             repository_id: repository.id.clone(),
             kind: JobKind::Read,
             goal: Some("summarize".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: None,
             requested_capabilities: Vec::new(),
             tool_args: None,
@@ -7940,6 +8090,9 @@ mod tests {
             repository_id: repository.id,
             kind: JobKind::Read,
             goal: Some("summarize".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: None,
             requested_capabilities: vec!["capability.discovery".to_string()],
             tool_args: None,
@@ -7981,6 +8134,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("  summarize  ".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -7996,6 +8152,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("summarize".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -8027,6 +8186,9 @@ mod tests {
             repository_id: repository.id.clone(),
             kind: JobKind::Read,
             goal: Some("   ".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: None,
             requested_capabilities: Vec::new(),
             tool_args: None,
@@ -8048,6 +8210,9 @@ mod tests {
             repository_id: repository.id,
             kind: JobKind::Read,
             goal: None,
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: None,
             requested_capabilities: Vec::new(),
             tool_args: None,
@@ -8092,6 +8257,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("inspect".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "repository".to_string(),
                     value: "binary.bin".to_string(),
@@ -8110,6 +8278,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("inspect".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "repository".to_string(),
                     value: "binary.bin".to_string(),
@@ -8148,6 +8319,9 @@ mod tests {
             repository_id: repository.id.clone(),
             kind: JobKind::Read,
             goal: Some("summarize;resource_scope=repository:.".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: Some(ResourceScope {
                 kind: "repository".to_string(),
                 value: "branch=main;capabilities=capability.discovery".to_string(),
@@ -8161,6 +8335,9 @@ mod tests {
             repository_id: repository.id,
             kind: JobKind::Read,
             goal: Some("summarize".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: Some(ResourceScope {
                 kind: "repository".to_string(),
                 value: "branch=main".to_string(),
@@ -8206,6 +8383,9 @@ mod tests {
             repository_id: repository.id,
             kind: JobKind::Read,
             goal: Some("search".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: Some(ResourceScope {
                 kind: "path".to_string(),
                 value: "note.txt".to_string(),
@@ -8230,6 +8410,9 @@ mod tests {
 
         let comparison_request = SubmitJobRequest {
             goal: Some("search".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: Some(ResourceScope {
                 kind: "path".to_string(),
                 value: "note.txt".to_string(),
@@ -8255,6 +8438,222 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_request_signature_includes_message_and_route_keys() {
+        let svc = ready_service();
+        let root = test_repo_dir("submit-job-signature-routing-metadata");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "signature-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let base_request = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id,
+            kind: JobKind::Read,
+            goal: None,
+            message: Some("free-form requester message".to_string()),
+            model_route_key: Some("model:fast".to_string()),
+            permission_mode_route_key: Some("permissions:ask".to_string()),
+            resource_scope: None,
+            requested_capabilities: Vec::new(),
+            tool_args: None,
+            idempotency_key: None,
+        };
+        let request_signature_one = submit_job_request_signature(
+            &base_request,
+            normalize_submit_job_goal(base_request.goal.clone()).as_deref(),
+            &normalize_requested_capabilities(&base_request.requested_capabilities)
+                .expect("capabilities should normalize"),
+        );
+
+        let comparison_request = SubmitJobRequest {
+            message: Some("different requester message".to_string()),
+            ..base_request.clone()
+        };
+        let request_signature_two = submit_job_request_signature(
+            &comparison_request,
+            normalize_submit_job_goal(comparison_request.goal.clone()).as_deref(),
+            &normalize_requested_capabilities(&comparison_request.requested_capabilities)
+                .expect("capabilities should normalize"),
+        );
+        assert_ne!(request_signature_one, request_signature_two);
+
+        let comparison_request = SubmitJobRequest {
+            model_route_key: Some("model:careful".to_string()),
+            ..base_request.clone()
+        };
+        let request_signature_three = submit_job_request_signature(
+            &comparison_request,
+            normalize_submit_job_goal(comparison_request.goal.clone()).as_deref(),
+            &normalize_requested_capabilities(&comparison_request.requested_capabilities)
+                .expect("capabilities should normalize"),
+        );
+        assert_ne!(request_signature_one, request_signature_three);
+
+        let comparison_request = SubmitJobRequest {
+            permission_mode_route_key: Some("permissions:auto".to_string()),
+            ..base_request
+        };
+        let request_signature_four = submit_job_request_signature(
+            &comparison_request,
+            normalize_submit_job_goal(comparison_request.goal.clone()).as_deref(),
+            &normalize_requested_capabilities(&comparison_request.requested_capabilities)
+                .expect("capabilities should normalize"),
+        );
+        assert_ne!(request_signature_one, request_signature_four);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_request_signature_preserves_raw_message_identity() {
+        let svc = ready_service();
+        let root = test_repo_dir("submit-job-signature-raw-message");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "signature-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let base_request = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id,
+            kind: JobKind::Read,
+            goal: None,
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
+            resource_scope: None,
+            requested_capabilities: Vec::new(),
+            tool_args: None,
+            idempotency_key: None,
+        };
+        let signature_for = |message: Option<&str>| {
+            let request = SubmitJobRequest {
+                message: message.map(str::to_string),
+                ..base_request.clone()
+            };
+            submit_job_request_signature(
+                &request,
+                normalize_submit_job_goal(request.goal.clone()).as_deref(),
+                &normalize_requested_capabilities(&request.requested_capabilities)
+                    .expect("capabilities should normalize"),
+            )
+        };
+
+        let absent = signature_for(None);
+        let empty = signature_for(Some(""));
+        let one_space = signature_for(Some(" "));
+        let two_spaces = signature_for(Some("  "));
+
+        assert_ne!(absent, empty);
+        assert_ne!(empty, one_space);
+        assert_ne!(one_space, two_spaces);
+        assert_ne!(absent, one_space);
+        assert_ne!(absent, two_spaces);
+        assert_ne!(empty, two_spaces);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_message_does_not_become_goal() {
+        let svc = ready_service();
+        let root = test_repo_dir("submit-job-message-not-goal");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "message-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: None,
+                message: Some("free-form requester message".to_string()),
+                model_route_key: Some("model:fast".to_string()),
+                permission_mode_route_key: Some("permissions:ask".to_string()),
+                resource_scope: None,
+                requested_capabilities: Vec::new(),
+                tool_args: None,
+                idempotency_key: Some("message-not-goal".to_string()),
+            })
+            .expect("message-only submit should succeed");
+
+        assert_eq!(receipt.job.goal, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_route_keys_participate_in_idempotency_replay_and_conflict() {
+        let svc = ready_service();
+        let root = test_repo_dir("submit-job-route-key-idempotency");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "route-key-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let request = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id.clone(),
+            kind: JobKind::Read,
+            goal: None,
+            message: Some("free-form requester message".to_string()),
+            model_route_key: Some("model:fast".to_string()),
+            permission_mode_route_key: Some("permissions:ask".to_string()),
+            resource_scope: None,
+            requested_capabilities: Vec::new(),
+            tool_args: None,
+            idempotency_key: Some("route-key-request".to_string()),
+        };
+
+        let first = svc
+            .submit_job(request.clone())
+            .expect("first submit should succeed");
+        let replayed = svc
+            .submit_job(request.clone())
+            .expect("same routing hints should replay");
+        assert_eq!(replayed.job.id, first.job.id);
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                model_route_key: Some("model:careful".to_string()),
+                ..request.clone()
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Conflict { reason: _ }));
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                permission_mode_route_key: Some("permissions:auto".to_string()),
+                ..request
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Conflict { reason: _ }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn submit_job_rejects_unsupported_requested_capabilities() {
         let svc = ready_service();
         let root = test_repo_dir("unsupported-capabilities");
@@ -8274,6 +8673,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("summarize".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: vec!["filesystem.write".to_string()],
                 tool_args: None,
@@ -8305,6 +8707,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("summarize".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -8318,6 +8723,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("summarize".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -8351,6 +8759,9 @@ mod tests {
             repository_id: repository.id.clone(),
             kind: JobKind::Mutate,
             goal: Some("delete temp file".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: Some(ResourceScope {
                 kind: "path".to_string(),
                 value: "to-delete.txt".to_string(),
@@ -8396,6 +8807,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("summarize".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -8410,6 +8824,9 @@ mod tests {
                     repository_id: repository.id.clone(),
                     kind: JobKind::Read,
                     goal: Some("summarize".to_string()),
+                    message: None,
+                    model_route_key: None,
+                    permission_mode_route_key: None,
                     resource_scope: None,
                     requested_capabilities: Vec::new(),
                     tool_args: None,
@@ -8430,6 +8847,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("summarize".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -8465,6 +8885,9 @@ mod tests {
                     repository_id,
                     kind: JobKind::Read,
                     goal: Some("summarize".to_string()),
+                    message: None,
+                    model_route_key: None,
+                    permission_mode_route_key: None,
                     resource_scope: None,
                     requested_capabilities: Vec::new(),
                     tool_args: None,
@@ -8523,6 +8946,9 @@ mod tests {
                 repository_id: repository.id.clone(),
                 kind: JobKind::Read,
                 goal: Some("summarize".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -8536,6 +8962,9 @@ mod tests {
                 repository_id: first.job.repository_id,
                 kind: JobKind::Read,
                 goal: Some("different summary".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -8567,6 +8996,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("summarize".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
                 tool_args: None,
@@ -8602,6 +9034,9 @@ mod tests {
             repository_id: repository_id.clone(),
             kind: JobKind::Read,
             goal: Some("from-first".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: None,
             requested_capabilities: Vec::new(),
             tool_args: None,
@@ -8613,6 +9048,9 @@ mod tests {
             repository_id: repository_id.clone(),
             kind: JobKind::Read,
             goal: Some("from-second".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             resource_scope: None,
             requested_capabilities: Vec::new(),
             tool_args: None,

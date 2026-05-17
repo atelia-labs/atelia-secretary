@@ -132,6 +132,16 @@ policy は、この PR とは別の future product lane です。この job requ
 あくまで optional な goal summary であり、first-class な goal lifecycle contract は
 将来に予約されています。
 
+`SubmitJobRequest.message` は任意の free-form requester message であり、`goal` の
+fallback ではありません。Secretary は request validation と idempotency semantics
+のために保持できますが、raw message を `Job` や default analytics record へ echo
+しません。`model_route_key` と `permission_mode_route_key` は任意の routing hint
+であり、同じ request signature semantics で保持します。
+`message`、`model_route_key`、`permission_mode_route_key` が指定された場合、
+それらは raw string identity として `SubmitJob` の request signature に参加します。
+空文字列や whitespace-only value は、未指定とも他の whitespace 表現とも別の値です。
+値を意図しない client は、blank value を送るのではなく field を省略してください。
+
 `SubmitJob` は policy evaluation 前に work を execute してはいけません。最初の observable effect は persisted `job` と `job_event` です。
 成功した submission は `idempotency_key` で replay でき、durable restart 後も有効です。failed submission は現在 replay result として cache されません。
 

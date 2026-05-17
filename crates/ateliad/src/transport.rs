@@ -461,6 +461,12 @@ struct SubmitJobRequestPayload {
     kind: String,
     #[serde(default)]
     goal: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    model_route_key: Option<String>,
+    #[serde(default)]
+    permission_mode_route_key: Option<String>,
     path_scope: Option<PathScopePayload>,
     requested_capabilities: Option<Vec<String>>,
     tool_args: Option<SubmitJobToolArgsPayload>,
@@ -1207,6 +1213,9 @@ fn parse_submit_job_payload(
         requester: parse_actor_payload(payload.requester),
         kind: payload.kind,
         goal: payload.goal,
+        message: payload.message,
+        model_route_key: payload.model_route_key,
+        permission_mode_route_key: payload.permission_mode_route_key,
         path_scope,
         requested_capabilities,
         tool_args,
@@ -6001,6 +6010,9 @@ mod tests {
             },
             kind: "read".to_string(),
             goal: Some("read over HTTP".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             path_scope: Some(PathScopePayload {
                 kind: None,
                 roots: None,
@@ -6026,6 +6038,9 @@ mod tests {
             },
             kind: "read".to_string(),
             goal: Some("list repository root".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             path_scope: Some(PathScopePayload {
                 kind: Some("repository".to_string()),
                 roots: Some(vec![".".to_string()]),
@@ -6058,6 +6073,9 @@ mod tests {
             },
             kind: "read".to_string(),
             goal: Some("stat repository root".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             path_scope: Some(PathScopePayload {
                 kind: Some("repository".to_string()),
                 roots: Some(vec![".".to_string()]),
@@ -6088,6 +6106,9 @@ mod tests {
                 },
                 kind: "read".to_string(),
                 goal: Some("reject diff root".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 path_scope: Some(PathScopePayload {
                     kind: Some("repository".to_string()),
                     roots: Some(vec![".".to_string()]),
@@ -6121,6 +6142,30 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_payload_preserves_message_and_route_keys_separate_from_goal() {
+        let repository_id = RepositoryId::new();
+        let payload: SubmitJobRequestPayload = serde_json::from_str(&format!(
+            r#"{{"repository_id":"{}","requester":{{"type":"agent","id":"agent:transport","display_name":null}},"kind":"read","message":"free-form requester message","model_route_key":"model:fast","permission_mode_route_key":"permissions:ask"}}"#,
+            repository_id.as_str()
+        ))
+        .expect("payload should deserialize routing metadata");
+
+        let parsed =
+            parse_submit_job_payload(payload).expect("routing metadata should be accepted");
+
+        assert_eq!(parsed.goal, None);
+        assert_eq!(
+            parsed.message,
+            Some("free-form requester message".to_string())
+        );
+        assert_eq!(parsed.model_route_key, Some("model:fast".to_string()));
+        assert_eq!(
+            parsed.permission_mode_route_key,
+            Some("permissions:ask".to_string())
+        );
+    }
+
+    #[test]
     fn submit_job_payload_rejects_unknown_tool_args_fields() {
         let repository_id = RepositoryId::new();
         let err = serde_json::from_str::<SubmitJobRequestPayload>(&format!(
@@ -6145,6 +6190,9 @@ mod tests {
             },
             kind: "read".to_string(),
             goal: Some("search over HTTP".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             path_scope: Some(PathScopePayload {
                 kind: Some("explicit_paths".to_string()),
                 roots: Some(vec!["notes".to_string()]),
@@ -6178,6 +6226,9 @@ mod tests {
             },
             kind: "read".to_string(),
             goal: Some("echo with tool args".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
             path_scope: None,
             requested_capabilities: Some(vec!["secretary.echo".to_string()]),
             tool_args: Some(SubmitJobToolArgsPayload {
@@ -6218,6 +6269,9 @@ mod tests {
                 },
                 kind: "read".to_string(),
                 goal: Some("read over HTTP".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 path_scope: Some(PathScopePayload {
                     kind: Some("explicit_paths".to_string()),
                     roots: Some(vec!["notes".to_string()]),
@@ -6407,6 +6461,9 @@ mod tests {
                 },
                 kind: "read".to_string(),
                 goal: Some("read over HTTP".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 path_scope: Some(PathScopePayload {
                     kind: Some("repository".to_string()),
                     roots: Some(roots),
@@ -6657,6 +6714,9 @@ mod tests {
                     },
                     kind: "read".to_string(),
                     goal: Some("first".to_string()),
+                    message: None,
+                    model_route_key: None,
+                    permission_mode_route_key: None,
                     path_scope: None,
                     requested_capabilities: Vec::new(),
                     tool_args: None,
@@ -6672,6 +6732,9 @@ mod tests {
                     },
                     kind: "read".to_string(),
                     goal: Some("between".to_string()),
+                    message: None,
+                    model_route_key: None,
+                    permission_mode_route_key: None,
                     path_scope: None,
                     requested_capabilities: Vec::new(),
                     tool_args: None,
@@ -6687,6 +6750,9 @@ mod tests {
                     },
                     kind: "read".to_string(),
                     goal: Some("second".to_string()),
+                    message: None,
+                    model_route_key: None,
+                    permission_mode_route_key: None,
                     path_scope: None,
                     requested_capabilities: Vec::new(),
                     tool_args: None,
@@ -6843,6 +6909,9 @@ mod tests {
                     },
                     kind: "read".to_string(),
                     goal: Some("first".to_string()),
+                    message: None,
+                    model_route_key: None,
+                    permission_mode_route_key: None,
                     path_scope: None,
                     requested_capabilities: Vec::new(),
                     tool_args: None,
@@ -6864,6 +6933,9 @@ mod tests {
                     },
                     kind: "read".to_string(),
                     goal: Some("second".to_string()),
+                    message: None,
+                    model_route_key: None,
+                    permission_mode_route_key: None,
                     path_scope: None,
                     requested_capabilities: Vec::new(),
                     tool_args: None,
@@ -8221,6 +8293,9 @@ mod tests {
                     repository_id: repository.id.clone(),
                     kind: atelia_core::JobKind::Read,
                     goal: Some("render tool output".to_string()),
+                    message: None,
+                    model_route_key: None,
+                    permission_mode_route_key: None,
                     resource_scope: None,
                     requested_capabilities: Vec::new(),
                     tool_args: None,
