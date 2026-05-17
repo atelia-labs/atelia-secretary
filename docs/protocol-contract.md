@@ -175,6 +175,11 @@ not a fallback for `goal`. Secretary may preserve it for request validation and
 idempotency semantics, but does not echo the raw message on `Job` or default
 analytics records. `model_route_key` and `permission_mode_route_key` are
 optional routing hints preserved with the same request-signature semantics.
+When present, `message`, `model_route_key`, and `permission_mode_route_key`
+participate in the `SubmitJob` request signature using raw string identity:
+blank strings and whitespace-only values are distinct from omission and from
+other whitespace spellings. Clients that do not intend a value should omit the
+field rather than send a blank value.
 
 `SubmitJob` must not execute work immediately before policy has been evaluated.
 The first observable effect is a persisted `job` and `job_event`.
