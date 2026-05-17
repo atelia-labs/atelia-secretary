@@ -463,7 +463,18 @@ struct SubmitJobRequestPayload {
     goal: Option<String>,
     path_scope: Option<PathScopePayload>,
     requested_capabilities: Option<Vec<String>>,
+    tool_args: Option<SubmitJobToolArgsPayload>,
     idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitJobToolArgsPayload {
+    pattern: Option<String>,
+    max: Option<u64>,
+    comparison_path: Option<String>,
+    max_bytes: Option<u64>,
+    max_chars: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,14 +486,45 @@ struct RegisterRepositoryRequestPayload {
     requester: Option<ActorPayload>,
 }
 
-fn requests_filesystem_read(capabilities: &[String]) -> bool {
+fn requests_filesystem_path_operation(capabilities: &[String]) -> bool {
     capabilities.iter().any(|capability| {
-        capability
-            .trim()
-            .to_ascii_lowercase()
-            .replace(['_', '-', ':', '/'], ".")
-            == "filesystem.read"
+        matches!(
+            normalize_capability_name(capability).as_str(),
+            "filesystem.read"
+                | "filesystem.list"
+                | "filesystem.stat"
+                | "filesystem.delete"
+                | "fs.read"
+                | "fs.list"
+                | "fs.stat"
+                | "fs.delete"
+                | "filesystem.search"
+                | "filesystem.diff"
+                | "fs.search"
+                | "fs.diff"
+        )
     })
+}
+
+fn requests_filesystem_concrete_path_operation(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|capability| {
+        matches!(
+            normalize_capability_name(capability).as_str(),
+            "filesystem.read"
+                | "fs.read"
+                | "filesystem.delete"
+                | "fs.delete"
+                | "filesystem.diff"
+                | "fs.diff"
+        )
+    })
+}
+
+fn normalize_capability_name(capability: &str) -> String {
+    capability
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-', ':', '/'], ".")
 }
 
 #[derive(Debug, Deserialize)]
@@ -1128,20 +1170,35 @@ fn parse_submit_job_payload(
         .path_scope
         .map(parse_path_scope_payload)
         .transpose()?;
+    let tool_args = payload.tool_args.map(|payload| rpc::SubmitJobToolArgs {
+        pattern: payload.pattern,
+        max: payload.max,
+        comparison_path: payload.comparison_path,
+        max_bytes: payload.max_bytes,
+        max_chars: payload.max_chars,
+    });
 
-    if requests_filesystem_read(&requested_capabilities) {
+    if tool_args.is_some() && !requests_filesystem_path_operation(&requested_capabilities) {
+        return Err(
+            "tool_args are only supported when a filesystem capability is requested".to_string(),
+        );
+    }
+
+    if requests_filesystem_path_operation(&requested_capabilities) {
         let roots = path_scope
             .as_ref()
             .map(|scope| scope.roots.as_slice())
             .ok_or_else(|| {
-                "filesystem.read requires path_scope.roots to contain exactly one concrete path"
+                "filesystem operation requires path_scope.roots to contain exactly one concrete path"
                     .to_string()
             })?;
-        if roots.len() != 1 || roots[0].trim().is_empty() || roots[0].trim() == "." {
-            return Err(
-                "filesystem.read requires path_scope.roots to contain exactly one concrete path"
-                    .to_string(),
-            );
+        if roots.len() != 1 || roots[0].trim().is_empty() {
+            return Err("filesystem operation requires path_scope.roots to contain exactly one concrete path".to_string());
+        }
+        if requests_filesystem_concrete_path_operation(&requested_capabilities)
+            && roots[0].trim() == "."
+        {
+            return Err("filesystem operation requires path_scope.roots to contain exactly one concrete path".to_string());
         }
     }
 
@@ -1152,6 +1209,7 @@ fn parse_submit_job_payload(
         goal: payload.goal,
         path_scope,
         requested_capabilities,
+        tool_args,
         idempotency_key: payload.idempotency_key,
     })
 }
@@ -5950,11 +6008,102 @@ mod tests {
                 exclude_patterns: None,
             }),
             requested_capabilities: Some(vec!["filesystem.read".to_string()]),
+            tool_args: None,
             idempotency_key: None,
         })
         .expect_err("filesystem.read should reject empty path_scope");
 
-        assert!(err.contains("filesystem.read requires path_scope.roots"));
+        assert!(err.contains("filesystem operation requires path_scope.roots"));
+    }
+
+    #[test]
+    fn submit_job_payload_accepts_root_filesystem_list_scope() {
+        let parsed = parse_submit_job_payload(SubmitJobRequestPayload {
+            repository_id: RepositoryId::new().as_str().to_string(),
+            requester: ActorPayload::Agent {
+                id: "agent:transport".to_string(),
+                display_name: None,
+            },
+            kind: "read".to_string(),
+            goal: Some("list repository root".to_string()),
+            path_scope: Some(PathScopePayload {
+                kind: Some("repository".to_string()),
+                roots: Some(vec![".".to_string()]),
+                include_patterns: None,
+                exclude_patterns: None,
+            }),
+            requested_capabilities: Some(vec!["filesystem.list".to_string()]),
+            tool_args: None,
+            idempotency_key: None,
+        })
+        .expect("filesystem.list should allow repository root scope");
+
+        assert_eq!(
+            parsed.path_scope.as_ref().expect("path_scope").roots,
+            vec![".".to_string()]
+        );
+        assert_eq!(
+            parsed.requested_capabilities,
+            vec!["filesystem.list".to_string()]
+        );
+    }
+
+    #[test]
+    fn submit_job_payload_accepts_root_filesystem_stat_scope() {
+        let parsed = parse_submit_job_payload(SubmitJobRequestPayload {
+            repository_id: RepositoryId::new().as_str().to_string(),
+            requester: ActorPayload::Agent {
+                id: "agent:transport".to_string(),
+                display_name: None,
+            },
+            kind: "read".to_string(),
+            goal: Some("stat repository root".to_string()),
+            path_scope: Some(PathScopePayload {
+                kind: Some("repository".to_string()),
+                roots: Some(vec![".".to_string()]),
+                include_patterns: None,
+                exclude_patterns: None,
+            }),
+            requested_capabilities: Some(vec!["fs.stat".to_string()]),
+            tool_args: None,
+            idempotency_key: None,
+        })
+        .expect("filesystem.stat should allow repository root scope");
+
+        assert_eq!(
+            parsed.path_scope.as_ref().expect("path_scope").roots,
+            vec![".".to_string()]
+        );
+        assert_eq!(parsed.requested_capabilities, vec!["fs.stat".to_string()]);
+    }
+
+    #[test]
+    fn submit_job_payload_rejects_root_filesystem_diff_scope() {
+        for capability in ["filesystem.diff", "fs.diff"] {
+            let err = parse_submit_job_payload(SubmitJobRequestPayload {
+                repository_id: RepositoryId::new().as_str().to_string(),
+                requester: ActorPayload::Agent {
+                    id: "agent:transport".to_string(),
+                    display_name: None,
+                },
+                kind: "read".to_string(),
+                goal: Some("reject diff root".to_string()),
+                path_scope: Some(PathScopePayload {
+                    kind: Some("repository".to_string()),
+                    roots: Some(vec![".".to_string()]),
+                    include_patterns: None,
+                    exclude_patterns: None,
+                }),
+                requested_capabilities: Some(vec![capability.to_string()]),
+                tool_args: None,
+                idempotency_key: None,
+            })
+            .expect_err("filesystem.diff should reject repository root scope");
+
+            assert!(err.contains(
+                "filesystem operation requires path_scope.roots to contain exactly one concrete path"
+            ));
+        }
     }
 
     #[test]
@@ -5969,6 +6118,124 @@ mod tests {
         let parsed = parse_submit_job_payload(payload).expect("missing goal should be accepted");
 
         assert_eq!(parsed.goal, None);
+    }
+
+    #[test]
+    fn submit_job_payload_rejects_unknown_tool_args_fields() {
+        let repository_id = RepositoryId::new();
+        let err = serde_json::from_str::<SubmitJobRequestPayload>(&format!(
+            r#"{{"repository_id":"{}","requester":{{"type":"agent","id":"agent:transport","display_name":null}},"kind":"read","tool_args":{{"pattern":"needle","unexpected":true}}}}"#,
+            repository_id.as_str()
+        ))
+        .expect_err("unknown tool_args fields should be rejected");
+
+        assert!(
+            err.to_string().contains("unknown field `unexpected`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn submit_job_payload_accepts_non_empty_search_tool_args() {
+        let parsed = parse_submit_job_payload(SubmitJobRequestPayload {
+            repository_id: RepositoryId::new().as_str().to_string(),
+            requester: ActorPayload::Agent {
+                id: "agent:transport".to_string(),
+                display_name: None,
+            },
+            kind: "read".to_string(),
+            goal: Some("search over HTTP".to_string()),
+            path_scope: Some(PathScopePayload {
+                kind: Some("explicit_paths".to_string()),
+                roots: Some(vec!["notes".to_string()]),
+                include_patterns: None,
+                exclude_patterns: None,
+            }),
+            requested_capabilities: Some(vec!["filesystem.search".to_string()]),
+            tool_args: Some(SubmitJobToolArgsPayload {
+                pattern: Some("needle".to_string()),
+                max: Some(2),
+                comparison_path: None,
+                max_bytes: None,
+                max_chars: None,
+            }),
+            idempotency_key: None,
+        })
+        .expect("filesystem.search tool_args should parse");
+
+        let tool_args = parsed.tool_args.expect("tool_args should be mapped");
+        assert_eq!(tool_args.pattern.as_deref(), Some("needle"));
+        assert_eq!(tool_args.max, Some(2));
+    }
+
+    #[test]
+    fn submit_job_payload_rejects_tool_args_without_filesystem_capability() {
+        let err = parse_submit_job_payload(SubmitJobRequestPayload {
+            repository_id: RepositoryId::new().as_str().to_string(),
+            requester: ActorPayload::Agent {
+                id: "agent:transport".to_string(),
+                display_name: None,
+            },
+            kind: "read".to_string(),
+            goal: Some("echo with tool args".to_string()),
+            path_scope: None,
+            requested_capabilities: Some(vec!["secretary.echo".to_string()]),
+            tool_args: Some(SubmitJobToolArgsPayload {
+                pattern: Some("needle".to_string()),
+                max: None,
+                comparison_path: None,
+                max_bytes: None,
+                max_chars: None,
+            }),
+            idempotency_key: None,
+        })
+        .expect_err("non-filesystem tool_args should be rejected");
+
+        assert!(err.contains("tool_args are only supported"));
+    }
+
+    #[test]
+    fn submit_job_payload_accepts_supported_filesystem_caps_with_explicit_path_scope() {
+        for capability in [
+            "filesystem.read",
+            "filesystem.list",
+            "filesystem.stat",
+            "filesystem.delete",
+            "filesystem.search",
+            "filesystem.diff",
+            "fs.read",
+            "fs.list",
+            "fs.stat",
+            "fs.delete",
+            "fs.search",
+            "fs.diff",
+        ] {
+            let parsed = parse_submit_job_payload(SubmitJobRequestPayload {
+                repository_id: RepositoryId::new().as_str().to_string(),
+                requester: ActorPayload::Agent {
+                    id: "agent:transport".to_string(),
+                    display_name: None,
+                },
+                kind: "read".to_string(),
+                goal: Some("read over HTTP".to_string()),
+                path_scope: Some(PathScopePayload {
+                    kind: Some("explicit_paths".to_string()),
+                    roots: Some(vec!["notes".to_string()]),
+                    include_patterns: None,
+                    exclude_patterns: None,
+                }),
+                requested_capabilities: Some(vec![capability.to_string()]),
+                tool_args: None,
+                idempotency_key: None,
+            })
+            .expect("filesystem capability payload should parse");
+
+            assert_eq!(
+                parsed.path_scope.as_ref().expect("path scope").roots[0],
+                "notes"
+            );
+            assert_eq!(parsed.requested_capabilities, vec![capability.to_string()]);
+        }
     }
 
     #[tokio::test]
@@ -6019,6 +6286,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn job_routes_submit_accepts_root_filesystem_list_scope() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("job-route-list-root");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes").join("a.txt"), "alpha\n").unwrap();
+        let repository = {
+            let server = rpc_server.read().await;
+            server
+                .register_repository(rpc::RegisterRepositoryRequest {
+                    display_name: "list-route-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed")
+                .repository
+        };
+
+        let response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/jobs/submit",
+            serde_json::json!({
+                "repository_id": repository.repository_id,
+                "requester": {
+                    "type": "agent",
+                    "id": "agent:job-route-list",
+                    "display_name": "Job Route Agent"
+                },
+                "kind": "read",
+                "goal": "list repository root",
+                "path_scope": {
+                    "kind": "repository",
+                    "roots": ["."],
+                },
+                "requested_capabilities": ["filesystem.list"],
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], Value::String("ok".to_string()));
+        assert_eq!(
+            payload["data"]["policy"]["requested_capability"],
+            "filesystem.list"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn job_routes_submit_accepts_root_filesystem_stat_scope() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("job-route-stat-root");
+        fs::write(root.join("note.txt"), "hello\n").unwrap();
+        let repository = {
+            let server = rpc_server.read().await;
+            server
+                .register_repository(rpc::RegisterRepositoryRequest {
+                    display_name: "stat-route-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed")
+                .repository
+        };
+
+        let response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/jobs/submit",
+            serde_json::json!({
+                "repository_id": repository.repository_id,
+                "requester": {
+                    "type": "agent",
+                    "id": "agent:job-route-stat",
+                    "display_name": "Job Route Agent"
+                },
+                "kind": "read",
+                "goal": "stat repository root",
+                "path_scope": {
+                    "kind": "repository",
+                    "roots": ["."],
+                },
+                "requested_capabilities": ["fs.stat"],
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], Value::String("ok".to_string()));
+        assert_eq!(
+            payload["data"]["policy"]["requested_capability"],
+            "filesystem.stat"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn submit_job_payload_rejects_ambiguous_filesystem_read_scopes() {
         for roots in [
@@ -6040,12 +6414,13 @@ mod tests {
                     exclude_patterns: None,
                 }),
                 requested_capabilities: Some(vec!["filesystem.read".to_string()]),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect_err("filesystem.read should reject ambiguous path_scope roots");
 
             assert!(err.contains(
-                "filesystem.read requires path_scope.roots to contain exactly one concrete path"
+                "filesystem operation requires path_scope.roots to contain exactly one concrete path"
             ));
         }
     }
@@ -6284,6 +6659,7 @@ mod tests {
                     goal: Some("first".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: None,
                 })
                 .expect("first submit should succeed");
@@ -6298,6 +6674,7 @@ mod tests {
                     goal: Some("between".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: None,
                 })
                 .expect("other repo submit should succeed");
@@ -6312,6 +6689,7 @@ mod tests {
                     goal: Some("second".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: None,
                 })
                 .expect("second submit should succeed");
@@ -6467,6 +6845,7 @@ mod tests {
                     goal: Some("first".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: Some("events-list-first".to_string()),
                 })
                 .expect("first submit should succeed")
@@ -6487,6 +6866,7 @@ mod tests {
                     goal: Some("second".to_string()),
                     path_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: Some("events-list-second".to_string()),
                 })
                 .expect("second submit should succeed")
@@ -7843,6 +8223,7 @@ mod tests {
                     goal: Some("render tool output".to_string()),
                     resource_scope: None,
                     requested_capabilities: Vec::new(),
+                    tool_args: None,
                     idempotency_key: None,
                 })
                 .expect("job submission should succeed");
@@ -8068,7 +8449,18 @@ mod tests {
             .iter()
             .map(|entry| entry["tool_id"].as_str().expect("tool id"))
             .collect();
-        assert_eq!(tool_ids, vec!["fs.read", "secretary.echo"]);
+        assert_eq!(
+            tool_ids,
+            vec![
+                "fs.delete",
+                "fs.diff",
+                "fs.list",
+                "fs.read",
+                "fs.search",
+                "fs.stat",
+                "secretary.echo"
+            ]
+        );
         assert_eq!(entries[0]["timeout_ms"].as_u64(), Some(0));
         assert_eq!(entries[1]["timeout_ms"].as_u64(), Some(0));
     }

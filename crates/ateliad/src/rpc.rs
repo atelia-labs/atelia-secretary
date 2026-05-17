@@ -18,6 +18,7 @@ use crate::service::{
     RegisterRepositoryRequest as ServiceRegisterRepositoryRequest,
     RenderToolOutputRequest as ServiceRenderToolOutputRequest, SecretaryService, ServiceError,
     StorageStatus, SubmitJobRequest as ServiceSubmitJobRequest,
+    SubmitJobToolArgs as ServiceSubmitJobToolArgs,
 };
 pub use crate::service::{
     ExtensionExecutionRequest, ExtensionExecutionResponse, ListPackageTrustIndexRequest,
@@ -180,6 +181,13 @@ impl SecretaryRpcServer {
             goal: request.goal,
             resource_scope: path_scope,
             requested_capabilities: request.requested_capabilities,
+            tool_args: request.tool_args.map(|args| ServiceSubmitJobToolArgs {
+                pattern: args.pattern,
+                max: args.max,
+                comparison_path: args.comparison_path,
+                max_bytes: args.max_bytes,
+                max_chars: args.max_chars,
+            }),
             idempotency_key: request.idempotency_key,
         })?;
 
@@ -1455,7 +1463,17 @@ pub struct SubmitJobRequest {
     pub goal: Option<String>,
     pub path_scope: Option<RpcPathScope>,
     pub requested_capabilities: Vec<String>,
+    pub tool_args: Option<SubmitJobToolArgs>,
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitJobToolArgs {
+    pub pattern: Option<String>,
+    pub max: Option<u64>,
+    pub comparison_path: Option<String>,
+    pub max_bytes: Option<u64>,
+    pub max_chars: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3476,6 +3494,7 @@ mod tests {
                 goal: Some("persist rpc state".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("job submission should succeed");
@@ -3573,7 +3592,18 @@ mod tests {
             .iter()
             .map(|entry| entry.tool_id.as_str())
             .collect();
-        assert_eq!(tool_ids, vec!["fs.read", "secretary.echo"]);
+        assert_eq!(
+            tool_ids,
+            vec![
+                "fs.delete",
+                "fs.diff",
+                "fs.list",
+                "fs.read",
+                "fs.search",
+                "fs.stat",
+                "secretary.echo"
+            ]
+        );
         let read = response
             .entries
             .iter()
@@ -3591,10 +3621,18 @@ mod tests {
         assert_eq!(echo.risk_tier, "R0");
         assert!(!echo.cancellable);
         assert_eq!(echo.timeout_ms, 0);
-        assert!(response
-            .entries
-            .iter()
-            .all(|entry| { matches!(entry.tool_id.as_str(), "fs.read" | "secretary.echo") }));
+        assert!(response.entries.iter().all(|entry| {
+            matches!(
+                entry.tool_id.as_str(),
+                "fs.delete"
+                    | "fs.diff"
+                    | "fs.list"
+                    | "fs.read"
+                    | "fs.search"
+                    | "fs.stat"
+                    | "secretary.echo"
+            )
+        }));
     }
 
     #[test]
@@ -3682,6 +3720,7 @@ mod tests {
                 goal: Some(long_goal.clone()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("job submission should succeed");
@@ -3769,6 +3808,7 @@ mod tests {
                 goal: Some("render tool output".to_string()),
                 resource_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("job submission should succeed");
@@ -4156,6 +4196,7 @@ mod tests {
                 goal: Some("summarize repository state".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit job should succeed");
@@ -4185,6 +4226,7 @@ mod tests {
                 goal: None,
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit job without goal should succeed");
@@ -4276,6 +4318,7 @@ mod tests {
                 goal: Some(" \t\n ".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("blank goal submit should succeed");
@@ -4369,6 +4412,7 @@ mod tests {
                 goal: Some("first".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("first submit should succeed");
@@ -4380,6 +4424,7 @@ mod tests {
                 goal: Some("between".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("other repo submit should succeed");
@@ -4391,6 +4436,7 @@ mod tests {
                 goal: Some("second".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("second submit should succeed");
@@ -4522,6 +4568,7 @@ mod tests {
                 goal: Some("first repo job".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("first repository job should submit");
@@ -4534,6 +4581,7 @@ mod tests {
                 goal: Some("second repo job".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("second repository job should submit");
@@ -4613,6 +4661,7 @@ mod tests {
                 goal: Some("watch live job".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit should succeed");
@@ -4736,6 +4785,7 @@ mod tests {
                 goal: Some("watch live anchor".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit should succeed");
@@ -5132,6 +5182,7 @@ mod tests {
                 goal: Some("one".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit job should succeed");
@@ -5143,6 +5194,7 @@ mod tests {
                 goal: Some("two".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit job should succeed");
@@ -5260,6 +5312,7 @@ mod tests {
                 goal: Some("finish immediately".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("submit job should succeed");
@@ -5288,6 +5341,7 @@ mod tests {
                 goal: Some("test".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .unwrap_err();
@@ -5333,6 +5387,7 @@ mod tests {
                     exclude_patterns: Vec::new(),
                 }),
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: None,
             })
             .unwrap_err();
@@ -5362,6 +5417,7 @@ mod tests {
                 goal: Some("first".to_string()),
                 path_scope: None,
                 requested_capabilities: vec!["policy.check".to_string()],
+                tool_args: None,
                 idempotency_key: Some("request-key".to_string()),
             })
             .expect("submit should succeed");
@@ -5377,6 +5433,7 @@ mod tests {
                 goal: Some("first".to_string()),
                 path_scope: None,
                 requested_capabilities: vec!["capability.discovery".to_string()],
+                tool_args: None,
                 idempotency_key: Some("request-key".to_string()),
             })
             .expect("replay should return same job");
@@ -5390,6 +5447,7 @@ mod tests {
                 goal: Some("second".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-key-2".to_string()),
             })
             .expect("submit job should succeed");
@@ -5400,6 +5458,7 @@ mod tests {
                 kind: "read".to_string(),
                 goal: Some("second".to_string()),
                 path_scope: None,
+                tool_args: None,
                 idempotency_key: Some("request-key-2".to_string()),
                 requested_capabilities: Vec::new(),
             })
@@ -5414,6 +5473,7 @@ mod tests {
                 goal: Some("conflicting goal".to_string()),
                 path_scope: None,
                 requested_capabilities: Vec::new(),
+                tool_args: None,
                 idempotency_key: Some("request-key".to_string()),
             })
             .unwrap_err();
@@ -5443,6 +5503,7 @@ mod tests {
                 goal: Some("unsupported".to_string()),
                 path_scope: None,
                 requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .unwrap_err();
@@ -5477,11 +5538,161 @@ mod tests {
                     exclude_patterns: Vec::new(),
                 }),
                 requested_capabilities: vec!["filesystem.read".to_string()],
+                tool_args: None,
                 idempotency_key: None,
             })
             .expect("filesystem.read should dispatch through RPC path_scope");
 
         assert_eq!(response.policy.requested_capability, "filesystem.read");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_list_with_explicit_path_scope() {
+        let server = ready_server();
+        let root = test_repo_dir("filesystem-list-rpc-dispatch");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes").join("a.txt"), "alpha\n").unwrap();
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "list-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let response = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id,
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: Some("list directory".to_string()),
+                path_scope: Some(RpcPathScope {
+                    kind: RpcPathScopeKind::ExplicitPaths,
+                    roots: vec!["notes".to_string()],
+                    include_patterns: Vec::new(),
+                    exclude_patterns: Vec::new(),
+                }),
+                requested_capabilities: vec!["fs.list".to_string()],
+                tool_args: None,
+                idempotency_key: None,
+            })
+            .expect("filesystem.list should dispatch through RPC path_scope");
+
+        assert_eq!(response.policy.requested_capability, "filesystem.list");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_tool_args_are_mapped_across_rpc_boundary_for_search_bounds() {
+        let mut server = ready_server();
+        let root = test_repo_dir("rpc-search-tool-args");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(
+            root.join("notes").join("note.txt"),
+            "needle line one\nnope\nneedle line two\nneedle line three\n",
+        )
+        .unwrap();
+        let registered = server
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "search-rpc-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let response = server
+            .submit_job(SubmitJobRequest {
+                repository_id: registered.repository.repository_id,
+                requester: actor(),
+                kind: "read".to_string(),
+                goal: Some("search with bounded max".to_string()),
+                path_scope: Some(RpcPathScope {
+                    kind: RpcPathScopeKind::ExplicitPaths,
+                    roots: vec!["notes".to_string()],
+                    include_patterns: Vec::new(),
+                    exclude_patterns: Vec::new(),
+                }),
+                requested_capabilities: vec!["filesystem.search".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("needle".to_string()),
+                    max: Some(1),
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .expect("rpc search submit should succeed");
+
+        let events = server
+            .list_events(ListEventsRequest {
+                repository_id: Some(response.job.repository_id.clone()),
+                cursor: Some(EventCursorRequest::Beginning),
+                subject_ids: Vec::new(),
+                job_ids: vec![response.job.job_id.clone()],
+                min_severity: None,
+                page_size: Some(32),
+                page_token: None,
+            })
+            .expect("events should be listable by job id");
+        let tool_result_event = events
+            .events
+            .iter()
+            .find(|event| event.kind == "tool_result_recorded")
+            .expect("tool_result_recorded event should exist");
+        let tool_result_id = tool_result_event
+            .refs
+            .tool_result_id
+            .as_deref()
+            .expect("tool result id should be present")
+            .to_string();
+
+        let rendered = server
+            .service_mut()
+            .render_tool_output(ServiceRenderToolOutputRequest {
+                tool_result_id: ToolResultId::try_from_string(tool_result_id.clone())
+                    .expect("tool result id should be parseable"),
+                repository_id: None,
+                format: atelia_core::OutputFormat::Json,
+            })
+            .expect("tool output should render");
+
+        let rendered_json: serde_json::Value = serde_json::from_str(&rendered.rendered_output.body)
+            .expect("tool output should be json");
+
+        let fields = rendered_json["fields"]
+            .as_array()
+            .expect("rendered output should include fields");
+        let summary = fields
+            .iter()
+            .find_map(|field| {
+                if field["key"].as_str() == Some("summary") {
+                    field["value"]["string"].as_str()
+                } else {
+                    None
+                }
+            })
+            .expect("search result summary should be present");
+        let pattern = fields
+            .iter()
+            .find_map(|field| {
+                if field["key"].as_str() == Some("pattern") {
+                    field["value"]["string"].as_str()
+                } else {
+                    None
+                }
+            })
+            .expect("search result pattern should be present");
+        let truncation_reason = rendered_json["truncation"]["reason"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(summary.contains("1 match"));
+        assert_eq!(pattern, "needle");
+        assert!(truncation_reason.contains("truncated at 1 matches"));
         let _ = fs::remove_dir_all(root);
     }
 

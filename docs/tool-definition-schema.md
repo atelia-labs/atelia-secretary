@@ -84,7 +84,11 @@ Rules:
 - destructive fields require explicit booleans and policy checks
 - free-form strings declare max length and redaction class
 
-Example:
+Example (**non-wire / non-normative; retained for early tool-definition drafting**):
+
+`fs.search.input.v1` in this document does not yet represent the `SubmitJob` HTTP wire shape.
+SubmitJob uses `pattern` / `max` for `fs.search` arguments and `comparison_path` for
+`fs.diff`.
 
 ```yaml
 schema: fs.search.input.v1
@@ -114,15 +118,20 @@ definition using this schema before implementation.
 
 Current shipped beta built-ins:
 
-- `secretary.echo`
-- `fs.read`
+- `fs.delete` (R2)
+- `fs.diff` (R1)
+- `fs.list` (R1)
+- `fs.read` (R1)
+- `fs.search` (R1)
+- `fs.stat` (R1)
+- `secretary.echo` (R0)
 
-Other built-ins may exist in future or non-shipped slices, but the current
-beta repertoire projection only exposes the tools above until dispatch exists.
+This beta currently dispatches and projects exactly the listed built-ins above
+in the computed repertoire surface.
 
-Note: this example uses `fs.search` as an illustrative schema for a future or
-non-shipped built-in. The current shipped beta built-ins are `secretary.echo`
-and `fs.read`.
+Note: this document defines the common envelope and metadata for all tool definitions
+and is intended to remain source-of-truth for schema shape even when dispatch for
+particular tools is not yet complete.
 
 Future or non-shipped built-ins:
 

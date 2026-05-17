@@ -1554,6 +1554,7 @@ pub struct FsSearchTool {
     pattern: String,
     max_results: usize,
     max_file_bytes: u64,
+    allowed_roots: Vec<PathBuf>,
 }
 
 impl FsSearchTool {
@@ -1563,6 +1564,7 @@ impl FsSearchTool {
             pattern: pattern.into(),
             max_results: DEFAULT_SEARCH_MAX_RESULTS,
             max_file_bytes: DEFAULT_SEARCH_MAX_FILE_BYTES,
+            allowed_roots: Vec::new(),
         }
     }
 
@@ -1573,6 +1575,20 @@ impl FsSearchTool {
 
     pub fn with_max_file_bytes(mut self, max: u64) -> Self {
         self.max_file_bytes = max;
+        self
+    }
+
+    pub fn with_allowed_roots<I, P>(mut self, allowed_roots: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.allowed_roots = allowed_roots
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        self.allowed_roots.sort();
+        self.allowed_roots.dedup();
         self
     }
 }
@@ -1623,8 +1639,25 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
         let mut truncated = false;
         let mut total_bytes: u64 = 0;
         let mut retained_bytes: u64 = 0;
+        let allowed_roots = if self.allowed_roots.is_empty() {
+            vec![canonical.root.clone()]
+        } else {
+            self.allowed_roots.clone()
+        };
 
         if canonical.canonical.is_file() {
+            if !is_within_allowed_roots(&canonical.canonical, &allowed_roots) {
+                return failed_result(
+                    invocation,
+                    schema_ref,
+                    "search failed: path rejected".to_string(),
+                    format!(
+                        "{}: path outside allowed search scope",
+                        canonical.display_path()
+                    ),
+                );
+            }
+
             let metadata = match fs::metadata(&canonical.canonical) {
                 Ok(metadata) => metadata,
                 Err(err) => {
@@ -1662,6 +1695,7 @@ impl crate::runtime::RuntimeTool for FsSearchTool {
             if let Err(err) = search_recursive(
                 &canonical.canonical,
                 &canonical.root,
+                &allowed_roots,
                 &self.pattern,
                 self.max_results,
                 self.max_file_bytes,
@@ -2969,6 +3003,7 @@ impl crate::runtime::RuntimeTool for ProcRunTool {
 fn search_recursive(
     dir: &Path,
     root: &Path,
+    allowed_roots: &[PathBuf],
     pattern: &str,
     max_results: usize,
     max_file_bytes: u64,
@@ -2996,12 +3031,17 @@ fn search_recursive(
 
         let metadata = fs::metadata(&canonical)?;
         if metadata.is_dir() {
+            if !is_within_or_ancestor_of_allowed_root(&canonical, allowed_roots) {
+                continue;
+            }
+
             if !visited_dirs.insert(canonical.clone()) {
                 continue;
             }
             search_recursive(
                 &canonical,
                 root,
+                allowed_roots,
                 pattern,
                 max_results,
                 max_file_bytes,
@@ -3014,6 +3054,10 @@ fn search_recursive(
                 visited_dirs,
             )?;
         } else if metadata.is_file() {
+            if !is_within_allowed_roots(&canonical, allowed_roots) {
+                continue;
+            }
+
             if metadata.len() > max_file_bytes {
                 *files_skipped += 1;
                 continue;
@@ -3045,6 +3089,16 @@ fn search_recursive(
         }
     }
     Ok(())
+}
+
+fn is_within_allowed_roots(path: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots.iter().any(|root| path.starts_with(root))
+}
+
+fn is_within_or_ancestor_of_allowed_root(path: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots
+        .iter()
+        .any(|root| path.starts_with(root) || root.starts_with(path))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6530,6 +6584,39 @@ mod tests {
                 assert_eq!(2, list.len());
                 assert!(list[0].contains("a.txt:1"));
                 assert!(list[1].contains("a.txt:3"));
+            }
+            other => panic!("expected StringList, got {:?}", other),
+        }
+        env.cleanup();
+    }
+
+    #[test]
+    fn fs_search_reaches_nested_allowed_root_from_ancestor() {
+        let env = TestEnv::new("search-nested-allowed-root");
+        env.create_file("src/allowed/hit.txt", "MATCH inside allowed root");
+        env.create_file("src/denied/sibling.txt", "MATCH outside allowed root");
+
+        let allowed_root = env.root.join("src/allowed").canonicalize().unwrap();
+        let tool = FsSearchTool::new(&env.root, "MATCH").with_allowed_roots([allowed_root]);
+        let invocation = fake_invocation(tool.tool_id());
+        let request = request_with_path(".");
+        let result = tool.execute(&invocation, &request);
+
+        assert_eq!(ToolResultStatus::Succeeded, result.status);
+
+        let count = result
+            .fields
+            .iter()
+            .find(|f| f.key == "match_count")
+            .unwrap();
+        assert_eq!(StructuredValue::Integer(1), count.value);
+
+        let matches_field = result.fields.iter().find(|f| f.key == "matches").unwrap();
+        match &matches_field.value {
+            StructuredValue::StringList(list) => {
+                assert_eq!(1, list.len());
+                assert!(list[0].contains("src/allowed/hit.txt:1"));
+                assert!(!list[0].contains("src/denied/sibling.txt"));
             }
             other => panic!("expected StringList, got {:?}", other),
         }

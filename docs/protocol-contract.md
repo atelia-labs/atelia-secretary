@@ -101,10 +101,12 @@ Beta RPC groups:
 
 The first beta server surface is intentionally small and currently projects
 only the built-in Secretary tools that are dispatchable in this beta slice:
-`fs.read` and `secretary.echo` as beta repertoire entries. Broader built-ins
-may exist in future or runtime-backed slices, but they are not claimed by
-`ListRepertoire` until dispatch exists. Package-backed repertoire entries
-remain a future slice.
+`fs.delete`, `fs.diff`, `fs.list`, `fs.read`, `fs.search`, `fs.stat`, and
+`secretary.echo` as beta repertoire entries. `secretary.echo` is R0;
+`fs.delete` is R2; `fs.diff`, `fs.list`, `fs.read`, `fs.search`, and `fs.stat`
+are R1. Broader built-ins may exist in future or runtime-backed slices, but
+they are not claimed by `ListRepertoire` until dispatch exists. Package-backed
+repertoire entries remain a future slice.
 
 For the beta slice, package management APIs are operator-facing. The RPC names
 still use `Extension*` because that is the current beta wire surface; docs and
@@ -172,6 +174,27 @@ lifecycle contract is reserved for later.
 The first observable effect is a persisted `job` and `job_event`.
 Successful submissions may be replayed by `idempotency_key`, including after a
 durable restart; failed submissions are not currently cached as replay results.
+
+`SubmitJobRequest.tool_args` is capability-specific and must match these shapes:
+
+- `filesystem.search` / `fs.search` (read tool)
+  - required: `pattern` (string, non-empty)
+  - optional: `max` (u64)
+  - unsupported: `comparison_path`, `max_bytes`, `max_chars`
+- `filesystem.diff` / `fs.diff` (read tool)
+  - required: `comparison_path` (string, non-empty)
+  - optional: `max_bytes` (u64), `max_chars` (u64)
+  - unsupported: `pattern`, `max`
+- other capabilities: `tool_args` must be omitted.
+
+Examples:
+
+```json
+{ "tool_args": { "pattern": "needle", "max": 10 } }
+{ "tool_args": { "comparison_path": "right.txt", "max_bytes": 4096, "max_chars": 120 } }
+```
+
+Requests using unsupported fields are rejected before `SubmitJob` execution.
 
 ### Event
 
