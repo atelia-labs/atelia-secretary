@@ -66,6 +66,7 @@ enum Route {
     ListJobEvents { job_id: String },
     CancelJob { job_id: String },
     ListRepositories,
+    RegisterRepository,
     ListRepertoire,
     ListEvents,
     WatchEvents,
@@ -225,6 +226,7 @@ fn route_for_path(path: &str) -> Route {
         "/v1/jobs/submit" => Route::SubmitJob,
         "/v1/jobs/list" => Route::ListJobs,
         "/v1/repositories:list" => Route::ListRepositories,
+        "/v1/repositories:register" => Route::RegisterRepository,
         "/v1/repertoire:list" => Route::ListRepertoire,
         "/v1/events/list" => Route::ListEvents,
         "/v1/events/watch" => Route::WatchEvents,
@@ -462,6 +464,15 @@ struct SubmitJobRequestPayload {
     path_scope: Option<PathScopePayload>,
     requested_capabilities: Option<Vec<String>>,
     idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterRepositoryRequestPayload {
+    display_name: String,
+    root_path: String,
+    allowed_scope: Option<PathScopePayload>,
+    requester: Option<ActorPayload>,
 }
 
 fn requests_filesystem_read(capabilities: &[String]) -> bool {
@@ -997,6 +1008,22 @@ fn parse_list_repositories_payload(
         trust_state: parse_trust_state(payload.trust_state)?,
         page_size: payload.page_size,
         page_token: payload.page_token,
+    })
+}
+
+fn parse_register_repository_payload(
+    payload: RegisterRepositoryRequestPayload,
+) -> Result<rpc::RegisterRepositoryRequest, String> {
+    let allowed_scope = payload
+        .allowed_scope
+        .map(parse_path_scope_payload)
+        .transpose()?;
+
+    Ok(rpc::RegisterRepositoryRequest {
+        display_name: payload.display_name,
+        root_path: payload.root_path,
+        allowed_scope,
+        requester: parse_optional_rpc_actor(payload.requester),
     })
 }
 
@@ -1694,6 +1721,16 @@ fn serialize_list_repositories_response(
             .map(serialize_repository)
             .collect::<Vec<_>>(),
         "next_page_token": response.next_page_token,
+    })
+}
+
+fn serialize_register_repository_response(
+    response: rpc::RegisterRepositoryResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": serialize_protocol_metadata(&response.metadata),
+        "repository": serialize_repository(&response.repository),
+        "policy": response.policy.as_ref().map(serialize_policy_decision),
     })
 }
 
@@ -2493,6 +2530,48 @@ async fn dispatch_list_repositories(state: RpcServerState, request: Request<Body
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::ok(serialize_list_repositories_response(
+                response,
+            ))),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, recoverable) = rpc_error_status(error.code);
+            make_error_response(status, "rpc_error", error.reason, recoverable, next_state)
+        }
+    }
+}
+
+async fn dispatch_register_repository(state: RpcServerState, request: Request<Body>) -> Response {
+    let payload = match body_or_empty_json::<RegisterRepositoryRequestPayload>(request).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return error.into_response(next_state);
+        }
+    };
+
+    let parsed = match parse_register_repository_payload(payload) {
+        Ok(request) => request,
+        Err(reason) => {
+            let rpc_server = state.read().await;
+            let next_state = rpc_next_state(&rpc_server);
+            return make_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                reason,
+                false,
+                next_state,
+            );
+        }
+    };
+
+    let rpc_server = state.read().await;
+    let next_state = rpc_next_state(&rpc_server);
+    match rpc_server.register_repository(parsed) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serialize_register_repository_response(
                 response,
             ))),
         )
@@ -3862,6 +3941,26 @@ async fn dispatch_route(State(state): State<RpcServerState>, request: Request<Bo
                     dispatch_list_repositories(state, request).await
                 }
             }
+            Route::RegisterRepository => {
+                if method != Method::POST {
+                    let mut response = make_error_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method_not_allowed",
+                        format!("{} is not supported on {path}", method),
+                        false,
+                        {
+                            let rpc_server = state.read().await;
+                            rpc_next_state(&rpc_server)
+                        },
+                    );
+                    response
+                        .headers_mut()
+                        .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+                    response
+                } else {
+                    dispatch_register_repository(state, request).await
+                }
+            }
             Route::ListRepertoire => {
                 if method != Method::POST {
                     let mut response = make_error_response(
@@ -4483,6 +4582,7 @@ pub fn build_router(rpc_server: RpcServerState, auth: LocalAuthConfig) -> Router
         .route("/v1/jobs/list", any(dispatch_route))
         .route("/v1/jobs/{*path}", any(dispatch_route))
         .route("/v1/repositories:list", any(dispatch_route))
+        .route("/v1/repositories:register", any(dispatch_route))
         .route("/v1/repertoire:list", any(dispatch_route))
         .route("/v1/events/list", any(dispatch_route))
         .route("/v1/events/watch", any(dispatch_route))
@@ -4862,6 +4962,10 @@ mod tests {
         assert_eq!(
             route_for_path("/v1/repositories:list"),
             Route::ListRepositories
+        );
+        assert_eq!(
+            route_for_path("/v1/repositories:register"),
+            Route::RegisterRepository
         );
         assert_eq!(route_for_path("/v1/repertoire:list"), Route::ListRepertoire);
         assert_eq!(route_for_path("/v1/events/list"), Route::ListEvents);
@@ -5776,6 +5880,57 @@ mod tests {
             .expect_err("blank scope kind should fail");
             assert!(err.contains("path_scope.kind must not be empty"));
         }
+    }
+
+    #[test]
+    fn register_repository_payload_parses_allowed_scope_and_requester() {
+        let parsed = parse_register_repository_payload(RegisterRepositoryRequestPayload {
+            display_name: "register-test-repo".to_string(),
+            root_path: "/tmp/register-test-repo".to_string(),
+            allowed_scope: Some(PathScopePayload {
+                kind: Some("read_only".to_string()),
+                roots: Some(vec![".".to_string()]),
+                include_patterns: None,
+                exclude_patterns: None,
+            }),
+            requester: Some(ActorPayload::Agent {
+                id: "agent:register".to_string(),
+                display_name: Some("Register Agent".to_string()),
+            }),
+        })
+        .expect("register payload parse should succeed");
+
+        assert_eq!(parsed.display_name, "register-test-repo");
+        assert_eq!(parsed.root_path, "/tmp/register-test-repo");
+        assert_eq!(
+            parsed.allowed_scope.as_ref().expect("scope").kind,
+            rpc::RpcPathScopeKind::ReadOnly
+        );
+        assert_eq!(
+            parsed.requester,
+            Some(rpc::RpcActorDto::Agent {
+                id: "agent:register".to_string(),
+                display_name: Some("Register Agent".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn register_repository_payload_rejects_unknown_allowed_scope_kind() {
+        let err = parse_register_repository_payload(RegisterRepositoryRequestPayload {
+            display_name: "register-test-repo".to_string(),
+            root_path: "/tmp/register-test-repo".to_string(),
+            allowed_scope: Some(PathScopePayload {
+                kind: Some("not-a-scope".to_string()),
+                roots: None,
+                include_patterns: None,
+                exclude_patterns: None,
+            }),
+            requester: None,
+        })
+        .expect_err("bad scope kind should fail");
+
+        assert!(err.contains("unknown path_scope.kind"));
     }
 
     #[test]
@@ -7801,6 +7956,67 @@ mod tests {
         let rpc_server = ready_rpc_server();
         let response = send_request(&rpc_server, Method::POST, "/v1/health").await;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn register_repository_router_registers_repository() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("repositories-register-route");
+        let normalized_root = fs::canonicalize(&root)
+            .expect("canonicalize test repository path")
+            .to_string_lossy()
+            .to_string();
+        let response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/repositories:register",
+            serde_json::json!({
+                "display_name": "register-route-repo",
+                "root_path": root.to_string_lossy().to_string(),
+                "allowed_scope": {
+                    "kind": "repository",
+                },
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(
+            payload["data"]["repository"]["display_name"],
+            "register-route-repo"
+        );
+        assert_eq!(
+            payload["data"]["repository"]["root_path"],
+            serde_json::Value::String(normalized_root)
+        );
+        assert_eq!(
+            payload["data"]["repository"]["trust_state"],
+            serde_json::Value::String("trusted".to_string())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn repositories_register_router_rejects_get() {
+        let rpc_server = ready_rpc_server();
+        let response = send_request(&rpc_server, Method::GET, "/v1/repositories:register").await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get(header::ALLOW),
+            Some(&header::HeaderValue::from_static("POST"))
+        );
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["error"]["code"], "method_not_allowed");
     }
 
     #[tokio::test]
