@@ -8545,6 +8545,61 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_route_keys_participate_in_idempotency_replay_and_conflict() {
+        let svc = ready_service();
+        let root = test_repo_dir("submit-job-route-key-idempotency");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "route-key-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let request = SubmitJobRequest {
+            requester: actor(),
+            repository_id: repository.id.clone(),
+            kind: JobKind::Read,
+            goal: None,
+            message: Some("free-form requester message".to_string()),
+            model_route_key: Some("model:fast".to_string()),
+            permission_mode_route_key: Some("permissions:ask".to_string()),
+            resource_scope: None,
+            requested_capabilities: Vec::new(),
+            tool_args: None,
+            idempotency_key: Some("route-key-request".to_string()),
+        };
+
+        let first = svc
+            .submit_job(request.clone())
+            .expect("first submit should succeed");
+        let replayed = svc
+            .submit_job(request.clone())
+            .expect("same routing hints should replay");
+        assert_eq!(replayed.job.id, first.job.id);
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                model_route_key: Some("model:careful".to_string()),
+                ..request.clone()
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Conflict { reason: _ }));
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                permission_mode_route_key: Some("permissions:auto".to_string()),
+                ..request
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Conflict { reason: _ }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn submit_job_rejects_unsupported_requested_capabilities() {
         let svc = ready_service();
         let root = test_repo_dir("unsupported-capabilities");
