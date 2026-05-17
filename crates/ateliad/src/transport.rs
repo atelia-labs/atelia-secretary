@@ -488,13 +488,8 @@ struct RegisterRepositoryRequestPayload {
 
 fn requests_filesystem_path_operation(capabilities: &[String]) -> bool {
     capabilities.iter().any(|capability| {
-        let normalized = capability
-            .trim()
-            .to_ascii_lowercase()
-            .replace(['_', '-', ':', '/'], ".");
-
         matches!(
-            normalized.as_str(),
+            normalize_capability_name(capability).as_str(),
             "filesystem.read"
                 | "filesystem.list"
                 | "filesystem.stat"
@@ -513,13 +508,8 @@ fn requests_filesystem_path_operation(capabilities: &[String]) -> bool {
 
 fn requests_filesystem_concrete_path_operation(capabilities: &[String]) -> bool {
     capabilities.iter().any(|capability| {
-        let normalized = capability
-            .trim()
-            .to_ascii_lowercase()
-            .replace(['_', '-', ':', '/'], ".");
-
         matches!(
-            normalized.as_str(),
+            normalize_capability_name(capability).as_str(),
             "filesystem.read"
                 | "fs.read"
                 | "filesystem.delete"
@@ -528,6 +518,13 @@ fn requests_filesystem_concrete_path_operation(capabilities: &[String]) -> bool 
                 | "fs.diff"
         )
     })
+}
+
+fn normalize_capability_name(capability: &str) -> String {
+    capability
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-', ':', '/'], ".")
 }
 
 #[derive(Debug, Deserialize)]
@@ -1180,6 +1177,12 @@ fn parse_submit_job_payload(
         max_bytes: payload.max_bytes,
         max_chars: payload.max_chars,
     });
+
+    if tool_args.is_some() && !requests_filesystem_path_operation(&requested_capabilities) {
+        return Err(
+            "tool_args are only supported when a filesystem capability is requested".to_string(),
+        );
+    }
 
     if requests_filesystem_path_operation(&requested_capabilities) {
         let roots = path_scope
@@ -6130,6 +6133,65 @@ mod tests {
             err.to_string().contains("unknown field `unexpected`"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn submit_job_payload_accepts_non_empty_search_tool_args() {
+        let parsed = parse_submit_job_payload(SubmitJobRequestPayload {
+            repository_id: RepositoryId::new().as_str().to_string(),
+            requester: ActorPayload::Agent {
+                id: "agent:transport".to_string(),
+                display_name: None,
+            },
+            kind: "read".to_string(),
+            goal: Some("search over HTTP".to_string()),
+            path_scope: Some(PathScopePayload {
+                kind: Some("explicit_paths".to_string()),
+                roots: Some(vec!["notes".to_string()]),
+                include_patterns: None,
+                exclude_patterns: None,
+            }),
+            requested_capabilities: Some(vec!["filesystem.search".to_string()]),
+            tool_args: Some(SubmitJobToolArgsPayload {
+                pattern: Some("needle".to_string()),
+                max: Some(2),
+                comparison_path: None,
+                max_bytes: None,
+                max_chars: None,
+            }),
+            idempotency_key: None,
+        })
+        .expect("filesystem.search tool_args should parse");
+
+        let tool_args = parsed.tool_args.expect("tool_args should be mapped");
+        assert_eq!(tool_args.pattern.as_deref(), Some("needle"));
+        assert_eq!(tool_args.max, Some(2));
+    }
+
+    #[test]
+    fn submit_job_payload_rejects_tool_args_without_filesystem_capability() {
+        let err = parse_submit_job_payload(SubmitJobRequestPayload {
+            repository_id: RepositoryId::new().as_str().to_string(),
+            requester: ActorPayload::Agent {
+                id: "agent:transport".to_string(),
+                display_name: None,
+            },
+            kind: "read".to_string(),
+            goal: Some("echo with tool args".to_string()),
+            path_scope: None,
+            requested_capabilities: Some(vec!["secretary.echo".to_string()]),
+            tool_args: Some(SubmitJobToolArgsPayload {
+                pattern: Some("needle".to_string()),
+                max: None,
+                comparison_path: None,
+                max_bytes: None,
+                max_chars: None,
+            }),
+            idempotency_key: None,
+        })
+        .expect_err("non-filesystem tool_args should be rejected");
+
+        assert!(err.contains("tool_args are only supported"));
     }
 
     #[test]

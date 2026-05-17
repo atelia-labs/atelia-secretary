@@ -18,7 +18,8 @@ agents are package-provided surfaces.
 The current beta repertoire surface projects only the built-in Secretary tools
 that are dispatchable in this beta slice: `fs.delete`, `fs.diff`, `fs.list`,
 `fs.read`, `fs.search`, `fs.stat`, and `secretary.echo`.
-`fs.delete` is R2; the other listed built-ins are R1.
+`secretary.echo` is R0; `fs.delete` is R2; `fs.diff`, `fs.list`, `fs.read`,
+`fs.search`, and `fs.stat` are R1.
 Broader built-ins may exist in future or runtime-backed slices, but they are
 not claimed by `ListRepertoire` until dispatch exists.
 
