@@ -2511,13 +2511,21 @@ fn resolve_submit_job_tool_kind(
                     .resource_scope
                     .as_ref()
                     .ok_or_else(|| ServiceError::InvalidArgument {
-                        reason: format!("{capability} requires a path_scope/resource_scope")
-                            .to_string(),
+                        reason: format!("{capability} requires a path_scope/resource_scope"),
                     })?;
 
             if capability == SECRETARY_FS_DELETE_CAPABILITY && request.kind != JobKind::Mutate {
                 return Err(ServiceError::InvalidArgument {
                     reason: "filesystem.delete requires job kind mutate".to_string(),
+                });
+            }
+
+            if capability == SECRETARY_FS_DELETE_CAPABILITY
+                && resource_scope.kind.trim() == "read_only"
+            {
+                return Err(ServiceError::InvalidArgument {
+                    reason: "filesystem.delete requires resource_scope.kind to be repository, explicit_paths, or path"
+                        .to_string(),
                 });
             }
 
@@ -2541,8 +2549,7 @@ fn resolve_submit_job_tool_kind(
                 return Err(ServiceError::InvalidArgument {
                     reason: format!(
                         "{capability} requires a concrete path_scope/resource_scope root"
-                    )
-                    .to_string(),
+                    ),
                 });
             }
 
@@ -7034,6 +7041,45 @@ mod tests {
         assert!(
             root.join("protected.txt").exists(),
             "read-typed delete should not remove the file"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_delete_with_read_only_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-delete-read-only");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "delete-read-only-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("protected.txt"), "contents\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("delete with read-only scope".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "read_only".to_string(),
+                    value: "protected.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.delete".to_string()],
+                tool_args: None,
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            root.join("protected.txt").exists(),
+            "read-only scoped delete should not remove the file"
         );
         let _ = fs::remove_dir_all(root);
     }
