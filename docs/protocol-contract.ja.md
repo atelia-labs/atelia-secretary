@@ -193,6 +193,8 @@ fallback ではありません。Secretary は request validation と idempotenc
 - severity
 - public message
 - job、policy decision、lock decision、tool invocation、tool result、audit record への ref
+- tool result ref の `content_type`。これにより `tool_result_recorded` event だけで
+  `RenderToolOutput` の `ToolResultRef` を組み立てられます
 
 `WatchEvents` は cursor を受け取り、その cursor に対する replay snapshot を返したあと、新しい ordered event を stream し続けます。reconnect guarantee は process-local です。つまり、同じ daemon process の中なら client は job history を失わずに live surface へ resume できます。daemon restart 後は、durable な最新状態を知るために `GetProjectStatus` を呼び、bounded replay-only の compatibility path が必要なら `ReplayEvents` を使います。
 

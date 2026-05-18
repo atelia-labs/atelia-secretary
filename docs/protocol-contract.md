@@ -236,6 +236,8 @@ Requests using unsupported fields are rejected before `SubmitJob` execution.
 - public message
 - refs to job, policy decision, lock decision, tool invocation, tool result, or
   audit record
+- `content_type` on tool result refs, so a `tool_result_recorded` event carries
+  enough information to construct a `RenderToolOutput` `ToolResultRef`
 
 `WatchEvents` accepts a cursor, returns a replay snapshot for that cursor, and
 then keeps streaming new ordered events. The reconnect guarantee is

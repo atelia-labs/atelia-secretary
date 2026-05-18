@@ -2386,6 +2386,7 @@ fn serialize_event_refs(refs: &rpc::RpcEventRefs) -> serde_json::Value {
         "lock_decision_id": refs.lock_decision_id,
         "tool_invocation_id": refs.tool_invocation_id,
         "tool_result_id": refs.tool_result_id,
+        "content_type": refs.content_type,
         "audit_ref": refs.audit_ref,
     })
 }

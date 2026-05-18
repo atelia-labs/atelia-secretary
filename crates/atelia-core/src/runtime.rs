@@ -1252,6 +1252,7 @@ fn refs_for_result(
 ) -> EventRefs {
     EventRefs {
         tool_result_id: Some(result.id.clone()),
+        content_type: Some("application/json".to_string()),
         ..refs_for_invocation(job, policy_decision, invocation)
     }
 }

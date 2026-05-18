@@ -567,6 +567,7 @@ pub struct EventRefs {
     pub lock_decision_id: Option<LockDecisionId>,
     pub tool_invocation_id: Option<ToolInvocationId>,
     pub tool_result_id: Option<ToolResultId>,
+    pub content_type: Option<String>,
     pub audit_record_id: Option<AuditRecordId>,
     pub output_refs: Vec<OutputRef>,
     pub artifact_refs: Vec<ArtifactRef>,
