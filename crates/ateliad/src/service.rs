@@ -1321,7 +1321,10 @@ impl SecretaryService {
                     | SubmitJobToolKind::FsDiff
                     | SubmitJobToolKind::FsMove
             ) {
-                if matches!(tool_kind, SubmitJobToolKind::FsWrite) {
+                if matches!(
+                    tool_kind,
+                    SubmitJobToolKind::FsWrite | SubmitJobToolKind::FsPatch
+                ) {
                     validate_filesystem_mutation_path_scope(&repository, &resource_scope)?;
                 } else {
                     validate_filesystem_path_scope(
@@ -1332,7 +1335,6 @@ impl SecretaryService {
                             SubmitJobToolKind::FsRead
                                 | SubmitJobToolKind::FsDelete
                                 | SubmitJobToolKind::FsDiff
-                                | SubmitJobToolKind::FsPatch
                                 | SubmitJobToolKind::FsMove
                         ),
                     )?;
@@ -2901,6 +2903,32 @@ fn resolve_filesystem_mutation_path(
     } else {
         canonical_root.join(relative_path)
     };
+
+    let mut ancestor = target.parent();
+    while let Some(path) = ancestor {
+        if path == canonical_root {
+            break;
+        }
+        if path.starts_with(&canonical_root) {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        return Err(PathResolutionError::SymlinkRejected {
+                            requested: path.to_path_buf(),
+                        });
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(PathResolutionError::MetadataFailure {
+                        requested: path.to_path_buf(),
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        ancestor = path.parent();
+    }
 
     match fs::symlink_metadata(&target) {
         Ok(metadata) => {
@@ -8651,6 +8679,176 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn submit_job_rejects_filesystem_patch_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-patch-symlink-target");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "patch-symlink-target-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("note.txt"), "alpha\nbeta\n").unwrap();
+        symlink(root.join("note.txt"), root.join("link.txt")).unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("patch symlink target".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "link.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.patch".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("beta".to_string()),
+                    max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: Some("delta".to_string()),
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("file should stay unchanged"),
+            "alpha\nbeta\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_job_rejects_filesystem_write_through_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-write-symlink-parent");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        symlink(root.join("docs"), root.join("linkdir")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "write-symlink-parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("write through symlink parent".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "linkdir/new.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: Some("blocked\n".to_string()),
+                    destination_path: None,
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            !root.join("docs").join("new.txt").exists(),
+            "rejected write should not create the file through the symlink"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_job_rejects_filesystem_patch_through_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-patch-symlink-parent");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs").join("note.txt"), "alpha\nbeta\n").unwrap();
+        symlink(root.join("docs"), root.join("linkdir")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "patch-symlink-parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("patch through symlink parent".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "linkdir/note.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.patch".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("beta".to_string()),
+                    max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: Some("delta".to_string()),
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert_eq!(
+            fs::read_to_string(root.join("docs").join("note.txt"))
+                .expect("file should stay unchanged"),
+            "alpha\nbeta\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn submit_job_dispatches_filesystem_move_tool() {
         let svc = ready_service();
@@ -8782,6 +8980,67 @@ mod tests {
             "payload\n"
         );
         assert!(receipt.tool_result.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_job_rejects_filesystem_move_to_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-move-symlink-parent");
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join("from.txt"), "payload\n").unwrap();
+        symlink(root.join("archive"), root.join("linkdir")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "move-symlink-parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("move to symlink parent".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "from.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.move".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: None,
+                    destination_path: Some("linkdir/from.txt".to_string()),
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            root.join("from.txt").exists(),
+            "rejected move should keep source file"
+        );
+        assert!(
+            !root.join("archive").join("from.txt").exists(),
+            "rejected move should not create the destination through the symlink"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -3427,6 +3427,32 @@ fn resolve_mutation_target(
         canonical_root.join(relative_path)
     };
 
+    let mut ancestor = target.parent();
+    while let Some(path) = ancestor {
+        if path == canonical_root {
+            break;
+        }
+        if path.starts_with(&canonical_root) {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        return Err(PathResolutionError::SymlinkRejected {
+                            requested: path.to_path_buf(),
+                        });
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(PathResolutionError::MetadataFailure {
+                        requested: path.to_path_buf(),
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        ancestor = path.parent();
+    }
+
     match fs::symlink_metadata(&target) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
@@ -5678,6 +5704,47 @@ mod tests {
 
         env.cleanup();
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_target_rejects_symlinked_parent_for_missing_leaf() {
+        let env = TestEnv::new("mutation-symlink-parent-missing-leaf");
+        env.create_dir("docs");
+        env.create_symlink("linkdir", &env.root.join("docs"));
+
+        let result = resolve_mutation_target(&env.root, Path::new("linkdir/new.txt"));
+
+        match result.unwrap_err() {
+            PathResolutionError::SymlinkRejected { requested } => {
+                assert_eq!(requested, env.root.join("linkdir"));
+            }
+            other => panic!("expected SymlinkRejected, got {:?}", other),
+        }
+        assert!(!env.root.join("docs").join("new.txt").exists());
+        env.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_target_rejects_symlinked_parent_for_existing_target() {
+        let env = TestEnv::new("mutation-symlink-parent-existing-target");
+        env.create_file("docs/note.txt", "inside");
+        env.create_symlink("linkdir", &env.root.join("docs"));
+
+        let result = resolve_mutation_target(&env.root, Path::new("linkdir/note.txt"));
+
+        match result.unwrap_err() {
+            PathResolutionError::SymlinkRejected { requested } => {
+                assert_eq!(requested, env.root.join("linkdir"));
+            }
+            other => panic!("expected SymlinkRejected, got {:?}", other),
+        }
+        assert_eq!(
+            "inside",
+            fs::read_to_string(env.root.join("docs").join("note.txt")).unwrap()
+        );
+        env.cleanup();
     }
 
     // -- FsListTool tests --
