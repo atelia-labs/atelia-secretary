@@ -1260,6 +1260,7 @@ impl From<atelia_core::EventRefs> for RpcEventRefs {
             lock_decision_id: refs.lock_decision_id.map(|id| id.as_str().to_string()),
             tool_invocation_id: refs.tool_invocation_id.map(|id| id.as_str().to_string()),
             tool_result_id: refs.tool_result_id.map(|id| id.as_str().to_string()),
+            content_type: refs.content_type,
             audit_ref: refs.audit_record_id.map(|id| id.as_str().to_string()),
         }
     }
@@ -1704,6 +1705,7 @@ pub struct RpcEventRefs {
     pub lock_decision_id: Option<String>,
     pub tool_invocation_id: Option<String>,
     pub tool_result_id: Option<String>,
+    pub content_type: Option<String>,
     pub audit_ref: Option<String>,
 }
 
@@ -5788,6 +5790,10 @@ mod tests {
             .as_deref()
             .expect("tool result id should be present")
             .to_string();
+        assert_eq!(
+            tool_result_event.refs.content_type.as_deref(),
+            Some("application/json")
+        );
 
         let rendered = server
             .service_mut()
