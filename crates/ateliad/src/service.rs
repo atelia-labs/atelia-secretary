@@ -8,24 +8,25 @@ use atelia_core::policy::{REASON_REPOSITORY_BLOCKED, SCOPE_KIND_REPOSITORY, SCOP
 use atelia_core::{
     canonicalize_job_requested_capability, canonicalize_within_scope,
     render_tool_result_with_policy, Actor, ApplyBlocklistRequest, ApplyBlocklistResponse,
-    AuditRecordId, BlockKey, BlocklistEntry, CancelJobReceipt, DefaultPolicyEngine,
+    AuditRecordId, BlockKey, BlocklistEntry, CancelJobReceipt, CanonicalPath, DefaultPolicyEngine,
     DisableExtensionRequest, DisableExtensionResponse, EchoTool, EnableExtensionRequest,
     EnableExtensionResponse, EventCursor, EventPage, EventQuery, ExtensionBlocklistMatch,
     ExtensionBoundary, ExtensionInstallStatus, ExtensionManifest, ExtensionPublication,
     ExtensionRegistry, ExtensionRegistryAuditKind, ExtensionRegistryAuditProvenance,
     ExtensionRegistryAuditRecord, ExtensionRegistryAuditRecordRef, ExtensionRegistryService,
     ExtensionRegistrySnapshot, ExtensionServices, ExtensionSourceSnapshot, ExtensionStatusRequest,
-    ExtensionStatusResponse, FsDeleteTool, FsDiffTool, FsListTool, FsReadTool, FsSearchTool,
-    FsStatTool, InMemoryStore, InMemoryToolOutputSettingsService, InstallExtensionRequest,
-    InstallExtensionResponse, JobEvent, JobId, JobKind, JobLifecycleService, JobPage, JobQuery,
-    JobRecord, JobStatus, LedgerTimestamp, ListBlocklistRequest, ListBlocklistResponse,
-    ListExtensionsRequest, ListExtensionsResponse, ManifestValidationPolicy, OutputFormat,
-    PathScope, PolicyDecision, PolicyEngine, PolicyInput, PolicyOutcome, RegistryError,
-    RemoveExtensionRequest, RemoveExtensionResponse, RenderedToolOutput, RepositoryId,
-    RepositoryRecord, RepositoryTrustState, ResourceScope, RollbackExtensionRequest,
-    RollbackExtensionResponse, RollbackSnapshot, RuntimeError, RuntimeJobReceipt,
-    RuntimeJobRequest, SecretaryStore, StoreError, SubmitJobIdempotencyRecord, ToolInvocationId,
-    ToolOutputDefaults, ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
+    ExtensionStatusResponse, FsDeleteTool, FsDiffTool, FsListTool, FsMoveTool, FsPatchTool,
+    FsReadTool, FsSearchTool, FsStatTool, FsWriteTool, InMemoryStore,
+    InMemoryToolOutputSettingsService, InstallExtensionRequest, InstallExtensionResponse, JobEvent,
+    JobId, JobKind, JobLifecycleService, JobPage, JobQuery, JobRecord, JobStatus, LedgerTimestamp,
+    ListBlocklistRequest, ListBlocklistResponse, ListExtensionsRequest, ListExtensionsResponse,
+    ManifestValidationPolicy, OutputFormat, PathResolutionError, PathScope, PolicyDecision,
+    PolicyEngine, PolicyInput, PolicyOutcome, RegistryError, RemoveExtensionRequest,
+    RemoveExtensionResponse, RenderedToolOutput, RepositoryId, RepositoryRecord,
+    RepositoryTrustState, ResourceScope, RollbackExtensionRequest, RollbackExtensionResponse,
+    RollbackSnapshot, RuntimeError, RuntimeJobReceipt, RuntimeJobRequest, SecretaryStore,
+    StoreError, SubmitJobIdempotencyRecord, ToolInvocationId, ToolOutputDefaults,
+    ToolOutputOverrides, ToolOutputSettingsChange, ToolOutputSettingsError,
     ToolOutputSettingsScope, ToolResultId, TruncationMetadata, UpdateExtensionPublicationRequest,
     UpdateExtensionPublicationResponse, UpdateExtensionRegistrySubmissionRequest,
     UpdateExtensionRegistrySubmissionResponse, UpdateExtensionRequest, UpdateExtensionResponse,
@@ -33,6 +34,8 @@ use atelia_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -66,6 +69,17 @@ const SECRETARY_FS_DELETE_TOOL_ID: &str = "fs.delete";
 const SECRETARY_FS_DELETE_TOOL_NAME: &str = "Filesystem Delete";
 const SECRETARY_FS_DELETE_TOOL_DESCRIPTION: &str =
     "Delete one file from an allowed repository path.";
+const SECRETARY_FS_WRITE_TOOL_ID: &str = "fs.write";
+const SECRETARY_FS_WRITE_TOOL_NAME: &str = "Filesystem Write";
+const SECRETARY_FS_WRITE_TOOL_DESCRIPTION: &str =
+    "Write UTF-8 content to an allowed repository path.";
+const SECRETARY_FS_PATCH_TOOL_ID: &str = "fs.patch";
+const SECRETARY_FS_PATCH_TOOL_NAME: &str = "Filesystem Patch";
+const SECRETARY_FS_PATCH_TOOL_DESCRIPTION: &str =
+    "Apply an exact-match text replacement to an allowed repository file.";
+const SECRETARY_FS_MOVE_TOOL_ID: &str = "fs.move";
+const SECRETARY_FS_MOVE_TOOL_NAME: &str = "Filesystem Move";
+const SECRETARY_FS_MOVE_TOOL_DESCRIPTION: &str = "Move a file within an allowed repository path.";
 const SECRETARY_FS_LIST_TOOL_ID: &str = "fs.list";
 const SECRETARY_FS_LIST_TOOL_NAME: &str = "Filesystem List";
 const SECRETARY_FS_LIST_TOOL_DESCRIPTION: &str = "List directory entries within an allowed scope.";
@@ -91,6 +105,9 @@ const SECRETARY_FS_READ_CAPABILITY: &str = "filesystem.read";
 const SECRETARY_FS_LIST_CAPABILITY: &str = "filesystem.list";
 const SECRETARY_FS_STAT_CAPABILITY: &str = "filesystem.stat";
 const SECRETARY_FS_DELETE_CAPABILITY: &str = "filesystem.delete";
+const SECRETARY_FS_WRITE_CAPABILITY: &str = "filesystem.write";
+const SECRETARY_FS_PATCH_CAPABILITY: &str = "filesystem.patch";
+const SECRETARY_FS_MOVE_CAPABILITY: &str = "filesystem.move";
 const SECRETARY_FS_SEARCH_CAPABILITY: &str = "filesystem.search";
 const SECRETARY_FS_DIFF_CAPABILITY: &str = "filesystem.diff";
 const SECRETARY_CAPABILITY_DISCOVERY: &str = "capability.discovery";
@@ -399,8 +416,12 @@ pub struct SubmitJobRequest {
 pub struct SubmitJobToolArgs {
     pub pattern: Option<String>,
     pub max: Option<u64>,
+    pub content: Option<String>,
     pub comparison_path: Option<String>,
     pub max_bytes: Option<u64>,
+    pub destination_path: Option<String>,
+    pub allow_overwrite: Option<bool>,
+    pub replacement_text: Option<String>,
     pub max_chars: Option<u64>,
 }
 
@@ -408,6 +429,26 @@ pub struct SubmitJobToolArgs {
 struct SubmitJobToolArgsSearch {
     pattern: String,
     max_results: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct SubmitJobToolArgsWrite {
+    content: String,
+    allow_overwrite: bool,
+    max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct SubmitJobToolArgsPatch {
+    find_text: String,
+    replacement_text: String,
+    max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct SubmitJobToolArgsMove {
+    destination_path: String,
+    allow_overwrite: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -420,6 +461,9 @@ struct SubmitJobToolArgsDiff {
 #[derive(Debug, Clone)]
 enum SubmitJobToolArgsSpec {
     Search(SubmitJobToolArgsSearch),
+    Write(SubmitJobToolArgsWrite),
+    Patch(SubmitJobToolArgsPatch),
+    Move(SubmitJobToolArgsMove),
     Diff(SubmitJobToolArgsDiff),
     None,
 }
@@ -431,6 +475,9 @@ enum SubmitJobToolKind {
     FsList,
     FsStat,
     FsDelete,
+    FsWrite,
+    FsPatch,
+    FsMove,
     FsSearch,
     FsDiff,
 }
@@ -443,6 +490,9 @@ impl SubmitJobToolKind {
             Self::FsList => SECRETARY_FS_LIST_TOOL_ID,
             Self::FsStat => SECRETARY_FS_STAT_TOOL_ID,
             Self::FsDelete => SECRETARY_FS_DELETE_TOOL_ID,
+            Self::FsWrite => SECRETARY_FS_WRITE_TOOL_ID,
+            Self::FsPatch => SECRETARY_FS_PATCH_TOOL_ID,
+            Self::FsMove => SECRETARY_FS_MOVE_TOOL_ID,
             Self::FsSearch => SECRETARY_FS_SEARCH_TOOL_ID,
             Self::FsDiff => SECRETARY_FS_DIFF_TOOL_ID,
         }
@@ -1265,26 +1315,50 @@ impl SecretaryService {
                     | SubmitJobToolKind::FsList
                     | SubmitJobToolKind::FsStat
                     | SubmitJobToolKind::FsDelete
+                    | SubmitJobToolKind::FsWrite
+                    | SubmitJobToolKind::FsPatch
                     | SubmitJobToolKind::FsSearch
                     | SubmitJobToolKind::FsDiff
+                    | SubmitJobToolKind::FsMove
             ) {
-                validate_filesystem_path_scope(
-                    &repository,
-                    &resource_scope,
-                    matches!(
-                        tool_kind,
-                        SubmitJobToolKind::FsRead
-                            | SubmitJobToolKind::FsDelete
-                            | SubmitJobToolKind::FsDiff
-                    ),
-                )?;
+                if matches!(
+                    tool_kind,
+                    SubmitJobToolKind::FsWrite
+                        | SubmitJobToolKind::FsPatch
+                        | SubmitJobToolKind::FsMove
+                ) {
+                    validate_filesystem_mutation_path_scope(&repository, &resource_scope)?;
+                } else {
+                    validate_filesystem_path_scope(
+                        &repository,
+                        &resource_scope,
+                        matches!(
+                            tool_kind,
+                            SubmitJobToolKind::FsRead
+                                | SubmitJobToolKind::FsDelete
+                                | SubmitJobToolKind::FsDiff
+                        ),
+                    )?;
+                }
             }
-            if let SubmitJobToolArgsSpec::Diff(diff) = &resolved_tool_args {
-                validate_secondary_filesystem_path_scope(
-                    &repository,
-                    &resource_scope,
-                    &diff.comparison_path,
-                )?;
+            match &resolved_tool_args {
+                SubmitJobToolArgsSpec::Diff(diff) => {
+                    validate_secondary_filesystem_path_scope(
+                        &repository,
+                        &resource_scope,
+                        &diff.comparison_path,
+                        "comparison",
+                    )?;
+                }
+                SubmitJobToolArgsSpec::Move(move_tool) => {
+                    validate_secondary_filesystem_mutation_path_scope(
+                        &repository,
+                        &resource_scope,
+                        &move_tool.destination_path,
+                        "destination",
+                    )?;
+                }
+                _ => {}
             }
             Ok(())
         };
@@ -1418,6 +1492,79 @@ impl SecretaryService {
                             )),
                         )?
                     }
+                    SubmitJobToolKind::FsWrite => {
+                        let write = match &resolved_tool_args {
+                            SubmitJobToolArgsSpec::Write(args) => args,
+                            _ => {
+                                return Err(ServiceError::InvalidArgument {
+                                    reason: "internal tool_args resolution lost for fs.write"
+                                        .to_string(),
+                                });
+                            }
+                        };
+                        let mut tool = FsWriteTool::new(&repository.root_path, &write.content)
+                            .with_allow_overwrite(write.allow_overwrite);
+                        if let Some(max_bytes) = write.max_bytes {
+                            tool = tool.with_max_bytes(max_bytes);
+                        }
+                        self.lifecycle.runtime().run_tool_job_with_finalizer(
+                            runtime_request.clone(),
+                            &tool,
+                            Some(make_submit_job_finalizer(
+                                idempotency_key.to_string(),
+                                request_signature.clone(),
+                            )),
+                        )?
+                    }
+                    SubmitJobToolKind::FsPatch => {
+                        let patch = match &resolved_tool_args {
+                            SubmitJobToolArgsSpec::Patch(args) => args,
+                            _ => {
+                                return Err(ServiceError::InvalidArgument {
+                                    reason: "internal tool_args resolution lost for fs.patch"
+                                        .to_string(),
+                                });
+                            }
+                        };
+                        let mut tool = FsPatchTool::new(
+                            &repository.root_path,
+                            &patch.find_text,
+                            &patch.replacement_text,
+                        );
+                        if let Some(max_bytes) = patch.max_bytes {
+                            tool = tool.with_max_bytes(max_bytes);
+                        }
+                        self.lifecycle.runtime().run_tool_job_with_finalizer(
+                            runtime_request.clone(),
+                            &tool,
+                            Some(make_submit_job_finalizer(
+                                idempotency_key.to_string(),
+                                request_signature.clone(),
+                            )),
+                        )?
+                    }
+                    SubmitJobToolKind::FsMove => {
+                        let move_tool = match &resolved_tool_args {
+                            SubmitJobToolArgsSpec::Move(args) => args,
+                            _ => {
+                                return Err(ServiceError::InvalidArgument {
+                                    reason: "internal tool_args resolution lost for fs.move"
+                                        .to_string(),
+                                });
+                            }
+                        };
+                        let tool =
+                            FsMoveTool::new(&repository.root_path, &move_tool.destination_path)
+                                .with_allow_overwrite(move_tool.allow_overwrite);
+                        self.lifecycle.runtime().run_tool_job_with_finalizer(
+                            runtime_request.clone(),
+                            &tool,
+                            Some(make_submit_job_finalizer(
+                                idempotency_key.to_string(),
+                                request_signature.clone(),
+                            )),
+                        )?
+                    }
                     SubmitJobToolKind::FsSearch => {
                         let search = match &resolved_tool_args {
                             SubmitJobToolArgsSpec::Search(args) => args,
@@ -1428,7 +1575,8 @@ impl SecretaryService {
                                 });
                             }
                         };
-                        let allowed_roots = allowed_search_roots_for_repository(&repository)?;
+                        let allowed_roots =
+                            allowed_search_roots_for_request(&repository, &resource_scope)?;
                         let mut tool = FsSearchTool::new(&repository.root_path, &search.pattern)
                             .with_allowed_roots(&allowed_roots);
                         if let Some(max) = search.max_results {
@@ -1555,6 +1703,75 @@ impl SecretaryService {
                         >,
                     )?
                 }
+                SubmitJobToolKind::FsWrite => {
+                    let write = match resolved_tool_args {
+                        SubmitJobToolArgsSpec::Write(ref args) => args,
+                        _ => {
+                            return Err(ServiceError::InvalidArgument {
+                                reason: "internal tool_args resolution lost for fs.write"
+                                    .to_string(),
+                            })
+                        }
+                    };
+                    let mut tool = FsWriteTool::new(&repository.root_path, &write.content)
+                        .with_allow_overwrite(write.allow_overwrite);
+                    if let Some(max_bytes) = write.max_bytes {
+                        tool = tool.with_max_bytes(max_bytes);
+                    }
+                    self.lifecycle.runtime().run_tool_job_with_finalizer(
+                        runtime_request,
+                        &tool,
+                        None::<
+                            fn(&RuntimeJobReceipt) -> Option<(String, SubmitJobIdempotencyRecord)>,
+                        >,
+                    )?
+                }
+                SubmitJobToolKind::FsPatch => {
+                    let patch = match resolved_tool_args {
+                        SubmitJobToolArgsSpec::Patch(ref args) => args,
+                        _ => {
+                            return Err(ServiceError::InvalidArgument {
+                                reason: "internal tool_args resolution lost for fs.patch"
+                                    .to_string(),
+                            })
+                        }
+                    };
+                    let mut tool = FsPatchTool::new(
+                        &repository.root_path,
+                        &patch.find_text,
+                        &patch.replacement_text,
+                    );
+                    if let Some(max_bytes) = patch.max_bytes {
+                        tool = tool.with_max_bytes(max_bytes);
+                    }
+                    self.lifecycle.runtime().run_tool_job_with_finalizer(
+                        runtime_request,
+                        &tool,
+                        None::<
+                            fn(&RuntimeJobReceipt) -> Option<(String, SubmitJobIdempotencyRecord)>,
+                        >,
+                    )?
+                }
+                SubmitJobToolKind::FsMove => {
+                    let move_tool = match resolved_tool_args {
+                        SubmitJobToolArgsSpec::Move(ref args) => args,
+                        _ => {
+                            return Err(ServiceError::InvalidArgument {
+                                reason: "internal tool_args resolution lost for fs.move"
+                                    .to_string(),
+                            })
+                        }
+                    };
+                    let tool = FsMoveTool::new(&repository.root_path, &move_tool.destination_path)
+                        .with_allow_overwrite(move_tool.allow_overwrite);
+                    self.lifecycle.runtime().run_tool_job_with_finalizer(
+                        runtime_request,
+                        &tool,
+                        None::<
+                            fn(&RuntimeJobReceipt) -> Option<(String, SubmitJobIdempotencyRecord)>,
+                        >,
+                    )?
+                }
                 SubmitJobToolKind::FsSearch => {
                     let search = match resolved_tool_args {
                         SubmitJobToolArgsSpec::Search(ref args) => args,
@@ -1565,7 +1782,8 @@ impl SecretaryService {
                             })
                         }
                     };
-                    let allowed_roots = allowed_search_roots_for_repository(&repository)?;
+                    let allowed_roots =
+                        allowed_search_roots_for_request(&repository, &resource_scope)?;
                     let mut tool = FsSearchTool::new(&repository.root_path, &search.pattern)
                         .with_allowed_roots(&allowed_roots);
                     if let Some(max) = search.max_results {
@@ -2301,7 +2519,25 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
             SECRETARY_FS_DELETE_TOOL_NAME,
             SECRETARY_FS_DELETE_TOOL_DESCRIPTION,
             "R2",
-            "not idempotent",
+            "non_idempotent",
+            false,
+            0,
+        ),
+        entry(
+            SECRETARY_FS_WRITE_TOOL_ID,
+            SECRETARY_FS_WRITE_TOOL_NAME,
+            SECRETARY_FS_WRITE_TOOL_DESCRIPTION,
+            "R2",
+            "non_idempotent",
+            false,
+            0,
+        ),
+        entry(
+            SECRETARY_FS_PATCH_TOOL_ID,
+            SECRETARY_FS_PATCH_TOOL_NAME,
+            SECRETARY_FS_PATCH_TOOL_DESCRIPTION,
+            "R2",
+            "non_idempotent",
             false,
             0,
         ),
@@ -2329,6 +2565,15 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
             SECRETARY_FS_LIST_TOOL_DESCRIPTION,
             "R1",
             "idempotent",
+            false,
+            0,
+        ),
+        entry(
+            SECRETARY_FS_MOVE_TOOL_ID,
+            SECRETARY_FS_MOVE_TOOL_NAME,
+            SECRETARY_FS_MOVE_TOOL_DESCRIPTION,
+            "R2",
+            "non_idempotent",
             false,
             0,
         ),
@@ -2503,6 +2748,12 @@ fn canonicalize_submit_requested_capability(name: &str) -> Option<&'static str> 
             "fs.stat" => Some(SECRETARY_FS_STAT_CAPABILITY),
             SECRETARY_FS_DELETE_CAPABILITY => Some(SECRETARY_FS_DELETE_CAPABILITY),
             "fs.delete" => Some(SECRETARY_FS_DELETE_CAPABILITY),
+            SECRETARY_FS_WRITE_CAPABILITY => Some(SECRETARY_FS_WRITE_CAPABILITY),
+            "fs.write" => Some(SECRETARY_FS_WRITE_CAPABILITY),
+            SECRETARY_FS_PATCH_CAPABILITY => Some(SECRETARY_FS_PATCH_CAPABILITY),
+            "fs.patch" => Some(SECRETARY_FS_PATCH_CAPABILITY),
+            SECRETARY_FS_MOVE_CAPABILITY => Some(SECRETARY_FS_MOVE_CAPABILITY),
+            "fs.move" => Some(SECRETARY_FS_MOVE_CAPABILITY),
             SECRETARY_FS_SEARCH_CAPABILITY => Some(SECRETARY_FS_SEARCH_CAPABILITY),
             "fs.search" => Some(SECRETARY_FS_SEARCH_CAPABILITY),
             SECRETARY_FS_DIFF_CAPABILITY => Some(SECRETARY_FS_DIFF_CAPABILITY),
@@ -2525,6 +2776,9 @@ fn resolve_submit_job_tool_kind(
                     | SECRETARY_FS_LIST_CAPABILITY
                     | SECRETARY_FS_STAT_CAPABILITY
                     | SECRETARY_FS_DELETE_CAPABILITY
+                    | SECRETARY_FS_WRITE_CAPABILITY
+                    | SECRETARY_FS_PATCH_CAPABILITY
+                    | SECRETARY_FS_MOVE_CAPABILITY
                     | SECRETARY_FS_SEARCH_CAPABILITY
                     | SECRETARY_FS_DIFF_CAPABILITY
             ) =>
@@ -2537,17 +2791,30 @@ fn resolve_submit_job_tool_kind(
                         reason: format!("{capability} requires a path_scope/resource_scope"),
                     })?;
 
-            if capability == SECRETARY_FS_DELETE_CAPABILITY && request.kind != JobKind::Mutate {
+            if matches!(
+                capability.as_str(),
+                SECRETARY_FS_DELETE_CAPABILITY
+                    | SECRETARY_FS_WRITE_CAPABILITY
+                    | SECRETARY_FS_PATCH_CAPABILITY
+                    | SECRETARY_FS_MOVE_CAPABILITY
+            ) && request.kind != JobKind::Mutate
+            {
                 return Err(ServiceError::InvalidArgument {
-                    reason: "filesystem.delete requires job kind mutate".to_string(),
+                    reason: "filesystem mutate operations require job kind mutate".to_string(),
                 });
             }
 
-            if capability == SECRETARY_FS_DELETE_CAPABILITY
-                && resource_scope.kind.trim() == "read_only"
+            if matches!(
+                capability.as_str(),
+                SECRETARY_FS_DELETE_CAPABILITY
+                    | SECRETARY_FS_WRITE_CAPABILITY
+                    | SECRETARY_FS_PATCH_CAPABILITY
+                    | SECRETARY_FS_MOVE_CAPABILITY
+            ) && resource_scope.kind.trim() == "read_only"
             {
                 return Err(ServiceError::InvalidArgument {
-                    reason: "filesystem.delete requires resource_scope.kind to be repository, explicit_paths, or path"
+                    reason:
+                        "filesystem mutate operations require resource_scope.kind to be repository, explicit_paths, or path"
                         .to_string(),
                 });
             }
@@ -2567,6 +2834,9 @@ fn resolve_submit_job_tool_kind(
                 SECRETARY_FS_LIST_CAPABILITY => Ok(SubmitJobToolKind::FsList),
                 SECRETARY_FS_STAT_CAPABILITY => Ok(SubmitJobToolKind::FsStat),
                 SECRETARY_FS_DELETE_CAPABILITY => Ok(SubmitJobToolKind::FsDelete),
+                SECRETARY_FS_WRITE_CAPABILITY => Ok(SubmitJobToolKind::FsWrite),
+                SECRETARY_FS_PATCH_CAPABILITY => Ok(SubmitJobToolKind::FsPatch),
+                SECRETARY_FS_MOVE_CAPABILITY => Ok(SubmitJobToolKind::FsMove),
                 SECRETARY_FS_SEARCH_CAPABILITY => Ok(SubmitJobToolKind::FsSearch),
                 SECRETARY_FS_DIFF_CAPABILITY => Ok(SubmitJobToolKind::FsDiff),
                 _ => Ok(SubmitJobToolKind::FsRead),
@@ -2621,6 +2891,150 @@ fn validate_filesystem_path_scope(
     }
 }
 
+fn resolve_filesystem_mutation_path(
+    repository_root: &Path,
+    relative_path: &Path,
+) -> Result<CanonicalPath, PathResolutionError> {
+    let canonical_root = repository_root
+        .canonicalize()
+        .map_err(|_| PathResolutionError::RootNotFound)?;
+
+    let target = if relative_path.is_absolute() {
+        relative_path.to_path_buf()
+    } else {
+        canonical_root.join(relative_path)
+    };
+
+    let mut ancestor = target.parent();
+    while let Some(path) = ancestor {
+        if path == canonical_root {
+            break;
+        }
+        if path.starts_with(&canonical_root) {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        return Err(PathResolutionError::SymlinkRejected {
+                            requested: path.to_path_buf(),
+                        });
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(PathResolutionError::MetadataFailure {
+                        requested: path.to_path_buf(),
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        ancestor = path.parent();
+    }
+
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(PathResolutionError::SymlinkRejected {
+                    requested: target.clone(),
+                });
+            }
+
+            let canonical_target =
+                target
+                    .canonicalize()
+                    .map_err(|_| PathResolutionError::TargetNotFound {
+                        requested: target.clone(),
+                    })?;
+
+            if !canonical_target.starts_with(&canonical_root) {
+                return Err(PathResolutionError::OutsideRepositoryScope {
+                    resolved: canonical_target,
+                    root: canonical_root,
+                });
+            }
+
+            return Ok(CanonicalPath {
+                canonical: canonical_target,
+                root: canonical_root,
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(PathResolutionError::MetadataFailure {
+                requested: target.clone(),
+                reason: error.to_string(),
+            });
+        }
+    }
+
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| PathResolutionError::TargetNotFound {
+            requested: target.clone(),
+        })?;
+    if file_name == "." || file_name == ".." {
+        return Err(PathResolutionError::TargetNotFound {
+            requested: target.clone(),
+        });
+    }
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| PathResolutionError::TargetNotFound {
+            requested: target.clone(),
+        })?;
+    let canonical_parent = canonicalize_within_scope(repository_root, parent)?;
+    let canonical_target = canonical_parent.canonical.join(file_name);
+
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err(PathResolutionError::OutsideRepositoryScope {
+            resolved: canonical_target,
+            root: canonical_root,
+        });
+    }
+
+    Ok(CanonicalPath {
+        canonical: canonical_target,
+        root: canonical_root,
+    })
+}
+
+fn validate_filesystem_mutation_path_scope(
+    repository: &RepositoryRecord,
+    resource_scope: &ResourceScope,
+) -> ServiceResult<()> {
+    let root = Path::new(&repository.root_path);
+    let requested = resolve_filesystem_mutation_path(root, Path::new(&resource_scope.value))
+        .map_err(|err| ServiceError::InvalidArgument {
+            reason: format!("filesystem path is outside repository scope: {err}"),
+        })?;
+
+    if requested.canonical == requested.root {
+        return Err(ServiceError::InvalidArgument {
+            reason: "filesystem operation requires a concrete path_scope/resource_scope path"
+                .to_string(),
+        });
+    }
+
+    let allowed = repository
+        .allowed_path_scope
+        .allowed_paths
+        .iter()
+        .any(|allowed_path| {
+            canonicalize_within_scope(root, Path::new(allowed_path))
+                .map(|allowed| requested.canonical.starts_with(&allowed.canonical))
+                .unwrap_or(false)
+        });
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(ServiceError::InvalidArgument {
+            reason: "filesystem operation path is outside allowed_path_scope".to_string(),
+        })
+    }
+}
+
 fn allowed_search_roots_for_repository(
     repository: &RepositoryRecord,
 ) -> ServiceResult<Vec<PathBuf>> {
@@ -2648,21 +3062,58 @@ fn allowed_search_roots_for_repository(
     Ok(allowed_roots)
 }
 
+fn allowed_search_roots_for_request(
+    repository: &RepositoryRecord,
+    resource_scope: &ResourceScope,
+) -> ServiceResult<Vec<PathBuf>> {
+    let root = Path::new(&repository.root_path);
+    let requested =
+        canonicalize_within_scope(root, Path::new(&resource_scope.value)).map_err(|err| {
+            ServiceError::InvalidArgument {
+                reason: format!("filesystem path is outside repository scope: {err}"),
+            }
+        })?;
+    let repository_roots = allowed_search_roots_for_repository(repository)?;
+    let mut allowed_roots = repository_roots
+        .into_iter()
+        .filter_map(|allowed| {
+            if requested.canonical.starts_with(&allowed) {
+                Some(requested.canonical.clone())
+            } else if allowed.starts_with(&requested.canonical) {
+                Some(allowed)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if allowed_roots.is_empty() {
+        return Err(ServiceError::InvalidArgument {
+            reason: "filesystem operation path is outside allowed_path_scope".to_string(),
+        });
+    }
+
+    allowed_roots.sort();
+    allowed_roots.dedup();
+    Ok(allowed_roots)
+}
+
 fn validate_secondary_filesystem_path_scope(
     repository: &RepositoryRecord,
     primary_scope: &ResourceScope,
-    comparison_path: &str,
+    secondary_path: &str,
+    secondary_path_name: &str,
 ) -> ServiceResult<()> {
     let root = Path::new(&repository.root_path);
-    let requested = canonicalize_within_scope(root, Path::new(comparison_path)).map_err(|err| {
+    let requested = canonicalize_within_scope(root, Path::new(secondary_path)).map_err(|err| {
         ServiceError::InvalidArgument {
-            reason: format!("comparison path is outside repository scope: {err}"),
+            reason: format!("{secondary_path_name} path is outside repository scope: {err}"),
         }
     })?;
 
     if requested.canonical == requested.root {
         return Err(ServiceError::InvalidArgument {
-            reason: "comparison path must be concrete".to_string(),
+            reason: format!("{secondary_path_name} path must be concrete"),
         });
     }
 
@@ -2686,7 +3137,52 @@ fn validate_secondary_filesystem_path_scope(
         Ok(())
     } else {
         Err(ServiceError::InvalidArgument {
-            reason: "comparison path is outside allowed_path_scope".to_string(),
+            reason: format!("{secondary_path_name} path is outside allowed_path_scope"),
+        })
+    }
+}
+
+fn validate_secondary_filesystem_mutation_path_scope(
+    repository: &RepositoryRecord,
+    primary_scope: &ResourceScope,
+    secondary_path: &str,
+    secondary_path_name: &str,
+) -> ServiceResult<()> {
+    let root = Path::new(&repository.root_path);
+    let requested =
+        resolve_filesystem_mutation_path(root, Path::new(secondary_path)).map_err(|err| {
+            ServiceError::InvalidArgument {
+                reason: format!("{secondary_path_name} path is outside repository scope: {err}"),
+            }
+        })?;
+
+    if requested.canonical == requested.root {
+        return Err(ServiceError::InvalidArgument {
+            reason: format!("{secondary_path_name} path must be concrete"),
+        });
+    }
+
+    let _ = canonicalize_within_scope(root, Path::new(&primary_scope.value)).map_err(|err| {
+        ServiceError::InvalidArgument {
+            reason: format!("primary path is outside repository scope: {err}"),
+        }
+    })?;
+
+    let allowed = repository
+        .allowed_path_scope
+        .allowed_paths
+        .iter()
+        .any(|allowed_path| {
+            canonicalize_within_scope(root, Path::new(allowed_path))
+                .map(|allowed| requested.canonical.starts_with(&allowed.canonical))
+                .unwrap_or(false)
+        });
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(ServiceError::InvalidArgument {
+            reason: format!("{secondary_path_name} path is outside allowed_path_scope"),
         })
     }
 }
@@ -2705,6 +3201,10 @@ fn resolve_submit_job_tool_args(
             if args.comparison_path.is_some()
                 || args.max_bytes.is_some()
                 || args.max_chars.is_some()
+                || args.content.is_some()
+                || args.destination_path.is_some()
+                || args.allow_overwrite.is_some()
+                || args.replacement_text.is_some()
             {
                 return Err(ServiceError::InvalidArgument {
                     reason: "search tool_args only supports pattern and max".to_string(),
@@ -2734,9 +3234,131 @@ fn resolve_submit_job_tool_args(
                 max_results,
             }))
         }
+        SubmitJobToolKind::FsWrite => {
+            let args = tool_args.ok_or_else(missing_tool_args)?;
+            if args.pattern.is_some()
+                || args.max.is_some()
+                || args.comparison_path.is_some()
+                || args.replacement_text.is_some()
+                || args.destination_path.is_some()
+                || args.max_chars.is_some()
+            {
+                return Err(ServiceError::InvalidArgument {
+                    reason: "write tool_args only supports content, allow_overwrite, and max_bytes"
+                        .to_string(),
+                });
+            }
+
+            let content = args
+                .content
+                .ok_or_else(|| ServiceError::InvalidArgument {
+                    reason: "write requires content in tool_args".to_string(),
+                })?;
+
+            let max_bytes = args
+                .max_bytes
+                .map(|max_bytes| {
+                    usize::try_from(max_bytes).map_err(|_| ServiceError::InvalidArgument {
+                        reason: "max_bytes must fit in usize".to_string(),
+                    })
+                })
+                .transpose()?;
+
+            Ok(SubmitJobToolArgsSpec::Write(SubmitJobToolArgsWrite {
+                content,
+                allow_overwrite: args.allow_overwrite.unwrap_or(false),
+                max_bytes,
+            }))
+        }
+        SubmitJobToolKind::FsPatch => {
+            let args = tool_args.ok_or_else(missing_tool_args)?;
+            if args.max.is_some()
+                || args.comparison_path.is_some()
+                || args.content.is_some()
+                || args.allow_overwrite.is_some()
+                || args.destination_path.is_some()
+                || args.max_chars.is_some()
+            {
+                return Err(ServiceError::InvalidArgument {
+                    reason:
+                        "patch tool_args only supports pattern, replacement_text, and max_bytes"
+                            .to_string(),
+                });
+            }
+
+            let find_text = args
+                .pattern
+                .ok_or_else(|| ServiceError::InvalidArgument {
+                    reason: "patch requires non-empty pattern in tool_args".to_string(),
+                })?;
+            if find_text.trim().is_empty() {
+                return Err(ServiceError::InvalidArgument {
+                    reason: "patch requires non-empty pattern in tool_args".to_string(),
+                });
+            }
+
+            let replacement_text = args
+                .replacement_text
+                .ok_or_else(|| ServiceError::InvalidArgument {
+                    reason: "patch requires replacement_text in tool_args".to_string(),
+                })?;
+
+            let max_bytes = args
+                .max_bytes
+                .map(|max_bytes| {
+                    usize::try_from(max_bytes).map_err(|_| ServiceError::InvalidArgument {
+                        reason: "max_bytes must fit in usize".to_string(),
+                    })
+                })
+                .transpose()?;
+
+            Ok(SubmitJobToolArgsSpec::Patch(SubmitJobToolArgsPatch {
+                find_text,
+                replacement_text,
+                max_bytes,
+            }))
+        }
+        SubmitJobToolKind::FsMove => {
+            let args = tool_args.ok_or_else(missing_tool_args)?;
+            if args.pattern.is_some()
+                || args.max.is_some()
+                || args.content.is_some()
+                || args.comparison_path.is_some()
+                || args.replacement_text.is_some()
+                || args.max_bytes.is_some()
+                || args.max_chars.is_some()
+            {
+                return Err(ServiceError::InvalidArgument {
+                    reason: "move tool_args only supports destination_path and allow_overwrite"
+                        .to_string(),
+                });
+            }
+
+            let destination_path = args
+                .destination_path
+                .ok_or_else(|| ServiceError::InvalidArgument {
+                    reason: "move requires non-empty destination_path in tool_args".to_string(),
+                })?;
+            if destination_path.trim().is_empty() {
+                return Err(ServiceError::InvalidArgument {
+                    reason: "move requires non-empty destination_path in tool_args".to_string(),
+                });
+            }
+
+            Ok(SubmitJobToolArgsSpec::Move(SubmitJobToolArgsMove {
+                destination_path,
+                allow_overwrite: args.allow_overwrite.unwrap_or(false),
+            }))
+        }
         SubmitJobToolKind::FsDiff => {
             let args = tool_args.ok_or_else(missing_tool_args)?;
-            if args.pattern.is_some() || args.max.is_some() {
+            if args.pattern.is_some()
+                || args.max.is_some()
+                || args.content.is_some()
+                || args.destination_path.is_some()
+                || args.allow_overwrite.is_some()
+                || args.replacement_text.is_some()
+            {
                 return Err(ServiceError::InvalidArgument {
                     reason:
                         "diff tool_args only supports comparison_path, max_bytes, and max_chars"
@@ -2779,7 +3401,7 @@ fn resolve_submit_job_tool_args(
             }))
         }
         _ if tool_args.is_some() => Err(ServiceError::InvalidArgument {
-            reason: "tool_args are only supported for filesystem.search and filesystem.diff"
+            reason: "tool_args are only supported for filesystem.search, filesystem.diff, filesystem.write, filesystem.patch, and filesystem.move"
                 .to_string(),
         }),
         _ => Ok(SubmitJobToolArgsSpec::None),
@@ -4687,9 +5309,12 @@ mod tests {
                 "fs.delete",
                 "fs.diff",
                 "fs.list",
+                "fs.move",
+                "fs.patch",
                 "fs.read",
                 "fs.search",
                 "fs.stat",
+                "fs.write",
                 "secretary.echo"
             ]
         );
@@ -4782,13 +5407,30 @@ mod tests {
         assert!(!stat.cancellable);
         assert_eq!(stat.timeout_ms, 0);
 
+        for (tool_id, expected_idempotency) in [
+            ("fs.delete", "non_idempotent"),
+            ("fs.write", "non_idempotent"),
+            ("fs.patch", "non_idempotent"),
+            ("fs.move", "non_idempotent"),
+        ] {
+            let entry = repertoire
+                .entries
+                .iter()
+                .find(|entry| entry.tool_id == tool_id)
+                .expect("repertoire entry should exist");
+            assert_eq!(entry.idempotency, expected_idempotency);
+        }
+
         assert!(repertoire.entries.iter().all(|entry| {
             matches!(
                 entry.tool_id.as_str(),
                 "fs.delete"
                     | "fs.diff"
                     | "fs.list"
+                    | "fs.move"
+                    | "fs.patch"
                     | "fs.read"
+                    | "fs.write"
                     | "fs.search"
                     | "fs.stat"
                     | "secretary.echo"
@@ -7028,6 +7670,10 @@ mod tests {
                 tool_args: Some(SubmitJobToolArgs {
                     pattern: Some("needle".to_string()),
                     max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
                     comparison_path: None,
                     max_bytes: None,
                     max_chars: None,
@@ -7096,6 +7742,10 @@ mod tests {
                 tool_args: Some(SubmitJobToolArgs {
                     pattern: Some("needle".to_string()),
                     max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
                     comparison_path: None,
                     max_bytes: None,
                     max_chars: None,
@@ -7105,6 +7755,38 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_search_allowed_roots_are_constrained_to_resource_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-search-resource-scope");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "search-resource-scope-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let allowed_roots = allowed_search_roots_for_request(
+            &repository,
+            &ResourceScope {
+                kind: "explicit_paths".to_string(),
+                value: "docs".to_string(),
+            },
+        )
+        .expect("search roots should resolve");
+
+        assert_eq!(
+            allowed_roots,
+            vec![root.join("docs").canonicalize().unwrap()]
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7150,6 +7832,10 @@ mod tests {
                 tool_args: Some(SubmitJobToolArgs {
                     pattern: Some("outside".to_string()),
                     max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
                     comparison_path: None,
                     max_bytes: None,
                     max_chars: None,
@@ -7212,6 +7898,10 @@ mod tests {
                 tool_args: Some(SubmitJobToolArgs {
                     pattern: None,
                     max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
                     comparison_path: Some("right.txt".to_string()),
                     max_bytes: Some(128),
                     max_chars: Some(128),
@@ -7539,6 +8229,993 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_dispatches_filesystem_write_tool() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-write-dispatch");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "write-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("notes.txt"), "before write\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("write file".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "notes.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: Some("hello\nworld\n".to_string()),
+                    destination_path: None,
+                    allow_overwrite: Some(true),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .expect("write dispatch should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.write"
+        );
+        assert_eq!(
+            receipt.policy_decision.requested_capability,
+            "filesystem.write"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("notes.txt")).expect("written file should exist"),
+            "hello\nworld\n"
+        );
+        assert!(receipt.tool_result.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_write_tool_to_create_file() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-write-create");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "write-create-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("create file".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "new.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: Some("created\n".to_string()),
+                    destination_path: None,
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .expect("write create dispatch should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.write"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("new.txt")).expect("created file should exist"),
+            "created\n"
+        );
+        assert!(receipt.tool_result.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_write_tool_with_empty_content() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-write-empty");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "write-empty-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("notes.txt"), "existing\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("truncate file".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "notes.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: Some(String::new()),
+                    destination_path: None,
+                    allow_overwrite: Some(true),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .expect("empty write content should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.write"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("notes.txt")).expect("written file should exist"),
+            ""
+        );
+        assert!(receipt.tool_result.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_write_without_content() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-write-missing-content");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "write-missing-content-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("write without content".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "notes.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            !root.join("notes.txt").exists(),
+            "missing-content write should not create the file"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_write_without_mutate_kind() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-write-mutate-kind");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "write-kind-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("write with read kind".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "notes.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: Some("contents\n".to_string()),
+                    destination_path: None,
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            !root.join("notes.txt").exists(),
+            "read-typed write should not create the file"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_write_with_read_only_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-write-read-only");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "write-read-only-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("write with read-only scope".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "read_only".to_string(),
+                    value: "notes.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: Some("contents\n".to_string()),
+                    destination_path: None,
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            !root.join("notes.txt").exists(),
+            "read-only scoped write should not create the file"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_patch_tool() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-patch-dispatch");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "patch-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("note.txt"), "alpha\nbeta\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("patch file".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "note.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.patch".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("beta".to_string()),
+                    max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: Some("delta".to_string()),
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .expect("patch dispatch should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.patch"
+        );
+        assert_eq!(
+            receipt.policy_decision.requested_capability,
+            "filesystem.patch"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("patched file should exist"),
+            "alpha\ndelta\n"
+        );
+        assert!(receipt.tool_result.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_patch_with_unexpected_args() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-patch-unexpected-args");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "patch-arg-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("note.txt"), "alpha\nbeta\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("patch with extra args".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "note.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.patch".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("beta".to_string()),
+                    max: Some(1),
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: Some("delta".to_string()),
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("file should stay unchanged"),
+            "alpha\nbeta\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_job_rejects_filesystem_patch_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-patch-symlink-target");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "patch-symlink-target-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("note.txt"), "alpha\nbeta\n").unwrap();
+        symlink(root.join("note.txt"), root.join("link.txt")).unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("patch symlink target".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "link.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.patch".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("beta".to_string()),
+                    max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: Some("delta".to_string()),
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("file should stay unchanged"),
+            "alpha\nbeta\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_job_rejects_filesystem_write_through_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-write-symlink-parent");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        symlink(root.join("docs"), root.join("linkdir")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "write-symlink-parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("write through symlink parent".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "linkdir/new.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: Some("blocked\n".to_string()),
+                    destination_path: None,
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            !root.join("docs").join("new.txt").exists(),
+            "rejected write should not create the file through the symlink"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_job_rejects_filesystem_patch_through_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-patch-symlink-parent");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs").join("note.txt"), "alpha\nbeta\n").unwrap();
+        symlink(root.join("docs"), root.join("linkdir")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "patch-symlink-parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("patch through symlink parent".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "linkdir/note.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.patch".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("beta".to_string()),
+                    max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: Some("delta".to_string()),
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert_eq!(
+            fs::read_to_string(root.join("docs").join("note.txt"))
+                .expect("file should stay unchanged"),
+            "alpha\nbeta\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_move_tool() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-move-dispatch");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "move-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("from.txt"), "payload\n").unwrap();
+        fs::write(root.join("to.txt"), "old payload\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("move file".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "from.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.move".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: None,
+                    destination_path: Some("to.txt".to_string()),
+                    allow_overwrite: Some(true),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .expect("move dispatch should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.move"
+        );
+        assert_eq!(
+            receipt.policy_decision.requested_capability,
+            "filesystem.move"
+        );
+        assert!(
+            !root.join("from.txt").exists(),
+            "move should remove source file"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("to.txt")).expect("moved file should exist"),
+            "payload\n"
+        );
+        assert!(receipt.tool_result.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_move_tool_to_new_destination() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-move-new-destination");
+        fs::create_dir_all(root.join("archive")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "move-new-destination-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("from.txt"), "payload\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("move file to archive".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "from.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.move".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: None,
+                    destination_path: Some("archive/from.txt".to_string()),
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .expect("move to new destination should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.move"
+        );
+        assert!(
+            !root.join("from.txt").exists(),
+            "move should remove source file"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("archive/from.txt")).expect("moved file should exist"),
+            "payload\n"
+        );
+        assert!(receipt.tool_result.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_job_rejects_filesystem_move_to_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-move-symlink-parent");
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join("from.txt"), "payload\n").unwrap();
+        symlink(root.join("archive"), root.join("linkdir")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "move-symlink-parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("move to symlink parent".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "from.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.move".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: None,
+                    destination_path: Some("linkdir/from.txt".to_string()),
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            root.join("from.txt").exists(),
+            "rejected move should keep source file"
+        );
+        assert!(
+            !root.join("archive").join("from.txt").exists(),
+            "rejected move should not create the destination through the symlink"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_job_rejects_filesystem_move_from_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-move-source-symlink-parent");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs").join("from.txt"), "payload\n").unwrap();
+        symlink(root.join("docs"), root.join("linkdir")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "move-source-symlink-parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("move from symlink parent".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "linkdir/from.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.move".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: None,
+                    destination_path: Some("to.txt".to_string()),
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert_eq!(
+            fs::read_to_string(root.join("docs").join("from.txt"))
+                .expect("source file should stay in place"),
+            "payload\n"
+        );
+        assert!(
+            !root.join("to.txt").exists(),
+            "rejected move should not create the destination"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_move_without_destination_path() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-move-missing-destination");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "move-destination-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("from.txt"), "payload\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("move without destination".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "from.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.move".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            root.join("from.txt").exists(),
+            "failed move should keep source file"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_move_with_content_arg() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-move-content-arg");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "move-content-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("from.txt"), "payload\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("move with content".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "from.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.move".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: Some("unsupported\n".to_string()),
+                    destination_path: Some("to.txt".to_string()),
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            root.join("from.txt").exists(),
+            "failed move should keep source file"
+        );
+        assert!(
+            !root.join("to.txt").exists(),
+            "failed move should not create destination file"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn submit_job_rejects_filesystem_read_outside_allowed_scope() {
         let svc = ready_service();
         let root = test_repo_dir("filesystem-read-allowed-scope");
@@ -7604,6 +9281,61 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_write_nonexistent_leaf_outside_allowed_scope() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-write-new-outside-allowed-scope");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "write-scope-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: Some(PathScope {
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_paths: vec!["docs".to_string()],
+                }),
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("write outside allowed scope".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "new.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: Some("blocked\n".to_string()),
+                    destination_path: None,
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            !root.join("new.txt").exists(),
+            "out-of-scope write should not create the file"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7685,6 +9417,10 @@ mod tests {
                 tool_args: Some(SubmitJobToolArgs {
                     pattern: None,
                     max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
                     comparison_path: None,
                     max_bytes: None,
                     max_chars: None,
@@ -7728,6 +9464,10 @@ mod tests {
                 tool_args: Some(SubmitJobToolArgs {
                     pattern: Some("needle".to_string()),
                     max: Some(1),
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
                     comparison_path: Some("note.txt".to_string()),
                     max_bytes: None,
                     max_chars: None,
@@ -7771,9 +9511,60 @@ mod tests {
                 tool_args: Some(SubmitJobToolArgs {
                     pattern: Some("needle".to_string()),
                     max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
                     comparison_path: None,
                     max_bytes: Some(1),
                     max_chars: Some(64),
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_search_with_content_arg() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-search-content-arg");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "search-content-arg-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("note.txt"), "alpha\nneedle\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("search with content".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "note.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.search".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("needle".to_string()),
+                    max: None,
+                    content: Some("ignored".to_string()),
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
                 }),
                 idempotency_key: None,
             })
@@ -7814,6 +9605,10 @@ mod tests {
                 tool_args: Some(SubmitJobToolArgs {
                     pattern: None,
                     max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
                     comparison_path: None,
                     max_bytes: None,
                     max_chars: None,
@@ -7822,6 +9617,58 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_patch_with_content_arg() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-patch-content-arg");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "patch-content-arg-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("note.txt"), "alpha\nbeta\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("patch with content".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "note.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.patch".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: Some("beta".to_string()),
+                    max: None,
+                    content: Some("ignored".to_string()),
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: Some("delta".to_string()),
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("file should stay unchanged"),
+            "alpha\nbeta\n"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7858,6 +9705,59 @@ mod tests {
                 tool_args: Some(SubmitJobToolArgs {
                     pattern: Some("alpha".to_string()),
                     max: Some(1),
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
+                    comparison_path: Some("right.txt".to_string()),
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_diff_with_content_arg() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-diff-content-arg");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "diff-content-arg-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("left.txt"), "alpha\n").unwrap();
+        fs::write(root.join("right.txt"), "alpha\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Read,
+                goal: Some("diff with content".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "left.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.diff".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: Some("ignored".to_string()),
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
                     comparison_path: Some("right.txt".to_string()),
                     max_bytes: None,
                     max_chars: None,
@@ -7907,6 +9807,10 @@ mod tests {
                 tool_args: Some(SubmitJobToolArgs {
                     pattern: None,
                     max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
                     comparison_path: Some("outside.txt".to_string()),
                     max_bytes: None,
                     max_chars: None,
@@ -7951,6 +9855,10 @@ mod tests {
                 tool_args: Some(SubmitJobToolArgs {
                     pattern: None,
                     max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
                     comparison_path: Some("right.txt".to_string()),
                     max_bytes: None,
                     max_chars: None,
@@ -8394,6 +10302,10 @@ mod tests {
             tool_args: Some(SubmitJobToolArgs {
                 pattern: Some("needle".to_string()),
                 max: None,
+                content: None,
+                destination_path: None,
+                allow_overwrite: None,
+                replacement_text: None,
                 comparison_path: None,
                 max_bytes: None,
                 max_chars: None,
@@ -8420,6 +10332,10 @@ mod tests {
             tool_args: Some(SubmitJobToolArgs {
                 pattern: Some("other".to_string()),
                 max: None,
+                content: None,
+                destination_path: None,
+                allow_overwrite: None,
+                replacement_text: None,
                 comparison_path: None,
                 max_bytes: None,
                 max_chars: None,
@@ -8677,7 +10593,7 @@ mod tests {
                 model_route_key: None,
                 permission_mode_route_key: None,
                 resource_scope: None,
-                requested_capabilities: vec!["filesystem.write".to_string()],
+                requested_capabilities: vec!["filesystem.magic".to_string()],
                 tool_args: None,
                 idempotency_key: None,
             })

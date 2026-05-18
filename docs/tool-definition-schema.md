@@ -119,9 +119,12 @@ definition using this schema before implementation.
 Current shipped beta built-ins:
 
 - `fs.delete` (R2)
+- `fs.move` (R2)
 - `fs.diff` (R1)
+- `fs.patch` (R2)
 - `fs.list` (R1)
 - `fs.read` (R1)
+- `fs.write` (R2)
 - `fs.search` (R1)
 - `fs.stat` (R1)
 - `secretary.echo` (R0)
@@ -186,6 +189,11 @@ packages.
 
 Every tool returns the canonical `tool_result.v1` envelope. Tool-specific
 evidence appears under stable evidence records.
+
+This document does not define a standalone `fs.search.output.v1` wire shape.
+The shipped beta `fs.search` result uses the canonical `tool_result.v1`
+envelope; any future tool-specific output example must be checked against the
+current wire shape before it is treated as normative.
 
 Tool definitions declare:
 

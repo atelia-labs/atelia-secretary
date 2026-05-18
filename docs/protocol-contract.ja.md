@@ -76,7 +76,7 @@ Beta RPC group:
 | --- | --- |
 | `ListRepertoire` | beta repertoire projection を inspect する |
 
-最初の beta server surface は意図的に小さく、この beta slice で dispatch 可能な built-in Secretary tool を、すなわち `fs.delete`、`fs.diff`、`fs.list`、`fs.read`、`fs.search`、`fs.stat`、`secretary.echo` を beta repertoire entry として projection します。`secretary.echo` は R0、`fs.delete` は R2、`fs.diff`、`fs.list`、`fs.read`、`fs.search`、`fs.stat` は R1 です。より広い built-in は将来の slice または runtime-backed slice に存在し得ますが、dispatch が存在するまでは `ListRepertoire` では claim しません。package-backed の repertoire entry は次の slice です。
+最初の beta server surface は意図的に小さく、この beta slice で dispatch 可能な built-in Secretary tool を、すなわち `fs.delete`、`fs.diff`、`fs.list`、`fs.move`、`fs.patch`、`fs.read`、`fs.search`、`fs.stat`、`fs.write`、`secretary.echo` を beta repertoire entry として projection します。`secretary.echo` は R0、`fs.delete`、`fs.move`、`fs.patch`、`fs.write` は R2、`fs.diff`、`fs.list`、`fs.read`、`fs.search`、`fs.stat` は R1 です。より広い built-in は将来の slice または runtime-backed slice に存在し得ますが、dispatch が存在するまでは `ListRepertoire` では claim しません。package-backed の repertoire entry は次の slice です。
 
 beta slice では package management API は operator-facing です。RPC name は現在の beta wire surface として `Extension*` を維持しますが、docs と新しい product language では AEP backend package management として扱い、公開 package storefront として扱いません。package execution の RPC は beta では未対応です。endpoint が存在する場合でも、invoke されたら unsupported-capability を返さなければなりません。
 
@@ -155,6 +155,18 @@ fallback ではありません。Secretary は request validation と idempotenc
   - 必須: `comparison_path`（文字列・空文字不可）
   - 任意: `max_bytes`（u64）、`max_chars`（u64）
   - 非対応: `pattern`、`max`
+- `filesystem.write` / `fs.write`（更新）
+  - 必須: `content`（文字列。create/truncate のため空文字も有効）
+  - 任意: `allow_overwrite`（bool）、`max_bytes`（u64）
+  - 非対応: `pattern`、`max`、`comparison_path`、`destination_path`、`replacement_text`、`max_chars`
+- `filesystem.patch` / `fs.patch`（更新）
+  - 必須: `pattern`（文字列・空文字不可）、`replacement_text`（文字列）
+  - 任意: `max_bytes`（u64）
+  - 非対応: `max`、`comparison_path`、`destination_path`、`allow_overwrite`、`max_chars`
+- `filesystem.move` / `fs.move`（更新）
+  - 必須: `destination_path`（文字列・空文字不可）
+  - 任意: `allow_overwrite`（bool）
+  - 非対応: `content`、`pattern`、`max`、`comparison_path`、`replacement_text`、`max_bytes`、`max_chars`
 - その他の capability: `tool_args` は省略のみ許可されます。
 
 例:
@@ -162,6 +174,9 @@ fallback ではありません。Secretary は request validation と idempotenc
 ```json
 { "tool_args": { "pattern": "needle", "max": 10 } }
 { "tool_args": { "comparison_path": "right.txt", "max_bytes": 4096, "max_chars": 120 } }
+{ "tool_args": { "content": "hello\nworld\n", "allow_overwrite": false, "max_bytes": 4096 } }
+{ "tool_args": { "pattern": "beta", "replacement_text": "delta", "max_bytes": 1024 } }
+{ "tool_args": { "destination_path": "archive/note.txt", "allow_overwrite": true } }
 ```
 
 非対応フィールドを含む `SubmitJob` は、実行前に却下されます。

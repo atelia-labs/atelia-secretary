@@ -101,9 +101,10 @@ Beta RPC groups:
 
 The first beta server surface is intentionally small and currently projects
 only the built-in Secretary tools that are dispatchable in this beta slice:
-`fs.delete`, `fs.diff`, `fs.list`, `fs.read`, `fs.search`, `fs.stat`, and
-`secretary.echo` as beta repertoire entries. `secretary.echo` is R0;
-`fs.delete` is R2; `fs.diff`, `fs.list`, `fs.read`, `fs.search`, and `fs.stat`
+`fs.delete`, `fs.diff`, `fs.list`, `fs.move`, `fs.patch`, `fs.read`,
+`fs.search`, `fs.stat`, `fs.write`, and `secretary.echo` as beta repertoire
+entries. `secretary.echo` is R0; `fs.delete`, `fs.move`, `fs.patch`, and
+`fs.write` are R2; `fs.diff`, `fs.list`, `fs.read`, `fs.search`, and `fs.stat`
 are R1. Broader built-ins may exist in future or runtime-backed slices, but
 they are not claimed by `ListRepertoire` until dispatch exists. Package-backed
 repertoire entries remain a future slice.
@@ -196,6 +197,18 @@ durable restart; failed submissions are not currently cached as replay results.
   - required: `comparison_path` (string, non-empty)
   - optional: `max_bytes` (u64), `max_chars` (u64)
   - unsupported: `pattern`, `max`
+- `filesystem.write` / `fs.write` (write tool)
+  - required: `content` (string; empty string is valid for create/truncate)
+  - optional: `allow_overwrite` (bool), `max_bytes` (u64)
+  - unsupported: `pattern`, `max`, `comparison_path`, `destination_path`, `replacement_text`, `max_chars`
+- `filesystem.patch` / `fs.patch` (write tool)
+  - required: `pattern` (string, non-empty), `replacement_text` (string)
+  - optional: `max_bytes` (u64)
+  - unsupported: `max`, `comparison_path`, `destination_path`, `allow_overwrite`, `max_chars`
+- `filesystem.move` / `fs.move` (write tool)
+  - required: `destination_path` (string, non-empty)
+  - optional: `allow_overwrite` (bool)
+  - unsupported: `content`, `pattern`, `max`, `comparison_path`, `replacement_text`, `max_bytes`, `max_chars`
 - other capabilities: `tool_args` must be omitted.
 
 Examples:
@@ -203,6 +216,9 @@ Examples:
 ```json
 { "tool_args": { "pattern": "needle", "max": 10 } }
 { "tool_args": { "comparison_path": "right.txt", "max_bytes": 4096, "max_chars": 120 } }
+{ "tool_args": { "content": "hello\nworld\n", "allow_overwrite": false, "max_bytes": 4096 } }
+{ "tool_args": { "pattern": "beta", "replacement_text": "delta", "max_bytes": 1024 } }
+{ "tool_args": { "destination_path": "archive/note.txt", "allow_overwrite": true } }
 ```
 
 Requests using unsupported fields are rejected before `SubmitJob` execution.
