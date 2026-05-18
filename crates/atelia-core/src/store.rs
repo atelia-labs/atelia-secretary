@@ -1740,13 +1740,33 @@ fn load_durable_snapshot(path: &Path) -> StoreResult<InMemoryInner> {
 
 fn persist_durable_snapshot(path: &Path, inner: &InMemoryInner) -> StoreResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| StoreError::Conflict {
-            collection: "store",
-            reason: format!(
-                "failed to create durable snapshot directory {}: {error}",
-                parent.display()
-            ),
-        })?;
+        // Ensure parent directory is created with restrictive permissions to prevent unauthorized access
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|error| StoreError::Conflict {
+                    collection: "store",
+                    reason: format!(
+                        "failed to create durable snapshot directory {}: {error}",
+                        parent.display()
+                    ),
+                })?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(parent).map_err(|error| StoreError::Conflict {
+                collection: "store",
+                reason: format!(
+                    "failed to create durable snapshot directory {}: {error}",
+                    parent.display()
+                ),
+            })?;
+        }
     }
 
     let snapshot = DurableStoreSnapshot {
