@@ -478,6 +478,10 @@ struct SubmitJobRequestPayload {
 struct SubmitJobToolArgsPayload {
     pattern: Option<String>,
     max: Option<u64>,
+    content: Option<String>,
+    destination_path: Option<String>,
+    allow_overwrite: Option<bool>,
+    replacement_text: Option<String>,
     comparison_path: Option<String>,
     max_bytes: Option<u64>,
     max_chars: Option<u64>,
@@ -500,10 +504,16 @@ fn requests_filesystem_path_operation(capabilities: &[String]) -> bool {
                 | "filesystem.list"
                 | "filesystem.stat"
                 | "filesystem.delete"
+                | "filesystem.write"
+                | "filesystem.patch"
+                | "filesystem.move"
                 | "fs.read"
                 | "fs.list"
                 | "fs.stat"
                 | "fs.delete"
+                | "fs.write"
+                | "fs.patch"
+                | "fs.move"
                 | "filesystem.search"
                 | "filesystem.diff"
                 | "fs.search"
@@ -522,6 +532,12 @@ fn requests_filesystem_concrete_path_operation(capabilities: &[String]) -> bool 
                 | "fs.delete"
                 | "filesystem.diff"
                 | "fs.diff"
+                | "filesystem.write"
+                | "fs.write"
+                | "filesystem.patch"
+                | "fs.patch"
+                | "filesystem.move"
+                | "fs.move"
         )
     })
 }
@@ -1179,6 +1195,10 @@ fn parse_submit_job_payload(
     let tool_args = payload.tool_args.map(|payload| rpc::SubmitJobToolArgs {
         pattern: payload.pattern,
         max: payload.max,
+        content: payload.content,
+        destination_path: payload.destination_path,
+        allow_overwrite: payload.allow_overwrite,
+        replacement_text: payload.replacement_text,
         comparison_path: payload.comparison_path,
         max_bytes: payload.max_bytes,
         max_chars: payload.max_chars,
@@ -6203,6 +6223,10 @@ mod tests {
             tool_args: Some(SubmitJobToolArgsPayload {
                 pattern: Some("needle".to_string()),
                 max: Some(2),
+                content: None,
+                destination_path: None,
+                allow_overwrite: None,
+                replacement_text: None,
                 comparison_path: None,
                 max_bytes: None,
                 max_chars: None,
@@ -6234,6 +6258,10 @@ mod tests {
             tool_args: Some(SubmitJobToolArgsPayload {
                 pattern: Some("needle".to_string()),
                 max: None,
+                content: None,
+                destination_path: None,
+                allow_overwrite: None,
+                replacement_text: None,
                 comparison_path: None,
                 max_bytes: None,
                 max_chars: None,
@@ -6254,12 +6282,18 @@ mod tests {
             "filesystem.delete",
             "filesystem.search",
             "filesystem.diff",
+            "filesystem.write",
+            "filesystem.patch",
+            "filesystem.move",
             "fs.read",
             "fs.list",
             "fs.stat",
             "fs.delete",
             "fs.search",
             "fs.diff",
+            "fs.write",
+            "fs.patch",
+            "fs.move",
         ] {
             let parsed = parse_submit_job_payload(SubmitJobRequestPayload {
                 repository_id: RepositoryId::new().as_str().to_string(),
@@ -8530,9 +8564,12 @@ mod tests {
                 "fs.delete",
                 "fs.diff",
                 "fs.list",
+                "fs.move",
+                "fs.patch",
                 "fs.read",
                 "fs.search",
                 "fs.stat",
+                "fs.write",
                 "secretary.echo"
             ]
         );

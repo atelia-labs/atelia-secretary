@@ -119,9 +119,12 @@ definition using this schema before implementation.
 Current shipped beta built-ins:
 
 - `fs.delete` (R2)
+- `fs.move` (R2)
 - `fs.diff` (R1)
+- `fs.patch` (R2)
 - `fs.list` (R1)
 - `fs.read` (R1)
+- `fs.write` (R2)
 - `fs.search` (R1)
 - `fs.stat` (R1)
 - `secretary.echo` (R0)

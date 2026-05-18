@@ -196,6 +196,18 @@ durable restart; failed submissions are not currently cached as replay results.
   - required: `comparison_path` (string, non-empty)
   - optional: `max_bytes` (u64), `max_chars` (u64)
   - unsupported: `pattern`, `max`
+- `filesystem.write` / `fs.write` (write tool)
+  - required: `content` (string, non-empty)
+  - optional: `allow_overwrite` (bool), `max_bytes` (u64)
+  - unsupported: `pattern`, `max`, `comparison_path`, `destination_path`, `replacement_text`, `max_chars`
+- `filesystem.patch` / `fs.patch` (write tool)
+  - required: `pattern` (string, non-empty), `replacement_text` (string)
+  - optional: `max_bytes` (u64)
+  - unsupported: `max`, `comparison_path`, `destination_path`, `allow_overwrite`, `max_chars`
+- `filesystem.move` / `fs.move` (write tool)
+  - required: `destination_path` (string, non-empty)
+  - optional: `allow_overwrite` (bool)
+  - unsupported: `content`, `pattern`, `max`, `comparison_path`, `replacement_text`, `max_bytes`, `max_chars`
 - other capabilities: `tool_args` must be omitted.
 
 Examples:
@@ -203,6 +215,9 @@ Examples:
 ```json
 { "tool_args": { "pattern": "needle", "max": 10 } }
 { "tool_args": { "comparison_path": "right.txt", "max_bytes": 4096, "max_chars": 120 } }
+{ "tool_args": { "content": "hello\nworld\n", "allow_overwrite": false, "max_bytes": 4096 } }
+{ "tool_args": { "pattern": "beta", "replacement_text": "delta", "max_bytes": 1024 } }
+{ "tool_args": { "destination_path": "archive/note.txt", "allow_overwrite": true } }
 ```
 
 Requests using unsupported fields are rejected before `SubmitJob` execution.

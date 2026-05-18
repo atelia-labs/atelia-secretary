@@ -155,6 +155,18 @@ fallback ではありません。Secretary は request validation と idempotenc
   - 必須: `comparison_path`（文字列・空文字不可）
   - 任意: `max_bytes`（u64）、`max_chars`（u64）
   - 非対応: `pattern`、`max`
+- `filesystem.write` / `fs.write`（更新）
+  - 必須: `content`（文字列・空文字不可）
+  - 任意: `allow_overwrite`（bool）、`max_bytes`（u64）
+  - 非対応: `pattern`、`max`、`comparison_path`、`destination_path`、`replacement_text`、`max_chars`
+- `filesystem.patch` / `fs.patch`（更新）
+  - 必須: `pattern`（文字列・空文字不可）、`replacement_text`（文字列）
+  - 任意: `max_bytes`（u64）
+  - 非対応: `max`、`comparison_path`、`destination_path`、`allow_overwrite`、`max_chars`
+- `filesystem.move` / `fs.move`（更新）
+  - 必須: `destination_path`（文字列・空文字不可）
+  - 任意: `allow_overwrite`（bool）
+  - 非対応: `content`、`pattern`、`max`、`comparison_path`、`replacement_text`、`max_bytes`、`max_chars`
 - その他の capability: `tool_args` は省略のみ許可されます。
 
 例:
@@ -162,6 +174,9 @@ fallback ではありません。Secretary は request validation と idempotenc
 ```json
 { "tool_args": { "pattern": "needle", "max": 10 } }
 { "tool_args": { "comparison_path": "right.txt", "max_bytes": 4096, "max_chars": 120 } }
+{ "tool_args": { "content": "hello\nworld\n", "allow_overwrite": false, "max_bytes": 4096 } }
+{ "tool_args": { "pattern": "beta", "replacement_text": "delta", "max_bytes": 1024 } }
+{ "tool_args": { "destination_path": "archive/note.txt", "allow_overwrite": true } }
 ```
 
 非対応フィールドを含む `SubmitJob` は、実行前に却下されます。

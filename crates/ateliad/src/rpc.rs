@@ -187,6 +187,10 @@ impl SecretaryRpcServer {
             tool_args: request.tool_args.map(|args| ServiceSubmitJobToolArgs {
                 pattern: args.pattern,
                 max: args.max,
+                content: args.content,
+                destination_path: args.destination_path,
+                allow_overwrite: args.allow_overwrite,
+                replacement_text: args.replacement_text,
                 comparison_path: args.comparison_path,
                 max_bytes: args.max_bytes,
                 max_chars: args.max_chars,
@@ -1477,6 +1481,10 @@ pub struct SubmitJobRequest {
 pub struct SubmitJobToolArgs {
     pub pattern: Option<String>,
     pub max: Option<u64>,
+    pub content: Option<String>,
+    pub destination_path: Option<String>,
+    pub allow_overwrite: Option<bool>,
+    pub replacement_text: Option<String>,
     pub comparison_path: Option<String>,
     pub max_bytes: Option<u64>,
     pub max_chars: Option<u64>,
@@ -3607,9 +3615,12 @@ mod tests {
                 "fs.delete",
                 "fs.diff",
                 "fs.list",
+                "fs.move",
+                "fs.patch",
                 "fs.read",
                 "fs.search",
                 "fs.stat",
+                "fs.write",
                 "secretary.echo"
             ]
         );
@@ -3635,8 +3646,11 @@ mod tests {
                 entry.tool_id.as_str(),
                 "fs.delete"
                     | "fs.diff"
+                    | "fs.move"
+                    | "fs.patch"
                     | "fs.list"
                     | "fs.read"
+                    | "fs.write"
                     | "fs.search"
                     | "fs.stat"
                     | "secretary.echo"
@@ -5614,7 +5628,7 @@ mod tests {
                 model_route_key: None,
                 permission_mode_route_key: None,
                 path_scope: None,
-                requested_capabilities: vec!["filesystem.write".to_string()],
+                requested_capabilities: vec!["filesystem.magic".to_string()],
                 tool_args: None,
                 idempotency_key: None,
             })
@@ -5740,6 +5754,10 @@ mod tests {
                 tool_args: Some(SubmitJobToolArgs {
                     pattern: Some("needle".to_string()),
                     max: Some(1),
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
                     comparison_path: None,
                     max_bytes: None,
                     max_chars: None,
