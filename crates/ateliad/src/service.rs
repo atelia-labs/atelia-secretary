@@ -7962,6 +7962,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Mutate,
                 goal: Some("write file".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "notes.txt".to_string(),
@@ -8022,6 +8025,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Read,
                 goal: Some("write with read kind".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "notes.txt".to_string(),
@@ -8070,6 +8076,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Mutate,
                 goal: Some("write with read-only scope".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "read_only".to_string(),
                     value: "notes.txt".to_string(),
@@ -8119,6 +8128,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Mutate,
                 goal: Some("patch file".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "note.txt".to_string(),
@@ -8180,6 +8192,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Mutate,
                 goal: Some("patch with extra args".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "note.txt".to_string(),
@@ -8230,6 +8245,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Mutate,
                 goal: Some("move file".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "from.txt".to_string(),
@@ -8295,6 +8313,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Mutate,
                 goal: Some("move without destination".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "from.txt".to_string(),
@@ -8344,6 +8365,9 @@ mod tests {
                 repository_id: repository.id,
                 kind: JobKind::Mutate,
                 goal: Some("move with content".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
                 resource_scope: Some(ResourceScope {
                     kind: "path".to_string(),
                     value: "from.txt".to_string(),
