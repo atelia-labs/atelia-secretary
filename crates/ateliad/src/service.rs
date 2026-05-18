@@ -3087,6 +3087,7 @@ fn resolve_submit_job_tool_args(
             let args = tool_args.ok_or_else(missing_tool_args)?;
             if args.pattern.is_some()
                 || args.max.is_some()
+                || args.content.is_some()
                 || args.comparison_path.is_some()
                 || args.replacement_text.is_some()
                 || args.max_bytes.is_some()
@@ -8318,6 +8319,59 @@ mod tests {
         assert!(
             root.join("from.txt").exists(),
             "failed move should keep source file"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_move_with_content_arg() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-move-content-arg");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "move-content-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("from.txt"), "payload\n").unwrap();
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("move with content".to_string()),
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "from.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.move".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: Some("unsupported\n".to_string()),
+                    destination_path: Some("to.txt".to_string()),
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            root.join("from.txt").exists(),
+            "failed move should keep source file"
+        );
+        assert!(
+            !root.join("to.txt").exists(),
+            "failed move should not create destination file"
         );
         let _ = fs::remove_dir_all(root);
     }
