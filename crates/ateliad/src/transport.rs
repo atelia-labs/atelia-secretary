@@ -632,8 +632,8 @@ fn validate_submit_job_tool_args_for_capabilities(
                         .to_string(),
                 );
             }
-            if args.content.as_deref().is_none_or(str::is_empty) {
-                return Err("write requires non-empty content in tool_args".to_string());
+            if args.content.is_none() {
+                return Err("write requires content in tool_args".to_string());
             }
         }
         "filesystem.patch" => {
@@ -6396,6 +6396,89 @@ mod tests {
         let tool_args = parsed.tool_args.expect("tool_args should be mapped");
         assert_eq!(tool_args.pattern.as_deref(), Some("needle"));
         assert_eq!(tool_args.max, Some(2));
+    }
+
+    #[test]
+    fn submit_job_payload_accepts_empty_write_content() {
+        let parsed = parse_submit_job_payload(SubmitJobRequestPayload {
+            repository_id: RepositoryId::new().as_str().to_string(),
+            requester: ActorPayload::Agent {
+                id: "agent:transport".to_string(),
+                display_name: None,
+            },
+            kind: "mutate".to_string(),
+            goal: Some("truncate over HTTP".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
+            path_scope: Some(PathScopePayload {
+                kind: Some("explicit_paths".to_string()),
+                roots: Some(vec!["notes.txt".to_string()]),
+                include_patterns: None,
+                exclude_patterns: None,
+            }),
+            requested_capabilities: Some(vec!["filesystem.write".to_string()]),
+            tool_args: Some(SubmitJobToolArgsPayload {
+                pattern: None,
+                max: None,
+                content: Some(String::new()),
+                destination_path: None,
+                allow_overwrite: Some(true),
+                replacement_text: None,
+                comparison_path: None,
+                max_bytes: None,
+                max_chars: None,
+            }),
+            idempotency_key: None,
+        })
+        .expect("filesystem.write empty content should parse");
+
+        assert_eq!(
+            parsed
+                .tool_args
+                .expect("tool_args should be mapped")
+                .content
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn submit_job_payload_rejects_missing_write_content() {
+        let err = parse_submit_job_payload(SubmitJobRequestPayload {
+            repository_id: RepositoryId::new().as_str().to_string(),
+            requester: ActorPayload::Agent {
+                id: "agent:transport".to_string(),
+                display_name: None,
+            },
+            kind: "mutate".to_string(),
+            goal: Some("write without content over HTTP".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
+            path_scope: Some(PathScopePayload {
+                kind: Some("explicit_paths".to_string()),
+                roots: Some(vec!["notes.txt".to_string()]),
+                include_patterns: None,
+                exclude_patterns: None,
+            }),
+            requested_capabilities: Some(vec!["filesystem.write".to_string()]),
+            tool_args: Some(SubmitJobToolArgsPayload {
+                pattern: None,
+                max: None,
+                content: None,
+                destination_path: None,
+                allow_overwrite: Some(true),
+                replacement_text: None,
+                comparison_path: None,
+                max_bytes: None,
+                max_chars: None,
+            }),
+            idempotency_key: None,
+        })
+        .expect_err("filesystem.write should require content");
+
+        assert!(err.contains("write requires content in tool_args"));
     }
 
     #[test]

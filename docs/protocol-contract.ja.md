@@ -156,7 +156,7 @@ fallback ではありません。Secretary は request validation と idempotenc
   - 任意: `max_bytes`（u64）、`max_chars`（u64）
   - 非対応: `pattern`、`max`
 - `filesystem.write` / `fs.write`（更新）
-  - 必須: `content`（文字列・空文字不可）
+  - 必須: `content`（文字列。create/truncate のため空文字も有効）
   - 任意: `allow_overwrite`（bool）、`max_bytes`（u64）
   - 非対応: `pattern`、`max`、`comparison_path`、`destination_path`、`replacement_text`、`max_chars`
 - `filesystem.patch` / `fs.patch`（更新）

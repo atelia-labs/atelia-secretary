@@ -2525,7 +2525,7 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
             SECRETARY_FS_WRITE_TOOL_NAME,
             SECRETARY_FS_WRITE_TOOL_DESCRIPTION,
             "R2",
-            "idempotent",
+            "non_idempotent",
             false,
             0,
         ),
@@ -2534,7 +2534,7 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
             SECRETARY_FS_PATCH_TOOL_NAME,
             SECRETARY_FS_PATCH_TOOL_DESCRIPTION,
             "R2",
-            "idempotent",
+            "non_idempotent",
             false,
             0,
         ),
@@ -2570,7 +2570,7 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
             SECRETARY_FS_MOVE_TOOL_NAME,
             SECRETARY_FS_MOVE_TOOL_DESCRIPTION,
             "R2",
-            "idempotent",
+            "non_idempotent",
             false,
             0,
         ),
@@ -3223,13 +3223,8 @@ fn resolve_submit_job_tool_args(
             let content = args
                 .content
                 .ok_or_else(|| ServiceError::InvalidArgument {
-                    reason: "write requires non-empty content in tool_args".to_string(),
+                    reason: "write requires content in tool_args".to_string(),
                 })?;
-            if content.is_empty() {
-                return Err(ServiceError::InvalidArgument {
-                    reason: "write requires non-empty content in tool_args".to_string(),
-                });
-            }
 
             let max_bytes = args
                 .max_bytes
@@ -5382,6 +5377,19 @@ mod tests {
         assert_eq!(stat.default_result_format, "toon");
         assert!(!stat.cancellable);
         assert_eq!(stat.timeout_ms, 0);
+
+        for (tool_id, expected_idempotency) in [
+            ("fs.write", "non_idempotent"),
+            ("fs.patch", "non_idempotent"),
+            ("fs.move", "non_idempotent"),
+        ] {
+            let entry = repertoire
+                .entries
+                .iter()
+                .find(|entry| entry.tool_id == tool_id)
+                .expect("repertoire entry should exist");
+            assert_eq!(entry.idempotency, expected_idempotency);
+        }
 
         assert!(repertoire.entries.iter().all(|entry| {
             matches!(
@@ -8310,6 +8318,117 @@ mod tests {
             "created\n"
         );
         assert!(receipt.tool_result.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_dispatches_filesystem_write_tool_with_empty_content() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-write-empty");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "write-empty-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+        fs::write(root.join("notes.txt"), "existing\n").unwrap();
+
+        let receipt = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("truncate file".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "notes.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: Some(String::new()),
+                    destination_path: None,
+                    allow_overwrite: Some(true),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .expect("empty write content should succeed");
+
+        assert_eq!(
+            receipt
+                .tool_invocation
+                .as_ref()
+                .expect("tool invocation should exist")
+                .tool_id,
+            "fs.write"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("notes.txt")).expect("written file should exist"),
+            ""
+        );
+        assert!(receipt.tool_result.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_job_rejects_filesystem_write_without_content() {
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-write-missing-content");
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "write-missing-content-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("write without content".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "notes.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.write".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: None,
+                    destination_path: None,
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert!(
+            !root.join("notes.txt").exists(),
+            "missing-content write should not create the file"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

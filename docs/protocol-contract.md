@@ -198,7 +198,7 @@ durable restart; failed submissions are not currently cached as replay results.
   - optional: `max_bytes` (u64), `max_chars` (u64)
   - unsupported: `pattern`, `max`
 - `filesystem.write` / `fs.write` (write tool)
-  - required: `content` (string, non-empty)
+  - required: `content` (string; empty string is valid for create/truncate)
   - optional: `allow_overwrite` (bool), `max_bytes` (u64)
   - unsupported: `pattern`, `max`, `comparison_path`, `destination_path`, `replacement_text`, `max_chars`
 - `filesystem.patch` / `fs.patch` (write tool)
