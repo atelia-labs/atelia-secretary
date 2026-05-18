@@ -2516,7 +2516,7 @@ fn list_repertoire_entries() -> Vec<RepertoireEntry> {
             SECRETARY_FS_DELETE_TOOL_NAME,
             SECRETARY_FS_DELETE_TOOL_DESCRIPTION,
             "R2",
-            "not idempotent",
+            "non_idempotent",
             false,
             0,
         ),
@@ -5379,6 +5379,7 @@ mod tests {
         assert_eq!(stat.timeout_ms, 0);
 
         for (tool_id, expected_idempotency) in [
+            ("fs.delete", "non_idempotent"),
             ("fs.write", "non_idempotent"),
             ("fs.patch", "non_idempotent"),
             ("fs.move", "non_idempotent"),
