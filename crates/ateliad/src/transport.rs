@@ -549,6 +549,168 @@ fn normalize_capability_name(capability: &str) -> String {
         .replace(['_', '-', ':', '/'], ".")
 }
 
+fn canonical_filesystem_capability(capability: &str) -> Option<&'static str> {
+    match normalize_capability_name(capability).as_str() {
+        "filesystem.read" | "fs.read" => Some("filesystem.read"),
+        "filesystem.list" | "fs.list" => Some("filesystem.list"),
+        "filesystem.stat" | "fs.stat" => Some("filesystem.stat"),
+        "filesystem.delete" | "fs.delete" => Some("filesystem.delete"),
+        "filesystem.write" | "fs.write" => Some("filesystem.write"),
+        "filesystem.patch" | "fs.patch" => Some("filesystem.patch"),
+        "filesystem.move" | "fs.move" => Some("filesystem.move"),
+        "filesystem.search" | "fs.search" => Some("filesystem.search"),
+        "filesystem.diff" | "fs.diff" => Some("filesystem.diff"),
+        _ => None,
+    }
+}
+
+fn requested_filesystem_capabilities(capabilities: &[String]) -> Vec<&'static str> {
+    let mut normalized = Vec::new();
+    for capability in capabilities {
+        if let Some(canonical) = canonical_filesystem_capability(capability) {
+            if !normalized.iter().any(|existing| existing == &canonical) {
+                normalized.push(canonical);
+            }
+        }
+    }
+    normalized
+}
+
+fn validate_submit_job_tool_args_for_capabilities(
+    tool_args: Option<&rpc::SubmitJobToolArgs>,
+    requested_capabilities: &[String],
+) -> Result<(), String> {
+    let filesystem_capabilities = requested_filesystem_capabilities(requested_capabilities);
+    let Some(capability) = filesystem_capabilities.first().copied() else {
+        if tool_args.is_some() {
+            return Err(
+                "tool_args are only supported when a filesystem capability is requested"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    };
+
+    let Some(args) = tool_args else {
+        return match capability {
+            "filesystem.search" | "filesystem.diff" | "filesystem.write" | "filesystem.patch"
+            | "filesystem.move" => Err(format!("tool_args is required for {capability}")),
+            _ => Ok(()),
+        };
+    };
+
+    match capability {
+        "filesystem.search" => {
+            if args.comparison_path.is_some()
+                || args.max_bytes.is_some()
+                || args.max_chars.is_some()
+                || args.content.is_some()
+                || args.destination_path.is_some()
+                || args.allow_overwrite.is_some()
+                || args.replacement_text.is_some()
+            {
+                return Err("search tool_args only supports pattern and max".to_string());
+            }
+            if args
+                .pattern
+                .as_deref()
+                .is_none_or(|pattern| pattern.trim().is_empty())
+            {
+                return Err("search requires non-empty pattern in tool_args".to_string());
+            }
+        }
+        "filesystem.write" => {
+            if args.pattern.is_some()
+                || args.max.is_some()
+                || args.comparison_path.is_some()
+                || args.replacement_text.is_some()
+                || args.destination_path.is_some()
+                || args.max_chars.is_some()
+            {
+                return Err(
+                    "write tool_args only supports content, allow_overwrite, and max_bytes"
+                        .to_string(),
+                );
+            }
+            if args.content.as_deref().is_none_or(str::is_empty) {
+                return Err("write requires non-empty content in tool_args".to_string());
+            }
+        }
+        "filesystem.patch" => {
+            if args.max.is_some()
+                || args.comparison_path.is_some()
+                || args.content.is_some()
+                || args.allow_overwrite.is_some()
+                || args.destination_path.is_some()
+                || args.max_chars.is_some()
+            {
+                return Err(
+                    "patch tool_args only supports pattern, replacement_text, and max_bytes"
+                        .to_string(),
+                );
+            }
+            if args
+                .pattern
+                .as_deref()
+                .is_none_or(|pattern| pattern.trim().is_empty())
+            {
+                return Err("patch requires non-empty pattern in tool_args".to_string());
+            }
+            if args.replacement_text.is_none() {
+                return Err("patch requires replacement_text in tool_args".to_string());
+            }
+        }
+        "filesystem.move" => {
+            if args.pattern.is_some()
+                || args.max.is_some()
+                || args.content.is_some()
+                || args.comparison_path.is_some()
+                || args.replacement_text.is_some()
+                || args.max_bytes.is_some()
+                || args.max_chars.is_some()
+            {
+                return Err(
+                    "move tool_args only supports destination_path and allow_overwrite".to_string(),
+                );
+            }
+            if args
+                .destination_path
+                .as_deref()
+                .is_none_or(|path| path.trim().is_empty())
+            {
+                return Err("move requires non-empty destination_path in tool_args".to_string());
+            }
+        }
+        "filesystem.diff" => {
+            if args.pattern.is_some()
+                || args.max.is_some()
+                || args.content.is_some()
+                || args.destination_path.is_some()
+                || args.allow_overwrite.is_some()
+                || args.replacement_text.is_some()
+            {
+                return Err(
+                    "diff tool_args only supports comparison_path, max_bytes, and max_chars"
+                        .to_string(),
+                );
+            }
+            if args
+                .comparison_path
+                .as_deref()
+                .is_none_or(|path| path.trim().is_empty())
+            {
+                return Err("diff requires non-empty comparison_path in tool_args".to_string());
+            }
+        }
+        _ => {
+            return Err("tool_args are only supported for filesystem.search, filesystem.diff, filesystem.write, filesystem.patch, and filesystem.move"
+                .to_string());
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct ListJobsRequestPayload {
     repository_id: Option<String>,
@@ -1204,12 +1366,6 @@ fn parse_submit_job_payload(
         max_chars: payload.max_chars,
     });
 
-    if tool_args.is_some() && !requests_filesystem_path_operation(&requested_capabilities) {
-        return Err(
-            "tool_args are only supported when a filesystem capability is requested".to_string(),
-        );
-    }
-
     if requests_filesystem_path_operation(&requested_capabilities) {
         let roots = path_scope
             .as_ref()
@@ -1227,6 +1383,8 @@ fn parse_submit_job_payload(
             return Err("filesystem operation requires path_scope.roots to contain exactly one concrete path".to_string());
         }
     }
+
+    validate_submit_job_tool_args_for_capabilities(tool_args.as_ref(), &requested_capabilities)?;
 
     Ok(rpc::SubmitJobRequest {
         repository_id: payload.repository_id,
@@ -6241,6 +6399,113 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_payload_rejects_capability_specific_tool_args_fields() {
+        for (capability, tool_args, expected) in [
+            (
+                "filesystem.search",
+                SubmitJobToolArgsPayload {
+                    pattern: Some("needle".to_string()),
+                    max: None,
+                    content: Some("ignored".to_string()),
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                },
+                "search tool_args only supports pattern and max",
+            ),
+            (
+                "filesystem.patch",
+                SubmitJobToolArgsPayload {
+                    pattern: Some("needle".to_string()),
+                    max: None,
+                    content: Some("ignored".to_string()),
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: Some("replacement".to_string()),
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                },
+                "patch tool_args only supports pattern, replacement_text, and max_bytes",
+            ),
+            (
+                "filesystem.diff",
+                SubmitJobToolArgsPayload {
+                    pattern: None,
+                    max: None,
+                    content: Some("ignored".to_string()),
+                    destination_path: None,
+                    allow_overwrite: None,
+                    replacement_text: None,
+                    comparison_path: Some("other.txt".to_string()),
+                    max_bytes: None,
+                    max_chars: None,
+                },
+                "diff tool_args only supports comparison_path, max_bytes, and max_chars",
+            ),
+        ] {
+            let err = parse_submit_job_payload(SubmitJobRequestPayload {
+                repository_id: RepositoryId::new().as_str().to_string(),
+                requester: ActorPayload::Agent {
+                    id: "agent:transport".to_string(),
+                    display_name: None,
+                },
+                kind: "read".to_string(),
+                goal: Some("filesystem with invalid args".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                path_scope: Some(PathScopePayload {
+                    kind: Some("explicit_paths".to_string()),
+                    roots: Some(vec!["notes".to_string()]),
+                    include_patterns: None,
+                    exclude_patterns: None,
+                }),
+                requested_capabilities: Some(vec![capability.to_string()]),
+                tool_args: Some(tool_args),
+                idempotency_key: None,
+            })
+            .expect_err("capability-specific unsupported fields should be rejected");
+
+            assert!(
+                err.contains(expected),
+                "unexpected error for {capability}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn submit_job_payload_rejects_missing_required_filesystem_tool_args() {
+        let err = parse_submit_job_payload(SubmitJobRequestPayload {
+            repository_id: RepositoryId::new().as_str().to_string(),
+            requester: ActorPayload::Agent {
+                id: "agent:transport".to_string(),
+                display_name: None,
+            },
+            kind: "read".to_string(),
+            goal: Some("search without args".to_string()),
+            message: None,
+            model_route_key: None,
+            permission_mode_route_key: None,
+            path_scope: Some(PathScopePayload {
+                kind: Some("explicit_paths".to_string()),
+                roots: Some(vec!["notes".to_string()]),
+                include_patterns: None,
+                exclude_patterns: None,
+            }),
+            requested_capabilities: Some(vec!["fs.search".to_string()]),
+            tool_args: None,
+            idempotency_key: None,
+        })
+        .expect_err("filesystem.search should require tool_args");
+
+        assert!(err.contains("tool_args is required for filesystem.search"));
+    }
+
+    #[test]
     fn submit_job_payload_rejects_tool_args_without_filesystem_capability() {
         let err = parse_submit_job_payload(SubmitJobRequestPayload {
             repository_id: RepositoryId::new().as_str().to_string(),
@@ -6313,7 +6578,64 @@ mod tests {
                     exclude_patterns: None,
                 }),
                 requested_capabilities: Some(vec![capability.to_string()]),
-                tool_args: None,
+                tool_args: match canonical_filesystem_capability(capability) {
+                    Some("filesystem.search") => Some(SubmitJobToolArgsPayload {
+                        pattern: Some("needle".to_string()),
+                        max: None,
+                        content: None,
+                        destination_path: None,
+                        allow_overwrite: None,
+                        replacement_text: None,
+                        comparison_path: None,
+                        max_bytes: None,
+                        max_chars: None,
+                    }),
+                    Some("filesystem.diff") => Some(SubmitJobToolArgsPayload {
+                        pattern: None,
+                        max: None,
+                        content: None,
+                        destination_path: None,
+                        allow_overwrite: None,
+                        replacement_text: None,
+                        comparison_path: Some("other.txt".to_string()),
+                        max_bytes: None,
+                        max_chars: None,
+                    }),
+                    Some("filesystem.write") => Some(SubmitJobToolArgsPayload {
+                        pattern: None,
+                        max: None,
+                        content: Some("payload".to_string()),
+                        destination_path: None,
+                        allow_overwrite: None,
+                        replacement_text: None,
+                        comparison_path: None,
+                        max_bytes: None,
+                        max_chars: None,
+                    }),
+                    Some("filesystem.patch") => Some(SubmitJobToolArgsPayload {
+                        pattern: Some("needle".to_string()),
+                        max: None,
+                        content: None,
+                        destination_path: None,
+                        allow_overwrite: None,
+                        replacement_text: Some("replacement".to_string()),
+                        comparison_path: None,
+                        max_bytes: None,
+                        max_chars: None,
+                    }),
+                    Some("filesystem.move") => Some(SubmitJobToolArgsPayload {
+                        pattern: None,
+                        max: None,
+                        content: None,
+                        destination_path: Some("other.txt".to_string()),
+                        allow_overwrite: None,
+                        replacement_text: None,
+                        comparison_path: None,
+                        max_bytes: None,
+                        max_chars: None,
+                    }),
+                    _ => None,
+                },
                 idempotency_key: None,
             })
             .expect("filesystem capability payload should parse");
