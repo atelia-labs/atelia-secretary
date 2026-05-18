@@ -173,6 +173,10 @@ Git helpers、GitHub、Linear、memory provider、memory strategy、notification
 
 すべての tool は canonical `tool_result.v1` envelope を返します。tool-specific evidence は stable evidence record として入れます。
 
+この文書は standalone の `fs.search.output.v1` wire 形を定義しません。
+shipped beta の `fs.search` result は canonical `tool_result.v1` envelope を使います。
+将来 tool-specific output example を追加する場合は、規範として扱う前に現行 wire 形と照合しなければなりません。
+
 tool definition は次を宣言します。
 
 - primary result schema

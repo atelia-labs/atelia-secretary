@@ -190,6 +190,11 @@ packages.
 Every tool returns the canonical `tool_result.v1` envelope. Tool-specific
 evidence appears under stable evidence records.
 
+This document does not define a standalone `fs.search.output.v1` wire shape.
+The shipped beta `fs.search` result uses the canonical `tool_result.v1`
+envelope; any future tool-specific output example must be checked against the
+current wire shape before it is treated as normative.
+
 Tool definitions declare:
 
 - primary result schema

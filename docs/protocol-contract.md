@@ -101,9 +101,10 @@ Beta RPC groups:
 
 The first beta server surface is intentionally small and currently projects
 only the built-in Secretary tools that are dispatchable in this beta slice:
-`fs.delete`, `fs.diff`, `fs.list`, `fs.read`, `fs.search`, `fs.stat`, and
-`secretary.echo` as beta repertoire entries. `secretary.echo` is R0;
-`fs.delete` is R2; `fs.diff`, `fs.list`, `fs.read`, `fs.search`, and `fs.stat`
+`fs.delete`, `fs.diff`, `fs.list`, `fs.move`, `fs.patch`, `fs.read`,
+`fs.search`, `fs.stat`, `fs.write`, and `secretary.echo` as beta repertoire
+entries. `secretary.echo` is R0; `fs.delete`, `fs.move`, `fs.patch`, and
+`fs.write` are R2; `fs.diff`, `fs.list`, `fs.read`, `fs.search`, and `fs.stat`
 are R1. Broader built-ins may exist in future or runtime-backed slices, but
 they are not claimed by `ListRepertoire` until dispatch exists. Package-backed
 repertoire entries remain a future slice.
