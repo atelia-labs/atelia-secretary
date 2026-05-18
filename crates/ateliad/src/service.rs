@@ -1323,7 +1323,9 @@ impl SecretaryService {
             ) {
                 if matches!(
                     tool_kind,
-                    SubmitJobToolKind::FsWrite | SubmitJobToolKind::FsPatch
+                    SubmitJobToolKind::FsWrite
+                        | SubmitJobToolKind::FsPatch
+                        | SubmitJobToolKind::FsMove
                 ) {
                     validate_filesystem_mutation_path_scope(&repository, &resource_scope)?;
                 } else {
@@ -1335,7 +1337,6 @@ impl SecretaryService {
                             SubmitJobToolKind::FsRead
                                 | SubmitJobToolKind::FsDelete
                                 | SubmitJobToolKind::FsDiff
-                                | SubmitJobToolKind::FsMove
                         ),
                     )?;
                 }
@@ -9040,6 +9041,68 @@ mod tests {
         assert!(
             !root.join("archive").join("from.txt").exists(),
             "rejected move should not create the destination through the symlink"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_job_rejects_filesystem_move_from_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let svc = ready_service();
+        let root = test_repo_dir("filesystem-move-source-symlink-parent");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs").join("from.txt"), "payload\n").unwrap();
+        symlink(root.join("docs"), root.join("linkdir")).unwrap();
+        let repository = svc
+            .register_repository(RegisterRepositoryRequest {
+                display_name: "move-source-symlink-parent-repo".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                trust_state: RepositoryTrustState::Trusted,
+                allowed_scope: None,
+                requester: None,
+            })
+            .expect("register should succeed");
+
+        let err = svc
+            .submit_job(SubmitJobRequest {
+                requester: actor(),
+                repository_id: repository.id,
+                kind: JobKind::Mutate,
+                goal: Some("move from symlink parent".to_string()),
+                message: None,
+                model_route_key: None,
+                permission_mode_route_key: None,
+                resource_scope: Some(ResourceScope {
+                    kind: "path".to_string(),
+                    value: "linkdir/from.txt".to_string(),
+                }),
+                requested_capabilities: vec!["filesystem.move".to_string()],
+                tool_args: Some(SubmitJobToolArgs {
+                    pattern: None,
+                    max: None,
+                    content: None,
+                    destination_path: Some("to.txt".to_string()),
+                    allow_overwrite: Some(false),
+                    replacement_text: None,
+                    comparison_path: None,
+                    max_bytes: None,
+                    max_chars: None,
+                }),
+                idempotency_key: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServiceError::InvalidArgument { .. }));
+        assert_eq!(
+            fs::read_to_string(root.join("docs").join("from.txt"))
+                .expect("source file should stay in place"),
+            "payload\n"
+        );
+        assert!(
+            !root.join("to.txt").exists(),
+            "rejected move should not create the destination"
         );
         let _ = fs::remove_dir_all(root);
     }
