@@ -35,6 +35,7 @@ pub struct RuntimeJobRequest {
     pub repository_id: RepositoryId,
     pub kind: JobKind,
     pub goal: Option<String>,
+    pub message: Option<String>,
     pub resource_scope: ResourceScope,
     pub requested_capabilities: Vec<String>,
     pub approval_available: bool,
@@ -94,6 +95,7 @@ impl RuntimeJobRequest {
             repository_id,
             kind,
             goal: goal.into_optional_goal(),
+            message: None,
             resource_scope: ResourceScope {
                 kind: "repository".to_string(),
                 value: ".".to_string(),
@@ -138,6 +140,11 @@ impl RuntimeJobRequest {
         self
     }
 
+    pub fn with_message(mut self, message: Option<String>) -> Self {
+        self.message = message;
+        self
+    }
+
     pub fn with_artifact_spillover(mut self, spillover: RuntimeArtifactSpillover) -> Self {
         self.artifact_spillover = Some(spillover);
         self
@@ -166,11 +173,19 @@ impl RuntimeArtifactSpillover {
     }
 }
 
-fn display_goal(goal: Option<&str>) -> std::borrow::Cow<'_, str> {
-    match goal.map(str::trim).filter(|goal| !goal.is_empty()) {
-        Some(goal) => std::borrow::Cow::Borrowed(goal),
+fn display_optional_runtime_text(value: Option<&str>) -> std::borrow::Cow<'_, str> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => std::borrow::Cow::Borrowed(value),
         None => std::borrow::Cow::Borrowed("<unset>"),
     }
+}
+
+fn display_goal(goal: Option<&str>) -> std::borrow::Cow<'_, str> {
+    display_optional_runtime_text(goal)
+}
+
+fn display_message(message: Option<&str>) -> std::borrow::Cow<'_, str> {
+    display_optional_runtime_text(message)
 }
 
 fn summarize_goal(goal: Option<&str>) -> String {
@@ -272,7 +287,15 @@ impl RuntimeTool for EchoTool {
     }
 
     fn args_summary(&self, request: &RuntimeJobRequest) -> String {
-        summarize_goal(request.goal.as_deref())
+        match request
+            .goal
+            .as_deref()
+            .map(str::trim)
+            .filter(|goal| !goal.is_empty())
+        {
+            Some(goal) => summarize_goal(Some(goal)),
+            None => display_message(request.message.as_deref()).to_string(),
+        }
     }
 
     fn execute(&self, invocation: &ToolInvocation, request: &RuntimeJobRequest) -> ToolResult {
@@ -281,14 +304,29 @@ impl RuntimeTool for EchoTool {
             .as_deref()
             .map(str::trim)
             .filter(|goal| !goal.is_empty());
+        let message = request
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty());
+        let summary = if let Some(goal) = goal {
+            format!("echoed goal: {}", display_goal(Some(goal)))
+        } else {
+            format!("echoed message: {}", display_message(message))
+        };
         let mut fields = vec![ToolResultField {
             key: "summary".to_string(),
-            value: StructuredValue::String(format!("echoed goal: {}", display_goal(goal))),
+            value: StructuredValue::String(summary),
         }];
         if let Some(goal) = goal {
             fields.push(ToolResultField {
                 key: "goal".to_string(),
                 value: StructuredValue::String(goal.to_string()),
+            });
+        } else if let Some(message) = message {
+            fields.push(ToolResultField {
+                key: "message".to_string(),
+                value: StructuredValue::String(message.to_string()),
             });
         }
         fields.push(ToolResultField {
@@ -302,7 +340,7 @@ impl RuntimeTool for EchoTool {
             invocation_id: invocation.id.clone(),
             tool_id: invocation.tool_id.clone(),
             status: ToolResultStatus::Succeeded,
-            schema_ref: Some("tool_result.secretary.echo.v1".to_string()),
+            schema_ref: Some("tool_result.secretary.echo.v2".to_string()),
             fields,
             evidence_refs: Vec::new(),
             output_refs: Vec::new(),
@@ -1621,6 +1659,138 @@ mod tests {
             .replay_job_events(EventCursor::Beginning, None)
             .unwrap();
         assert_eq!(receipt.events, replayed);
+    }
+
+    #[test]
+    fn echo_tool_job_prefers_goal_and_omits_message_field() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(
+            actor(),
+            repository.id.clone(),
+            JobKind::Read,
+            "summarize the runtime loop",
+        )
+        .with_message(Some("free-form request message".to_string()));
+
+        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+        assert_eq!(
+            receipt
+                .tool_result
+                .as_ref()
+                .and_then(|result| result.schema_ref.as_deref()),
+            Some("tool_result.secretary.echo.v2")
+        );
+        let rendered = receipt
+            .rendered_output
+            .expect("rendered output should exist");
+        let summary = rendered
+            .body
+            .lines()
+            .find(|line| line.starts_with("  summary,"))
+            .expect("summary field should be present");
+        let goal = rendered
+            .body
+            .lines()
+            .find(|line| line.starts_with("  goal,"))
+            .expect("goal field should be present");
+        assert!(summary.contains("echoed goal: summarize the runtime loop"));
+        assert_eq!(goal, "  goal,\"summarize the runtime loop\"");
+        assert!(
+            !rendered
+                .body
+                .lines()
+                .any(|line| line.starts_with("  message,")),
+            "message field should be omitted when goal is present"
+        );
+    }
+
+    #[test]
+    fn echo_tool_job_prefers_message_when_goal_is_absent() {
+        let runtime = SecretaryRuntime::in_memory();
+        let repository = repository();
+        runtime
+            .store()
+            .create_repository(repository.clone())
+            .unwrap();
+
+        let request = RuntimeJobRequest::new(actor(), repository.id.clone(), JobKind::Read, " ")
+            .with_message(Some("plain message to echo".to_string()));
+
+        let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+        assert_eq!(
+            receipt
+                .tool_result
+                .as_ref()
+                .and_then(|result| result.schema_ref.as_deref()),
+            Some("tool_result.secretary.echo.v2")
+        );
+        let rendered = receipt
+            .rendered_output
+            .expect("rendered output should exist");
+        let summary = rendered
+            .body
+            .lines()
+            .find(|line| line.starts_with("  summary,"))
+            .expect("summary field should be present");
+        let message = rendered
+            .body
+            .lines()
+            .find(|line| line.starts_with("  message,"))
+            .expect("message field should be present");
+        let has_goal = rendered
+            .body
+            .lines()
+            .any(|line| line.starts_with("  goal,"));
+
+        assert!(summary.contains("echoed message: plain message to echo"));
+        assert_eq!(message, "  message,\"plain message to echo\"");
+        assert!(!has_goal, "goal field should be omitted without goal input");
+    }
+
+    #[test]
+    fn echo_tool_job_reports_unset_when_goal_and_message_are_absent_or_blank() {
+        for message in [None, Some("   ".to_string())] {
+            let runtime = SecretaryRuntime::in_memory();
+            let repository = repository();
+            runtime
+                .store()
+                .create_repository(repository.clone())
+                .unwrap();
+
+            let request =
+                RuntimeJobRequest::new(actor(), repository.id.clone(), JobKind::Read, " ")
+                    .with_message(message);
+
+            let receipt = runtime.run_tool_job(request, &EchoTool).unwrap();
+            let result = receipt.tool_result.as_ref().expect("tool result");
+            let summary = result
+                .fields
+                .iter()
+                .find(|field| field.key == "summary")
+                .expect("summary field");
+
+            assert_eq!(
+                result.schema_ref.as_deref(),
+                Some("tool_result.secretary.echo.v2")
+            );
+            assert_eq!(
+                summary.value,
+                StructuredValue::String("echoed message: <unset>".to_string())
+            );
+            assert!(
+                !result
+                    .fields
+                    .iter()
+                    .any(|field| field.key == "goal" || field.key == "message"),
+                "blank goal and message should not emit goal/message fields"
+            );
+        }
     }
 
     #[test]

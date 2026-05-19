@@ -401,6 +401,7 @@ pub struct SubmitJobRequest {
     pub repository_id: RepositoryId,
     pub kind: JobKind,
     pub goal: Option<String>,
+    /// Free-form user message routed to default `secretary.echo` when `goal` is absent.
     pub message: Option<String>,
     pub model_route_key: Option<String>,
     pub permission_mode_route_key: Option<String>,
@@ -1305,6 +1306,7 @@ impl SecretaryService {
             normalized_goal.clone(),
         )
         .with_requested_capabilities(requested_capabilities)
+        .with_message(request.message.clone())
         .with_tool_output_defaults(tool_output_defaults)
         .with_resource_scope(resource_scope.kind.clone(), resource_scope.value.clone());
 
@@ -10511,6 +10513,16 @@ mod tests {
             .expect("message-only submit should succeed");
 
         assert_eq!(receipt.job.goal, None);
+        let rendered_output = receipt
+            .rendered_output
+            .as_ref()
+            .expect("message-only submit should still render tool output");
+        assert!(rendered_output
+            .body
+            .contains("echoed message: free-form requester message"));
+        assert!(!rendered_output
+            .body
+            .contains("echoed goal: free-form requester message"));
         let _ = fs::remove_dir_all(root);
     }
 

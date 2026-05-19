@@ -132,11 +132,17 @@ policy は、この PR とは別の future product lane です。この job requ
 あくまで optional な goal summary であり、first-class な goal lifecycle contract は
 将来に予約されています。
 
-`SubmitJobRequest.message` は任意の free-form requester message であり、`goal` の
-fallback ではありません。Secretary は request validation と idempotency semantics
-のために保持できますが、raw message を `Job` や default analytics record へ echo
-しません。`model_route_key` と `permission_mode_route_key` は任意の routing hint
-であり、同じ request signature semantics で保持します。
+`SubmitJobRequest.message` は任意の free-form requester message です。これは durable
+な `goal` fallback ではありません。trim 後に `goal` が存在する場合は `goal` が優先され、
+default の `secretary.echo` result は goal を報告し、message field は省略します。`goal`
+が存在しない場合、coding-agent MVP は `message` を default の `secretary.echo` answer
+へ route し、tool result と `RenderToolOutput` output では `summary: "echoed message: ..."`
+と `message` field として visible になります。`goal` と `message` がどちらも未指定または
+blank の場合、`secretary.echo` は `summary: "echoed message: <unset>"` を返し、`goal` と
+`message` field はどちらも省略します。`Job` 自体は raw message を直接 echo しません。
+client は `tool_result_recorded` event refs を使って参照先 tool result を render してください。
+`model_route_key` と `permission_mode_route_key` は任意の routing hint であり、同じ request
+signature semantics で保持します。
 `message`、`model_route_key`、`permission_mode_route_key` が指定された場合、
 それらは raw string identity として `SubmitJob` の request signature に参加します。
 空文字列や whitespace-only value は、未指定とも他の whitespace 表現とも別の値です。
@@ -214,6 +220,12 @@ fallback ではありません。Secretary は request validation と idempotenc
 ### Tool Result
 
 `ToolResultRef` は canonical structured output を指します。protocol は default では ref を返し、`RenderToolOutput` で TOON、JSON、text を選べるようにします。underlying result は変わりません。
+
+`tool_result.secretary.echo.v2` は `secretary.echo` の built-in deterministic answer
+contract です。常に `summary` と `policy.state` を含みます。non-blank な
+`SubmitJobRequest.goal` がある場合は `goal` を含みます。それ以外で non-blank な
+`SubmitJobRequest.message` がある場合は `message` を含みます。`tool_result_recorded`
+event は、これらの field を render するために必要な result refs を運びます。
 
 ### Package Trust Index
 
