@@ -1740,13 +1740,33 @@ fn load_durable_snapshot(path: &Path) -> StoreResult<InMemoryInner> {
 
 fn persist_durable_snapshot(path: &Path, inner: &InMemoryInner) -> StoreResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| StoreError::Conflict {
-            collection: "store",
-            reason: format!(
-                "failed to create durable snapshot directory {}: {error}",
-                parent.display()
-            ),
-        })?;
+        // Ensure parent directory is created with restrictive permissions to prevent unauthorized access
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|error| StoreError::Conflict {
+                    collection: "store",
+                    reason: format!(
+                        "failed to create durable snapshot directory {}: {error}",
+                        parent.display()
+                    ),
+                })?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(parent).map_err(|error| StoreError::Conflict {
+                collection: "store",
+                reason: format!(
+                    "failed to create durable snapshot directory {}: {error}",
+                    parent.display()
+                ),
+            })?;
+        }
     }
 
     let snapshot = DurableStoreSnapshot {
@@ -8404,6 +8424,22 @@ mod tests {
 
         let mode = fs::metadata(snapshot_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_durable_snapshot_creates_parent_directory_with_owner_only_permissions() {
+        let storage_dir = durable_storage_dir("durable-snapshot-dir-permissions");
+        let snapshot_path = storage_dir
+            .join("snapshot")
+            .join("nested")
+            .join(DURABLE_STORE_FILE_NAME);
+
+        persist_durable_snapshot(&snapshot_path, &InMemoryInner::default()).unwrap();
+
+        let parent = snapshot_path.parent().unwrap();
+        let mode = fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]
