@@ -171,11 +171,18 @@ and OM default package policy in separate future product lanes. This job
 request still only carries an optional goal summary; a first-class goal
 lifecycle contract is reserved for later.
 
-`SubmitJobRequest.message` is an optional free-form requester message and is
-not a fallback for `goal`. Secretary may preserve it for request validation and
-idempotency semantics, but does not echo the raw message on `Job` or default
-analytics records. `model_route_key` and `permission_mode_route_key` are
-optional routing hints preserved with the same request-signature semantics.
+`SubmitJobRequest.message` is an optional free-form requester message. It is
+not a durable `goal` fallback: when `goal` is present after trimming, `goal`
+wins and the default `secretary.echo` result reports the goal, omitting the
+message field. When `goal` is absent, the coding-agent MVP routes `message` to
+the default `secretary.echo` answer, where it is visible in the tool result and
+`RenderToolOutput` output as `summary: "echoed message: ..."` plus a `message`
+field. If both `goal` and `message` are absent or blank, `secretary.echo`
+returns `summary: "echoed message: <unset>"` and omits both `goal` and `message`
+fields. `Job` still does not echo the raw message directly; clients should use
+the `tool_result_recorded` event refs and render the referenced tool result.
+`model_route_key` and `permission_mode_route_key` are optional routing hints
+preserved with the same request-signature semantics.
 When present, `message`, `model_route_key`, and `permission_mode_route_key`
 participate in the `SubmitJob` request signature using raw string identity:
 blank strings and whitespace-only values are distinct from omission and from
@@ -268,6 +275,13 @@ tokens or replay/query cursor syntax still return `INVALID_REQUEST`.
 `ToolResultRef` points to canonical structured output. The protocol returns refs
 by default and renders output through `RenderToolOutput` so clients can choose
 TOON, JSON, or text without changing the underlying result.
+
+`tool_result.secretary.echo.v2` is the built-in deterministic answer contract
+for `secretary.echo`. It always includes `summary` and `policy.state`. It
+includes `goal` when a non-blank `SubmitJobRequest.goal` is present. Otherwise,
+it includes `message` when a non-blank `SubmitJobRequest.message` is present.
+The `tool_result_recorded` event carries the result refs needed to render these
+fields.
 
 ### Package Trust Index
 

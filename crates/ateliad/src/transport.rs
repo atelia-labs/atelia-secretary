@@ -6887,6 +6887,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn job_routes_submit_message_is_rendered_by_tool_output_endpoint() {
+        let rpc_server = ready_rpc_server();
+        let root = test_repo_dir("job-route-message-render");
+        let repository = {
+            let server = rpc_server.write().await;
+            server
+                .register_repository(rpc::RegisterRepositoryRequest {
+                    display_name: "message-render-repo".to_string(),
+                    root_path: root.to_string_lossy().to_string(),
+                    allowed_scope: None,
+                    requester: None,
+                })
+                .expect("register should succeed")
+                .repository
+        };
+
+        let submit_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/jobs/submit",
+            serde_json::json!({
+                "repository_id": repository.repository_id,
+                "requester": {
+                    "type": "agent",
+                    "id": "agent:job-route-message",
+                    "display_name": "Job Route Message Agent"
+                },
+                "kind": "read",
+                "message": "what happened to file X?",
+                "requested_capabilities": []
+            }),
+        )
+        .await;
+        assert_eq!(submit_response.status(), StatusCode::OK);
+        let submit_payload = to_bytes(submit_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(submit_payload["status"], Value::String("ok".to_string()));
+        let job_id = submit_payload["data"]["job"]["job_id"]
+            .as_str()
+            .expect("job id should be present")
+            .to_string();
+
+        let events_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            &format!("/v1/jobs/{job_id}/events"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(events_response.status(), StatusCode::OK);
+        let events_payload = to_bytes(events_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        let tool_result_event = events_payload["data"]["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .find(|event| event["kind"].as_str() == Some("tool_result_recorded"))
+            .expect("tool_result_recorded event should exist");
+        let tool_result_id = tool_result_event["refs"]["tool_result_id"]
+            .as_str()
+            .expect("tool result id");
+        let tool_invocation_id = tool_result_event["refs"]["tool_invocation_id"]
+            .as_str()
+            .expect("tool invocation id");
+
+        let render_response = send_json_request(
+            &rpc_server,
+            Method::POST,
+            "/v1/tool-results:render",
+            serde_json::json!({
+                "tool_result": {
+                    "tool_result_id": tool_result_id,
+                    "tool_invocation_id": tool_invocation_id,
+                    "job_id": job_id,
+                    "repository_id": repository.repository_id,
+                    "content_type": "application/json",
+                },
+                "format": "json",
+            }),
+        )
+        .await;
+        assert_eq!(render_response.status(), StatusCode::OK);
+        let render_payload = to_bytes(render_response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).expect("response json"))
+            .expect("response bytes");
+        assert_eq!(render_payload["status"], Value::String("ok".to_string()));
+        let rendered_output: serde_json::Value = serde_json::from_str(
+            render_payload["data"]["rendered_output"]
+                .as_str()
+                .expect("rendered output body should be string"),
+        )
+        .expect("rendered output should parse as json");
+        let fields = rendered_output["fields"]
+            .as_array()
+            .expect("rendered fields should be present")
+            .iter()
+            .map(|field| {
+                (
+                    field["key"].as_str().unwrap_or(""),
+                    field["value"]["string"].as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let summary = fields
+            .iter()
+            .find(|(key, _)| *key == "summary")
+            .and_then(|(_, value)| *value)
+            .expect("summary field");
+        let message = fields
+            .iter()
+            .find(|(key, _)| *key == "message")
+            .and_then(|(_, value)| *value)
+            .expect("message field");
+
+        assert!(summary.contains("echoed message: what happened to file X?"));
+        assert_eq!(message, "what happened to file X?");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn submit_job_payload_rejects_ambiguous_filesystem_read_scopes() {
         for roots in [
