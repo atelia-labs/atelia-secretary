@@ -1,3 +1,8 @@
+## 2026-05-19 - [Restrict Durable Snapshot Directory Permissions] (entry recorded: 2026-05-19)
+**Vulnerability:** Durable snapshot parent directories could be created with default Unix permissions, potentially exposing snapshot storage to other users.
+**Learning:** Sensitive directory permissions are as critical as file permissions for durable snapshot confidentiality.
+**Prevention:** In `persist_durable_snapshot`, create missing parents with `std::os::unix::fs::DirBuilderExt::mode(0o700)` and add a Unix regression test validating parent mode `0o700`.
+
 ## 2025-02-27 - [Fix overly permissive permissions on store files] (entry recorded: 2026-05-11)
 **Vulnerability:** Newly created store snapshot files and ledger.json were created with default umask permissions during atomic writes instead of restrictive `0o600` permissions.
 **Learning:** In Rust, `fs::File::create` or `OpenOptions::new().write(true).create_new(true).open()` without explicit `mode(0o600)` on unix can result in files with broader than intended read access.

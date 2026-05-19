@@ -8426,6 +8426,22 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn persist_durable_snapshot_creates_parent_directory_with_owner_only_permissions() {
+        let storage_dir = durable_storage_dir("durable-snapshot-dir-permissions");
+        let snapshot_path = storage_dir
+            .join("snapshot")
+            .join("nested")
+            .join(DURABLE_STORE_FILE_NAME);
+
+        persist_durable_snapshot(&snapshot_path, &InMemoryInner::default()).unwrap();
+
+        let parent = snapshot_path.parent().unwrap();
+        let mode = fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
     #[test]
     fn durable_store_round_trips_submit_job_idempotency_records() {
         let storage_dir = durable_storage_dir("idempotency-roundtrip");
